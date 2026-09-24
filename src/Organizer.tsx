@@ -35,7 +35,7 @@ function Thumbnail({ document, index }: { document: DocumentInfo; index: number 
   return <div ref={element} className={s.thumbnail} style={{ aspectRatio: `${size.width}/${size.height}` }}>{url ? <img src={url} alt={`Page ${index + 1} preview`} draggable={false} /> : <span>{error ? 'Preview unavailable' : 'Loading…'}</span>}</div>;
 }
 
-export default function Organizer({ document, currentPage = 0, pageLabels = null, busy, edit, save, split, crop, insert = () => {}, replace = () => {}, close }: { document: DocumentInfo; currentPage?: number; pageLabels?: DocumentPageLabels | null; busy: boolean; edit: (action: PageEdit) => Promise<boolean>; save: (pages?: number[]) => Promise<void>; split: (pagesPerFile: number) => Promise<SplitOutput | null>; crop: (target: { id: number; revision: number; pages: number[] }, insets: CropInsets) => Promise<void>; insert?: () => void; replace?: (pages: number[]) => void; close: () => void }) {
+export default function Organizer({ document, currentPage = 0, pageLabels = null, busy, edit, save, split, crop, resetCrop = async () => {}, insert = () => {}, replace = () => {}, close }: { document: DocumentInfo; currentPage?: number; pageLabels?: DocumentPageLabels | null; busy: boolean; edit: (action: PageEdit) => Promise<boolean>; save: (pages?: number[]) => Promise<void>; split: (pagesPerFile: number) => Promise<SplitOutput | null>; crop: (target: { id: number; revision: number; pages: number[] }, insets: CropInsets) => Promise<void>; resetCrop?: (target: { id: number; revision: number; pages: number[] }) => Promise<void>; insert?: () => void; replace?: (pages: number[]) => void; close: () => void }) {
   const [selected, setSelected] = useState<number[]>(() => [clampPage(currentPage, document.pages.length)]);
   const [range, setRange] = useState(() => String(clampPage(currentPage, document.pages.length) + 1));
   const [destination, setDestination] = useState('');
@@ -44,6 +44,7 @@ export default function Organizer({ document, currentPage = 0, pageLabels = null
   const [splitOpen, setSplitOpen] = useState(false);
   const [cropTarget, setCropTarget] = useState<{ id: number; revision: number; pages: CropPage[] } | null>(null);
   const lastClicked = useRef(clampPage(currentPage, document.pages.length));
+  const resetInFlight = useRef(false);
   useEffect(() => {
     const fallback = clampPage(lastClicked.current, document.pages.length);
     const bounded = selected.filter(index => index >= 0 && index < document.pages.length);
@@ -78,6 +79,13 @@ export default function Organizer({ document, currentPage = 0, pageLabels = null
     if (busy || !count) return;
     setCropTarget({ id: document.id, revision: document.revision, pages: selected.map(page => ({ page, width: document.pages[page].width, height: document.pages[page].height })) });
   };
+  const resetSelectedCrops = () => {
+    if (busy || resetInFlight.current || !count) return;
+    const pages = [...new Set(selected)].filter(page => page >= 0 && page < document.pages.length).sort((left, right) => left - right);
+    if (!pages.length) return;
+    resetInFlight.current = true; setError('');
+    void resetCrop({ id: document.id, revision: document.revision, pages }).finally(() => { resetInFlight.current = false; });
+  };
   return <section className={s.organizer} aria-label="Organize pages workspace">
     <div className={s.heading}><div><h1>Organize pages</h1><p>Rotate, reorder, or extract pages. Save your changes as a new PDF.</p></div><button onClick={close} disabled={busy}><X size={17} /> Close tool</button></div>
     <div className={s.toolbar}>
@@ -99,6 +107,7 @@ export default function Organizer({ document, currentPage = 0, pageLabels = null
       <button disabled={busy} onClick={insert}><Files size={16} /> Insert pages</button>
       <button disabled={busy || !count} onClick={() => replace(selected)}><Files size={16} /> Replace pages</button>
       <button disabled={busy || !count} onClick={openCrop}><Crop size={16} /> Crop</button>
+      <button aria-label="Reset crop on selected pages" title="Remove crop edits made in this open session. Original PDF crop and page boxes stay unchanged." disabled={busy || !count} onClick={resetSelectedCrops}>Reset crop</button>
       <button disabled={busy} onClick={() => setSplitOpen(true)}><Scissors size={16} /> Split</button>
       <button className={s.save} disabled={busy} onClick={() => void save()}>Save a copy</button>
     </div>

@@ -74,6 +74,7 @@ export const splitDocument = (id: number, revision: number, pagesPerFile: number
 export type CropInsets = { top: number; right: number; bottom: number; left: number };
 export const cropPage = (id: number, page: number, revision: number, rect: { x: number; y: number; width: number; height: number }) => invoke<DocumentInfo>('crop_page', { id, page, revision, rect });
 export const cropPages = (id: number, revision: number, pages: number[], insets: CropInsets) => invoke<DocumentInfo>('crop_pages', { id, revision, pages, insets });
+export const resetCrops = (id: number, revision: number, pages: number[]) => invoke<DocumentInfo>('reset_crops', { id, revision, pages });
 export async function renderPage(id: number, page: number, width: number) {
   const bytes = await invoke<ArrayBuffer>('render_page', { id, page, width });
   return URL.createObjectURL(new Blob([bytes], { type: 'image/png' }));

@@ -99,6 +99,10 @@ async fn crop_pages(service: State<'_, PdfService>, id: u64, pages: Vec<u16>, re
     service.crop_pages(id, pages, revision, insets).await
 }
 #[tauri::command]
+async fn reset_crops(service: State<'_, PdfService>, id: u64, revision: u64, pages: Vec<u16>) -> Result<DocumentInfo, String> {
+    service.reset_crops(id, pages, revision).await
+}
+#[tauri::command]
 async fn save_copy(app: tauri::AppHandle, service: State<'_, PdfService>, id: u64, pages: Option<Vec<usize>>) -> Result<Option<service::SavedCopy>, String> {
     let window = app.get_webview_window("main").ok_or("Application window is unavailable")?;
     let suggested = if pages.is_some() { "extracted-pages.pdf" } else { "organized-copy.pdf" };
@@ -167,6 +171,6 @@ fn main() {
         app.manage(PdfService::start(library));
         app.manage(print_commands::PrintJobs::default());
         Ok(())
-    }).invoke_handler(tauri::generate_handler![document_form_fields, fill_form_copy, open_document, reopen_document, open_example, render_page, export_page_image, close_document, edit_pages, crop_page, crop_pages, create_pdf_from_image, create_comment, update_comment, delete_comment, document_comments, document_annotations, create_highlight, create_text_highlight, update_highlight, delete_highlight, save_copy, split_document, combine_documents, insert_pages_copy, replace_pages_copy, page_text, page_text_geometry, document_bookmarks, document_page_labels, document_properties, dependency_notices, unlock_document, cancel_password_request, print_commands::print_document, print_commands::cancel_print])
+    }).invoke_handler(tauri::generate_handler![document_form_fields, fill_form_copy, open_document, reopen_document, open_example, render_page, export_page_image, close_document, edit_pages, crop_page, crop_pages, reset_crops, create_pdf_from_image, create_comment, update_comment, delete_comment, document_comments, document_annotations, create_highlight, create_text_highlight, update_highlight, delete_highlight, save_copy, split_document, combine_documents, insert_pages_copy, replace_pages_copy, page_text, page_text_geometry, document_bookmarks, document_page_labels, document_properties, dependency_notices, unlock_document, cancel_password_request, print_commands::print_document, print_commands::cancel_print])
       .run(tauri::generate_context!()).expect("Desktop application failed");
 }

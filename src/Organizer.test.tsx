@@ -109,6 +109,34 @@ it('crops a captured multi-page selection once with physical indices and revisio
   act(() => ui.unmount());
 });
 
+it('resets a captured sorted physical selection without using page labels', async () => {
+  const resetCrop = vi.fn().mockResolvedValue(undefined); const pageLabels = { documentId: 1, revision: 0, status: 'supported' as const, reason: null, labels: document.pages.map((_, page) => ({ page, label: `label-${20 - page}` })) }; let ui!: ReactTestRenderer;
+  act(() => { ui = create(<Organizer document={document} pageLabels={pageLabels} busy={false} edit={vi.fn()} save={vi.fn()} split={vi.fn()} crop={vi.fn()} resetCrop={resetCrop} close={vi.fn()} />); });
+  act(() => pageButton(ui, 4).props.onClick({ shiftKey: false, ctrlKey: false, metaKey: false }));
+  act(() => pageButton(ui, 2).props.onClick({ shiftKey: false, ctrlKey: true, metaKey: false }));
+  await act(async () => ui.root.findByProps({ 'aria-label': 'Reset crop on selected pages' }).props.onClick());
+  expect(resetCrop).toHaveBeenCalledWith({ id: 1, revision: 0, pages: [1, 3] });
+  expect(pageButton(ui, 2).props['aria-pressed']).toBe(true);
+  expect(pageButton(ui, 4).props['aria-pressed']).toBe(true);
+  act(() => ui.unmount());
+});
+
+it('disables reset crop for no selection and suppresses duplicate requests while pending', async () => {
+  let resolve!: () => void;
+  const resetCrop = vi.fn(() => new Promise<void>(done => { resolve = done; })); let ui!: ReactTestRenderer;
+  act(() => { ui = create(<Organizer document={document} busy={false} edit={vi.fn()} save={vi.fn()} split={vi.fn()} crop={vi.fn()} resetCrop={resetCrop} close={vi.fn()} />); });
+  const reset = () => ui.root.findByProps({ 'aria-label': 'Reset crop on selected pages' });
+  act(() => reset().props.onClick()); act(() => reset().props.onClick());
+  expect(resetCrop).toHaveBeenCalledOnce();
+  await act(async () => resolve());
+  act(() => ui.update(<Organizer document={document} busy edit={vi.fn()} save={vi.fn()} split={vi.fn()} crop={vi.fn()} resetCrop={resetCrop} close={vi.fn()} />));
+  expect(reset().props.disabled).toBe(true);
+  act(() => ui.update(<Organizer document={document} busy={false} edit={vi.fn()} save={vi.fn()} split={vi.fn()} crop={vi.fn()} resetCrop={resetCrop} close={vi.fn()} />));
+  act(() => pageButton(ui, 1).props.onClick({ shiftKey: false, ctrlKey: true, metaKey: false }));
+  expect(reset().props.disabled).toBe(true);
+  act(() => ui.unmount());
+});
+
 it('starts on the current page, preserves later user selection, and clamps it when pages disappear', async () => {
   const crop = vi.fn().mockResolvedValue(undefined);
   const pages = document.pages.map((page, index) => index === 5 ? { width: 792, height: 612 } : page);

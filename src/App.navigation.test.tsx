@@ -2,14 +2,15 @@ import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import App from './App';
 import Viewer from './Viewer';
-import { documentPageLabels, editPages, openDocument, pageText, renderPage } from './bridge';
+import { documentPageLabels, editPages, openDocument, pageText, renderPage, resetCrops } from './bridge';
 import type { DocumentInfo } from './model';
-vi.mock('./bridge', () => ({ native: false, openDocument: vi.fn(), reopenDocument: vi.fn(), closeDocument: vi.fn(), editPages: vi.fn(), saveCopy: vi.fn(), pageText: vi.fn(), renderPage: vi.fn(), createPdfFromImage: vi.fn(), documentPageLabels: vi.fn() }));
+vi.mock('./bridge', () => ({ native: false, openDocument: vi.fn(), reopenDocument: vi.fn(), closeDocument: vi.fn(), editPages: vi.fn(), saveCopy: vi.fn(), pageText: vi.fn(), renderPage: vi.fn(), resetCrops: vi.fn(), createPdfFromImage: vi.fn(), documentPageLabels: vi.fn() }));
 vi.mock('./Viewer', () => ({ default: () => <div>Viewer</div> }));
 const document = (id: number, count = 6): DocumentInfo => ({ id, name: `file-${id}.pdf`, path: `C:/file-${id}.pdf`, pages: Array.from({ length: count }, () => ({ width: 612, height: 792 })), revision: 0, dirty: false, can_undo: true, can_redo: false });
 beforeEach(() => {
   vi.clearAllMocks(); const storage = new Map();
   vi.stubGlobal('window', { localStorage: { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value) }, addEventListener: vi.fn(), removeEventListener: vi.fn() });
+  vi.stubGlobal('IntersectionObserver', class { observe() {} disconnect() {} });
 });
 afterEach(() => vi.unstubAllGlobals());
 const tab = (ui: ReactTestRenderer, name: string) => ui.root.findAllByType('button').find(button => button.findAllByType('span').some(span => span.children.includes(name)))!;
@@ -53,6 +54,38 @@ it('enables Next on the first page and disables it only at the final page', asyn
   expect(ui.root.findByType(Viewer).props.target.page).toBe(5);
   expect(previous().props.disabled).toBe(false);
   expect(next().props.disabled).toBe(true);
+  act(() => ui.unmount());
+});
+
+it('keeps reset-crop no-ops neutral and allows a stale failure to retry without leaving Organizer', async () => {
+  let ui!: ReactTestRenderer; act(() => { ui = create(<App />); });
+  await open(ui, 1);
+  act(() => ui.root.findByType(Viewer).props.onPage(3));
+  act(() => ui.root.findByProps({ 'aria-expanded': false }).props.onClick());
+  act(() => ui.root.findAllByType('button').find(button => button.children.includes('Organize pages'))!.props.onClick());
+  const reset = () => ui.root.findByProps({ 'aria-label': 'Reset crop on selected pages' });
+  vi.mocked(resetCrops).mockResolvedValueOnce(document(1));
+  await act(async () => reset().props.onClick());
+  expect(resetCrops).toHaveBeenLastCalledWith(1, 0, [3]);
+  expect(text(ui.toJSON())).toContain('no crop edits from this session');
+  expect(ui.root.findByProps({ 'aria-label': 'Select page 4' }).props['aria-pressed']).toBe(true);
+  expect(text(ui.toJSON())).not.toContain('Unsaved changes');
+  act(() => ui.root.findAllByType('button').find(button => text(button.props.children).includes('Close tool'))!.props.onClick());
+  act(() => ui.root.findByProps({ 'aria-expanded': false }).props.onClick());
+  act(() => ui.root.findAllByType('button').find(button => button.children.includes('Organize pages'))!.props.onClick());
+  expect(ui.root.findByProps({ 'aria-label': 'Select page 4' }).props['aria-pressed']).toBe(true);
+  vi.mocked(resetCrops).mockResolvedValueOnce({ ...document(2), revision: 1, dirty: true, can_undo: true });
+  await act(async () => reset().props.onClick());
+  expect(text(ui.toJSON())).toContain('The crop reset returned an unexpected document.');
+  expect(ui.root.findByProps({ 'aria-label': 'Organize pages workspace' })).toBeTruthy();
+  vi.mocked(resetCrops).mockRejectedValueOnce(new Error('Document changed. Reset crop again.')).mockResolvedValueOnce({ ...document(1), revision: 1, dirty: true, can_undo: true });
+  await act(async () => reset().props.onClick());
+  expect(text(ui.toJSON())).toContain('Document changed. Reset crop again.');
+  expect(ui.root.findByProps({ 'aria-label': 'Organize pages workspace' })).toBeTruthy();
+  await act(async () => reset().props.onClick());
+  expect(resetCrops).toHaveBeenLastCalledWith(1, 0, [3]);
+  expect(ui.root.findByProps({ 'aria-label': 'Select page 4' }).props['aria-pressed']).toBe(true);
+  expect(text(ui.toJSON())).toContain('Unsaved changes');
   act(() => ui.unmount());
 });
 it('shows labels as secondary text while numeric navigation stays physical', async () => {
