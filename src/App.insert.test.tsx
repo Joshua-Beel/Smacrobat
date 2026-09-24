@@ -5,7 +5,7 @@ import Viewer from './Viewer';
 import { insertPagesCopy, openDocument } from './bridge';
 import type { DocumentInfo } from './model';
 
-vi.mock('./bridge', () => ({ native: false, openDocument: vi.fn(), reopenDocument: vi.fn(), closeDocument: vi.fn(), editPages: vi.fn(), saveCopy: vi.fn(), splitDocument: vi.fn(), cropPage: vi.fn(), combineDocuments: vi.fn(), insertPagesCopy: vi.fn(), documentPageLabels: vi.fn() }));
+vi.mock('./bridge', () => ({ native: false, openDocument: vi.fn(), reopenDocument: vi.fn(), closeDocument: vi.fn(), editPages: vi.fn(), saveCopy: vi.fn(), splitDocument: vi.fn(), cropPage: vi.fn(), cropPages: vi.fn(), combineDocuments: vi.fn(), insertPagesCopy: vi.fn(), documentPageLabels: vi.fn() }));
 vi.mock('./Viewer', () => ({ default: () => <div>Viewer</div> }));
 vi.mock('./Organizer', () => ({ default: ({ insert }: { insert: () => void }) => <button onClick={insert}>Insert pages</button> }));
 const document = (id: number, revision: number): DocumentInfo => ({ id, name: `file-${id}.pdf`, path: `C:/file-${id}.pdf`, pages: Array.from({ length: id + 1 }, () => ({ width: 612, height: 792 })), revision, dirty: true, can_undo: true, can_redo: false });

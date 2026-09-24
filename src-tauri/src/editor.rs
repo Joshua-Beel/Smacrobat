@@ -54,6 +54,8 @@ pub enum PageEdit {
     Move { from: usize, to: usize },
     #[serde(skip_deserializing)]
     Crop { page: usize, crop: CropBox },
+    #[serde(skip_deserializing)]
+    CropMany { crops: Vec<(usize, CropBox)> },
     Undo,
     Redo,
 }
@@ -203,7 +205,7 @@ impl EditSession {
             }
             edit => {
                 let mut next = self.plan.clone();
-                let structural = !matches!(&edit, PageEdit::Rotate { .. } | PageEdit::Crop { .. });
+                let structural = !matches!(&edit, PageEdit::Rotate { .. } | PageEdit::Crop { .. } | PageEdit::CropMany { .. });
                 let removal = matches!(&edit, PageEdit::Delete { .. });
                 let document = self.load_source()?;
                 check_supported(&document, structural, removal)?;
@@ -224,13 +226,21 @@ impl EditSession {
                     }
                     PageEdit::Crop { page, crop } => {
                         let spec = next.get_mut(page).ok_or("Page is out of range")?;
-                        let id = *document.get_pages().values().nth(spec.source).ok_or("Source page mapping is invalid.")?;
-                        let rotation = inherited(&document, id, b"Rotate")?.map(|value| value.as_i64().map_err(|error| error.to_string())).transpose()?.unwrap_or(0);
-                        if rotation % 90 != 0 { return Err("This document has an unsupported page rotation.".into()); }
-                        let visible = match spec.crop { Some(crop) => crop, None => visible_box(&document, id)? };
-                        crop.validate_within(visible)?;
+                        let visible = validate_crop(&document, spec, crop)?;
                         if crop == visible { return Ok(()); }
                         spec.crop = Some(crop);
+                    }
+                    PageEdit::CropMany { crops } => {
+                        if crops.is_empty() || crops.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+                            return Err("Select one or more pages in ascending order without duplicates.".into());
+                        }
+                        for &(page, crop) in &crops {
+                            let spec = next.get(page).ok_or("Page is out of range")?;
+                            if validate_crop(&document, spec, crop)? == crop {
+                                return Err("The insets are too small to change every selected page.".into());
+                            }
+                        }
+                        for (page, crop) in crops { next[page].crop = Some(crop); }
                     }
                     _ => unreachable!(),
                 }
@@ -301,6 +311,15 @@ fn visible_box(document: &Document, id: ObjectId) -> Result<CropBox, String> {
     let crop = inherited(document, id, b"CropBox")?.map(read_box).transpose()?.unwrap_or(media);
     let visible = CropBox { left: media.left.max(crop.left), bottom: media.bottom.max(crop.bottom), right: media.right.min(crop.right), top: media.top.min(crop.top) };
     if !visible.valid() { return Err("The page has an empty visible boundary box.".into()); }
+    Ok(visible)
+}
+
+fn validate_crop(document: &Document, spec: &PageSpec, crop: CropBox) -> Result<CropBox, String> {
+    let id = *document.get_pages().values().nth(spec.source).ok_or("Source page mapping is invalid.")?;
+    let rotation = inherited(document, id, b"Rotate")?.map(|value| value.as_i64().map_err(|error| error.to_string())).transpose()?.unwrap_or(0);
+    if rotation % 90 != 0 { return Err("This document has an unsupported page rotation.".into()); }
+    let visible = match spec.crop { Some(crop) => crop, None => visible_box(document, id)? };
+    crop.validate_within(visible)?;
     Ok(visible)
 }
 
@@ -420,6 +439,33 @@ mod tests {
         assert!(!session.can_redo()); assert_eq!(session.plan[0].crop, Some(crop));
         assert_eq!(session.source, bytes); assert_history_budget(&session);
         assert!(serde_json::from_str::<PageEdit>(r#"{"kind":"crop","page":0,"crop":{"left":0,"bottom":0,"right":1,"top":1}}"#).is_err(), "Source-coordinate crop cannot bypass the dedicated revision-checked IPC");
+    }
+    #[test]
+    fn batch_crop_validates_every_target_before_one_history_commit() {
+        let source = sample();
+        let document = Document::load_mem(&source).unwrap();
+        let pages: Vec<_> = document.get_pages().values().copied().collect();
+        let first = visible_box(&document, pages[0]).unwrap();
+        let third = visible_box(&document, pages[2]).unwrap();
+        let first_crop = CropBox { left: first.left + 10.0, bottom: first.bottom + 20.0, right: first.right - 30.0, top: first.top - 40.0 };
+        let third_crop = CropBox { left: third.left + 20.0, bottom: third.bottom + 10.0, right: third.right - 40.0, top: third.top - 30.0 };
+        let mut session = EditSession::new(source.clone(), pages.len());
+        let original = session.plan.clone();
+
+        assert!(session.apply(PageEdit::CropMany { crops: vec![(0, first_crop), (pages.len(), third_crop)] }).unwrap_err().contains("range"));
+        assert_eq!(session.plan, original); assert_eq!(session.revision, 0); assert!(!session.can_undo()); assert!(!session.dirty());
+        assert!(session.apply(PageEdit::CropMany { crops: vec![(2, third_crop), (0, first_crop)] }).unwrap_err().contains("ascending"));
+        assert!(session.apply(PageEdit::CropMany { crops: vec![(0, first_crop), (0, first_crop)] }).unwrap_err().contains("duplicates"));
+        assert!(session.apply(PageEdit::CropMany { crops: vec![(0, first)] }).unwrap_err().contains("too small"));
+        assert_eq!(session.plan, original); assert_eq!(session.revision, 0); assert!(!session.can_undo());
+
+        session.apply(PageEdit::CropMany { crops: vec![(0, first_crop), (2, third_crop)] }).unwrap();
+        assert_eq!(session.revision, 1); assert!(session.can_undo()); assert!(!session.can_redo());
+        assert_eq!(session.plan[0].crop, Some(first_crop)); assert_eq!(session.plan[2].crop, Some(third_crop));
+        assert_eq!(session.plan[1], original[1]); assert_eq!(session.source, source);
+        session.apply(PageEdit::Undo).unwrap(); assert_eq!(session.plan, original); assert_eq!(session.revision, 2); assert!(session.can_redo());
+        session.apply(PageEdit::Redo).unwrap(); assert_eq!(session.plan[0].crop, Some(first_crop)); assert_eq!(session.plan[2].crop, Some(third_crop)); assert_eq!(session.revision, 3);
+        assert_history_budget(&session);
     }
     #[test]
     fn crop_inherited_intersected_boxes_survive_structural_export_and_invalid_edits_are_atomic() {

@@ -8,7 +8,8 @@ import { renderPage } from './bridge';
 import s from './Organizer.module.css';
 import ConfirmDialog from './ConfirmDialog';
 import SplitDialog from './SplitDialog';
-import CropDialog from './CropDialog';
+import CropDialog, { type CropPage } from './CropDialog';
+import type { CropInsets } from './bridge';
 
 const clampPage = (page: number, pageCount: number) => Math.min(Math.max(page, 0), Math.max(pageCount - 1, 0));
 
@@ -34,14 +35,14 @@ function Thumbnail({ document, index }: { document: DocumentInfo; index: number 
   return <div ref={element} className={s.thumbnail} style={{ aspectRatio: `${size.width}/${size.height}` }}>{url ? <img src={url} alt={`Page ${index + 1} preview`} draggable={false} /> : <span>{error ? 'Preview unavailable' : 'Loading…'}</span>}</div>;
 }
 
-export default function Organizer({ document, currentPage = 0, pageLabels = null, busy, edit, save, split, crop, insert = () => {}, replace = () => {}, close }: { document: DocumentInfo; currentPage?: number; pageLabels?: DocumentPageLabels | null; busy: boolean; edit: (action: PageEdit) => Promise<boolean>; save: (pages?: number[]) => Promise<void>; split: (pagesPerFile: number) => Promise<SplitOutput | null>; crop: (page: number, rect: { x: number; y: number; width: number; height: number }) => Promise<void>; insert?: () => void; replace?: (pages: number[]) => void; close: () => void }) {
+export default function Organizer({ document, currentPage = 0, pageLabels = null, busy, edit, save, split, crop, insert = () => {}, replace = () => {}, close }: { document: DocumentInfo; currentPage?: number; pageLabels?: DocumentPageLabels | null; busy: boolean; edit: (action: PageEdit) => Promise<boolean>; save: (pages?: number[]) => Promise<void>; split: (pagesPerFile: number) => Promise<SplitOutput | null>; crop: (target: { id: number; revision: number; pages: number[] }, insets: CropInsets) => Promise<void>; insert?: () => void; replace?: (pages: number[]) => void; close: () => void }) {
   const [selected, setSelected] = useState<number[]>(() => [clampPage(currentPage, document.pages.length)]);
   const [range, setRange] = useState(() => String(clampPage(currentPage, document.pages.length) + 1));
   const [destination, setDestination] = useState('');
   const [error, setError] = useState('');
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [splitOpen, setSplitOpen] = useState(false);
-  const [cropOpen, setCropOpen] = useState(false);
+  const [cropTarget, setCropTarget] = useState<{ id: number; revision: number; pages: CropPage[] } | null>(null);
   const lastClicked = useRef(clampPage(currentPage, document.pages.length));
   useEffect(() => {
     const fallback = clampPage(lastClicked.current, document.pages.length);
@@ -73,6 +74,10 @@ export default function Organizer({ document, currentPage = 0, pageLabels = null
     lastClicked.current = index;
   };
   const count = selected.length;
+  const openCrop = () => {
+    if (busy || !count) return;
+    setCropTarget({ id: document.id, revision: document.revision, pages: selected.map(page => ({ page, width: document.pages[page].width, height: document.pages[page].height })) });
+  };
   return <section className={s.organizer} aria-label="Organize pages workspace">
     <div className={s.heading}><div><h1>Organize pages</h1><p>Rotate, reorder, or extract pages. Save your changes as a new PDF.</p></div><button onClick={close} disabled={busy}><X size={17} /> Close tool</button></div>
     <div className={s.toolbar}>
@@ -93,7 +98,7 @@ export default function Organizer({ document, currentPage = 0, pageLabels = null
       <button aria-label="Redo page edit" disabled={busy || !document.can_redo} onClick={() => void change({ kind: 'redo' })}><Redo2 size={17} /></button>
       <button disabled={busy} onClick={insert}><Files size={16} /> Insert pages</button>
       <button disabled={busy || !count} onClick={() => replace(selected)}><Files size={16} /> Replace pages</button>
-      <button disabled={busy || count !== 1} onClick={() => setCropOpen(true)}><Crop size={16} /> Crop</button>
+      <button disabled={busy || !count} onClick={openCrop}><Crop size={16} /> Crop</button>
       <button disabled={busy} onClick={() => setSplitOpen(true)}><Scissors size={16} /> Split</button>
       <button className={s.save} disabled={busy} onClick={() => void save()}>Save a copy</button>
     </div>
@@ -102,6 +107,6 @@ export default function Organizer({ document, currentPage = 0, pageLabels = null
     <div className={s.grid}>{document.pages.map((_, index) => { const label = pageLabelFor(pageLabels, index); return <button key={index} disabled={busy} aria-label={`Select page ${index + 1}`} aria-pressed={selected.includes(index)} className={`${s.card} ${selected.includes(index) ? s.selected : ''}`} onClick={e => select(index, e.shiftKey, e.ctrlKey || e.metaKey)}><Thumbnail document={document} index={index} /><span className={s.pageLabel}><span className={s.checkbox}>{selected.includes(index) ? '✓' : ''}</span><span style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>Page {index + 1}{label !== null && <small style={{ color: 'var(--muted)', fontSize: 10, whiteSpace: 'pre-wrap' }}>Label: {pageLabelDescription(label)}</small>}</span></span></button>; })}</div>
     {confirmDelete && <ConfirmDialog title={`Delete ${count} selected ${count === 1 ? 'page' : 'pages'}?`} message="This changes the working document. You can undo it. Your original file stays unchanged." confirmLabel="Delete pages" onCancel={() => setConfirmDelete(false)} onConfirm={() => { setConfirmDelete(false); void change({ kind: 'delete', pages: selected }); }} />}
     {splitOpen && <SplitDialog pageCount={document.pages.length} busy={busy} split={split} close={() => setSplitOpen(false)} />}
-    {cropOpen && count === 1 && <CropDialog page={selected[0]} pageWidth={document.pages[selected[0]].width} pageHeight={document.pages[selected[0]].height} busy={busy} crop={rect => crop(selected[0], rect)} close={() => setCropOpen(false)} />}
+    {cropTarget && <CropDialog pages={cropTarget.pages} busy={busy} crop={insets => crop({ id: cropTarget.id, revision: cropTarget.revision, pages: cropTarget.pages.map(page => page.page) }, insets)} close={() => setCropTarget(null)} />}
   </section>;
 }

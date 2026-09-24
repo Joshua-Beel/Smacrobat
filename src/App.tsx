@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { Undo2, Redo2 } from 'lucide-react';
 import { ArrowDownToLine, ArrowUpRight, Bookmark, ChevronDown, ChevronLeft, ChevronRight, ChevronsUpDown, CircleHelp, Combine, File, FileCheck2, FileImage, FileOutput, FilePenLine, FilePlus2, Files, FolderOpen, Hand, Highlighter, Home, LayoutGrid, List, Maximize, Menu, MessageSquare, Minus, MoreHorizontal, MousePointer2, PanelLeftClose, Pencil, Plus, Printer, RotateCw, Save, ScanLine, Search, ShieldCheck, Signature, SlidersHorizontal, Star, Sun, Type, X, ZoomIn, ZoomOut, type LucideIcon } from 'lucide-react';
-import { closeDocument, native, openDocument, reopenDocument, editPages, saveCopy, splitDocument, cropPage, combineDocuments, insertPagesCopy, replacePagesCopy, documentFormFields, fillFormCopy, documentAnnotations, documentPageLabels, createComment, updateComment, deleteComment, createHighlight, createTextHighlight, updateHighlight, deleteHighlight, type Annotation, type CommentRect, type DocumentAnnotations, type DocumentFormFields, type FormPatch, type OpenResult, type SplitOutput, type SavedCopy } from './bridge';
+import { closeDocument, native, openDocument, reopenDocument, editPages, saveCopy, splitDocument, cropPages, combineDocuments, insertPagesCopy, replacePagesCopy, documentFormFields, fillFormCopy, documentAnnotations, documentPageLabels, createComment, updateComment, deleteComment, createHighlight, createTextHighlight, updateHighlight, deleteHighlight, type Annotation, type CommentRect, type CropInsets, type DocumentAnnotations, type DocumentFormFields, type FormPatch, type OpenResult, type SplitOutput, type SavedCopy } from './bridge';
 import { clampPage, toolGroups, type DocumentInfo, type PageEdit } from './model';
 import { pageLabelDescription, pageLabelFor, validatePageLabels, type DocumentPageLabels } from './pageLabels';
 import Viewer from './Viewer';
@@ -213,10 +213,10 @@ export default function App() {
     try { return await splitDocument(doc.id, doc.revision, pagesPerFile); }
     finally { setBusy(false); }
   };
-  const crop = async (cropPageIndex: number, rect: { x: number; y: number; width: number; height: number }): Promise<void> => {
-    if (!doc || busy || closingDocument.current !== null) throw new Error('The document is no longer ready to crop.');
+  const crop = async (target: { id: number; revision: number; pages: number[] }, insets: CropInsets): Promise<void> => {
+    if (!doc || doc.id !== target.id || busy || closingDocument.current !== null) throw new Error('The document is no longer ready to crop.');
     setBusy(true); setError(''); setNotice('');
-    try { updateDocument(await cropPage(doc.id, cropPageIndex, doc.revision, rect)); }
+    try { updateDocument(await cropPages(target.id, target.revision, target.pages, insets)); }
     finally { setBusy(false); }
   };
   const mutateAnnotation = async (operation: (document: DocumentInfo) => Promise<DocumentInfo>) => {

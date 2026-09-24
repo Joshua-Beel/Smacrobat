@@ -66,7 +66,9 @@ export const updateHighlight = (id: number, revision: number, annotationId: stri
 export const deleteHighlight = (id: number, revision: number, annotationId: string) => invoke<DocumentInfo>('delete_highlight', { id, revision, annotationId });
 export type SplitOutput = { folder: string; files: { path: string; first_page: number; last_page: number; page_count: number }[] };
 export const splitDocument = (id: number, revision: number, pagesPerFile: number) => invoke<SplitOutput | null>('split_document', { id, revision, pagesPerFile });
+export type CropInsets = { top: number; right: number; bottom: number; left: number };
 export const cropPage = (id: number, page: number, revision: number, rect: { x: number; y: number; width: number; height: number }) => invoke<DocumentInfo>('crop_page', { id, page, revision, rect });
+export const cropPages = (id: number, revision: number, pages: number[], insets: CropInsets) => invoke<DocumentInfo>('crop_pages', { id, revision, pages, insets });
 export async function renderPage(id: number, page: number, width: number) {
   const bytes = await invoke<ArrayBuffer>('render_page', { id, page, width });
   return URL.createObjectURL(new Blob([bytes], { type: 'image/png' }));

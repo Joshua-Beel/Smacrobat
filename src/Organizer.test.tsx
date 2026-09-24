@@ -91,7 +91,21 @@ it('crops exactly one selected current page through the crop dialog', async () =
   expect(ui.root.findByProps({ id: 'crop-title' }).children.join('')).toBe('Crop page 3');
   for (const edge of ['Top', 'Right', 'Bottom', 'Left']) act(() => ui.root.findByProps({ 'aria-label': `${edge} crop inset` }).props.onChange({ target: { value: '12' } }));
   await act(async () => ui.root.findAllByType('button').find(button => button.children.join('') === 'Apply crop')!.props.onClick());
-  expect(crop).toHaveBeenCalledWith(2, { x: 12 / 612, y: 12 / 792, width: 588 / 612, height: 768 / 792 });
+  expect(crop).toHaveBeenCalledWith({ id: 1, revision: 0, pages: [2] }, { top: 12, right: 12, bottom: 12, left: 12 });
+  act(() => ui.unmount());
+});
+
+it('crops a captured multi-page selection once with physical indices and revision', async () => {
+  const crop = vi.fn().mockResolvedValue(undefined); const pages = document.pages.map((page, index) => index === 3 ? { width: 792, height: 612 } : page); const pageLabels = { documentId: 1, revision: 0, status: 'supported' as const, reason: null, labels: pages.map((_, page) => ({ page, label: String(20 - page) })) }; let ui!: ReactTestRenderer;
+  act(() => { ui = create(<Organizer document={{ ...document, pages }} pageLabels={pageLabels} busy={false} edit={vi.fn()} save={vi.fn()} split={vi.fn()} crop={crop} close={vi.fn()} />); });
+  act(() => pageButton(ui, 2).props.onClick({ shiftKey: false, ctrlKey: false, metaKey: false }));
+  act(() => pageButton(ui, 4).props.onClick({ shiftKey: false, ctrlKey: true, metaKey: false }));
+  act(() => ui.root.findAllByType('button').find(button => button.children.includes(' Crop'))!.props.onClick());
+  expect(ui.root.findByProps({ id: 'crop-title' }).children.join('')).toBe('Crop 2 pages');
+  act(() => ui.update(<Organizer document={{ ...document, pages: pages.slice(0, 4), revision: 2 }} busy={false} edit={vi.fn()} save={vi.fn()} split={vi.fn()} crop={crop} close={vi.fn()} />));
+  for (const edge of ['Top', 'Right', 'Bottom', 'Left']) act(() => ui.root.findByProps({ 'aria-label': `${edge} crop inset` }).props.onChange({ target: { value: '12' } }));
+  await act(async () => ui.root.findAllByType('button').find(button => button.children.join('') === 'Apply crop')!.props.onClick());
+  expect(crop).toHaveBeenCalledWith({ id: 1, revision: 0, pages: [1, 3] }, { top: 12, right: 12, bottom: 12, left: 12 });
   act(() => ui.unmount());
 });
 
@@ -107,7 +121,7 @@ it('starts on the current page, preserves later user selection, and clamps it wh
   expect(ui.root.findByProps({ id: 'crop-title' }).children.join('')).toBe('Crop page 6');
   for (const [edge, value] of [['Top', '72'], ['Right', '36'], ['Bottom', '36'], ['Left', '72']]) act(() => ui.root.findByProps({ 'aria-label': `${edge} crop inset` }).props.onChange({ target: { value } }));
   await act(async () => ui.root.findAllByType('button').find(button => button.children.join('') === 'Apply crop')!.props.onClick());
-  expect(crop).toHaveBeenCalledWith(5, { x: 72 / 792, y: 72 / 612, width: 684 / 792, height: 504 / 612 });
+  expect(crop).toHaveBeenCalledWith({ id: 1, revision: 0, pages: [5] }, { top: 72, right: 36, bottom: 36, left: 72 });
   act(() => pageButton(ui, 2).props.onClick({ shiftKey: false, ctrlKey: false, metaKey: false }));
   act(() => ui.update(<Organizer {...props} document={{ ...document, pages }} currentPage={0} />));
   expect(pageButton(ui, 2).props['aria-pressed']).toBe(true);
