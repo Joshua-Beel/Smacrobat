@@ -14,7 +14,7 @@ Version 0.2.0 is the current published release and has a signed update package, 
 
 ## What works
 
-- **Reading:** open PDFs in tabs, scroll through pages, pan, jump to a page, zoom from 10% to 400%, or fit the page to the window width. The source build restores each open tab's last page when switching documents; this position lasts for the session.
+- **Reading:** open PDFs in tabs, scroll through pages, pan, jump to a page, zoom from 10% to 400%, fit the document width, or fit one explicitly selected current page. The source build restores each open tab's last page when switching documents; this position lasts for the session.
 - **Pages sidebar (source build):** mounts only the rows near its viewport: `ceil(clientHeight / 96) + 12` overscan rows and up to two current or focused rows. Up/Down arrow keys, Home, and End move a roving page focus; Enter or Space opens that physical page. Full page-label text remains available in the button name and title when the fixed visual slot clips it. Sidebar scrolling does not request page renders or page-label snapshots.
 - **Page labels (source build):** read supported PDF page labels beside their physical numbers in Pages, Organize pages, and the status bar. Empty, duplicate, numeric, Unicode, and whitespace labels stay as supplied text; physical page numbers remain authoritative for navigation. Stale, malformed, partial, encrypted, oversized, or unavailable snapshots fall back to physical numbers. See the [Page labels guide](docs/tools/page-labels.md).
 - **Create a PDF from an image (source build):** choose one PNG or JPEG by content, then save a new one-page PDF. Letter or A4 pages use Auto, portrait, or landscape orientation and a finite 0–72 point margin; Auto makes a square image portrait. The image is contained and centered with upscaling allowed, and the source file and open tabs stay unchanged. PNG animation, JPEG multi-picture data, malformed or trailing image data, and images over the native input, dimension, decoded-size, or output limits are refused. Conversion applies EXIF orientation, composites transparency onto white, and normalizes to 8-bit RGB without retaining ICC color profiles or image metadata. See the [Create PDF from image guide](docs/tools/create-pdf.md).
@@ -31,7 +31,7 @@ Version 0.2.0 is the current published release and has a signed update package, 
 - **Combining (source build):** open two distinct PDFs, choose their order in **Combine Files**, then save a new copy containing their current edited pages. The first PDF’s document metadata is retained; both source tabs, including unsaved edits, stay unchanged.
 - **Organizing pages:** select thumbnails or enter a page range, rotate pages, move a page earlier or later, delete pages, and extract a selection into a new PDF. The source build also adds direct Move to page, Split, Crop, **Insert pages**, and **Replace pages**. Batch crop applies the same point insets to selected physical pages using each page’s current displayed bounds; mixed sizes or rotations show dimensional ranges only. Insert adds every current edited page from a distinct open donor PDF at a target boundary; Replace substitutes one contiguous target range with those donor pages in a new copy. The target PDF’s Info/XMP metadata is retained and both source tabs stay unchanged. Cropping hides content; it does not redact it.
 - **Saving:** undo and redo page edits, then use **Save a Copy**. Your original stays untouched, and the app asks before closing a document with unsaved edits. The source build limits undo/redo snapshots to 32 MiB per document, dropping the oldest history when needed.
-- **Workspace:** light and dark themes and an All tools panel. The source build remembers theme, zoom, fit width, pan mode, panel visibility, and up to 50 recent file locations with stars across launches. Clear file history removes this list without deleting PDFs. Unsaved edits are not restored after restart.
+- **Workspace:** light and dark themes and an All tools panel. The source build remembers theme, zoom, fit mode, pan mode, panel visibility, and up to 50 recent file locations with stars across launches. Clear file history removes this list without deleting PDFs. Unsaved edits are not restored after restart.
 
 Your PDFs stay on your computer. There's no document upload service or telemetry.
 
@@ -46,7 +46,7 @@ Your PDFs stay on your computer. There's no document upload service or telemetry
 | Document properties (source build) | Ctrl+D |
 | Undo / redo | Ctrl+Z / Ctrl+Shift+Z or Ctrl+Y |
 | Close a tab / switch tabs | Ctrl+W / Ctrl+Tab |
-| Actual size / fit width | Ctrl+1 / Ctrl+2 |
+| Actual size / fit width / fit page | Ctrl+1 / Ctrl+2 / Ctrl+0 |
 | Previous / next page | Page Up / Page Down |
 | First / last page | Home / End |
 | Toggle page list / tools panel | F4 / Shift+F4 |
@@ -100,6 +100,8 @@ An open document keeps a snapshot of its original bytes. Before saving, the app 
 For more background, see the [architecture notes](docs/decisions.md) and [PDFium documentation](https://docs.rs/pdfium-render/0.9.4/pdfium_render/). The interface follows the [current Acrobat workspace](https://helpx.adobe.com/acrobat/desktop/get-started/learn-the-basics/workspace.html).
 
 ## Recent changes
+
+- Added source-only **Fit page** reading mode. It uses the current target’s physical page dimensions, including the current crop and rotation, inside the existing 144-pixel width and 48-pixel height allowances. Ctrl+0, the reading controls, and the Zoom menu select it; Ctrl+1, Ctrl+2, and manual zoom retain their existing meanings. A manual scroll reports the reading page without continuously changing the fit reference; a page jump, tab restoration, or document revision supplies a new target. Older saved Boolean fit settings map to width or none. The 10% minimum scale remains, so a very small viewport can prevent a full-page fit. The frontend gate passed 196 tests across 43 files; the production build transformed 1,936 modules in 2.69 seconds. The final standalone debug/no-bundle gate exited 0 with 1,936 frontend modules in 2.25 seconds and native compilation in 18.38 seconds. Its 30,177,792-byte executable SHA-256 is `1C9C4C87A4239BF231CBDD2527D99CF06B6ADD4DDDF7FC4CD3F347349FF71F5A`; exact current `index-DLU2IhcL.js`, CSS, and transformed HTML Brotli bytes were verified embedded. A local mixed-size, 1,500-page browser harness captured page 750, explicitly moved to 751, retained that target through resize, and manually scrolled to 752 without changing it; it had no browser errors or native calls. This is not native rendering or installed-app evidence.
 
 - The final standalone debug/no-bundle build for the Viewer scroll update exited 0 with 1,936 frontend modules in 2.65 seconds and native compilation in 21.67 seconds. Its 30,177,792-byte executable SHA-256 is `CA50BB8E215821F61FC6371783D7233C6BCD1E97311DFC8A498C23DF252E164D`; exact `index-CtBH9GLt.js`, CSS, and transformed HTML Brotli bytes were verified embedded.
 

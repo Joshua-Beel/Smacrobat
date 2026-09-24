@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { renderPage, type Annotation, type CommentRect } from './bridge';
-import { currentPageAt, maxPageWidth, pageLayout, scaleAnchoredTop, visiblePageRange, type DocumentInfo } from './model';
+import { clampPage, currentPageAt, fitPageScale, maxPageWidth, pageLayout, scaleAnchoredTop, visiblePageRange, type DocumentInfo } from './model';
+import type { FitMode } from './preferences';
 import TextLayer from './TextLayer';
 import CommentLayer from './CommentLayer';
 import type { TextHighlightSelection, TextHighlightSelectionSource } from './textHighlightSelection';
@@ -29,7 +30,7 @@ function Page({ id, index, width, height, scale, revision, selectable, search, a
   </div>;
 }
 
-export default function Viewer({ document, zoom, fit, target, onPage, hand, search, annotations = [], commentMode = false, highlightMode = false, annotationAvailable = false, annotationInteractive = false, onCommentCreate = () => {}, onHighlightCreate = () => {}, onAnnotationSelect = () => {}, onTextSelection }: { document: DocumentInfo; zoom: number; fit: boolean; target: { page: number; token: number }; onPage: (page: number) => void; hand: boolean; search?: ActiveSearch | null; annotations?: Annotation[]; commentMode?: boolean; highlightMode?: boolean; annotationAvailable?: boolean; annotationInteractive?: boolean; onCommentCreate?: (page: number, rect: CommentRect) => void; onHighlightCreate?: (page: number, rect: CommentRect) => void; onAnnotationSelect?: (annotation: Annotation) => void; onTextSelection?: (selection: TextHighlightSelection | null, source: TextHighlightSelectionSource) => void }) {
+export default function Viewer({ document, zoom, fit, target, onPage, hand, search, annotations = [], commentMode = false, highlightMode = false, annotationAvailable = false, annotationInteractive = false, onCommentCreate = () => {}, onHighlightCreate = () => {}, onAnnotationSelect = () => {}, onTextSelection }: { document: DocumentInfo; zoom: number; fit: FitMode; target: { page: number; token: number }; onPage: (page: number) => void; hand: boolean; search?: ActiveSearch | null; annotations?: Annotation[]; commentMode?: boolean; highlightMode?: boolean; annotationAvailable?: boolean; annotationInteractive?: boolean; onCommentCreate?: (page: number, rect: CommentRect) => void; onHighlightCreate?: (page: number, rect: CommentRect) => void; onAnnotationSelect?: (annotation: Annotation) => void; onTextSelection?: (selection: TextHighlightSelection | null, source: TextHighlightSelectionSource) => void }) {
   const viewport = useRef<HTMLDivElement>(null);
   const [bounds, setBounds] = useState({ width: 900, height: 800 });
   const [top, setTop] = useState(0);
@@ -40,7 +41,8 @@ export default function Viewer({ document, zoom, fit, target, onPage, hand, sear
     observer.observe(element); return () => observer.disconnect();
   }, []);
   const maxWidth = useMemo(() => maxPageWidth(document.pages), [document]);
-  const scale = fit ? Math.max(0.1, (bounds.width - 144) / maxWidth) : zoom / 100 * 96 / 72;
+  const targetPage = clampPage(target.page, document.pages.length);
+  const scale = fit === 'width' ? Math.max(0.1, (bounds.width - 144) / maxWidth) : fit === 'page' ? fitPageScale(document.pages[targetPage], bounds.width, bounds.height) : zoom / 100 * 96 / 72;
   const layout = useMemo(() => pageLayout(document.pages, scale, maxWidth), [document, scale, maxWidth]);
   const previousLayout = useRef({ layout, scale });
   const range = visiblePageRange(layout, top, bounds.height);
@@ -54,7 +56,7 @@ export default function Viewer({ document, zoom, fit, target, onPage, hand, sear
     }
     previousLayout.current = { layout, scale };
   }, [layout, scale]);
-  useEffect(() => { viewport.current?.scrollTo({ top: layout.offsets[target.page] - 24 }); }, [target]);
+  useEffect(() => { viewport.current?.scrollTo({ top: layout.offsets[targetPage] - 24 }); }, [target]);
   return <div ref={viewport} className={`${styles.viewport} ${hand ? styles.hand : ''}`} onScroll={event => {
     const scrollTop = event.currentTarget.scrollTop;
     setTop(scrollTop);

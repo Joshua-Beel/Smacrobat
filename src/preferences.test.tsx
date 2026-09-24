@@ -26,8 +26,22 @@ describe('reading preferences', () => {
     expect(readPreferences()).toEqual({ ...defaultPreferences, dark: true, hand: false, nav: true });
     for (const invalid of ['null', '[]', 'broken json']) { stored = invalid; expect(readPreferences()).toEqual(defaultPreferences); }
   });
+  it('migrates legacy fit booleans and accepts only current fit modes', () => {
+    stored = JSON.stringify({ fit: true });
+    expect(readPreferences().fit).toBe('width');
+    stored = JSON.stringify({ fit: false });
+    expect(readPreferences().fit).toBe('none');
+    for (const fit of ['none', 'width', 'page']) {
+      stored = JSON.stringify({ fit });
+      expect(readPreferences().fit).toBe(fit);
+    }
+    for (const fit of [null, 'fit', 1, {}]) {
+      stored = JSON.stringify({ fit });
+      expect(readPreferences().fit).toBe('width');
+    }
+  });
   it('round trips all reading settings without storing document contents or paths', () => {
-    const value = { dark: true, zoom: 175, fit: false, hand: false, toolsOpen: false, nav: true };
+    const value = { dark: true, zoom: 175, fit: 'page' as const, hand: false, toolsOpen: false, nav: true };
     expect(savePreferences(value)).toBe(true);
     expect(readPreferences()).toEqual(value);
     expect(Object.keys(JSON.parse(stored!)).sort()).toEqual(Object.keys(defaultPreferences).sort());

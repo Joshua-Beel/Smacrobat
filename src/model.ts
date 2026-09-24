@@ -21,6 +21,9 @@ export function maxPageWidth(pages: PageSize[]) {
   for (const page of pages) width = Math.max(width, page.width);
   return width;
 }
+export function fitPageScale(page: PageSize, width: number, height: number) {
+  return Math.max(0.1, Math.min((width - 144) / page.width, (height - 48) / page.height));
+}
 export function pageLayout(pages: PageSize[], scale: number, maxWidth = maxPageWidth(pages)): PageLayout {
   const offsets = new Array<number>(pages.length), bottoms = new Array<number>(pages.length);
   let offset = 24;

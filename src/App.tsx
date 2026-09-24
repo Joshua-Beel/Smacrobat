@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { Undo2, Redo2 } from 'lucide-react';
-import { ArrowDownToLine, ArrowUpRight, Bookmark, ChevronDown, ChevronLeft, ChevronRight, ChevronsUpDown, CircleHelp, Combine, File, FileCheck2, FileImage, FileOutput, FilePenLine, FilePlus2, Files, FolderOpen, Hand, Highlighter, Home, LayoutGrid, List, Maximize, Menu, MessageSquare, Minus, MoreHorizontal, MousePointer2, PanelLeftClose, Pencil, Plus, Printer, RotateCw, Save, ScanLine, Search, ShieldCheck, Signature, SlidersHorizontal, Star, Sun, Type, X, ZoomIn, ZoomOut, type LucideIcon } from 'lucide-react';
+import { ArrowDownToLine, ArrowUpRight, Bookmark, ChevronDown, ChevronLeft, ChevronRight, ChevronsUpDown, CircleHelp, Combine, File, FileCheck2, FileImage, FileOutput, FilePenLine, FilePlus2, Files, FolderOpen, Hand, Highlighter, Home, LayoutGrid, List, Maximize, Menu, MessageSquare, Minimize2, Minus, MoreHorizontal, MousePointer2, PanelLeftClose, Pencil, Plus, Printer, RotateCw, Save, ScanLine, Search, ShieldCheck, Signature, SlidersHorizontal, Star, Sun, Type, X, ZoomIn, ZoomOut, type LucideIcon } from 'lucide-react';
 import { closeDocument, native, openDocument, reopenDocument, editPages, saveCopy, splitDocument, cropPages, combineDocuments, insertPagesCopy, replacePagesCopy, documentFormFields, fillFormCopy, documentAnnotations, documentPageLabels, createPdfFromImage, exportPageImage, createComment, updateComment, deleteComment, createHighlight, createTextHighlight, updateHighlight, deleteHighlight, type Annotation, type CommentRect, type CropInsets, type CreatePdfOptions, type DocumentAnnotations, type DocumentFormFields, type FormPatch, type OpenResult, type PageImageExport, type PageImageExportRequest, type SplitOutput, type SavedCopy } from './bridge';
 import { clampPage, toolGroups, type DocumentInfo, type PageEdit } from './model';
 import { pageLabelDescription, pageLabelFor, validatePageLabels, type DocumentPageLabels } from './pageLabels';
@@ -26,7 +26,7 @@ import PageList from './PageList';
 import CommentsPanel from './CommentsPanel';
 import CommentEditor, { type AnnotationDraft } from './CommentEditor';
 import type { TextHighlightSelection, TextHighlightSelectionSource } from './textHighlightSelection';
-import { readPreferences, savePreferences } from './preferences';
+import { readPreferences, savePreferences, type FitMode } from './preferences';
 import { readRecentFiles, saveRecentFiles, rememberFile } from './recentFiles';
 import s from './Workspace.module.css';
 
@@ -63,7 +63,7 @@ export default function App() {
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [zoom, setZoom] = useState(preferences.zoom);
-  const [fit, setFit] = useState(preferences.fit);
+  const [fit, setFit] = useState<FitMode>(preferences.fit);
   const [hand, setHand] = useState(preferences.hand);
   const [page, setPage] = useState(0);
   const readingPages = useRef(new Map<number, number>());
@@ -391,6 +391,12 @@ export default function App() {
     setReplaceRange({ start: selected[0], count: selected.length }); setMenu(false); setReplaceOpen(true);
   };
   const go = (value: number) => { if (doc) { const next = clampPage(value, doc.pages.length); trackPage(next); setTarget(v => ({ page: next, token: v.token + 1 })); } };
+  const selectPageFit = () => {
+    setFit('page');
+    if (!doc) return;
+    const current = clampPage(page, doc.pages.length);
+    setTarget(value => ({ page: current, token: value.token + 1 }));
+  };
   useEffect(() => {
     const listener = (event: KeyboardEvent) => {
       if (updatesOpen || pageTextOpen || printOpen || propertiesOpen || noticesOpen || passwordRequest || pendingClose !== null || createOpen || pageImageTarget || combineOpen || insertOpen || replaceOpen || commentEditor) return;
@@ -403,8 +409,9 @@ export default function App() {
       if (event.key === 'Escape' && (commentsOpen || commentMode || highlightMode)) { setCommentsOpen(false); setCommentMode(false); setHighlightMode(false); return; }
       if ((event.target as HTMLElement).matches('input,select,textarea')) return;
       if (event.key === 'F4') { event.preventDefault(); event.shiftKey ? setToolsOpen(v => !v) : setNav(v => !v); }
-      if (event.ctrlKey && event.key === '2') { event.preventDefault(); setFit(true); }
-      if (event.ctrlKey && event.key === '1') { event.preventDefault(); setFit(false); setZoom(100); }
+      if (event.ctrlKey && event.key === '2') { event.preventDefault(); setFit('width'); }
+      if (event.ctrlKey && event.key === '1') { event.preventDefault(); setFit('none'); setZoom(100); }
+      if (event.ctrlKey && event.key === '0') { event.preventDefault(); selectPageFit(); }
       if (view !== 'document' || !doc) return;
       if (event.ctrlKey && event.key.toLowerCase() === 's') { event.preventDefault(); void save(); return; }
       if (event.ctrlKey && event.key.toLowerCase() === 'z') { event.preventDefault(); void edit({ kind: event.shiftKey ? 'redo' : 'undo' }); return; }
@@ -420,7 +427,7 @@ export default function App() {
     window.addEventListener('keydown', listener); return () => window.removeEventListener('keydown', listener);
   });
   const listed = recentFiles.filter(d => d.name.toLowerCase().includes(query.toLowerCase()) && (section !== 'Starred' || d.starred));
-  const changeZoom = (value: number) => { setFit(false); setZoom(Math.max(10, Math.min(400, value))); };
+  const changeZoom = (value: number) => { setFit('none'); setZoom(Math.max(10, Math.min(400, value))); };
   const toolRow = (name: string, index: number) => {
     const Icon = icons[name] || FileCheck2;
     const available = name === 'Create a PDF' || name === 'Export a PDF' || name === 'Organize pages' || name === 'Combine files' || name === 'Comment' || name === 'Fill forms';
@@ -492,10 +499,10 @@ export default function App() {
         {!organizing && bookmarksOpen && <BookmarksPanel key={`${doc.id}-${doc.revision}`} document={doc} go={go} close={() => setBookmarksOpen(false)} />}
         {!organizing && searchOpen && !bookmarksOpen && <SearchPanel key={`${doc.id}-${doc.revision}`} document={doc} go={go} close={closeSearch} onHighlights={receiveSearch} />}
         {!organizing && nav && !searchOpen && !bookmarksOpen && <aside className={s.pagesPanel}><div className={s.panelHeading}><h2>Pages</h2><IconButton icon={X} label="Close pages" onClick={() => setNav(false)} /></div><button onClick={() => setBookmarksOpen(true)}>Bookmarks</button><PageList key={`${doc.id}:${doc.revision}:${doc.pages.length}`} document={doc} page={page} pageLabels={pageLabels} go={go} /></aside>}
-        <aside className={s.rightRail}><div><IconButton icon={MessageSquare} label="Comments" active={commentsOpen} disabled={busy} onClick={() => { closeSearch(); setBookmarksOpen(false); setOrganizing(false); setCommentsOpen(value => !value); }} /><IconButton icon={Bookmark} label="Bookmarks" active={bookmarksOpen} onClick={() => { closeSearch(); setCommentsOpen(false); setOrganizing(false); setBookmarksOpen(v => !v); }} /><IconButton icon={Files} label="Pages" active={nav && !bookmarksOpen && !searchOpen} onClick={() => { closeSearch(); setCommentsOpen(false); setBookmarksOpen(false); setNav(v => !v); }} /></div><div className={s.pageControls}><IconButton icon={ChevronLeft} label="Previous page" disabled={page === 0} onClick={() => go(page - 1)} /><input aria-label="Page number" key={`${doc.id}-${page}`} type="number" min={1} max={doc.pages.length} defaultValue={page + 1} onKeyDown={e => { if (e.key === 'Enter') go(Number(e.currentTarget.value) - 1); }} onBlur={e => go(Number(e.currentTarget.value) - 1)} /><span className={s.pageCount}>/ {doc.pages.length}</span><IconButton icon={ChevronRight} label="Next page" disabled={page === doc.pages.length - 1} onClick={() => go(page + 1)} /><span className={s.horizontalDivider} /><IconButton icon={RotateCw} label="Rotate view" disabled /><IconButton icon={Maximize} label="Fit width" active={fit} onClick={() => setFit(true)} /><IconButton icon={ZoomIn} label="Zoom in" onClick={() => changeZoom(zoom + 25)} /><IconButton icon={ZoomOut} label="Zoom out" onClick={() => changeZoom(zoom - 25)} /></div></aside>
+        <aside className={s.rightRail}><div><IconButton icon={MessageSquare} label="Comments" active={commentsOpen} disabled={busy} onClick={() => { closeSearch(); setBookmarksOpen(false); setOrganizing(false); setCommentsOpen(value => !value); }} /><IconButton icon={Bookmark} label="Bookmarks" active={bookmarksOpen} onClick={() => { closeSearch(); setCommentsOpen(false); setOrganizing(false); setBookmarksOpen(v => !v); }} /><IconButton icon={Files} label="Pages" active={nav && !bookmarksOpen && !searchOpen} onClick={() => { closeSearch(); setCommentsOpen(false); setBookmarksOpen(false); setNav(v => !v); }} /></div><div className={s.pageControls}><IconButton icon={ChevronLeft} label="Previous page" disabled={page === 0} onClick={() => go(page - 1)} /><input aria-label="Page number" key={`${doc.id}-${page}`} type="number" min={1} max={doc.pages.length} defaultValue={page + 1} onKeyDown={e => { if (e.key === 'Enter') go(Number(e.currentTarget.value) - 1); }} onBlur={e => go(Number(e.currentTarget.value) - 1)} /><span className={s.pageCount}>/ {doc.pages.length}</span><IconButton icon={ChevronRight} label="Next page" disabled={page === doc.pages.length - 1} onClick={() => go(page + 1)} /><span className={s.horizontalDivider} /><IconButton icon={RotateCw} label="Rotate view" disabled /><IconButton icon={Maximize} label="Fit width" active={fit === 'width'} onClick={() => setFit('width')} /><IconButton icon={Minimize2} label="Fit page" active={fit === 'page'} onClick={selectPageFit} /><IconButton icon={ZoomIn} label="Zoom in" onClick={() => changeZoom(zoom + 25)} /><IconButton icon={ZoomOut} label="Zoom out" onClick={() => changeZoom(zoom - 25)} /></div></aside>
       </> : null}
     </main>
-    <footer className={s.statusbar}><span style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{view === 'document' && doc ? (() => { const currentPage = clampPage(page, doc.pages.length); const label = pageLabelFor(pageLabels, currentPage); return <>Page {currentPage + 1}{label !== null && <> · Label: {pageLabelDescription(label)}</>} · {(doc.pages[currentPage].width / 72).toFixed(2)} × {(doc.pages[currentPage].height / 72).toFixed(2)} in</>; })() : 'PDF Workstation'}</span><span>{busy ? 'Working…' : view === 'document' && doc ? `${doc.name} · ${doc.dirty ? 'Unsaved changes' : 'Source preserved'}` : 'Files stay on your computer'}</span>{view === 'document' ? <select aria-label="Zoom" value={fit ? 'fit' : zoom} onChange={e => e.target.value === 'fit' ? setFit(true) : changeZoom(Number(e.target.value))}><option value="fit">Fit width</option>{Array.from(new Set([10,25,50,75,100,125,150,200,300,400,zoom])).sort((a,b) => a-b).map(z => <option value={z} key={z}>{z}%</option>)}</select> : <span>Local workspace</span>}</footer>
+    <footer className={s.statusbar}><span style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{view === 'document' && doc ? (() => { const currentPage = clampPage(page, doc.pages.length); const label = pageLabelFor(pageLabels, currentPage); return <>Page {currentPage + 1}{label !== null && <> · Label: {pageLabelDescription(label)}</>} · {(doc.pages[currentPage].width / 72).toFixed(2)} × {(doc.pages[currentPage].height / 72).toFixed(2)} in</>; })() : 'PDF Workstation'}</span><span>{busy ? 'Working…' : view === 'document' && doc ? `${doc.name} · ${doc.dirty ? 'Unsaved changes' : 'Source preserved'}` : 'Files stay on your computer'}</span>{view === 'document' ? <select aria-label="Zoom" value={fit === 'none' ? zoom : fit} onChange={e => e.target.value === 'width' ? setFit('width') : e.target.value === 'page' ? selectPageFit() : changeZoom(Number(e.target.value))}><option value="width">Fit width</option><option value="page">Fit page</option>{Array.from(new Set([10,25,50,75,100,125,150,200,300,400,zoom])).sort((a,b) => a-b).map(z => <option value={z} key={z}>{z}%</option>)}</select> : <span>Local workspace</span>}</footer>
     {pendingClose !== null && <ConfirmDialog title="Discard unsaved page edits?" message="Save a copy before closing to keep your changes. Your original PDF has not been modified." confirmLabel="Discard and close" onCancel={() => setPendingClose(null)} onConfirm={() => { const pending = pendingClose; setPendingClose(null); if (pending === 'window') void getCurrentWindow().destroy(); else void close(pending, true); }} />}
   </div>;
 }

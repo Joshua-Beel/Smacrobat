@@ -1,8 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { clampPage, currentPageAt, firstPageAfter, maxPageWidth, pageLayout, pageOffsets, scaleAnchoredTop, visiblePageRange, visiblePages, parsePageRange } from './model';
+import { clampPage, currentPageAt, firstPageAfter, fitPageScale, maxPageWidth, pageLayout, pageOffsets, scaleAnchoredTop, visiblePageRange, visiblePages, parsePageRange } from './model';
 describe('document viewport', () => {
   it('bounds invalid navigation', () => { expect(clampPage(-1, 98)).toBe(0); expect(clampPage(120, 98)).toBe(97); expect(clampPage(NaN, 98)).toBe(0); });
   it('lays out mixed page sizes without overlap', () => { expect(pageOffsets([{ width: 612, height: 792 }, { width: 792, height: 612 }], 2)).toEqual([24, 1632]); });
+  it('fits one current page inside the existing horizontal and vertical allowances', () => {
+    expect(fitPageScale({ width: 600, height: 900 }, 744, 948)).toBe(1);
+    expect(fitPageScale({ width: 1_000, height: 500 }, 844, 1_048)).toBe(.7);
+    expect(fitPageScale({ width: 10_000, height: 10_000 }, 200, 80)).toBe(.1);
+  });
   it('keeps raster work bounded on a 1500-page document', () => {
     const pages = Array.from({ length: 1500 }, () => ({ width: 612, height: 792 }));
     const offsets = pageOffsets(pages, 1);
