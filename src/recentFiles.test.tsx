@@ -5,7 +5,7 @@ import { reopenDocument } from './bridge';
 import { readRecentFiles, rememberFile, saveRecentFiles, type RecentFile } from './recentFiles';
 import type { DocumentInfo } from './model';
 
-vi.mock('./bridge', () => ({ native: false, openDocument: vi.fn(), reopenDocument: vi.fn(), closeDocument: vi.fn(), editPages: vi.fn(), saveCopy: vi.fn() }));
+vi.mock('./bridge', () => ({ native: false, openDocument: vi.fn(), reopenDocument: vi.fn(), closeDocument: vi.fn(), editPages: vi.fn(), saveCopy: vi.fn(), documentPageLabels: vi.fn() }));
 vi.mock('./Viewer', () => ({ default: () => <div>Rendered document</div> }));
 let storage: Map<string, string>;
 const file: RecentFile = { path: 'C:/docs/one.pdf', name: 'one.pdf', pages: 1, starred: false };

@@ -9,6 +9,7 @@ mod split;
 mod combine;
 mod comments;
 mod forms;
+mod page_labels;
 use service::{DocumentInfo, PdfService};
 use tauri::{Manager, State};
 
@@ -45,6 +46,9 @@ async fn page_text_geometry(service: State<'_, PdfService>, id: u64, page: u16, 
 
 #[tauri::command]
 async fn document_bookmarks(service: State<'_, PdfService>, id: u64, revision: u64) -> Result<service::BookmarkList, String> { service.bookmarks(id, revision).await }
+
+#[tauri::command]
+async fn document_page_labels(service: State<'_, PdfService>, id: u64, revision: u64) -> Result<page_labels::DocumentPageLabels, String> { service.page_labels(id, revision).await }
 
 #[tauri::command]
 async fn document_properties(service: State<'_, PdfService>, id: u64, revision: u64) -> Result<document_properties::DocumentProperties, String> { service.properties(id, revision).await }
@@ -139,6 +143,6 @@ fn main() {
         app.manage(PdfService::start(library));
         app.manage(print_commands::PrintJobs::default());
         Ok(())
-    }).invoke_handler(tauri::generate_handler![document_form_fields, fill_form_copy, open_document, reopen_document, open_example, render_page, close_document, edit_pages, crop_page, create_comment, update_comment, delete_comment, document_comments, document_annotations, create_highlight, create_text_highlight, update_highlight, delete_highlight, save_copy, split_document, combine_documents, insert_pages_copy, replace_pages_copy, page_text, page_text_geometry, document_bookmarks, document_properties, dependency_notices, unlock_document, cancel_password_request, print_commands::print_document, print_commands::cancel_print])
+    }).invoke_handler(tauri::generate_handler![document_form_fields, fill_form_copy, open_document, reopen_document, open_example, render_page, close_document, edit_pages, crop_page, create_comment, update_comment, delete_comment, document_comments, document_annotations, create_highlight, create_text_highlight, update_highlight, delete_highlight, save_copy, split_document, combine_documents, insert_pages_copy, replace_pages_copy, page_text, page_text_geometry, document_bookmarks, document_page_labels, document_properties, dependency_notices, unlock_document, cancel_password_request, print_commands::print_document, print_commands::cancel_print])
       .run(tauri::generate_context!()).expect("Desktop application failed");
 }

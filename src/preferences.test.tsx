@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
 import { defaultPreferences, readPreferences, savePreferences } from './preferences';
 
-vi.mock('./bridge', () => ({ native: false, openDocument: vi.fn(), closeDocument: vi.fn(), editPages: vi.fn(), saveCopy: vi.fn() }));
+vi.mock('./bridge', () => ({ native: false, openDocument: vi.fn(), closeDocument: vi.fn(), editPages: vi.fn(), saveCopy: vi.fn(), documentPageLabels: vi.fn() }));
 describe('reading preferences', () => {
   let stored: string | null;
   beforeEach(() => {

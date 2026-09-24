@@ -3,6 +3,7 @@ import { ArrowDownToLine, ArrowLeft, ArrowRight, CheckSquare, Crop, Files, Rotat
 import type { SplitOutput } from './bridge';
 import type { DocumentInfo, PageEdit } from './model';
 import { parsePageRange } from './model';
+import { pageLabelDescription, pageLabelFor, type DocumentPageLabels } from './pageLabels';
 import { renderPage } from './bridge';
 import s from './Organizer.module.css';
 import ConfirmDialog from './ConfirmDialog';
@@ -33,7 +34,7 @@ function Thumbnail({ document, index }: { document: DocumentInfo; index: number 
   return <div ref={element} className={s.thumbnail} style={{ aspectRatio: `${size.width}/${size.height}` }}>{url ? <img src={url} alt={`Page ${index + 1} preview`} draggable={false} /> : <span>{error ? 'Preview unavailable' : 'Loading…'}</span>}</div>;
 }
 
-export default function Organizer({ document, currentPage = 0, busy, edit, save, split, crop, insert = () => {}, replace = () => {}, close }: { document: DocumentInfo; currentPage?: number; busy: boolean; edit: (action: PageEdit) => Promise<boolean>; save: (pages?: number[]) => Promise<void>; split: (pagesPerFile: number) => Promise<SplitOutput | null>; crop: (page: number, rect: { x: number; y: number; width: number; height: number }) => Promise<void>; insert?: () => void; replace?: (pages: number[]) => void; close: () => void }) {
+export default function Organizer({ document, currentPage = 0, pageLabels = null, busy, edit, save, split, crop, insert = () => {}, replace = () => {}, close }: { document: DocumentInfo; currentPage?: number; pageLabels?: DocumentPageLabels | null; busy: boolean; edit: (action: PageEdit) => Promise<boolean>; save: (pages?: number[]) => Promise<void>; split: (pagesPerFile: number) => Promise<SplitOutput | null>; crop: (page: number, rect: { x: number; y: number; width: number; height: number }) => Promise<void>; insert?: () => void; replace?: (pages: number[]) => void; close: () => void }) {
   const [selected, setSelected] = useState<number[]>(() => [clampPage(currentPage, document.pages.length)]);
   const [range, setRange] = useState(() => String(clampPage(currentPage, document.pages.length) + 1));
   const [destination, setDestination] = useState('');
@@ -98,7 +99,7 @@ export default function Organizer({ document, currentPage = 0, busy, edit, save,
     </div>
     <div className={s.selectionInfo}><span>{count} selected · {document.pages.length} pages{document.dirty ? ' · Unsaved changes' : ''}</span><span>Ctrl+click to add · Shift+click for a range</span></div>
     {error && <p className={s.error} role="alert">{error}</p>}
-    <div className={s.grid}>{document.pages.map((_, index) => <button key={index} disabled={busy} aria-label={`Select page ${index + 1}`} aria-pressed={selected.includes(index)} className={`${s.card} ${selected.includes(index) ? s.selected : ''}`} onClick={e => select(index, e.shiftKey, e.ctrlKey || e.metaKey)}><Thumbnail document={document} index={index} /><span className={s.pageLabel}><span className={s.checkbox}>{selected.includes(index) ? '✓' : ''}</span>Page {index + 1}</span></button>)}</div>
+    <div className={s.grid}>{document.pages.map((_, index) => { const label = pageLabelFor(pageLabels, index); return <button key={index} disabled={busy} aria-label={`Select page ${index + 1}`} aria-pressed={selected.includes(index)} className={`${s.card} ${selected.includes(index) ? s.selected : ''}`} onClick={e => select(index, e.shiftKey, e.ctrlKey || e.metaKey)}><Thumbnail document={document} index={index} /><span className={s.pageLabel}><span className={s.checkbox}>{selected.includes(index) ? '✓' : ''}</span><span style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>Page {index + 1}{label !== null && <small style={{ color: 'var(--muted)', fontSize: 10, whiteSpace: 'pre-wrap' }}>Label: {pageLabelDescription(label)}</small>}</span></span></button>; })}</div>
     {confirmDelete && <ConfirmDialog title={`Delete ${count} selected ${count === 1 ? 'page' : 'pages'}?`} message="This changes the working document. You can undo it. Your original file stays unchanged." confirmLabel="Delete pages" onCancel={() => setConfirmDelete(false)} onConfirm={() => { setConfirmDelete(false); void change({ kind: 'delete', pages: selected }); }} />}
     {splitOpen && <SplitDialog pageCount={document.pages.length} busy={busy} split={split} close={() => setSplitOpen(false)} />}
     {cropOpen && count === 1 && <CropDialog page={selected[0]} pageWidth={document.pages[selected[0]].width} pageHeight={document.pages[selected[0]].height} busy={busy} crop={rect => crop(selected[0], rect)} close={() => setCropOpen(false)} />}

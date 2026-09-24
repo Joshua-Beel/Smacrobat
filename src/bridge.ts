@@ -1,5 +1,6 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import type { DocumentInfo, PageEdit } from './model';
+import type { DocumentPageLabels } from './pageLabels';
 export const native = isTauri();
 export type PasswordChallenge = { status: 'password_required'; request_id: number; name: string; incorrect: boolean };
 export type OpenResult = { status: 'opened'; document: DocumentInfo } | PasswordChallenge;
@@ -23,6 +24,7 @@ export type DocumentPropertiesInfo = {
   reported_signature_count: number | null; signature_validation: 'not_performed';
 };
 export const documentProperties = (id: number, revision: number) => invoke<DocumentPropertiesInfo>('document_properties', { id, revision });
+export const documentPageLabels = (id: number, revision: number) => invoke<DocumentPageLabels>('document_page_labels', { id, revision });
 export const dependencyNotices = () => invoke<string>('dependency_notices');
 export const pageText = (id: number, page: number, revision: number) => invoke<string>('page_text', { id, page, revision });
 export type PageTextGeometry = {

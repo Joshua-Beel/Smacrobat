@@ -67,6 +67,8 @@ enum Request {
     OpenDocumentsForPath(PathBuf, Reply<Vec<u64>>),
     #[cfg(test)]
     PasswordRequestsForPath(PathBuf, Reply<Vec<u64>>),
+    #[cfg(test)]
+    EnginePageLabels(u64, Reply<Vec<Option<String>>>),
     Open(PathBuf, Reply<ReplyLease<DocumentInfo>>),
     BeginOpen(PathBuf, Reply<ReplyLease<OpenResult>>),
     Unlock(u64, String, Reply<ReplyLease<OpenResult>>),
@@ -78,6 +80,7 @@ enum Request {
     Text(u64, u16, u64, Reply<String>),
     TextGeometry(u64, u16, u64, Reply<crate::text_geometry::PageTextGeometry>),
     Bookmarks(u64, u64, Reply<BookmarkList>),
+    PageLabels(u64, u64, Reply<crate::page_labels::DocumentPageLabels>),
     Properties(u64, u64, Reply<crate::document_properties::DocumentProperties>),
     FormFields(u64, u64, Reply<crate::forms::FormFields>),
     CheckFormCopy(u64, u64, Vec<crate::forms::FieldValue>, Reply<()>),
@@ -163,6 +166,7 @@ impl PdfService {
             let mut sessions = HashMap::<u64, (EditSession, DocumentInfo)>::new();
             let mut note_documents = HashMap::new();
             let mut cache = Cache { entries: VecDeque::new(), weight: 0 };
+            let mut page_labels = crate::page_labels::PageLabelCache::default();
             let mut next_id = 1;
             let mut pending = HashMap::<u64, PathBuf>::new();
             let mut next_request = 1;
@@ -204,6 +208,11 @@ impl PdfService {
                     Request::PasswordRequestsForPath(path, reply) => {
                         let ids = pending.iter().filter_map(|(id, source)| (*source == path).then_some(*id)).collect();
                         let _ = reply.send(Ok(ids));
+                    }
+                    #[cfg(test)]
+                    Request::EnginePageLabels(id, reply) => {
+                        let result = documents.get(&id).ok_or_else(|| "Document is closed".to_owned()).map(|document: &std::rc::Rc<PdfDocument<'_>>| document.pages().iter().map(|page| page.label().map(str::to_owned)).collect());
+                        let _ = reply.send(result);
                     }
                     Request::BeginPrint(id, revision, reply) => {
                         if reply.is_closed() { continue; }
@@ -321,6 +330,17 @@ impl PdfService {
                             let document = documents.get(&id).ok_or("Document is closed")?;
                             let dimensions = current_info(session, original, document)?.pages.iter().map(|page| (page.width, page.height)).collect::<Vec<_>>();
                             crate::document_properties::inspect(document, session.source.len(), &dimensions)
+                        })();
+                        let _ = reply.send(result);
+                    }
+                    Request::PageLabels(id, revision, reply) => {
+                        if reply.is_closed() { continue; }
+                        let result = (|| {
+                            let (session, _) = sessions.get(&id).ok_or("Document is closed")?;
+                            if session.revision != revision { return Err("Document changed. Reopen page labels.".into()); }
+                            let document = documents.get(&id).ok_or("Document is closed")?;
+                            let source = page_labels.read(id, &session.source, document.pages().len() as usize);
+                            Ok(crate::page_labels::project(&source, id, revision, &session.plan))
                         })();
                         let _ = reply.send(result);
                     }
@@ -635,7 +655,7 @@ impl PdfService {
                         })();
                         let _ = reply.send(result);
                     }
-                    Request::Close(id, reply) => { documents.remove(&id); sessions.remove(&id); note_documents.remove(&id); cache.close(id); let _ = reply.send(Ok(())); }
+                    Request::Close(id, reply) => { documents.remove(&id); sessions.remove(&id); note_documents.remove(&id); cache.close(id); page_labels.close(id); let _ = reply.send(Ok(())); }
                 }
             }
         }).expect("Could not start PDF worker");
@@ -676,6 +696,9 @@ impl PdfService {
     }
     pub async fn bookmarks(&self, id: u64, revision: u64) -> Result<BookmarkList, String> {
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::Bookmarks(id, revision, tx)).map_err(|e| e.to_string())?; rx.await.map_err(|e| e.to_string())?
+    }
+    pub async fn page_labels(&self, id: u64, revision: u64) -> Result<crate::page_labels::DocumentPageLabels, String> {
+        let (tx, rx) = oneshot::channel(); self.sender.send(Request::PageLabels(id, revision, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
     }
     pub async fn properties(&self, id: u64, revision: u64) -> Result<crate::document_properties::DocumentProperties, String> {
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::Properties(id, revision, tx)).map_err(|e| e.to_string())?; rx.await.map_err(|e| e.to_string())?
@@ -936,9 +959,64 @@ mod tests {
     macro_rules! accepted_reply_values {
         ($($value:ty),* $(,)?) => { $(impl TestReplyValue for $value { type Accepted = Self; fn accept(self) -> Self { self } })* };
     }
-    accepted_reply_values!((), Vec<u8>, Vec<u64>, String, DocumentInfo, SavedCopy, OpenResult, PrintSnapshotInfo, PrintBitmap, BookmarkList, RenderWork, crate::document_properties::DocumentProperties, crate::text_geometry::PageTextGeometry, crate::split::SplitOutput, crate::comments::CommentList, crate::comments::AnnotationList, crate::forms::FormFields);
+    accepted_reply_values!((), Vec<u8>, Vec<u64>, Vec<Option<String>>, String, DocumentInfo, SavedCopy, OpenResult, PrintSnapshotInfo, PrintBitmap, BookmarkList, RenderWork, crate::page_labels::DocumentPageLabels, crate::document_properties::DocumentProperties, crate::text_geometry::PageTextGeometry, crate::split::SplitOutput, crate::comments::CommentList, crate::comments::AnnotationList, crate::forms::FormFields);
     fn call<T: TestReplyValue>(service: &PdfService, request: impl FnOnce(Reply<T>) -> Request) -> Result<T::Accepted, String> {
         let (tx, rx) = oneshot::channel(); service.sender.send(request(tx)).unwrap(); rx.blocking_recv().unwrap().map(TestReplyValue::accept)
+    }
+    #[test]
+    fn page_labels_follow_current_plan_revision_and_close_without_changing_source() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let path = root.join("tests/fixtures/reportlab-page-labels.pdf");
+        let source = std::fs::read(&path).unwrap();
+        let library = root.join("resources/pdfium/bin/pdfium.dll");
+        let expected = ["1", "2", "iv", "v", "I", "II", "AA", "BB", "bb", "cc", "Appendix", "Appendix", "N-5", "N-6"];
+        let service = PdfService::start(library);
+        let mut info = call(&service, |reply| Request::Open(path.clone(), reply)).unwrap();
+        let engine_labels = call(&service, |reply| Request::EnginePageLabels(info.id, reply)).unwrap();
+        assert_eq!(engine_labels, expected.map(|label| Some(label.to_owned())), "PDFium must independently agree with all fixture labels");
+        assert_eq!(info.pages.len(), 14, "PDFium must agree with the 14-page fixture");
+        let original = call(&service, |reply| Request::PageLabels(info.id, info.revision, reply)).unwrap();
+        assert_eq!(original.status, crate::page_labels::PageLabelStatus::Supported);
+        assert_eq!(original.labels.len(), 14);
+        assert_eq!(original.labels[8].label, "bb");
+        assert!(original.labels.iter().enumerate().all(|(page, label)| label.page == page));
+
+        assert!(call(&service, |reply| Request::Edit(info.id, PageEdit::Move { from: 8, to: 0 }, reply)).err().unwrap().contains("page labels"));
+        info = call(&service, |reply| Request::Edit(info.id, PageEdit::Rotate { pages: vec![8], clockwise: true }, reply)).unwrap();
+        assert!(call(&service, |reply| Request::PageLabels(info.id, 0, reply)).unwrap_err().contains("changed"));
+        let rotated = call(&service, |reply| Request::PageLabels(info.id, info.revision, reply)).unwrap();
+        assert_eq!(rotated.labels[0].label, "1");
+        assert_eq!(rotated.labels[8].label, "bb");
+        assert!(rotated.labels.iter().enumerate().all(|(page, label)| label.page == page));
+
+        call(&service, |reply| Request::Close(info.id, reply)).unwrap();
+        assert!(call(&service, |reply| Request::PageLabels(info.id, info.revision, reply)).unwrap_err().contains("closed"));
+        assert_eq!(std::fs::read(path).unwrap(), source);
+    }
+    #[test]
+    fn page_labels_reads_preserve_all_corpus_sources_sessions_and_renders() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let service = PdfService::start(root.join("resources/pdfium/bin/pdfium.dll"));
+        for (fixture, count) in [("resources/welcome.pdf", 6usize), ("../test-corpus/synthetic-scan-98.pdf", 98), ("../test-corpus/synthetic-text-1500.pdf", 1500)] {
+            let path = root.join(fixture);
+            let source = std::fs::read(&path).unwrap();
+            let info = call(&service, |reply| Request::Open(path.clone(), reply)).unwrap();
+            assert_eq!(info.pages.len(), count);
+            let before_first = call(&service, |reply| Request::Render(info.id, 0, 64, reply)).unwrap();
+            let before_last = call(&service, |reply| Request::Render(info.id, (count - 1) as u16, 64, reply)).unwrap();
+            for _ in 0..2 {
+                let labels = call(&service, |reply| Request::PageLabels(info.id, 0, reply)).unwrap();
+                assert_eq!(labels.status, crate::page_labels::PageLabelStatus::None);
+                assert!(labels.labels.is_empty() && labels.reason.is_none());
+            }
+            assert_eq!(call(&service, |reply| Request::Render(info.id, 0, 64, reply)).unwrap(), before_first);
+            assert_eq!(call(&service, |reply| Request::Render(info.id, (count - 1) as u16, 64, reply)).unwrap(), before_last);
+            let unchanged = call(&service, |reply| Request::Edit(info.id, PageEdit::Move { from: 0, to: 0 }, reply)).unwrap();
+            assert_eq!(unchanged.revision, 0);
+            assert!(!unchanged.dirty && !unchanged.can_undo && !unchanged.can_redo);
+            call(&service, |reply| Request::Close(info.id, reply)).unwrap();
+            assert_eq!(std::fs::read(path).unwrap(), source);
+        }
     }
     #[test]
     fn forms_empty_values_require_an_actual_named_engine_field() {
