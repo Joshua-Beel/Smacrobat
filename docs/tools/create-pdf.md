@@ -1,0 +1,11 @@
+# Create a PDF from an image
+
+The source build can create one new PDF from one PNG or JPEG image. Choose **Create** in the header or **Create a PDF** in All tools. The native flow asks for the source image, then asks where to save the new PDF. Canceling either picker leaves the source file, open tabs, recent files, and existing edits unchanged.
+
+The initial policy is **Letter**, **Auto**, and a **36 point** margin. You can choose Letter or A4, Auto/portrait/landscape orientation, and a finite margin from 0 through 72 points. Auto chooses landscape only when the image is wider than it is tall; a square image is portrait. The image is contained and centered inside the page, with upscaling allowed and no cropping. The native conversion also requires at least one point of image area after margins.
+
+Native validation uses file content rather than the filename extension. PNG animation, JPEG multi-picture data, malformed or trailing image data, and images over the native limits are refused. The current limits are a 64 MiB source file, 16,384 pixels on either edge, 32 megapixels, 128 MiB decoded image data, and a 256 MiB output PDF. These are conversion guards, not a general application memory cap.
+
+Conversion applies EXIF orientation metadata, composites transparency onto white, and writes an 8-bit RGB image XObject on one PDF page. ICC color profiles and image metadata are not retained. The source image is never decoded in the renderer, and the source file is never overwritten. A returned PDF opens as one clean output tab; a rejected or canceled operation does not create a tab.
+
+This is a bounded image-to-one-page slice. General format conversion, animation or multi-image documents, OCR, image enhancement, image editing, and preservation of source color profiles or metadata remain unavailable. Focused native checks cover malformed and concatenated input, MPO refusal, limits, EXIF orientation, alpha conversion, page placement, output structure, and source preservation; an independent RGBA probe confirmed the centered one-page DeviceRGB result. The full native gate passed 158 tests (0 failed, 1 ignored) in 726.02 seconds. The standalone Tauri debug/no-bundle build exited 0 with 1,933 frontend modules (5.56 seconds frontend, 35.42 seconds native); native desktop picker and save-dialog interaction remains pending.

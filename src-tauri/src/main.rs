@@ -10,6 +10,7 @@ mod combine;
 mod comments;
 mod forms;
 mod page_labels;
+mod image_pdf;
 use service::{DocumentInfo, PdfService};
 use tauri::{Manager, State};
 
@@ -98,6 +99,17 @@ async fn save_copy(app: tauri::AppHandle, service: State<'_, PdfService>, id: u6
 }
 
 #[tauri::command]
+async fn create_pdf_from_image(app: tauri::AppHandle, service: State<'_, PdfService>, options: image_pdf::ImagePdfOptions) -> Result<Option<service::SavedCopy>, String> {
+    let window = app.get_webview_window("main").ok_or("Application window is unavailable")?;
+    let source_window = window.clone();
+    let source = tauri::async_runtime::spawn_blocking(move || rfd::FileDialog::new().set_parent(&source_window).set_title("Choose one PNG or JPEG image").add_filter("PNG and JPEG images", &["png", "jpg", "jpeg"]).pick_file()).await.map_err(|error| error.to_string())?;
+    let Some(source) = source else { return Ok(None); };
+    let suggested = format!("{}.pdf", source.file_stem().unwrap_or_default().to_string_lossy());
+    let output = tauri::async_runtime::spawn_blocking(move || rfd::FileDialog::new().set_parent(&window).set_title("Save image as a new PDF").add_filter("PDF documents", &["pdf"]).set_file_name(suggested).save_file()).await.map_err(|error| error.to_string())?;
+    match output { Some(output) => service.create_image_pdf(source, output, options).await.map(Some), None => Ok(None) }
+}
+
+#[tauri::command]
 async fn split_document(app: tauri::AppHandle, service: State<'_, PdfService>, id: u64, revision: u64, pages_per_file: usize) -> Result<Option<split::SplitOutput>, String> {
     let window = app.get_webview_window("main").ok_or("Application window is unavailable")?;
     let folder = tauri::async_runtime::spawn_blocking(move || rfd::FileDialog::new().set_parent(&window).set_title("Choose a new folder for split PDFs").set_file_name("Split PDFs").save_file()).await.map_err(|error| error.to_string())?;
@@ -147,6 +159,6 @@ fn main() {
         app.manage(PdfService::start(library));
         app.manage(print_commands::PrintJobs::default());
         Ok(())
-    }).invoke_handler(tauri::generate_handler![document_form_fields, fill_form_copy, open_document, reopen_document, open_example, render_page, close_document, edit_pages, crop_page, crop_pages, create_comment, update_comment, delete_comment, document_comments, document_annotations, create_highlight, create_text_highlight, update_highlight, delete_highlight, save_copy, split_document, combine_documents, insert_pages_copy, replace_pages_copy, page_text, page_text_geometry, document_bookmarks, document_page_labels, document_properties, dependency_notices, unlock_document, cancel_password_request, print_commands::print_document, print_commands::cancel_print])
+    }).invoke_handler(tauri::generate_handler![document_form_fields, fill_form_copy, open_document, reopen_document, open_example, render_page, close_document, edit_pages, crop_page, crop_pages, create_pdf_from_image, create_comment, update_comment, delete_comment, document_comments, document_annotations, create_highlight, create_text_highlight, update_highlight, delete_highlight, save_copy, split_document, combine_documents, insert_pages_copy, replace_pages_copy, page_text, page_text_geometry, document_bookmarks, document_page_labels, document_properties, dependency_notices, unlock_document, cancel_password_request, print_commands::print_document, print_commands::cancel_print])
       .run(tauri::generate_context!()).expect("Desktop application failed");
 }

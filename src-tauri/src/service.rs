@@ -87,6 +87,7 @@ enum Request {
     FormFields(u64, u64, Reply<crate::forms::FormFields>),
     CheckFormCopy(u64, u64, Vec<crate::forms::FieldValue>, Reply<()>),
     FillFormCopy(u64, u64, Vec<crate::forms::FieldValue>, PathBuf, Reply<ReplyLease<SavedCopy>>),
+    CreateImagePdf(PathBuf, PathBuf, crate::image_pdf::ImagePdfOptions, Reply<ReplyLease<SavedCopy>>),
     Close(u64, Reply<()>),
     Edit(u64, PageEdit, Reply<DocumentInfo>),
     Crop(u64, u16, u64, CropRect, Reply<DocumentInfo>),
@@ -660,6 +661,33 @@ impl PdfService {
                         let result = result.map(|saved| { let cleanup = UnclaimedReply::Document(saved.document.id); ReplyLease::new(saved, cleanup, resource_cleanup.clone()) });
                         if let Err(Ok(saved)) = reply.send(result) { documents.remove(&saved.document.id); sessions.remove(&saved.document.id); }
                     }
+                    Request::CreateImagePdf(source, path, options, reply) => {
+                        if reply.is_closed() { continue; }
+                        let result = (|| {
+                            let engine = pdfium.as_ref().map_err(Clone::clone)?;
+                            let mut prepared_document = None;
+                            let prepared = crate::image_pdf::prepare_and_write(&source, &path, options, |prepared| {
+                                if reply.is_closed() { return Err("Create PDF was canceled.".into()); }
+                                let document = engine.load_pdf_from_byte_vec(prepared.bytes.clone(), None).map_err(|error| format!("Output could not be opened: {error}"))?;
+                                let pages = page_sizes(&document)?;
+                                if pages.len() != 1 || (pages[0].width - prepared.page_width).abs() > 0.02 || (pages[0].height - prepared.page_height).abs() > 0.02 { return Err("Output page dimensions differ from the image conversion plan.".into()); }
+                                let page = document.pages().get(0).map_err(|error| format!("Output page could not be read: {error}"))?;
+                                let bitmap = page.render_with_config(&PdfRenderConfig::new().set_target_width(64).set_maximum_height(64)).map_err(|error| format!("Output page could not be rendered: {error}"))?;
+                                if bitmap.width() <= 0 || bitmap.height() <= 0 { return Err("Output page has an invalid bitmap.".into()); }
+                                if reply.is_closed() { return Err("Create PDF was canceled.".into()); }
+                                prepared_document = Some((document, pages));
+                                Ok(())
+                            })?;
+                            let (document, pages) = prepared_document.ok_or("Created PDF output was not validated")?;
+                            let id = next_id; next_id += 1;
+                            let info = DocumentInfo { id, name: path.file_name().unwrap_or_default().to_string_lossy().into_owned(), path: path.to_string_lossy().into_owned(), pages, revision: 0, dirty: false, can_undo: false, can_redo: false };
+                            sessions.insert(id, (EditSession::new(prepared.bytes, 1), info.clone()));
+                            documents.insert(id, std::rc::Rc::new(document));
+                            Ok(SavedCopy { path: path.to_string_lossy().into_owned(), document: info })
+                        })();
+                        let result = result.map(|saved| { let cleanup = UnclaimedReply::Document(saved.document.id); ReplyLease::new(saved, cleanup, resource_cleanup.clone()) });
+                        if let Err(Ok(saved)) = reply.send(result) { documents.remove(&saved.document.id); sessions.remove(&saved.document.id); }
+                    }
                     Request::Save(id, pages, path, reply) => {
                         let result = (|| {
                             let (session, original) = sessions.get_mut(&id).ok_or("Document is closed")?;
@@ -737,6 +765,9 @@ impl PdfService {
     }
     pub async fn crop(&self, id: u64, page: u16, revision: u64, rect: CropRect) -> Result<DocumentInfo, String> {
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::Crop(id, page, revision, rect, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
+    }
+    pub async fn create_image_pdf(&self, source: PathBuf, path: PathBuf, options: crate::image_pdf::ImagePdfOptions) -> Result<SavedCopy, String> {
+        let (tx, rx) = oneshot::channel(); self.sender.send(Request::CreateImagePdf(source, path, options, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?.map(ReplyLease::accept)
     }
     pub async fn crop_pages(&self, id: u64, pages: Vec<u16>, revision: u64, insets: CropInsets) -> Result<DocumentInfo, String> {
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::CropPages(id, pages, revision, insets, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
@@ -1897,6 +1928,31 @@ mod tests {
         assert_eq!(std::fs::read(&first_path).unwrap(), source); assert_eq!(std::fs::read(&second_path).unwrap(), source);
         for source in [&first, &second] { assert_eq!(call(&service, |reply| Request::Properties(source.id, 0, reply)).unwrap().page_count, 6); }
         assert!(retained.is_empty(), "Successfully sent but unread Combine retained {} session(s)", retained.len());
+    }
+    #[test]
+    fn image_pdf_output_is_clean_printable_exportable_and_preserves_open_sessions() {
+        let _print_lock = print_test_lock(); let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")); let service = PdfService::start(root.join("resources/pdfium/bin/pdfium.dll")); let folder = tempfile::tempdir().unwrap();
+        let source = folder.path().join("source.data"); let output = folder.path().join("created.pdf"); let exported = folder.path().join("exported.pdf");
+        let pixels = image::RgbaImage::from_raw(2, 1, vec![255, 0, 0, 128, 0, 0, 255, 255]).unwrap(); pixels.save_with_format(&source, image::ImageFormat::Png).unwrap(); let source_bytes = std::fs::read(&source).unwrap();
+        let existing = call(&service, |reply| Request::Open(root.join("resources/welcome.pdf"), reply)).unwrap(); let before = call(&service, |reply| Request::Render(existing.id, 0, 128, reply)).unwrap();
+        let options = crate::image_pdf::ImagePdfOptions { page_size: crate::image_pdf::ImagePdfPageSize::Letter, orientation: crate::image_pdf::ImagePdfOrientation::Auto, margin_points: 12.0 };
+        let saved = call(&service, |reply| Request::CreateImagePdf(source.clone(), output.clone(), options, reply)).unwrap();
+        assert_eq!(saved.path, output.to_string_lossy()); assert_eq!(saved.document.pages.len(), 1); assert_eq!((saved.document.pages[0].width, saved.document.pages[0].height), (792.0, 612.0)); assert_eq!(saved.document.revision, 0); assert!(!saved.document.dirty && !saved.document.can_undo && !saved.document.can_redo);
+        let preview = call(&service, |reply| Request::Render(saved.document.id, 0, 128, reply)).unwrap(); assert!(preview.starts_with(b"\x89PNG\r\n\x1a\n"));
+        let snapshot = call(&service, |reply| Request::BeginPrint(saved.document.id, 0, reply)).unwrap(); let printed = service.print_render_blocking(snapshot.token, 0, 128, 128).unwrap(); assert!(printed.width > 0 && printed.height > 0 && !printed.bgra.is_empty()); call(&service, |reply| Request::EndPrint(snapshot.token, reply)).unwrap(); std::mem::forget(snapshot);
+        call(&service, |reply| Request::Save(saved.document.id, None, exported.clone(), reply)).unwrap(); let reopened = call(&service, |reply| Request::Open(exported.clone(), reply)).unwrap(); assert_eq!(reopened.pages.len(), 1); assert_eq!(call(&service, |reply| Request::Render(reopened.id, 0, 128, reply)).unwrap(), preview);
+        assert_eq!(std::fs::read(&source).unwrap(), source_bytes); assert_eq!(call(&service, |reply| Request::Render(existing.id, 0, 128, reply)).unwrap(), before); assert_eq!(call(&service, |reply| Request::Properties(existing.id, 0, reply)).unwrap().page_count, 6);
+        for id in [saved.document.id, reopened.id, existing.id] { call(&service, |reply| Request::Close(id, reply)).unwrap(); }
+    }
+    #[test]
+    fn unread_image_pdf_reply_releases_session_and_preserves_published_output() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")); let service = PdfService::start(root.join("resources/pdfium/bin/pdfium.dll")); let folder = tempfile::tempdir().unwrap();
+        let source = folder.path().join("source.png"); let output = folder.path().join("created.pdf"); image::RgbImage::from_raw(1, 1, vec![10, 20, 30]).unwrap().save(&source).unwrap(); let source_bytes = std::fs::read(&source).unwrap();
+        let options = crate::image_pdf::ImagePdfOptions { page_size: crate::image_pdf::ImagePdfPageSize::A4, orientation: crate::image_pdf::ImagePdfOrientation::Portrait, margin_points: 0.0 };
+        let _cleanup = UnreadReplyCleanup { service: service.clone(), paths: vec![output.clone()] };
+        let retained = unread_document_reply(&service, &output, |reply| Request::CreateImagePdf(source.clone(), output.clone(), options, reply));
+        assert!(retained.is_empty(), "Successfully sent but unread CreateImagePdf retained {} session(s)", retained.len()); assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
+        assert_eq!(lopdf::Document::load(&output).unwrap().get_pages().len(), 1); let reopened = call(&service, |reply| Request::Open(output.clone(), reply)).unwrap(); assert_eq!(reopened.pages.len(), 1); call(&service, |reply| Request::Close(reopened.id, reply)).unwrap();
     }
     #[test]
     fn unread_password_required_reply_releases_pending_challenge() {

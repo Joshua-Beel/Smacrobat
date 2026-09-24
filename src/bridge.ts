@@ -38,6 +38,8 @@ export const documentBookmarks = (id: number, revision: number) => invoke<Bookma
 export const editPages = (id: number, edit: PageEdit) => invoke<DocumentInfo>('edit_pages', { id, edit });
 export type SavedCopy = { path: string; document: DocumentInfo };
 export const saveCopy = (id: number, pages?: number[]) => invoke<SavedCopy | null>('save_copy', { id, pages: pages ?? null });
+export type CreatePdfOptions = { pageSize: 'letter' | 'a4'; orientation: 'auto' | 'portrait' | 'landscape'; marginPoints: number };
+export const createPdfFromImage = (options: CreatePdfOptions) => invoke<SavedCopy | null>('create_pdf_from_image', { options });
 export type FormTextField = { kind: 'text'; fieldId: string; name: string; page: number; value: string; maxLength: number | null };
 export type FormCheckboxField = { kind: 'checkbox'; fieldId: string; name: string; page: number; checked: boolean };
 export type FormRadioField = { kind: 'radio'; fieldId: string; name: string; page: number; options: { optionId: string; label: string }[]; selectedOptionId: string | null };

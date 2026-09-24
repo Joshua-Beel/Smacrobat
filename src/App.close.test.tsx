@@ -4,7 +4,7 @@ import App from './App';
 import { closeDocument, editPages, openDocument, saveCopy } from './bridge';
 import type { DocumentInfo } from './model';
 
-vi.mock('./bridge', () => ({ native: false, openDocument: vi.fn(), reopenDocument: vi.fn(), closeDocument: vi.fn(), editPages: vi.fn(), saveCopy: vi.fn(), documentPageLabels: vi.fn() }));
+vi.mock('./bridge', () => ({ native: false, openDocument: vi.fn(), reopenDocument: vi.fn(), closeDocument: vi.fn(), editPages: vi.fn(), saveCopy: vi.fn(), createPdfFromImage: vi.fn(), documentPageLabels: vi.fn() }));
 vi.mock('./Viewer', () => ({ default: ({ document }: { document: DocumentInfo }) => <div data-viewed-document={document.id}>{document.name}</div> }));
 
 const first: DocumentInfo = { id: 1, name: 'a.pdf', path: 'C:/docs/a.pdf', pages: [{ width: 612, height: 792 }], revision: 0, dirty: false, can_undo: true, can_redo: false };

@@ -4,7 +4,7 @@ import App from './App';
 import Viewer from './Viewer';
 import { documentPageLabels, editPages, openDocument, pageText } from './bridge';
 import type { DocumentInfo } from './model';
-vi.mock('./bridge', () => ({ native: false, openDocument: vi.fn(), reopenDocument: vi.fn(), closeDocument: vi.fn(), editPages: vi.fn(), saveCopy: vi.fn(), pageText: vi.fn(), documentPageLabels: vi.fn() }));
+vi.mock('./bridge', () => ({ native: false, openDocument: vi.fn(), reopenDocument: vi.fn(), closeDocument: vi.fn(), editPages: vi.fn(), saveCopy: vi.fn(), pageText: vi.fn(), createPdfFromImage: vi.fn(), documentPageLabels: vi.fn() }));
 vi.mock('./Viewer', () => ({ default: () => <div>Viewer</div> }));
 const document = (id: number): DocumentInfo => ({ id, name: `file-${id}.pdf`, path: `C:/file-${id}.pdf`, pages: Array.from({ length: 6 }, () => ({ width: 612, height: 792 })), revision: 0, dirty: false, can_undo: true, can_redo: false });
 beforeEach(() => {

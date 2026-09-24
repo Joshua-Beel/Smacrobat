@@ -5,7 +5,7 @@ import { openDocument } from './bridge';
 import { readRecentFiles } from './recentFiles';
 import type { DocumentInfo } from './model';
 
-vi.mock('./bridge', () => ({ native: false, openDocument: vi.fn(), reopenDocument: vi.fn(), closeDocument: vi.fn(), editPages: vi.fn(), saveCopy: vi.fn(), documentPageLabels: vi.fn() }));
+vi.mock('./bridge', () => ({ native: false, openDocument: vi.fn(), reopenDocument: vi.fn(), closeDocument: vi.fn(), editPages: vi.fn(), saveCopy: vi.fn(), createPdfFromImage: vi.fn(), documentPageLabels: vi.fn() }));
 vi.mock('./Viewer', () => ({ default: () => <div>Rendered document</div> }));
 vi.mock('./PasswordDialog', () => ({ default: (props: { onOpened: (document: DocumentInfo) => void; onClose: () => void }) => <div><button onClick={() => props.onOpened(document)}>Simulate unlock</button><button onClick={props.onClose}>Simulate cancel</button></div> }));
 const document: DocumentInfo = { id: 3, name: 'locked.pdf', path: 'C:/docs/locked.pdf', pages: [{ width: 612, height: 792 }], revision: 0, dirty: false, can_undo: false, can_redo: false };
