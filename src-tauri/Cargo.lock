@@ -2948,6 +2948,7 @@ dependencies = [
  "image",
  "lopdf",
  "pdfium-render",
+ "png 0.18.1",
  "rfd",
  "serde",
  "serde_json",

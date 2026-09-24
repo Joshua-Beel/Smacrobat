@@ -92,6 +92,10 @@ impl EditSession {
     pub fn can_redo(&self) -> bool { !self.redo.is_empty() }
     pub fn mark_saved(&mut self) { self.saved = self.plan.clone(); }
     pub fn comments_reason(&self) -> Option<&str> { self.comments_reason.as_deref() }
+    pub fn page_image_export_guard(&self) -> Result<(), String> {
+        let document = self.load_source()?;
+        check_supported(&document, false, false)
+    }
     pub fn proposed_comment(&self, page: Option<(usize, CropBox)>, note_id: Option<&str>, contents: Option<&str>) -> Result<Vec<PageSpec>, String> {
         if let Some(reason) = &self.comments_reason { return Err(reason.clone()); }
         let document = self.load_source()?; crate::comments::read(&document)?;
