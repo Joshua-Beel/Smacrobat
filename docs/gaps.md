@@ -6,7 +6,7 @@ Embedded-text Find is implemented in the source build: matching pages, highlight
 
 ## Performance and compatibility
 
-No validated 60 fps target, 10,000-page open latency, real 300-dpi scan benchmark, or multi-viewer round trip. The page geometry list is collected at open, rather than a fully lazy page-tree implementation. The Pages sidebar virtualizes its buttons, but the existing full-height viewer has no measurement establishing end-to-end navigation through a 65,536-page document. Rendered page images are virtualized separately. The native cache, undo/redo snapshots and individual print bitmaps have limits; these are not a measured total application RSS cap.
+No validated 60 fps target, 10,000-page open latency, real 300-dpi scan benchmark, or multi-viewer round trip. The page geometry list is collected at open, rather than a fully lazy page-tree implementation. The Viewer uses indexed visible/current-page lookups, but its 65,536-page access-count test is not a frame-rate or memory benchmark. The Pages sidebar virtualizes its buttons, while the existing full-height viewer has no measurement establishing end-to-end navigation through a 65,536-page document. Rendered page images are virtualized separately. The native cache, undo/redo snapshots and individual print bitmaps have limits; these are not a measured total application RSS cap.
 
 ## Remaining tools
 

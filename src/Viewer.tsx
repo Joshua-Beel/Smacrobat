@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { renderPage, type Annotation, type CommentRect } from './bridge';
-import { pageOffsets, visiblePages, type DocumentInfo } from './model';
+import { currentPageAt, maxPageWidth, pageLayout, scaleAnchoredTop, visiblePageRange, type DocumentInfo } from './model';
 import TextLayer from './TextLayer';
 import CommentLayer from './CommentLayer';
 import type { TextHighlightSelection, TextHighlightSelectionSource } from './textHighlightSelection';
@@ -39,28 +39,26 @@ export default function Viewer({ document, zoom, fit, target, onPage, hand, sear
     const observer = new ResizeObserver(([entry]) => setBounds({ width: entry.contentRect.width, height: entry.contentRect.height }));
     observer.observe(element); return () => observer.disconnect();
   }, []);
-  const scale = fit ? Math.max(0.1, (bounds.width - 144) / Math.max(...document.pages.map(p => p.width))) : zoom / 100 * 96 / 72;
-  const offsets = useMemo(() => pageOffsets(document.pages, scale), [document, scale]);
-  const previousLayout = useRef({ offsets, scale });
-  const visible = visiblePages(offsets, document.pages, scale, top, bounds.height);
-  const height = offsets.at(-1)! + document.pages.at(-1)!.height * scale + 24;
+  const maxWidth = useMemo(() => maxPageWidth(document.pages), [document]);
+  const scale = fit ? Math.max(0.1, (bounds.width - 144) / maxWidth) : zoom / 100 * 96 / 72;
+  const layout = useMemo(() => pageLayout(document.pages, scale, maxWidth), [document, scale, maxWidth]);
+  const previousLayout = useRef({ layout, scale });
+  const range = visiblePageRange(layout, top, bounds.height);
+  const visible = Array.from({ length: range.end - range.start }, (_, index) => range.start + index);
   useLayoutEffect(() => {
     const element = viewport.current!;
     const old = previousLayout.current;
     if (old.scale !== scale) {
-      let anchor = old.offsets.findIndex((offset, i) => offset + document.pages[i].height * old.scale > element.scrollTop);
-      anchor = Math.max(0, anchor);
-      element.scrollTop = offsets[anchor] + (element.scrollTop - old.offsets[anchor]) * scale / old.scale;
+      element.scrollTop = scaleAnchoredTop(old.layout, layout, old.scale, scale, element.scrollTop);
       setTop(element.scrollTop);
     }
-    previousLayout.current = { offsets, scale };
-  }, [offsets, scale, document]);
-  useEffect(() => { viewport.current?.scrollTo({ top: offsets[target.page] - 24 }); }, [target]);
+    previousLayout.current = { layout, scale };
+  }, [layout, scale]);
+  useEffect(() => { viewport.current?.scrollTo({ top: layout.offsets[target.page] - 24 }); }, [target]);
   return <div ref={viewport} className={`${styles.viewport} ${hand ? styles.hand : ''}`} onScroll={event => {
     const scrollTop = event.currentTarget.scrollTop;
     setTop(scrollTop);
-    let page = offsets.findIndex((offset, i) => offset + document.pages[i].height * scale > scrollTop + 80);
-    onPage(page < 0 ? document.pages.length - 1 : page);
+    onPage(currentPageAt(layout, scrollTop + 80));
   }} onPointerDown={event => {
     if (!hand || event.button !== 0) return;
     const element = viewport.current!;
@@ -71,8 +69,8 @@ export default function Viewer({ document, zoom, fit, target, onPage, hand, sear
     viewport.current!.scrollTop = drag.current.top - event.clientY + drag.current.y;
     viewport.current!.scrollLeft = drag.current.left - event.clientX + drag.current.x;
   }} onPointerUp={() => { drag.current = null; }} onLostPointerCapture={() => { drag.current = null; }}>
-    <div className={styles.pageStack} style={{ height, minWidth: Math.max(...document.pages.map(p => p.width)) * scale + 144 }}>
-      {visible.map(index => <div key={`${document.id}-${index}`} className={styles.pagePosition} style={{ top: offsets[index] }}>
+    <div className={styles.pageStack} style={{ height: layout.height, minWidth: layout.maxWidth * scale + 144 }}>
+      {visible.map(index => <div key={`${document.id}-${index}`} className={styles.pagePosition} style={{ top: layout.offsets[index] }}>
         <Page id={document.id} index={index} {...document.pages[index]} scale={scale} revision={document.revision} selectable={!hand && !commentMode && !highlightMode} search={search?.documentId === document.id && search.revision === document.revision && search.pages.includes(index) ? search : undefined} annotations={annotations.filter(annotation => annotation.page === index && annotation.rect)} commentMode={commentMode} highlightMode={highlightMode} annotationAvailable={annotationAvailable} annotationInteractive={annotationInteractive} onCommentCreate={onCommentCreate} onHighlightCreate={onHighlightCreate} onAnnotationSelect={onAnnotationSelect} onTextSelection={onTextSelection} />
       </div>)}
     </div>
