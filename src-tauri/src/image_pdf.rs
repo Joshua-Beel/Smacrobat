@@ -41,6 +41,14 @@ fn read_source(path: &Path) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+fn validate_output_path(path: &Path) -> Result<(), String> {
+    if !path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("pdf")) { return Err("The output filename must end in .pdf.".into()); }
+    if path.symlink_metadata().is_ok() { return Err("That file already exists. Choose a new filename; Create PDF never overwrites an existing file.".into()); }
+    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty()).ok_or("Choose an output folder.")?;
+    if !parent.is_dir() { return Err("Choose an existing output folder.".into()); }
+    Ok(())
+}
+
 fn png_is_single(bytes: &[u8]) -> Result<(), String> {
     if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") { return Err("The source is not a valid PNG image.".into()); }
     let mut offset = 8usize;
@@ -200,7 +208,7 @@ fn assemble(image: DynamicImage, options: ImagePdfOptions) -> Result<PreparedIma
 }
 
 pub fn prepare_and_write(source: &Path, output: &Path, options: ImagePdfOptions, validate: impl FnOnce(&PreparedImagePdf) -> Result<(), String>) -> Result<PreparedImagePdf, String> {
-    if output.symlink_metadata().is_ok() { return Err("That file already exists. Choose a new filename; Create PDF never overwrites an existing file.".into()); }
+    validate_output_path(output)?;
     let prepared = assemble(decode(read_source(source)?)?, options)?;
     validate(&prepared).map_err(|error| format!("Created PDF validation failed: {error}"))?;
     crate::editor::write_new_file(output, &prepared.bytes)?;
@@ -324,6 +332,24 @@ mod tests {
         let mut mpo = first[..2].to_vec(); mpo.extend_from_slice(&[0xff, 0xe2, 0, 6, b'M', b'P', b'F', 0]); mpo.extend_from_slice(&first[2..]); std::fs::write(&source, mpo).unwrap();
         assert!(prepare_and_write(&source, &second_output, options(ImagePdfPageSize::A4, ImagePdfOrientation::Portrait, 0.0), |_| Ok(())).unwrap_err().contains("Multi-picture JPEG"));
         assert!(!second_output.exists());
+    }
+
+    #[test]
+    fn invalid_output_paths_fail_before_source_work() {
+        let folder = tempfile::tempdir().unwrap();
+        let missing_source = folder.path().join("missing-source.png");
+        let wrong_extension = folder.path().join("created.jpg");
+        assert!(prepare_and_write(&missing_source, &wrong_extension, options(ImagePdfPageSize::A4, ImagePdfOrientation::Portrait, 0.0), |_| Ok(())).unwrap_err().contains("must end in .pdf"));
+
+        let malformed_source = folder.path().join("malformed.png");
+        std::fs::write(&malformed_source, b"GIF89a").unwrap();
+        let missing_parent = folder.path().join("missing-folder").join("created.pdf");
+        assert!(prepare_and_write(&malformed_source, &missing_parent, options(ImagePdfPageSize::A4, ImagePdfOrientation::Portrait, 0.0), |_| Ok(())).unwrap_err().contains("existing output folder"));
+
+        let existing_output = folder.path().join("owned.pdf");
+        std::fs::write(&existing_output, b"owned").unwrap();
+        assert!(prepare_and_write(&missing_source, &existing_output, options(ImagePdfPageSize::A4, ImagePdfOrientation::Portrait, 0.0), |_| Ok(())).unwrap_err().contains("never overwrites"));
+        assert_eq!(std::fs::read(existing_output).unwrap(), b"owned");
     }
 
     #[test]
