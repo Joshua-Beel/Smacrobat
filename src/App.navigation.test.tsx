@@ -2,11 +2,11 @@ import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import App from './App';
 import Viewer from './Viewer';
-import { documentPageLabels, editPages, openDocument, pageText } from './bridge';
+import { documentPageLabels, editPages, openDocument, pageText, renderPage } from './bridge';
 import type { DocumentInfo } from './model';
-vi.mock('./bridge', () => ({ native: false, openDocument: vi.fn(), reopenDocument: vi.fn(), closeDocument: vi.fn(), editPages: vi.fn(), saveCopy: vi.fn(), pageText: vi.fn(), createPdfFromImage: vi.fn(), documentPageLabels: vi.fn() }));
+vi.mock('./bridge', () => ({ native: false, openDocument: vi.fn(), reopenDocument: vi.fn(), closeDocument: vi.fn(), editPages: vi.fn(), saveCopy: vi.fn(), pageText: vi.fn(), renderPage: vi.fn(), createPdfFromImage: vi.fn(), documentPageLabels: vi.fn() }));
 vi.mock('./Viewer', () => ({ default: () => <div>Viewer</div> }));
-const document = (id: number): DocumentInfo => ({ id, name: `file-${id}.pdf`, path: `C:/file-${id}.pdf`, pages: Array.from({ length: 6 }, () => ({ width: 612, height: 792 })), revision: 0, dirty: false, can_undo: true, can_redo: false });
+const document = (id: number, count = 6): DocumentInfo => ({ id, name: `file-${id}.pdf`, path: `C:/file-${id}.pdf`, pages: Array.from({ length: count }, () => ({ width: 612, height: 792 })), revision: 0, dirty: false, can_undo: true, can_redo: false });
 beforeEach(() => {
   vi.clearAllMocks(); const storage = new Map();
   vi.stubGlobal('window', { localStorage: { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value) }, addEventListener: vi.fn(), removeEventListener: vi.fn() });
@@ -14,10 +14,11 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllGlobals());
 const tab = (ui: ReactTestRenderer, name: string) => ui.root.findAllByType('button').find(button => button.findAllByType('span').some(span => span.children.includes(name)))!;
 const text = (node: unknown): string => Array.isArray(node) ? node.map(text).join('') : typeof node === 'string' ? node : (node && typeof node === 'object' && 'children' in node) ? text((node as { children?: unknown }).children) : '';
-async function open(ui: ReactTestRenderer, id: number) {
-  vi.mocked(openDocument).mockResolvedValue({ status: 'opened', document: document(id) });
+async function open(ui: ReactTestRenderer, id: number, count = 6) {
+  vi.mocked(openDocument).mockResolvedValue({ status: 'opened', document: document(id, count) });
   await act(async () => ui.root.findAllByType('button').find(button => button.children.includes('Open a file'))!.props.onClick());
 }
+const virtualRows = (ui: ReactTestRenderer) => ui.root.findAllByType('button').filter(button => button.props['data-page-index'] !== undefined);
 it('restores each tab to its last scrolled or explicitly chosen page', async () => {
   let ui!: ReactTestRenderer; act(() => { ui = create(<App />); });
   await open(ui, 1);
@@ -66,6 +67,29 @@ it('shows labels as secondary text while numeric navigation stays physical', asy
   expect(rendered).toContain('Label:   Ω  ');
   act(() => ui.root.findByProps({ 'aria-label': 'Page number' }).props.onKeyDown({ key: 'Enter', currentTarget: { value: '12' } }));
   expect(ui.root.findByType(Viewer).props.target.page).toBe(5);
+  act(() => ui.unmount());
+});
+it('keeps virtual page-list scroll and focus local to its active tab without fetching or rendering', async () => {
+  vi.mocked(documentPageLabels).mockImplementation((id, revision) => Promise.resolve({ documentId: id, revision, status: 'supported', reason: null, labels: Array.from({ length: 1_500 }, (_, page) => ({ page, label: `label-${page}` })) }));
+  let ui!: ReactTestRenderer; act(() => { ui = create(<App />); });
+  await open(ui, 1, 1_500);
+  await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+  act(() => ui.root.findByProps({ 'aria-label': 'Pages' }).props.onClick());
+  const list = ui.root.findByProps({ 'aria-label': 'Page list' });
+  vi.mocked(documentPageLabels).mockClear(); vi.mocked(renderPage).mockClear();
+  act(() => list.props.onScroll({ currentTarget: { scrollTop: 100 * 96 } }));
+  act(() => ui.root.findByProps({ 'data-page-index': 100 }).props.onFocus());
+  expect(documentPageLabels).not.toHaveBeenCalled();
+  expect(renderPage).not.toHaveBeenCalled();
+  act(() => ui.root.findByType(Viewer).props.onPage(900));
+  expect(ui.root.findByProps({ 'data-page-index': 900 }).props['aria-current']).toBe('page');
+  await open(ui, 2, 1_500);
+  expect(virtualRows(ui).filter(button => button.props.tabIndex === 0).map(button => button.props['data-page-index'])).toEqual([0]);
+  expect(virtualRows(ui).some(button => button.props['data-page-index'] === 100)).toBe(false);
+  act(() => tab(ui, 'file-1.pdf').props.onClick());
+  expect(ui.root.findByType(Viewer).props.target.page).toBe(900);
+  expect(ui.root.findByProps({ 'data-page-index': 900 }).props.tabIndex).toBe(0);
+  expect(virtualRows(ui).some(button => button.props['data-page-index'] === 100)).toBe(false);
   act(() => ui.unmount());
 });
 it('clears labels on revision changes and ignores a stale snapshot', async () => {
