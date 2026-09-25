@@ -16,8 +16,10 @@ mod page_image;
 #[allow(dead_code)]
 mod ocr_process;
 #[cfg(windows)]
-#[allow(dead_code)]
+#[cfg_attr(not(ocr_opt_in), allow(dead_code))]
 mod ocr;
+#[cfg(windows)]
+mod ocr_commands;
 use service::{DocumentInfo, PdfService};
 use tauri::{Manager, State};
 
@@ -35,6 +37,17 @@ async fn reopen_document(service: State<'_, PdfService>, path: String) -> Result
 async fn unlock_document(service: State<'_, PdfService>, request_id: u64, password: String) -> Result<service::OpenResult, String> { service.unlock(request_id, password).await }
 #[tauri::command]
 async fn cancel_password_request(service: State<'_, PdfService>, request_id: u64) -> Result<(), String> { service.cancel_password(request_id).await }
+#[cfg(windows)]
+#[tauri::command]
+fn ocr_capability(commands: State<'_, ocr_commands::OcrCommands>) -> ocr_commands::OcrCapability { commands.capability() }
+#[cfg(windows)]
+#[tauri::command]
+async fn recognize_page_ocr(commands: State<'_, ocr_commands::OcrCommands>, request_id: String, id: u64, revision: u64, page: u16) -> Result<ocr_commands::OcrReceipt, String> {
+    commands.recognize(request_id, id, revision, page).await
+}
+#[cfg(windows)]
+#[tauri::command]
+fn cancel_page_ocr(commands: State<'_, ocr_commands::OcrCommands>, request_id: String) -> Result<ocr_commands::OcrCancelAck, String> { commands.cancel(request_id) }
 #[tauri::command]
 async fn open_example(app: tauri::AppHandle, service: State<'_, PdfService>) -> Result<DocumentInfo, String> {
     service.open(app.path().resource_dir().map_err(|e| e.to_string())?.join("resources/welcome.pdf")).await
@@ -174,9 +187,21 @@ async fn fill_form_copy(app: tauri::AppHandle, service: State<'_, PdfService>, i
 fn main() {
     tauri::Builder::default().plugin(tauri_plugin_updater::Builder::new().build()).setup(|app| {
         let library = app.path().resource_dir()?.join("resources/pdfium/bin/pdfium.dll");
-        app.manage(PdfService::start(library));
+        let service = PdfService::start(library);
+        #[cfg(windows)]
+        {
+            let commands = ocr_commands::OcrCommands::new(service.clone(), app.path().resource_dir()?);
+            let close_commands = commands.clone();
+            if let Some(window) = app.get_webview_window("main") {
+                window.on_window_event(move |event| {
+                    if matches!(event, tauri::WindowEvent::Destroyed) { close_commands.cancel_active(); }
+                });
+            }
+            app.manage(commands);
+        }
+        app.manage(service);
         app.manage(print_commands::PrintJobs::default());
         Ok(())
-    }).invoke_handler(tauri::generate_handler![document_form_fields, fill_form_copy, open_document, reopen_document, open_example, render_page, export_page_image, close_document, edit_pages, crop_page, crop_pages, reset_crops, create_pdf_from_image, create_comment, update_comment, delete_comment, document_comments, document_annotations, create_highlight, create_text_highlight, update_highlight, delete_highlight, save_copy, split_document, combine_documents, insert_pages_copy, replace_pages_copy, page_text, page_text_geometry, document_bookmarks, document_page_labels, document_properties, dependency_notices, unlock_document, cancel_password_request, print_commands::print_document, print_commands::cancel_print])
+    }).invoke_handler(tauri::generate_handler![document_form_fields, fill_form_copy, open_document, reopen_document, open_example, render_page, export_page_image, close_document, edit_pages, crop_page, crop_pages, reset_crops, create_pdf_from_image, create_comment, update_comment, delete_comment, document_comments, document_annotations, create_highlight, create_text_highlight, update_highlight, delete_highlight, save_copy, split_document, combine_documents, insert_pages_copy, replace_pages_copy, page_text, page_text_geometry, document_bookmarks, document_page_labels, document_properties, dependency_notices, unlock_document, cancel_password_request, ocr_capability, recognize_page_ocr, cancel_page_ocr, print_commands::print_document, print_commands::cancel_print])
       .run(tauri::generate_context!()).expect("Desktop application failed");
 }

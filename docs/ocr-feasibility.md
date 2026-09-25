@@ -2,21 +2,21 @@
 
 ## Status
 
-OCR is disabled. Nothing from this research is bundled, installed, or shipped, and there is no OCR command, user interface, or document mutation path.
+OCR is unavailable by default and remains absent from the installed app and releases. A developer can build an opt-in source executable with a verified local English engine; that build alone enables one current-page, plain-text OCR dialog. It does not add the engine to an installer or release, create a searchable PDF, edit a document, or call a service.
 
 ## Internal runner foundation
 
-The native source now contains an internal runner foundation only. It has no application command, bridge, interface, bundled resource, installer wiring, or release behavior. OCR therefore remains disabled and unshipped.
+The native runner is exposed only to an opt-in source build. Default builds report OCR unavailable, even if stale copied resources exist. There is no installer or release resource path.
 
 The runner requires a trusted internal engine identity and a fixed English-model identity, with no IPC or user engine path or hash, shell, or `PATH` lookup. One global admission gate refuses a second job immediately and limits process-plus-job committed memory to 256 MiB. It accepts only owned P6 input up to 16,777,216 bytes and a 16,384-pixel edge, uses fixed English-fast/150-DPI arguments, strict UTF-8 decoding, 1 MiB standard output, 64 KiB standard error, and a 30-second limit. Successful standard error fails closed. Each child is created suspended, assigned to its kill-on-close job, cancellation-checked, then resumed; timeout, cancellation, or output-cap work kills and reaps the child tree. These bounds do not cover RSS, application or PDFium memory, or source-raster allocation.
 
 Focused native checks passed 14 tests with 0 failures and 3 ignored in 3.64 seconds; retained checks passed 3 of 3 in 0.87 seconds. They included a deterministic 16,766,993-byte owned P6 result at 88,735,744 bytes peak job commitment. The full native gate passed 181 tests with 0 failures and 4 ignored in 420.00 seconds. A successful standalone debug/no-bundle rerun transformed 1,936 frontend modules in 2.96 seconds and native code in 22.78 seconds; its 30,217,216-byte executable SHA-256 is `E69DB97531D2A5A6A74BA8E8DB98ACAA04715D11F553EFC7920FDB148B103085`. The embedded Brotli JavaScript and CSS bytes exactly matched current assets; embedded transformed HTML referenced those assets. This is runner evidence only; it does not establish general recognition accuracy, end-to-end page-to-text time, desktop interaction, installed-app behavior, or a reachable OCR runtime.
 
-## Internal snapshot and coordinator foundation
+## Current-page source build
 
-The native source also contains an internal coordinator with no application command, bridge, interface, bundled resource, installer wiring, or release behavior. It captures one current physical page at fixed 150 DPI, including supported current edits, and conservatively refuses encrypted, restricted, signed, or certified documents. A cancellation cannot interrupt a PDFium call already in progress; shared admission stays held until the cancelled worker drains. A later consumer must validate the revision-tagged result before use. These controls do not bound total application RSS.
+The coordinator captures one current physical page at fixed 150 DPI, including supported current edits, and conservatively refuses encrypted, restricted, signed, or certified documents. The dialog captures a document ID, revision, zero-based physical page, and opaque request ID. It accepts text only when the returned ID, revision, page, and request ID match. The text is read-only and copyable; it is never indexed, overlaid, or written into the PDF. A cancellation cannot interrupt a PDFium call already in progress; shared admission stays held until the cancelled worker drains. These controls do not bound total application RSS.
 
-Focused and retained checks are verified. The retained case captured document 2, revision 5, physical page 0 as a 1,618×1,250 P6 snapshot: 6,067,517 bytes, SHA-256 `8084BE11A715ADC2937EEF8E117DA35F69240E00D0D3158035E68F5DCF493292`. Its 222-byte receipt SHA-256 was `3F3C168A7906FE16F15000A745703282E6C069559C2B8005B951369605D0D14F`; the fixed known text matched exactly and peak child commitment was 39,063,552 bytes. The full native gate passed 185 tests with 0 failures and 7 ignored tests in 316.01 seconds. A standalone debug/no-bundle build transformed 1,936 frontend modules in 2.19 seconds and native code in 13.97 seconds; its 30,262,784-byte executable SHA-256 is `A65C0A71C6F246CAA142BFAB2C486003D6FAB21ED7CC810550D2842502B4CA71`. Current JavaScript/CSS bytes and transformed HTML references to those assets were verified embedded. This is not a general recognition-accuracy, total-memory, desktop-interaction, installed-app, or reachable OCR-runtime claim.
+Focused and retained checks are verified. The retained case captured document 2, revision 5, physical page 0 as a 1,618×1,250 P6 snapshot: 6,067,517 bytes, SHA-256 `8084BE11A715ADC2937EEF8E117DA35F69240E00D0D3158035E68F5DCF493292`. Its 222-byte receipt SHA-256 was `3F3C168A7906FE16F15000A745703282E6C069559C2B8005B951369605D0D14F`; the fixed known text matched exactly and peak child commitment was 39,063,552 bytes. The frontend gate passed 207 tests across 45 files, including eight mocked-IPC OCR tests. The opt-in native gate passed 190 tests with 0 failures and 11 ignored in 416.28 seconds, and its build helper passed 6 tests in 0.07 seconds. A separately invoked retained command path passed three real command tests in 2.71 seconds; its log SHA-256 is `721C41114EBF7C61DCCDE99061CB67E7A738AB328207721FA6191538C91DD3B8`, and its binding receipt SHA-256 is `8A2B09E8381AC480F9E30CB0483355DC279778FF75503C9B10467F7AD4B0F48D`. The final retained opt-in standalone build transformed 1,937 frontend modules in 2.18 seconds and native code in 5.49 seconds. Its retained executable is `target/ocr-page-probe/artifacts/pdf-workstation-opt-in-20260924.exe`, 30,574,080 bytes, SHA-256 `EB90DD65BE72CACC98E945EF21AD1B0C32E0901066BFB534016B41B75DA6E5D7`. The native log `target/ocr-page-probe/logs/full-native-opt-in-20260924.log` has SHA-256 `7D5F231B6765B5F83976AB8E49E9145229A21B713E32448AC64D752C459A2E99`; retained standalone log `target/ocr-page-probe/logs/standalone-opt-in-20260924-retained.log` has SHA-256 `06408AEA10ED2526F9A04F4071E2DE7BF97060D14B4390834D339BF44CD3B159`; and retained build receipt `target/ocr-page-probe/opt-in-build-receipt-retained-20260924.json` is 5,652 bytes with SHA-256 `4CA41349E7AAEC1ECC4251E2085AF0D2230ACAAD678D5A7C178DDF8881398246`. That receipt binds the retained and live executable, current assets, copied resources, and all logs. A separate default-build proof passed with stale resources present but the opt-in environment absent, confirming that OCR remained unavailable. A local browser harness exercised recognized text, an empty response, and cancellation for `{id:9,revision:3,page:1}` without browser errors. Those checks do not establish native desktop interaction, installed-app behavior, general recognition accuracy, total memory, or end-to-end page-to-text time.
 
 ## Windows OCR API
 
@@ -71,6 +71,19 @@ pwsh -NoProfile -File scripts/ocr/setup-ocr.test.ps1 -EvidenceRoot target/ocr-se
 
 Both parameters are required: `-EvidenceRoot` must be a new directory beneath `target`, and `-VerifiedRoot` must be a completed setup output whose manifest binds the current setup script. The 12 controls tie the current setup script to the verified manifest and check outside-target, existing-root, and junction refusal; bounded standard-output, standard-error, and timeout cleanup; same-length hash tampering; ZIP traversal, link, and expanded-size guards; and the final-log oversize pre-spawn receipt. They do not inject a tampered HTTP response, and TAR hostile-entry handling is source-inspected rather than exercised by these controls. The retained receipt is `target/ocr-setup-negative-controls-v8-20260924/negative-controls.json`, SHA-256 `79BCC6AD7A8966342A273972D0525E68DC9B29E0D04CEBE86E927B56270051E1`.
 
+## Enabling the source build
+
+After a completed setup, set the root for the build and create a debug executable:
+
+```powershell
+$env:PDF_WORKSTATION_OCR_SETUP_ROOT = 'target/ocr/5.5.3-eng-fast-4.1.0'
+npm.cmd run tauri -- build --debug --no-bundle
+```
+
+The environment value must name that completed setup root. The build rechecks the current setup and support files, engine and model sizes and hashes, fixed configuration, licenses, and non-reparse paths before embedding the executable identity and fixed English-model identity with a resource-relative path. The runtime rechecks copied resources and reparse points; it does not trust the adjacent setup manifest and exposes no engine paths or hashes to the interface. The resulting source-build resources must remain beside the executable at its built resource path.
+
+This only binds selected local inputs to an unsigned development build. It does not authenticate a publisher, validate an installed copy, or make the engine a release or installer resource.
+
 ## Retained evidence
 
 The following local, unshipped research artifacts provide provenance. They are not release assets.
@@ -80,8 +93,6 @@ The following local, unshipped research artifacts provide provenance. They are n
 - Build record: `target/ocr-probe/logs/build-20260924-193345.log`, with version, import, and cache evidence under `target/ocr-probe/results/`.
 - Static executable: `target/ocr-probe/install/bin/tesseract.exe`, SHA-256 `1AD66BE462A9295B1B6371768147584947442A47DA34DA62DEDEAB309909D3EF`.
 
-## Before any integration
+## Remaining work
 
-The next proposed implementation slice is local recognition of one current physical page into a copyable plain-text dialog. It would not write OCR text to a PDF, create searchable content or overlays, save a file, alter the source session, or call a cloud service.
-
-That proposal needs a product contract for current physical-page identity, revision ownership, stale results, copy/display behavior, and source-session preservation. It also needs a reviewed packaging and licensing plan for the executable and language data, defined process ownership and bounds, decoding and error policy, supported language selection, and user-cancellation semantics. A representative real-document corpus must measure recognition quality, total page-to-text time, and resource use. Desktop and installed-app behavior would need separate verification.
+The opt-in source build still needs native desktop interaction testing, installed-copy validation, and release packaging and signing work before it can be described as installed or shipped. A representative real-document corpus is still needed to measure recognition quality, total page-to-text time, and resource use.

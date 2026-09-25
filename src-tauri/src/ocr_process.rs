@@ -91,6 +91,10 @@ impl OcrCancellation {
         self.0.load(Ordering::Acquire) == RUN_STATE_CANCELLED
     }
 
+    pub(crate) fn is_completed(&self) -> bool {
+        self.0.load(Ordering::Acquire) == RUN_STATE_COMPLETED
+    }
+
     pub(crate) fn ensure_runnable(&self) -> Result<(), OcrProcessError> {
         match self.0.load(Ordering::Acquire) {
             RUN_STATE_RUNNING => Ok(()),

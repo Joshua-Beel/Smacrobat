@@ -12,6 +12,13 @@ export const closeDocument = (id: number) => invoke<void>('close_document', { id
 export const reopenDocument = (path: string) => invoke<OpenResult>('reopen_document', { path });
 export const unlockDocument = (requestId: number, password: string) => invoke<OpenResult>('unlock_document', { requestId, password });
 export const cancelPasswordRequest = (requestId: number) => invoke<void>('cancel_password_request', { requestId });
+export type OcrCapability = { available: boolean; reason: string | null; language: 'eng' | null };
+export type OcrRequest = { requestId: string; id: number; revision: number; page: number };
+export type OcrReceipt = { status: 'recognized' | 'no_text'; requestId: string; documentId: number; revision: number; page: number; dpi: 150; language: 'eng'; width: number; height: number; text: string };
+export type OcrCancelAck = { requestId: string; status: 'cancelled' | 'already_cancelled' | 'finished' };
+export const ocrCapability = () => invoke<OcrCapability>('ocr_capability');
+export const recognizePageOcr = (request: OcrRequest) => invoke<OcrReceipt>('recognize_page_ocr', request);
+export const cancelPageOcr = (requestId: string) => invoke<OcrCancelAck>('cancel_page_ocr', { requestId });
 export type PrintResult = { status: 'cancelled' } | { status: 'submitted'; pages: number };
 export const printDocument = (id: number, revision: number, currentPage: number, requestId: string) => invoke<PrintResult>('print_document', { id, revision, currentPage, requestId });
 export const cancelPrint = (requestId: string) => invoke<void>('cancel_print', { requestId });

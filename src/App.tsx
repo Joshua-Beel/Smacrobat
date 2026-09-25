@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { Undo2, Redo2 } from 'lucide-react';
 import { ArrowDownToLine, ArrowUpRight, Bookmark, ChevronDown, ChevronLeft, ChevronRight, ChevronsUpDown, CircleHelp, Combine, File, FileCheck2, FileImage, FileOutput, FilePenLine, FilePlus2, Files, FolderOpen, Hand, Highlighter, Home, LayoutGrid, List, Maximize, Menu, MessageSquare, Minimize2, Minus, MoreHorizontal, MousePointer2, PanelLeftClose, Pencil, Plus, Printer, RotateCw, Save, ScanLine, Search, ShieldCheck, Signature, SlidersHorizontal, Star, Sun, Type, X, ZoomIn, ZoomOut, type LucideIcon } from 'lucide-react';
-import { closeDocument, native, openDocument, reopenDocument, editPages, saveCopy, splitDocument, cropPages, resetCrops, combineDocuments, insertPagesCopy, replacePagesCopy, documentFormFields, fillFormCopy, documentAnnotations, documentPageLabels, createPdfFromImage, exportPageImage, createComment, updateComment, deleteComment, createHighlight, createTextHighlight, updateHighlight, deleteHighlight, type Annotation, type CommentRect, type CropInsets, type CreatePdfOptions, type DocumentAnnotations, type DocumentFormFields, type FormPatch, type OpenResult, type PageImageExport, type PageImageExportRequest, type SplitOutput, type SavedCopy } from './bridge';
+import { closeDocument, native, openDocument, reopenDocument, editPages, saveCopy, splitDocument, cropPages, resetCrops, combineDocuments, insertPagesCopy, replacePagesCopy, documentFormFields, fillFormCopy, documentAnnotations, documentPageLabels, createPdfFromImage, exportPageImage, createComment, updateComment, deleteComment, createHighlight, createTextHighlight, updateHighlight, deleteHighlight, ocrCapability as getOcrCapability, type Annotation, type CommentRect, type CropInsets, type CreatePdfOptions, type DocumentAnnotations, type DocumentFormFields, type FormPatch, type OcrCapability, type OpenResult, type PageImageExport, type PageImageExportRequest, type SplitOutput, type SavedCopy } from './bridge';
 import { clampPage, toolGroups, type DocumentInfo, type PageEdit } from './model';
 import { pageLabelDescription, pageLabelFor, validatePageLabels, type DocumentPageLabels } from './pageLabels';
 import Viewer from './Viewer';
@@ -12,6 +12,7 @@ import Updates from './Updates';
 import SearchPanel, { type ActiveSearch } from './SearchPanel';
 import BookmarksPanel from './BookmarksPanel';
 import PageText from './PageText';
+import PageOcrDialog, { type PageOcrTarget } from './PageOcrDialog';
 import PasswordDialog from './PasswordDialog';
 import PrintDialog from './PrintDialog';
 import DocumentProperties from './DocumentProperties';
@@ -51,6 +52,8 @@ export default function App() {
   const [activeSearch, setActiveSearch] = useState<ActiveSearch | null>(null);
   const [bookmarksOpen, setBookmarksOpen] = useState(false);
   const [pageTextOpen, setPageTextOpen] = useState(false);
+  const [pageOcrTarget, setPageOcrTarget] = useState<PageOcrTarget | null>(null);
+  const [ocr, setOcr] = useState<OcrCapability>({ available: false, reason: native ? 'Checking OCR availability…' : 'OCR is unavailable in the browser preview.', language: null });
   const [printOpen, setPrintOpen] = useState(false);
   const [propertiesOpen, setPropertiesOpen] = useState(false);
   const [noticesOpen, setNoticesOpen] = useState(false);
@@ -95,6 +98,16 @@ export default function App() {
   useEffect(() => {
     if (!saveRecentFiles(recentFiles)) setNotice('Recent files and stars could not be saved. They will last for this session only.');
   }, [recentFiles]);
+  useEffect(() => {
+    let disposed = false;
+    if (!native) return;
+    void getOcrCapability().then(capability => {
+      const coherent = capability?.available === true && capability.reason === null && capability.language === 'eng' || capability?.available === false && typeof capability.reason === 'string' && capability.reason.trim().length > 0 && capability.language === null;
+      if (!disposed && coherent) setOcr(capability);
+      else if (!disposed) setOcr({ available: false, reason: 'OCR is unavailable in this build.', language: null });
+    }).catch(() => { if (!disposed) setOcr({ available: false, reason: 'OCR is unavailable in this build.', language: null }); });
+    return () => { disposed = true; };
+  }, []);
   const latest = useRef({ documents, busy, active });
   latest.current = { documents, busy, active };
   useEffect(() => {
@@ -155,6 +168,7 @@ export default function App() {
     if (busy || closingDocument.current !== null) return;
     const document = documents.find(item => item.id === id);
     if (!document) return;
+    if (pageOcrTarget && pageOcrTarget.id !== id) setPageOcrTarget(null);
     const next = clampPage(readingPages.current.get(id) ?? 0, document.pages.length);
     setActive(id); setView('document'); setPage(next); setTarget(value => ({ page: next, token: value.token + 1 }));
   };
@@ -187,6 +201,7 @@ export default function App() {
   const close = async (id: number, discard = false) => {
     if (busy || closingDocument.current !== null) return;
     if (!discard && documents.find(document => document.id === id)?.dirty) { setPendingClose(id); return; }
+    if (pageOcrTarget?.id === id) setPageOcrTarget(null);
     closingDocument.current = id; setBusy(true); setError('');
     try {
       await closeDocument(id); readingPages.current.delete(id); setDocuments(list => list.filter(d => d.id !== id));
@@ -224,6 +239,9 @@ export default function App() {
     try { updateDocument(await cropPages(target.id, target.revision, target.pages, insets)); }
     finally { setBusy(false); }
   };
+  useEffect(() => {
+    if (pageOcrTarget && !documents.some(document => document.id === pageOcrTarget.id && document.revision === pageOcrTarget.revision)) setPageOcrTarget(null);
+  }, [documents, pageOcrTarget]);
   const resetCrop = async (target: { id: number; revision: number; pages: number[] }): Promise<void> => {
     if (!doc || doc.id !== target.id || doc.revision !== target.revision || busy || closingDocument.current !== null) { setError('The document changed. Reset crop again.'); return; }
     setBusy(true); setError(''); setNotice('');
@@ -390,6 +408,12 @@ export default function App() {
     if (!doc || busy || closingDocument.current !== null) return;
     setMenu(false); setOrganizing(false); closeSearch(); setBookmarksOpen(false); setFormsOpen(true);
   };
+  const launchPageOcr = () => {
+    if (!doc || busy || closingDocument.current !== null || !ocr.available) return;
+    const currentPage = clampPage(page, doc.pages.length);
+    setMenu(false); setOrganizing(false); closeSearch(); setBookmarksOpen(false);
+    setPageOcrTarget({ id: doc.id, revision: doc.revision, page: currentPage, name: doc.name });
+  };
   const launchInsert = () => {
     if (busy || closingDocument.current !== null) return;
     if (documents.length < 2) { setNotice('Open two PDFs to insert pages into a new copy.'); return; }
@@ -410,7 +434,7 @@ export default function App() {
   };
   useEffect(() => {
     const listener = (event: KeyboardEvent) => {
-      if (updatesOpen || pageTextOpen || printOpen || propertiesOpen || noticesOpen || passwordRequest || pendingClose !== null || createOpen || pageImageTarget || combineOpen || insertOpen || replaceOpen || commentEditor) return;
+      if (updatesOpen || pageTextOpen || pageOcrTarget || printOpen || propertiesOpen || noticesOpen || passwordRequest || pendingClose !== null || createOpen || pageImageTarget || combineOpen || insertOpen || replaceOpen || commentEditor) return;
       if ((event.target as HTMLElement | null)?.closest?.('dialog')) return;
       if (event.ctrlKey && event.key.toLowerCase() === 'o') { event.preventDefault(); void open(); }
       if (event.ctrlKey && event.key.toLowerCase() === 'f' && doc) { event.preventDefault(); setView('document'); setOrganizing(false); setSearchOpen(true); return; }
@@ -441,14 +465,15 @@ export default function App() {
   const changeZoom = (value: number) => { setFit('none'); setZoom(Math.max(10, Math.min(400, value))); };
   const toolRow = (name: string, index: number) => {
     const Icon = icons[name] || FileCheck2;
-    const available = name === 'Create a PDF' || name === 'Export a PDF' || name === 'Organize pages' || name === 'Combine files' || name === 'Comment' || name === 'Fill forms';
+    const pageOcr = name === 'Scan & OCR';
+    const available = name === 'Create a PDF' || name === 'Export a PDF' || name === 'Organize pages' || name === 'Combine files' || name === 'Comment' || name === 'Fill forms' || pageOcr && ocr.available;
     const create = name === 'Create a PDF';
     const imageExport = name === 'Export a PDF';
     const combine = name === 'Combine files';
     const comment = name === 'Comment';
     const forms = name === 'Fill forms';
-    const disabled = busy || !available || (combine && documents.length < 2) || ((comment || forms || imageExport) && !doc);
-    return <button key={name} className={s.toolRow} disabled={disabled} onClick={create ? launchCreate : imageExport ? launchPageImageExport : combine ? launchCombine : comment ? launchCommentMode : forms ? launchForms : launchOrganizer} title={combine && documents.length < 2 ? 'Open two PDFs to combine them' : (comment || forms || imageExport) && !doc ? 'Open a PDF first' : imageExport ? 'Export the current page as PNG' : forms ? 'Fill existing fields' : available ? name : `${name} — planned, not implemented yet`}><span className={s.toolIcon} style={{ color: ['#7361b3', '#277bb4', '#239576', '#bc6b25'][index % 4] }}><Icon size={21} strokeWidth={1.7} /></span><span>{imageExport ? 'Export page as PNG' : name}</span></button>;
+    const disabled = busy || !available || (combine && documents.length < 2) || ((comment || forms || imageExport || pageOcr) && !doc);
+    return <button key={name} className={s.toolRow} disabled={disabled} onClick={create ? launchCreate : imageExport ? launchPageImageExport : pageOcr ? launchPageOcr : combine ? launchCombine : comment ? launchCommentMode : forms ? launchForms : launchOrganizer} title={combine && documents.length < 2 ? 'Open two PDFs to combine them' : (comment || forms || imageExport || pageOcr) && !doc ? 'Open a PDF first' : imageExport ? 'Export the current page as PNG' : pageOcr ? (ocr.available ? 'Recognize text on the current page in English' : ocr.reason || 'OCR is unavailable in this build.') : forms ? 'Fill existing fields' : available ? name : `${name} — planned, not implemented yet`}><span className={s.toolIcon} style={{ color: ['#7361b3', '#277bb4', '#239576', '#bc6b25'][index % 4] }}><Icon size={21} strokeWidth={1.7} /></span><span>{imageExport ? 'Export page as PNG' : name}</span></button>;
   };
   return <div className={`${s.app} ${dark ? s.dark : ''}`}>
     <header className={s.tabbar}>
@@ -463,15 +488,17 @@ export default function App() {
       <button onClick={() => void open()}>Open… <kbd>Ctrl+O</kbd></button><button onClick={() => void open(true)}>Open sample PDF</button>
       <button disabled={!doc || busy} onClick={() => { setMenu(false); void save(); }}>Save a copy… <kbd>Ctrl+S</kbd></button>
       <button disabled={!doc || busy} onClick={launchPageImageExport}>Export page as PNG…</button>
+      <button disabled={!doc || busy || !ocr.available} onClick={launchPageOcr} title={ocr.available ? 'Recognize text on the current page in English' : ocr.reason || 'OCR is unavailable in this build.'}>Recognize current page…</button>
       <button onClick={() => { setMenu(false); launchOrganizer(); }}>Organize pages</button>
       <button disabled={!doc || busy} onClick={() => { setMenu(false); setPropertiesOpen(true); }}>Document properties… <kbd>Ctrl+D</kbd></button><hr />
       <button onClick={() => { setDark(v => !v); setMenu(false); }}>Switch to {dark ? 'light' : 'dark'} theme</button>
       <button disabled={busy} onClick={() => { setMenu(false); setUpdatesOpen(true); }}>Check for updates…</button>
       <button disabled={busy} onClick={() => { setMenu(false); setNoticesOpen(true); }}>Third-party notices…</button>
-      <button onClick={() => { setNotice('PDF viewing, embedded-text search, Create a PDF from a PNG or JPEG image, Combine Files, Organize Pages, and filling a strict subset of existing plain text fields are available. Rotate, reorder, delete, extract, undo/redo, and save a new copy. Text editing, OCR, and signatures are not implemented yet.'); setMenu(false); }}>About this build</button>
+      <button onClick={() => { setNotice(`PDF viewing, embedded-text search, Create a PDF from a PNG or JPEG image, Combine Files, Organize Pages, and filling a strict subset of existing plain text fields are available. Rotate, reorder, delete, extract, undo/redo, and save a new copy.${ocr.available ? ' Current-page English OCR is enabled in this opt-in source build.' : ' OCR is not enabled in this build.'} Text editing and signatures are not implemented yet.`); setMenu(false); }}>About this build</button>
     </div>}
     {updatesOpen && <Updates dirty={documents.some(document => document.dirty)} busy={busy} setBusy={setBusy} close={() => setUpdatesOpen(false)} />}
     {pageTextOpen && doc && <PageText key={`${doc.id}-${doc.revision}-${page}`} document={doc} page={page} close={() => setPageTextOpen(false)} />}
+    {pageOcrTarget && <PageOcrDialog key={`${pageOcrTarget.id}-${pageOcrTarget.revision}-${pageOcrTarget.page}`} target={pageOcrTarget} setBusy={setBusy} close={() => setPageOcrTarget(null)} />}
     {passwordRequest && <PasswordDialog key={passwordRequest.challenge.request_id} challenge={passwordRequest.challenge} onOpened={info => { opened(info, passwordRequest.organize); setPasswordRequest(null); }} onClose={() => setPasswordRequest(null)} />}
     {printOpen && doc && <PrintDialog document={doc} page={page} setBusy={setBusy} close={() => setPrintOpen(false)} />}
     {propertiesOpen && doc && <DocumentProperties key={`${doc.id}-${doc.revision}`} document={doc} close={() => setPropertiesOpen(false)} />}
@@ -503,7 +530,7 @@ export default function App() {
           {!listed.length && <div className={s.empty}><div className={s.emptyIcon}><Files size={36} strokeWidth={1.25} /></div><h3>{query ? 'No matching files' : section === 'Starred' ? 'Keep important files close' : 'Your documents start here'}</h3><p>{query ? 'Try another file name.' : section === 'Starred' ? 'Star an open file to find it here.' : 'Open a PDF from your computer to start reading.'}</p>{!query && section !== 'Starred' && <><button className={s.openButton} onClick={() => void open()} disabled={busy}>Open a file</button><button className={s.textButton} onClick={() => void open(true)} disabled={busy}>Explore a sample PDF <ChevronRight size={15} /></button></>}</div>}
           <p className={s.foundationNote}>Viewer + Organize Pages · More tools are in development{!native ? ' · Browser preview' : ''}</p>
         </section>
-      </> : view === 'tools' ? <section className={s.toolsCatalog}><div className={s.catalogHeading}><div><p className={s.eyebrow}>THE COMPLETE WORKSPACE</p><h1>All tools</h1><p>Create a PDF, export a page as PNG, Combine Files, Organize Pages, and Fill forms are ready. Other advanced tools are planned for later milestones.</p></div><label className={s.search}><Search size={16} /><input aria-label="Search tools" placeholder="Find a tool" value={query} onChange={e => setQuery(e.target.value)} /></label></div>{toolGroups.map(group => <section key={group.name}><h2>{group.name}</h2><div className={s.catalogGrid}>{group.tools.filter(name => name.toLowerCase().includes(query.toLowerCase())).map((name, i) => <div className={s.catalogCard} key={name}>{toolRow(name, i)}<span className={s.planned}>{name === 'Create a PDF' || name === 'Export a PDF' || name === 'Organize pages' || name === 'Combine files' || name === 'Fill forms' ? 'Available' : 'Not available yet'}</span></div>)}</div></section>)}</section> : doc ? <>
+      </> : view === 'tools' ? <section className={s.toolsCatalog}><div className={s.catalogHeading}><div><p className={s.eyebrow}>THE COMPLETE WORKSPACE</p><h1>All tools</h1><p>Create a PDF, export a page as PNG, Combine Files, Organize Pages, and Fill forms are ready. OCR is available only when enabled in an opt-in source build. Other advanced tools are planned for later milestones.</p></div><label className={s.search}><Search size={16} /><input aria-label="Search tools" placeholder="Find a tool" value={query} onChange={e => setQuery(e.target.value)} /></label></div>{toolGroups.map(group => <section key={group.name}><h2>{group.name}</h2><div className={s.catalogGrid}>{group.tools.filter(name => name.toLowerCase().includes(query.toLowerCase())).map((name, i) => <div className={s.catalogCard} key={name}>{toolRow(name, i)}<span className={s.planned}>{name === 'Create a PDF' || name === 'Export a PDF' || name === 'Organize pages' || name === 'Combine files' || name === 'Fill forms' || name === 'Scan & OCR' && ocr.available ? 'Available' : 'Not available yet'}</span></div>)}</div></section>)}</section> : doc ? <>
         {toolsOpen && <aside className={s.toolsPanel}><div className={s.panelHeading}><h2>All tools</h2><IconButton icon={PanelLeftClose} label="Collapse all tools" onClick={() => setToolsOpen(false)} /></div>{['Export a PDF', 'Edit a PDF', 'Create a PDF', 'Combine files', 'Organize pages', 'Comment', 'Fill forms', 'Scan & OCR', 'Protect a PDF', 'Compress a PDF'].map(toolRow)}<button className={s.textButton} onClick={() => setView('tools')}>View all tools <ChevronRight size={15} /></button><div className={s.panelNote}>Export page as PNG, Create a PDF, Combine Files, Organize Pages, and Fill forms are available. More tools are in development.</div></aside>}
         {organizing ? <Organizer key={doc.id} document={doc} currentPage={page} pageLabels={pageLabels} busy={busy} edit={edit} save={save} split={split} crop={crop} resetCrop={resetCrop} insert={launchInsert} replace={launchReplace} close={() => setOrganizing(false)} /> : <div className={s.documentArea}><Viewer key={`${doc.id}-${doc.revision}`} document={doc} zoom={zoom} fit={fit} target={target} onPage={trackPage} hand={hand} search={activeSearch} annotations={annotations?.status === 'supported' ? annotations.annotations : []} commentMode={commentMode} highlightMode={highlightMode} annotationAvailable={annotations?.status === 'supported'} annotationInteractive={commentMode && !hand && !highlightMode} onCommentCreate={beginComment} onHighlightCreate={beginHighlight} onAnnotationSelect={selectAnnotation} onTextSelection={receiveTextHighlightSelection} /><div className={s.quickToolbar}><IconButton icon={MousePointer2} label="Select text on page" active={!hand && !commentMode && !highlightMode} onClick={() => { setHand(false); setCommentMode(false); setHighlightMode(false); }} /><IconButton icon={Highlighter} label="Highlight selected text" disabled={busy || !textHighlightSelection || annotations?.status !== 'supported'} onPointerDown={captureTextHighlightSelection} onClick={beginTextHighlight} /><IconButton icon={Hand} label="Pan document" active={hand} onClick={() => { setHand(true); setCommentMode(false); setHighlightMode(false); }} /><IconButton icon={Type} label="Read and copy page text" onClick={() => setPageTextOpen(true)} /><span className={s.horizontalDivider} /><IconButton icon={MessageSquare} label="Add comment" active={commentMode} disabled={busy} onClick={launchCommentMode} /><IconButton icon={Highlighter} label="Add area highlight" active={highlightMode} disabled={busy} onClick={launchHighlightMode} /><IconButton icon={Pencil} label="Draw" disabled /><IconButton icon={Type} label="Fill existing fields" disabled={busy} onClick={launchForms} /><IconButton icon={Signature} label="Add signature" disabled /><span className={s.horizontalDivider} /><IconButton icon={MoreHorizontal} label="Customize quick tools" disabled /></div></div>}
         {!organizing && commentsOpen && doc && <CommentsPanel key={`${doc.id}-${doc.revision}`} document={doc} page={page} annotations={annotations} error={annotationsLoad.request === annotationsRequest ? annotationsLoad.error : ''} selectedId={commentEditor?.kind === 'edit' ? commentEditor.annotation.id : null} onAddComment={addCommentOnCurrentPage} onAddHighlight={addHighlightOnCurrentPage} onSelect={selectAnnotation} close={() => setCommentsOpen(false)} />}
