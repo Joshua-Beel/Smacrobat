@@ -75,13 +75,29 @@ This table highlights exceptions; it is not the complete transitive package list
 
 ## Generated collection
 
-`scripts/dependency-notices.mjs` collects the conservative resolved Windows Cargo graph and production npm lock entries into `src-tauri/resources/third-party-licenses/inventory.json` and `THIRD-PARTY-NOTICES.txt`. There are 367 package records, including build/auxiliary packages; this is not a count of libraries linked into the application. The collection includes Lucide's Feather attribution and nested `ring` notices.
+`scripts/dependency-notices.mjs` collects the conservative resolved Windows Cargo graph and production npm lock entries into `src-tauri/resources/third-party-licenses/inventory.json` and `THIRD-PARTY-NOTICES.txt`. There are 367 package records, including build/auxiliary packages; this is not a count of libraries linked into the application. The collection includes Lucide's Feather attribution and nested `ring` notices. The current inventory is 209,343 bytes with SHA-256 `E167ED2496828C8654FFBA8387D808CC742E843095A03E8900803551DA67CA0F`; its refresh changed only Cargo input hashes, not package records or notice text.
 
 Twelve missing local notices were resolved using published crate commits and official upstream license files. `scripts/notice-supplements/manifest.json` records exact commits, provenance URLs and SHA-256 hashes. Offline generation verifies those inputs. Explicitly running `scripts/fetch-notice-supplements.mjs --fetch` retrieves the recorded files and rejects unexpected hashes.
 
 `scripts/mpl-source-archives.manifest.json` pins `cssparser` 0.36.0, `cssparser-macros` 0.6.1, `dtoa-short` 0.3.5, `option-ext` 0.2.0, and `selectors` 0.36.1 to their Cargo.lock SHA-256 values and official crates.io archive URLs. `scripts/mpl-source-archives.mjs` verifies every cached archive hash and every extracted source file before copying the archives and a resource manifest to `src-tauri/resources/third-party-sources/`. It fails closed for a missing, tampered, stale, lock-mismatched, or source-mismatched archive without network access. The local cache comparison found no changed or missing source files; Cargo's generated `.cargo-ok` marker is excluded from that comparison.
 
 The generated files are included in Tauri resources and available through **Menu > Third-party notices** in the source build. The installer script checks freshness before building. Existing PDFium notices remain separately packaged.
+
+## Optional OCR installer sidecars
+
+The normal generated notice collection remains the 367-package Cargo/npm inventory above. It does not include OCR files, and the default installer extraction proof contains no `resources/ocr/` entries. That default behavior must remain unchanged while OCR is absent.
+
+An explicitly requested unsigned local OCR installer proof copied a separate five-file resource set under `resources/ocr/1d0f85d0655ed8c0b5f6472cd29213bbd79dc5275ccbee7336360665a94f8c16/`: `bin/tesseract.exe`, `tessdata/eng.traineddata`, and these license-text sidecars:
+
+| Component | Version / source record | Packaged relative path | License-text SHA-256 |
+| --- | --- | --- | --- |
+| Tesseract | 5.5.3; `scripts/ocr/pins.json` | `licenses/Tesseract-Apache-2.0.txt` | `CFC7749B96F63BD31C3C42B5C471BF756814053E847C10F3EB003417BC523D30` |
+| Leptonica | 1.87.0; `scripts/ocr/pins.json` | `licenses/Leptonica-BSD-2-Clause.txt` | `87829ABB5BBB00B55A107365DA89E9A33F86C4250169E5A1E5588505BE7D5806` |
+| English fast model | 4.1.0; `scripts/ocr/pins.json` | `licenses/eng-fast-Apache-2.0.txt` | `CFC7749B96F63BD31C3C42B5C471BF756814053E847C10F3EB003417BC523D30` |
+
+The opt-in extraction receipt is `target/ocr-installer-opt-in-proof-20260925-v3/installer-verification.json`, SHA-256 `0E4B373E90916D2B50BD3C1B09000B15030E6A8646C91CA2B1C4362CBA0BDBC6`; the corresponding default receipt is `target/ocr-installer-default-proof-20260925-v3/installer-verification.json`, SHA-256 `E5962F54E3E85F6E78AA1A1EA29291100652ED11B4F1B30BAA1F63197865C50A`. Both checks only inspect unsigned installer contents. They do not verify installation, application launch, updates, signing, a release artifact, or the notice-dialog interaction. Signed OCR packaging is explicitly refused and remains unverified.
+
+These OCR texts are packaged sidecars, not entries in the current **Third-party notices** menu. Any future OCR distribution needs to keep this separate inventory and its copied source texts accurate, then decide and verify how users reach them. The signed-OCR installer path fails closed before an output root, credentials, build, or signing; its retained control log is `target/ocr-page-probe/logs/installer-signed-ocr-refusal-20260925.log`, SHA-256 `E5C0794710A39270F47D58AFE6503427E7489A523DA74A5F0D9309B334CAF048`. Azure-signed OCR packaging remains unsupported pending a signed-engine/Tauri hash-order solution. This is an inventory and provenance record, not a complete licensing review or legal advice.
 
 To regenerate after a dependency change:
 

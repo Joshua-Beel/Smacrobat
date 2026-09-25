@@ -2,11 +2,11 @@
 
 ## Status
 
-OCR is unavailable by default and remains absent from the installed app and releases. A developer can build an opt-in source executable with a verified local English engine; that build alone enables one current-page, plain-text OCR dialog. It does not add the engine to an installer or release, create a searchable PDF, edit a document, or call a service.
+OCR is unavailable by default and remains absent from published releases. A developer can build an opt-in source executable with a verified local English engine; that build alone enables one current-page, plain-text OCR dialog. It does not create a searchable PDF, edit a document, or call a service. An unsigned local opt-in installer extraction now proves the selected resources can be packaged, but not installed, launched, updated, signed, or released.
 
 ## Internal runner foundation
 
-The native runner is exposed only to an opt-in source build. Default builds report OCR unavailable, even if stale copied resources exist. There is no installer or release resource path.
+The native runner is exposed only to an opt-in source build. Default builds report OCR unavailable, even if stale copied resources exist. The default installer has no OCR resource path; the separately checked unsigned opt-in installer is not a signed or release path.
 
 The runner requires a trusted internal engine identity and a fixed English-model identity, with no IPC or user engine path or hash, shell, or `PATH` lookup. One global admission gate refuses a second job immediately and limits process-plus-job committed memory to 256 MiB. It accepts only owned P6 input up to 16,777,216 bytes and a 16,384-pixel edge, uses fixed English-fast/150-DPI arguments, strict UTF-8 decoding, 1 MiB standard output, 64 KiB standard error, and a 30-second limit. Successful standard error fails closed. Each child is created suspended, assigned to its kill-on-close job, cancellation-checked, then resumed; timeout, cancellation, or output-cap work kills and reaps the child tree. These bounds do not cover RSS, application or PDFium memory, or source-raster allocation.
 
@@ -82,7 +82,7 @@ npm.cmd run tauri -- build --debug --no-bundle
 
 The environment value must name that completed setup root. The build rechecks the current setup and support files, engine and model sizes and hashes, fixed configuration, licenses, and non-reparse paths before embedding the executable identity and fixed English-model identity with a resource-relative path. The runtime rechecks copied resources and reparse points; it does not trust the adjacent setup manifest and exposes no engine paths or hashes to the interface. The resulting source-build resources must remain beside the executable at its built resource path.
 
-This only binds selected local inputs to an unsigned development build. It does not authenticate a publisher, validate an installed copy, or make the engine a release or installer resource.
+This only binds selected local inputs to an unsigned development build. It does not authenticate a publisher, validate an installed copy, or make the engine a release resource. A separate unsigned local installer extraction check packaged exactly five OCR sidecars under an engine-identity directory: the engine, English model, and the three license texts. The default installer check packaged zero OCR files. Both checks stop before installation or launch. Signed OCR packaging is refused before an output root, credentials, build, or signing; Azure-signed OCR packaging remains unsupported pending a signed-engine/Tauri hash-order solution. The existing **Third-party notices** menu does not yet include the OCR sidecars. The accompanying full frontend gate passed 209 tests across 46 files in 5.30 seconds; its log is `target/ocr-page-probe/logs/installer-full-frontend-20260925.log`, SHA-256 `0DEF91FCB2F6869734206FF5092DE84B0F7A668BE507E8627065708B5841DDAD`. See the [dependency license inventory](license-inventory.md) for paths, license-text hashes, and the extraction receipts.
 
 ## Retained evidence
 
