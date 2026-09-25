@@ -4,6 +4,14 @@
 
 OCR is disabled. Nothing from this research is bundled, installed, or shipped, and there is no OCR command, user interface, or document mutation path.
 
+## Internal runner foundation
+
+The native source now contains an internal runner foundation only. It has no application command, bridge, interface, bundled resource, installer wiring, or release behavior. OCR therefore remains disabled and unshipped.
+
+The runner requires a trusted internal engine identity and a fixed English-model identity, with no IPC or user engine path or hash, shell, or `PATH` lookup. One global admission gate refuses a second job immediately and limits process-plus-job committed memory to 256 MiB. It accepts only owned P6 input up to 16,777,216 bytes and a 16,384-pixel edge, uses fixed English-fast/150-DPI arguments, strict UTF-8 decoding, 1 MiB standard output, 64 KiB standard error, and a 30-second limit. Successful standard error fails closed. Each child is created suspended, assigned to its kill-on-close job, cancellation-checked, then resumed; timeout, cancellation, or output-cap work kills and reaps the child tree. These bounds do not cover RSS, application or PDFium memory, or source-raster allocation.
+
+Focused native checks passed 14 tests with 0 failures and 3 ignored in 3.64 seconds; retained checks passed 3 of 3 in 0.87 seconds. They included a deterministic 16,766,993-byte owned P6 result at 88,735,744 bytes peak job commitment. The full native gate passed 181 tests with 0 failures and 4 ignored in 420.00 seconds. A successful standalone debug/no-bundle rerun transformed 1,936 frontend modules in 2.96 seconds and native code in 22.78 seconds; its 30,217,216-byte executable SHA-256 is `E69DB97531D2A5A6A74BA8E8DB98ACAA04715D11F553EFC7920FDB148B103085`. The embedded Brotli JavaScript and CSS bytes exactly matched current assets; embedded transformed HTML referenced those assets. This is runner evidence only; it does not establish general recognition accuracy, end-to-end page-to-text time, desktop interaction, installed-app behavior, or a reachable OCR runtime.
+
 ## Windows OCR API
 
 The current NSIS distribution has no package identity. Microsoft lists `Windows.Media.Ocr` among the WinRT APIs that require package identity, and says those APIs are supported only for desktop apps packaged with MSIX. See [WinRT APIs not supported in desktop apps](https://learn.microsoft.com/en-us/windows/apps/desktop/modernize/winrt-api-desktop-app-support) and the [Windows.Media.Ocr namespace](https://learn.microsoft.com/en-us/uwp/api/windows.media.ocr?view=winrt-26100). An isolated unpackaged experiment does not change that support boundary. No MSIX packaging change is proposed.

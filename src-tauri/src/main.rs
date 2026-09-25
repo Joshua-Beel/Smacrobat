@@ -12,6 +12,9 @@ mod forms;
 mod page_labels;
 mod image_pdf;
 mod page_image;
+#[cfg(windows)]
+#[allow(dead_code)]
+mod ocr_process;
 use service::{DocumentInfo, PdfService};
 use tauri::{Manager, State};
 
