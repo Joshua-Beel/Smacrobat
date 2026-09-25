@@ -1,0 +1,75 @@
+{
+  "schemaVersion": 1,
+  "recipeVersion": "1",
+  "cmake": {
+    "version": "3.31.8",
+    "archivePrefix": "cmake-3.31.8-windows-x86_64/",
+    "archive": {
+      "file": "cmake-3.31.8-windows-x86_64.zip",
+      "url": "https://github.com/Kitware/CMake/releases/download/v3.31.8/cmake-3.31.8-windows-x86_64.zip",
+      "bytes": 46709267,
+      "sha256": "81AA9964DBABD71FE02E7EC50472FD3AD56138C49944515ECE9001EFBFF8D719"
+    },
+    "checksums": {
+      "file": "cmake-3.31.8-SHA-256.txt",
+      "url": "https://github.com/Kitware/CMake/releases/download/v3.31.8/cmake-3.31.8-SHA-256.txt",
+      "bytes": 1646,
+      "sha256": "8D08CE0586BF40FF6B80E46FFFE2DB8855BAB5B030DB8B3782F11F68B6274AD8"
+    }
+  },
+  "tesseract": {
+    "version": "5.5.3",
+    "tagObject": "6951ffe10ce031374bcd04fe400811da1e7e04ad",
+    "commit": "db0ec62f81b0737fbbe184d8fea40af5738f8eef",
+    "archivePrefix": "tesseract-5.5.3/",
+    "archive": {
+      "file": "tesseract-5.5.3.tar.gz",
+      "url": "https://github.com/tesseract-ocr/tesseract/archive/refs/tags/5.5.3.tar.gz",
+      "bytes": 1916037,
+      "sha256": "9218E62793116D42A9F6D14CD9348518B27F382096EEA3D0F2D1A24616BB5884"
+    },
+    "license": {
+      "source": "LICENSE",
+      "output": "Tesseract-Apache-2.0.txt",
+      "bytes": 11358,
+      "sha256": "CFC7749B96F63BD31C3C42B5C471BF756814053E847C10F3EB003417BC523D30"
+    }
+  },
+  "leptonica": {
+    "version": "1.87.0",
+    "commit": "13275a278eb55b5746e33f95fbf5a2c8f604b3ab",
+    "archivePrefix": "leptonica-1.87.0/",
+    "archive": {
+      "file": "leptonica-1.87.0.tar.gz",
+      "url": "https://github.com/DanBloomberg/leptonica/archive/refs/tags/1.87.0.tar.gz",
+      "bytes": 13719323,
+      "sha256": "FA2B40C5CAEA96D1BB93A97486262AED8731B69CE25A84A6BF5D25323E33F631"
+    },
+    "license": {
+      "source": "leptonica-license.txt",
+      "output": "Leptonica-BSD-2-Clause.txt",
+      "bytes": 1521,
+      "sha256": "87829ABB5BBB00B55A107365DA89E9A33F86C4250169E5A1E5588505BE7D5806"
+    }
+  },
+  "model": {
+    "language": "eng",
+    "variant": "fast",
+    "version": "4.1.0",
+    "tagObject": "a8ba5063ab8013372a20e300da0c97ee46b92b07",
+    "commit": "65727574dfcd264acbb0c3e07860e4e9e9b22185",
+    "data": {
+      "file": "eng.traineddata",
+      "url": "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/65727574dfcd264acbb0c3e07860e4e9e9b22185/eng.traineddata",
+      "bytes": 4113088,
+      "sha256": "7D4322BD2A7749724879683FC3912CB542F19906C83BCC1A52132556427170B2"
+    },
+    "license": {
+      "file": "tessdata-fast-4.1.0-LICENSE",
+      "url": "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/65727574dfcd264acbb0c3e07860e4e9e9b22185/LICENSE",
+      "output": "eng-fast-Apache-2.0.txt",
+      "bytes": 11358,
+      "sha256": "CFC7749B96F63BD31C3C42B5C471BF756814053E847C10F3EB003417BC523D30"
+    }
+  }
+}

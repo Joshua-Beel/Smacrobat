@@ -1,0 +1,1 @@
+add_compile_definitions(TESSERACT_DISABLE_DEBUG_FONTS)

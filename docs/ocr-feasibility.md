@@ -27,6 +27,36 @@ The table records the observed range across three runs. Time is OCR child-proces
 
 The exact-pass field is a normalized comparison to the owned fixture's expected text. It is not a general accuracy estimate. The bitmap fixtures are synthetic smoke inputs, and the Arial fixture is locally rendered text; none establishes results on real scanned pages. Both models recognized the synthetic page footer but also emitted line-pattern noise. This narrow suite makes fast a smaller, lower-observed-cost prototype candidate with the same observed exact-pass set; it does not select a product engine or model.
 
+## Opt-in source-build recipe
+
+This development recipe does not enable OCR in the app and does not add an application, installer, or release resource. It requires x64 Windows, PowerShell 7 or later, the Visual Studio C++ build tools, and Internet access to download the pinned inputs.
+
+From the repository root, run:
+
+```powershell
+pwsh -NoProfile -File scripts/setup-ocr.ps1
+```
+
+The default output is `target/ocr/5.5.3-eng-fast-4.1.0`. To use a fresh named output root or fewer build jobs, run:
+
+```powershell
+pwsh -NoProfile -File scripts/setup-ocr.ps1 -OutputRoot target/ocr-my-run -Jobs 1
+```
+
+`-OutputRoot` must resolve to a new directory under this repository's `target`; `-Jobs` accepts 1 through 4. The recipe refuses an existing output root or a path outside `target`, does not clean a failed root, and does not install tools globally. It keeps verified downloads, extracted sources, and build directories in that selected root.
+
+The finished root contains `engine/bin/tesseract.exe`, `engine/tessdata/eng.traineddata`, the three source/model license texts under `engine/licenses`, `engine/ocr-engine-manifest.json`, and `logs/setup.log`. The manifest records relative paths, versions, byte counts, and SHA-256 values. The recipe verifies its pinned HTTPS inputs, builds a static x64 `/MT` engine with the pinned fast English model, validates its configured build properties, and completes only after the owned P6 smoke text matches exactly and an oversize input is rejected before the process starts. Pinned inputs and options make the recipe repeatable, but executable bytes are not claimed to be bit-reproducible across toolchain or operating-system updates.
+
+One verified run used `target/ocr-recipe-verified-20260924` with four jobs and finished in about 173.70 seconds. Its exact smoke text matched with empty standard error in 160 ms; a 16,777,217-byte control input was rejected before spawn. The local manifest was 8,096 bytes with SHA-256 `3C6B8130968955B50AA252778BAF5D0D188AA7680F35A61EF9E8EEF990A70144`; its setup log was 266,611 bytes with SHA-256 `2877A57ED2F4A03088FCCFF33409A7AAACAF7AE93FAE1AC134C9B992167F9817`. The executable was 4,391,424 bytes with SHA-256 `1D0F85D0655ED8C0B5F6472CD29213BBD79DC5275CCBEE7336360665A94F8C16`; the model retained its pinned SHA-256 `7D4322BD2A7749724879683FC3912CB542F19906C83BCC1A52132556427170B2`.
+
+After a successful setup, run the focused offline recipe controls with fresh evidence and a completed verified root:
+
+```powershell
+pwsh -NoProfile -File scripts/ocr/setup-ocr.test.ps1 -EvidenceRoot target/ocr-setup-controls-my-run -VerifiedRoot target/ocr/5.5.3-eng-fast-4.1.0
+```
+
+Both parameters are required: `-EvidenceRoot` must be a new directory beneath `target`, and `-VerifiedRoot` must be a completed setup output whose manifest binds the current setup script. The 12 controls tie the current setup script to the verified manifest and check outside-target, existing-root, and junction refusal; bounded standard-output, standard-error, and timeout cleanup; same-length hash tampering; ZIP traversal, link, and expanded-size guards; and the final-log oversize pre-spawn receipt. They do not inject a tampered HTTP response, and TAR hostile-entry handling is source-inspected rather than exercised by these controls. The retained receipt is `target/ocr-setup-negative-controls-v8-20260924/negative-controls.json`, SHA-256 `79BCC6AD7A8966342A273972D0525E68DC9B29E0D04CEBE86E927B56270051E1`.
+
 ## Retained evidence
 
 The following local, unshipped research artifacts provide provenance. They are not release assets.
