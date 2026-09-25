@@ -69,14 +69,19 @@ export default function PageOcrDialog({ target, setBusy, close }: { target: Page
   };
 
   useEffect(() => {
+    mounted.current = true;
+    if (pending.current) active.current = pending.current;
     dialog.current?.showModal();
     begin();
     return () => {
       mounted.current = false;
       const requestId = pending.current;
       active.current = null;
-      if (requestId) void cancelPageOcr(requestId);
-      if (!requestId) setBusy(false);
+      queueMicrotask(() => {
+        if (mounted.current || pending.current !== requestId) return;
+        if (requestId) void cancelPageOcr(requestId).catch(() => {});
+        else setBusy(false);
+      });
     };
   }, []);
 

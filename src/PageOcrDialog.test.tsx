@@ -83,9 +83,28 @@ it('cancels a pending unmount but releases global busy only after the original c
   let finish!: (value: OcrReceipt) => void;
   vi.mocked(recognizePageOcr).mockImplementation(request => new Promise(done => { finish = value => done({ ...value, requestId: request.requestId }); }));
   const { ui, setBusy } = await mount();
-  act(() => ui.unmount());
+  await act(async () => { ui.unmount(); await Promise.resolve(); });
   expect(cancelPageOcr).toHaveBeenCalledWith('11111111-1111-4111-8111-111111111111');
   expect(setBusy.mock.calls).toEqual([[true]]);
   await act(async () => finish(receipt()));
   expect(setBusy.mock.calls).toEqual([[true], [false]]);
+});
+
+it('suppresses a teardown-only cancellation rejection until the original request drains', async () => {
+  let finishFirst!: (value: OcrReceipt) => void;
+  vi.mocked(recognizePageOcr).mockImplementation(request => new Promise(done => { finishFirst = value => done({ ...value, requestId: request.requestId }); }));
+  vi.mocked(cancelPageOcr).mockRejectedValue(new Error('IPC unavailable during teardown'));
+  const rejections: unknown[] = [];
+  const capture = (reason: unknown) => rejections.push(reason);
+  process.on('unhandledRejection', capture);
+  try {
+    const { ui, setBusy } = await mount();
+    act(() => ui.unmount());
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); });
+    await act(async () => finishFirst(receipt()));
+    expect(setBusy.mock.calls).toEqual([[true], [false]]);
+    expect(rejections).toEqual([]);
+  } finally {
+    process.off('unhandledRejection', capture);
+  }
 });
