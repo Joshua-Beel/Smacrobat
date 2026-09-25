@@ -15,6 +15,9 @@ mod page_image;
 #[cfg(windows)]
 #[allow(dead_code)]
 mod ocr_process;
+#[cfg(windows)]
+#[allow(dead_code)]
+mod ocr;
 use service::{DocumentInfo, PdfService};
 use tauri::{Manager, State};
 

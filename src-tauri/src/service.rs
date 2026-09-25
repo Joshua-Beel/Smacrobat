@@ -17,6 +17,12 @@ enum CommentMutation { Create(u16, CropRect, String), Update(String, String), De
 pub struct PageSize { width: f32, height: f32 }
 #[derive(Clone, Serialize)]
 pub struct DocumentInfo { id: u64, name: String, path: String, pages: Vec<PageSize>, revision: u64, dirty: bool, can_undo: bool, can_redo: bool }
+impl DocumentInfo {
+    #[cfg(all(test, windows))]
+    pub(crate) fn ocr_request(&self, page: u16) -> crate::ocr::OcrPageRequest {
+        crate::ocr::OcrPageRequest { document_id: self.id, revision: self.revision, page }
+    }
+}
 #[derive(Serialize)]
 pub struct SavedCopy { path: String, document: DocumentInfo }
 #[derive(Debug)]
@@ -46,6 +52,22 @@ type Reply<T> = oneshot::Sender<Result<T, String>>;
 #[cfg(test)]
 #[derive(Default, Debug)]
 struct RenderWork { dequeued: usize, skipped_closed: usize, rendered: usize }
+#[cfg(test)]
+#[derive(Default, Debug)]
+struct OcrWork { dequeued: usize, preflighted: usize, rendered: usize, converted: usize }
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq)]
+struct OcrWorkerState {
+    source: Vec<u8>,
+    plan: Vec<PageSpec>,
+    revision: u64,
+    dirty: bool,
+    can_undo: bool,
+    can_redo: bool,
+    cache_entries: Vec<(CacheKey, usize)>,
+    cache_weight: usize,
+    note_documents: Vec<(u64, u64)>,
+}
 enum UnclaimedReply { Document(u64), Password(u64) }
 struct ReplyLease<T> { value: Option<T>, cleanup: Option<UnclaimedReply>, sender: mpsc::Sender<Request> }
 impl<T> ReplyLease<T> {
@@ -71,6 +93,10 @@ enum Request {
     #[cfg(test)]
     RenderWorkForDocument(u64, Reply<RenderWork>),
     #[cfg(test)]
+    OcrWorkForDocument(u64, Reply<OcrWork>),
+    #[cfg(test)]
+    OcrWorkerState(u64, Reply<OcrWorkerState>),
+    #[cfg(test)]
     OpenDocumentsForPath(PathBuf, Reply<Vec<u64>>),
     #[cfg(test)]
     PasswordRequestsForPath(PathBuf, Reply<Vec<u64>>),
@@ -85,6 +111,10 @@ enum Request {
     EndPrint(u64, Reply<()>),
     PreflightPageImage(u64, u64, u16, u16, Reply<PageImagePreflight>),
     ExportPageImage(u64, u64, u16, u16, PathBuf, Reply<PageImageReceipt>),
+    #[cfg(windows)]
+    OcrRaster(crate::ocr::OcrPageRequest, crate::ocr_process::OcrCancellation, crate::ocr_process::OcrWorkerHold, Reply<crate::ocr::OcrPageRaster>),
+    #[cfg(windows)]
+    ValidateOcrResult(crate::ocr::OcrPageRequest, crate::ocr_process::OcrWorkerHold, Reply<()>),
     Render(u64, u16, i32, Reply<Vec<u8>>),
     Text(u64, u16, u64, Reply<String>),
     TextGeometry(u64, u16, u64, Reply<crate::text_geometry::PageTextGeometry>),
@@ -186,6 +216,8 @@ impl PdfService {
             let mut next_print = 1;
             #[cfg(test)]
             let mut render_work = HashMap::<u64, RenderWork>::new();
+            #[cfg(test)]
+            let mut ocr_work = HashMap::<u64, OcrWork>::new();
             let mut requests = RequestQueue::default();
             while let Ok(request) = requests.next(&receiver) {
                 let request = match request {
@@ -211,6 +243,23 @@ impl PdfService {
                     }
                     #[cfg(test)]
                     Request::RenderWorkForDocument(id, reply) => { let _ = reply.send(Ok(render_work.remove(&id).unwrap_or_default())); }
+                    #[cfg(test)]
+                    Request::OcrWorkForDocument(id, reply) => { let _ = reply.send(Ok(ocr_work.remove(&id).unwrap_or_default())); }
+                    #[cfg(test)]
+                    Request::OcrWorkerState(id, reply) => {
+                        let result = (|| {
+                            let (session, _) = sessions.get(&id).ok_or("Document is closed")?;
+                            let note_state = note_documents.get(&id).map(|(revision, _)| vec![(id, *revision)]).unwrap_or_default();
+                            Ok(OcrWorkerState {
+                                source: session.source.clone(), plan: session.plan.clone(), revision: session.revision,
+                                dirty: session.dirty(), can_undo: session.can_undo(), can_redo: session.can_redo(),
+                                cache_entries: cache.entries.iter().filter(|(key, _, _)| key.0 == id).map(|(key, bytes, _)| (*key, bytes.len())).collect(),
+                                cache_weight: cache.entries.iter().filter(|(key, _, _)| key.0 == id).map(|(_, _, weight)| *weight).sum(),
+                                note_documents: note_state,
+                            })
+                        })();
+                        let _ = reply.send(result);
+                    }
                     #[cfg(test)]
                     Request::OpenDocumentsForPath(path, reply) => {
                         let ids = sessions.iter().filter_map(|(id, (_, info))| (PathBuf::from(&info.path) == path).then_some(*id)).collect();
@@ -291,6 +340,75 @@ impl PdfService {
                             crate::page_image::write_png(&path, dimensions, dpi, &bgra, || reply.is_closed())?;
                             Ok(PageImageReceipt { path: path.to_string_lossy().into_owned(), document_id: id, revision, page, dpi, width: dimensions.width, height: dimensions.height })
                         })();
+                        let _ = reply.send(result);
+                    }
+                    #[cfg(windows)]
+                    Request::OcrRaster(request, cancellation, admission, reply) => {
+                        #[cfg(test)]
+                        { ocr_work.entry(request.document_id).or_default().dequeued += 1; }
+                        if reply.is_closed() || cancellation.is_cancelled() { continue; }
+                        let result = (|| {
+                            cancellation.ensure_runnable().map_err(|error| error.to_string())?;
+                            let (session, _) = sessions.get(&request.document_id).ok_or("Document is closed")?;
+                            let original = documents.get(&request.document_id).ok_or("Document is closed")?;
+                            let (dimensions, spec) = checked_ocr_request(session, original, request)?;
+                            #[cfg(test)]
+                            { ocr_work.entry(request.document_id).or_default().preflighted += 1; }
+                            cancellation.ensure_runnable().map_err(|error| error.to_string())?;
+                            if reply.is_closed() { return Err("OCR was cancelled".into()); }
+                            let engine = pdfium.as_ref().map_err(Clone::clone)?;
+                            let mut ocr_note_documents = HashMap::new();
+                            let document = note_document(engine, original, session, &mut ocr_note_documents, request.document_id)?;
+                            cancellation.ensure_runnable().map_err(|error| error.to_string())?;
+                            let bgra = with_planned_page(&document, &spec, |page| {
+                                if cancellation.is_cancelled() || reply.is_closed() { return Err("OCR was cancelled".into()); }
+                                #[cfg(test)]
+                                { ocr_work.entry(request.document_id).or_default().rendered += 1; }
+                                let bitmap = page.render_with_config(&PdfRenderConfig::new()
+                                    .set_fixed_size(dimensions.width as i32, dimensions.height as i32)
+                                    .set_format(PdfBitmapFormat::BGRA)
+                                    .set_reverse_byte_order(false)
+                                    .clear_before_rendering(true)
+                                    .set_clear_color(PdfColor::WHITE)
+                                    .render_annotations(true)
+                                    .render_form_data(true)
+                                    .use_print_quality(true))
+                                    .map_err(|error| format!("Could not render the OCR page: {error}"))?;
+                                let bgra = bitmap.as_raw_bytes();
+                                if bitmap.width() != dimensions.width as i32
+                                    || bitmap.height() != dimensions.height as i32
+                                    || bitmap.format().map_err(|error| format!("Could not inspect the OCR bitmap format: {error}"))? != PdfBitmapFormat::BGRA
+                                    || bgra.len() != dimensions.bgra_bytes
+                                {
+                                    return Err("Unexpected OCR bitmap layout.".into());
+                                }
+                                drop(bitmap);
+                                Ok(bgra)
+                            })?;
+                            drop(document);
+                            drop(ocr_note_documents);
+                            cancellation.ensure_runnable().map_err(|error| error.to_string())?;
+                            if reply.is_closed() { return Err("OCR was cancelled".into()); }
+                            let p6 = crate::ocr::bgra_to_p6(dimensions, &bgra, &cancellation)?;
+                            #[cfg(test)]
+                            { ocr_work.entry(request.document_id).or_default().converted += 1; }
+                            cancellation.ensure_runnable().map_err(|error| error.to_string())?;
+                            if reply.is_closed() { return Err("OCR was cancelled".into()); }
+                            Ok(crate::ocr::OcrPageRaster {
+                                request,
+                                width: dimensions.width,
+                                height: dimensions.height,
+                                p6,
+                            })
+                        })();
+                        drop(admission);
+                        if !reply.is_closed() { let _ = reply.send(result); }
+                    }
+                    #[cfg(windows)]
+                    Request::ValidateOcrResult(request, admission, reply) => {
+                        if reply.is_closed() { continue; }
+                        let result = validate_ocr_result(&sessions, &documents, request);
+                        drop(admission);
                         let _ = reply.send(result);
                     }
                     Request::BeginOpen(_, _) => unreachable!(),
@@ -790,6 +908,14 @@ impl PdfService {
     pub async fn export_page_image(&self, id: u64, revision: u64, page: u16, dpi: u16, path: PathBuf) -> Result<PageImageReceipt, String> {
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::ExportPageImage(id, revision, page, dpi, path, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
     }
+    #[cfg(windows)]
+    pub(crate) async fn ocr_raster(&self, request: crate::ocr::OcrPageRequest, cancellation: crate::ocr_process::OcrCancellation, admission: crate::ocr_process::OcrWorkerHold) -> Result<crate::ocr::OcrPageRaster, String> {
+        let (tx, rx) = oneshot::channel(); self.sender.send(Request::OcrRaster(request, cancellation, admission, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
+    }
+    #[cfg(windows)]
+    pub(crate) async fn validate_ocr_result(&self, request: crate::ocr::OcrPageRequest, admission: crate::ocr_process::OcrWorkerHold) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel(); self.sender.send(Request::ValidateOcrResult(request, admission, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
+    }
     pub fn print_render_blocking(&self, token: u64, page: usize, max_width: u32, max_height: u32) -> Result<PrintBitmap, String> {
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::PrintRender(token, page, max_width, max_height, tx)).map_err(|error| error.to_string())?; rx.blocking_recv().map_err(|error| error.to_string())?
     }
@@ -960,6 +1086,41 @@ fn checked_page_image_request(session: &EditSession, document: &PdfDocument<'_>,
     Ok((dimensions, spec))
 }
 
+#[cfg(windows)]
+fn checked_ocr_request(
+    session: &EditSession,
+    document: &PdfDocument<'_>,
+    request: crate::ocr::OcrPageRequest,
+) -> Result<(crate::ocr::OcrRasterDimensions, PageSpec), String> {
+    if session.revision != request.revision { return Err("Document changed. Start OCR again.".into()); }
+    let permissions = document.permissions();
+    match permissions.can_extract_text_and_graphics() {
+        Ok(true) => {}
+        Ok(false) => return Err("This PDF does not allow text and graphics extraction.".into()),
+        Err(_) => return Err("The PDF extraction permission could not be verified.".into()),
+    }
+    if !matches!(permissions.security_handler_revision(), Ok(PdfSecurityHandlerRevision::Unprotected)) {
+        return Err("OCR of encrypted or restricted PDFs is not supported in this build.".into());
+    }
+    session.page_image_export_guard()?;
+    let spec = session.plan.get(usize::from(request.page)).ok_or("OCR page is out of range")?.clone();
+    let dimensions = with_planned_page(document, &spec, |page| crate::ocr::raster_dimensions(page.width().value, page.height().value))?;
+    Ok((dimensions, spec))
+}
+
+#[cfg(windows)]
+fn validate_ocr_result(
+    sessions: &HashMap<u64, (EditSession, DocumentInfo)>,
+    documents: &HashMap<u64, std::rc::Rc<PdfDocument<'_>>>,
+    request: crate::ocr::OcrPageRequest,
+) -> Result<(), String> {
+    let (session, _) = sessions.get(&request.document_id).ok_or("Document is closed")?;
+    if !documents.contains_key(&request.document_id) { return Err("Document is closed".into()); }
+    if session.revision != request.revision { return Err("Document changed. Start OCR again.".into()); }
+    session.plan.get(usize::from(request.page)).ok_or("OCR page is out of range")?;
+    Ok(())
+}
+
 fn print_dimensions(width: f32, height: f32, max_width: u32, max_height: u32) -> Result<(u32, u32), String> {
     if max_width == 0 || max_height == 0 || !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 { return Err("Invalid print dimensions.".into()); }
     let limit_width = max_width.min(4096) as f64;
@@ -1128,9 +1289,21 @@ mod tests {
     macro_rules! accepted_reply_values {
         ($($value:ty),* $(,)?) => { $(impl TestReplyValue for $value { type Accepted = Self; fn accept(self) -> Self { self } })* };
     }
-    accepted_reply_values!((), Vec<u8>, Vec<u64>, Vec<Option<String>>, String, DocumentInfo, SavedCopy, OpenResult, PrintSnapshotInfo, PrintBitmap, PageImagePreflight, PageImageReceipt, BookmarkList, RenderWork, crate::page_labels::DocumentPageLabels, crate::document_properties::DocumentProperties, crate::text_geometry::PageTextGeometry, crate::split::SplitOutput, crate::comments::CommentList, crate::comments::AnnotationList, crate::forms::FormFields);
+    accepted_reply_values!((), Vec<u8>, Vec<u64>, Vec<Option<String>>, String, DocumentInfo, SavedCopy, OpenResult, PrintSnapshotInfo, PrintBitmap, PageImagePreflight, PageImageReceipt, BookmarkList, RenderWork, OcrWork, OcrWorkerState, crate::ocr::OcrPageRaster, crate::page_labels::DocumentPageLabels, crate::document_properties::DocumentProperties, crate::text_geometry::PageTextGeometry, crate::split::SplitOutput, crate::comments::CommentList, crate::comments::AnnotationList, crate::forms::FormFields);
     fn call<T: TestReplyValue>(service: &PdfService, request: impl FnOnce(Reply<T>) -> Request) -> Result<T::Accepted, String> {
         let (tx, rx) = oneshot::channel(); service.sender.send(request(tx)).unwrap(); rx.blocking_recv().unwrap().map(TestReplyValue::accept)
+    }
+    fn ocr_raster(service: &PdfService, request: crate::ocr::OcrPageRequest, cancellation: crate::ocr_process::OcrCancellation) -> Result<crate::ocr::OcrPageRaster, String> {
+        let operation = crate::ocr_process::OcrOperation::try_begin(&cancellation).map_err(|error| error.to_string())?;
+        let result = call(service, |reply| Request::OcrRaster(request, cancellation, operation.worker_hold(), reply));
+        operation.finish(result.map_err(crate::ocr_process::OcrProcessError::Document)).map_err(|error| error.to_string())
+    }
+    fn p6_pixels(p6: &[u8]) -> (u32, u32, &[u8]) {
+        let mut lines = p6.splitn(4, |byte| *byte == b'\n');
+        assert_eq!(lines.next(), Some(b"P6".as_slice()));
+        let dimensions = std::str::from_utf8(lines.next().unwrap()).unwrap().split_once(' ').unwrap();
+        assert_eq!(lines.next(), Some(b"255".as_slice()));
+        (dimensions.0.parse().unwrap(), dimensions.1.parse().unwrap(), lines.next().unwrap())
     }
     #[test]
     fn page_labels_follow_current_plan_revision_and_close_without_changing_source() {
@@ -3566,6 +3739,158 @@ mod tests {
             assert!(read(0, changed.revision).is_err());
         }
     }
+    #[test]
+    fn ocr_raster_matches_current_print_pixels_and_preserves_worker_state() {
+        let _ocr_guard = crate::ocr_process::test_lock();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let source_path = root.join("resources/welcome.pdf");
+        let source_bytes = std::fs::read(&source_path).unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        let service = PdfService::start(root.join("resources/pdfium/bin/pdfium.dll"));
+        let mut info = call(&service, |reply| Request::Open(source_path.clone(), reply)).unwrap();
+        info = call(&service, |reply| Request::Edit(info.id, PageEdit::Rotate { pages: vec![0], clockwise: true }, reply)).unwrap();
+        info = call(&service, |reply| Request::Crop(info.id, 0, info.revision, CropRect { x: 0.05, y: 0.05, width: 0.9, height: 0.8 }, reply)).unwrap();
+        info = call(&service, |reply| Request::Comment(info.id, info.revision, CommentMutation::CreateHighlight(0, CropRect { x: 0.68, y: 0.08, width: 0.18, height: 0.12 }, Some("OCR raster note".into())), reply)).unwrap();
+        let annotations = call(&service, |reply| Request::Annotations(info.id, info.revision, reply)).unwrap();
+        assert!(annotations.annotations.iter().any(|annotation| annotation.contents.as_deref() == Some("OCR raster note")));
+        info = call(&service, |reply| Request::Edit(info.id, PageEdit::Rotate { pages: vec![0], clockwise: true }, reply)).unwrap();
+        info = call(&service, |reply| Request::Edit(info.id, PageEdit::Undo, reply)).unwrap();
+        assert!(info.can_redo);
+        let preview = call(&service, |reply| Request::Render(info.id, 0, 211, reply)).unwrap();
+        let before = call(&service, |reply| Request::OcrWorkerState(info.id, reply)).unwrap();
+        let request = crate::ocr::OcrPageRequest { document_id: info.id, revision: info.revision, page: 0 };
+        let raster = ocr_raster(&service, request, crate::ocr_process::OcrCancellation::default()).unwrap();
+        assert_eq!(raster.request, request);
+        assert!(raster.p6.len() <= crate::ocr_process::OCR_INPUT_LIMIT);
+        let (width, height, pixels) = p6_pixels(&raster.p6);
+        assert_eq!((width, height), (raster.width, raster.height));
+        let output = folder.path().join("current-ocr-reference.png");
+        let png = call(&service, |reply| Request::ExportPageImage(info.id, info.revision, 0, 150, output.clone(), reply)).unwrap();
+        assert_eq!((png.width, png.height), (width, height));
+        let decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(output).unwrap()));
+        let mut reader = decoder.read_info().unwrap();
+        let mut decoded = vec![0; reader.output_buffer_size().unwrap()];
+        let frame = reader.next_frame(&mut decoded).unwrap();
+        assert_eq!(frame.buffer_size(), pixels.len());
+        assert_eq!(&decoded[..frame.buffer_size()], pixels, "OCR P6 must match the independently encoded current-page PNG pixels");
+        assert_eq!(call(&service, |reply| Request::Render(info.id, 0, 211, reply)).unwrap(), preview);
+        let after = call(&service, |reply| Request::OcrWorkerState(info.id, reply)).unwrap();
+        assert_eq!(after, before, "OCR must not change source, plan/history flags, viewer cache, or persistent note cache");
+        let work = call(&service, |reply| Request::OcrWorkForDocument(info.id, reply)).unwrap();
+        assert_eq!((work.dequeued, work.preflighted, work.rendered, work.converted), (1, 1, 1, 1));
+        assert_eq!(std::fs::read(source_path).unwrap(), source_bytes);
+        call(&service, |reply| Request::Close(info.id, reply)).unwrap();
+
+        let form = call(&service, |reply| Request::Open(root.join("tests/fixtures/reportlab-mixed-fields.pdf"), reply)).unwrap();
+        assert!(!call(&service, |reply| Request::FormFields(form.id, 0, reply)).unwrap().fields.is_empty());
+        let form_request = crate::ocr::OcrPageRequest { document_id: form.id, revision: 0, page: 0 };
+        let form_raster = ocr_raster(&service, form_request, crate::ocr_process::OcrCancellation::default()).unwrap();
+        let (form_width, form_height, form_pixels) = p6_pixels(&form_raster.p6);
+        let snapshot = call(&service, |reply| Request::BeginPrint(form.id, 0, reply)).unwrap();
+        let print = call(&service, |reply| Request::PrintRender(snapshot.token, 0, form_width, form_height, reply)).unwrap();
+        let form_expected = print.bgra.chunks_exact(4).flat_map(|pixel| {
+            let alpha = u16::from(pixel[3]);
+            [pixel[2], pixel[1], pixel[0]].map(|channel| ((u16::from(channel) * alpha + 255 * (255 - alpha) + 127) / 255) as u8)
+        }).collect::<Vec<_>>();
+        assert_eq!(form_pixels, form_expected, "OCR form pixels must match an independent print-quality form render");
+        call(&service, |reply| Request::Close(form.id, reply)).unwrap();
+    }
+
+    #[test]
+    fn ocr_raster_rejects_stale_closed_protected_and_preclosed_requests_atomically() {
+        let _ocr_guard = crate::ocr_process::test_lock();
+        use lopdf::dictionary;
+        let _password_guard = password_test_lock();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let folder = tempfile::tempdir().unwrap();
+        let service = PdfService::start(root.join("resources/pdfium/bin/pdfium.dll"));
+        let ordinary = call(&service, |reply| Request::Open(root.join("resources/welcome.pdf"), reply)).unwrap();
+        for request in [
+            crate::ocr::OcrPageRequest { document_id: ordinary.id, revision: 1, page: 0 },
+            crate::ocr::OcrPageRequest { document_id: ordinary.id, revision: 0, page: 6 },
+        ] {
+            assert!(ocr_raster(&service, request, crate::ocr_process::OcrCancellation::default()).is_err());
+        }
+        let invalid = call(&service, |reply| Request::OcrWorkForDocument(ordinary.id, reply)).unwrap();
+        assert_eq!((invalid.dequeued, invalid.preflighted, invalid.rendered, invalid.converted), (2, 0, 0, 0));
+        let cancellation = crate::ocr_process::OcrCancellation::default();
+        cancellation.cancel();
+        assert!(ocr_raster(&service, crate::ocr::OcrPageRequest { document_id: ordinary.id, revision: 0, page: 0 }, cancellation).is_err());
+
+        let cancellation = crate::ocr_process::OcrCancellation::default();
+        let operation = crate::ocr_process::OcrOperation::try_begin(&cancellation).unwrap();
+        let (reply, receiver) = oneshot::channel(); drop(receiver);
+        service.sender.send(Request::OcrRaster(crate::ocr::OcrPageRequest { document_id: ordinary.id, revision: 0, page: 0 }, cancellation, operation.worker_hold(), reply)).unwrap();
+        let skipped = call(&service, |reply| Request::OcrWorkForDocument(ordinary.id, reply)).unwrap();
+        operation.finish(Ok(())).unwrap();
+        assert_eq!((skipped.dequeued, skipped.preflighted, skipped.rendered, skipped.converted), (1, 0, 0, 0));
+
+        for kind in ["signed", "extraction-denied", "encrypted-allowed"] {
+            let mut pdf = lopdf::Document::load(root.join("resources/welcome.pdf")).unwrap();
+            pdf.trailer.set("ID", vec![lopdf::Object::string_literal(format!("ocr-{kind}")), lopdf::Object::string_literal(format!("ocr-{kind}"))]);
+            match kind {
+                "signed" => { pdf.catalog_mut().unwrap().set("Perms", dictionary! {}); }
+                "extraction-denied" => {
+                    let encryption = lopdf::EncryptionVersion::V2 { document: &pdf, owner_password: "owner", user_password: "", key_length: 128, permissions: lopdf::Permissions::empty() };
+                    pdf.encrypt(&lopdf::EncryptionState::try_from(encryption).unwrap()).unwrap();
+                }
+                _ => {
+                    let encryption = lopdf::EncryptionVersion::V2 { document: &pdf, owner_password: "owner", user_password: "", key_length: 128, permissions: lopdf::Permissions::all() };
+                    pdf.encrypt(&lopdf::EncryptionState::try_from(encryption).unwrap()).unwrap();
+                }
+            }
+            let path = folder.path().join(format!("{kind}.pdf")); pdf.save(&path).unwrap();
+            let opened = call(&service, |reply| Request::BeginOpen(path, reply)).unwrap();
+            let info = match opened {
+                OpenResult::Opened { document } => document,
+                OpenResult::PasswordRequired { request_id, .. } => match call(&service, |reply| Request::Unlock(request_id, String::new(), reply)).unwrap() { OpenResult::Opened { document } => document, _ => panic!("{kind} did not unlock") },
+            };
+            let error = ocr_raster(&service, crate::ocr::OcrPageRequest { document_id: info.id, revision: 0, page: 0 }, crate::ocr_process::OcrCancellation::default()).unwrap_err();
+            match kind {
+                "signed" => assert!(error.contains("Signed or certified")),
+                "extraction-denied" => assert!(error.contains("does not allow")),
+                _ => assert!(error.contains("encrypted or restricted")),
+            }
+            call(&service, |reply| Request::Close(info.id, reply)).unwrap();
+        }
+        call(&service, |reply| Request::Close(ordinary.id, reply)).unwrap();
+        assert!(ocr_raster(&service, crate::ocr::OcrPageRequest { document_id: ordinary.id, revision: 0, page: 0 }, crate::ocr_process::OcrCancellation::default()).unwrap_err().contains("closed"));
+    }
+
+    #[test]
+    fn ocr_worker_holds_admission_until_aborted_raster_and_validation_requests_drain() {
+        let _ocr_guard = crate::ocr_process::test_lock();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let service = PdfService::start(root.join("resources/pdfium/bin/pdfium.dll"));
+        let info = call(&service, |reply| Request::Open(root.join("resources/welcome.pdf"), reply)).unwrap();
+        let request = crate::ocr::OcrPageRequest { document_id: info.id, revision: 0, page: 0 };
+
+        for validation in [false, true] {
+            let (release, gate) = mpsc::channel();
+            let (ready, waiting) = oneshot::channel();
+            service.sender.send(Request::BacklogGate(gate, ready)).unwrap();
+            waiting.blocking_recv().unwrap().unwrap();
+            let cancellation = crate::ocr_process::OcrCancellation::default();
+            let operation = crate::ocr_process::OcrOperation::try_begin(&cancellation).unwrap();
+            if validation {
+                let (reply, receiver) = oneshot::channel(); drop(receiver);
+                service.sender.send(Request::ValidateOcrResult(request, operation.worker_hold(), reply)).unwrap();
+            } else {
+                let (reply, receiver) = oneshot::channel(); drop(receiver);
+                service.sender.send(Request::OcrRaster(request, cancellation.clone(), operation.worker_hold(), reply)).unwrap();
+            }
+            cancellation.cancel();
+            drop(operation);
+            assert!(matches!(crate::ocr_process::OcrOperation::try_begin(&crate::ocr_process::OcrCancellation::default()), Err(crate::ocr_process::OcrProcessError::Busy)));
+            release.send(Vec::new()).unwrap();
+            let work = call(&service, |reply| Request::OcrWorkForDocument(info.id, reply)).unwrap();
+            assert_eq!((work.dequeued, work.preflighted, work.rendered, work.converted), if validation { (0, 0, 0, 0) } else { (1, 0, 0, 0) });
+            let next = crate::ocr_process::OcrOperation::try_begin(&crate::ocr_process::OcrCancellation::default()).unwrap();
+            next.finish(Ok(())).unwrap();
+        }
+        call(&service, |reply| Request::Close(info.id, reply)).unwrap();
+    }
+
     #[test]
     fn page_image_export_tracks_current_plan_pixels_and_preserves_session() {
         let _print_guard = print_test_lock();

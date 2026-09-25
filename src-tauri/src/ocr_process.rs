@@ -55,9 +55,16 @@ const EXIT_CANCELLED: u32 = 0xc000_013a;
 const EXIT_RESOURCE_LIMIT: u32 = 0xc000_009a;
 
 static OCR_SLOT: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static OCR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 const RUN_STATE_RUNNING: u8 = 0;
 const RUN_STATE_CANCELLED: u8 = 1;
 const RUN_STATE_COMPLETED: u8 = 2;
+
+#[cfg(test)]
+pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    OCR_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 #[derive(Clone)]
 pub(crate) struct OcrCancellation(Arc<AtomicU8>);
@@ -80,11 +87,11 @@ impl OcrCancellation {
             .is_ok()
     }
 
-    fn is_cancelled(&self) -> bool {
+    pub(crate) fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Acquire) == RUN_STATE_CANCELLED
     }
 
-    fn ensure_runnable(&self) -> Result<(), OcrProcessError> {
+    pub(crate) fn ensure_runnable(&self) -> Result<(), OcrProcessError> {
         match self.0.load(Ordering::Acquire) {
             RUN_STATE_RUNNING => Ok(()),
             RUN_STATE_CANCELLED => Err(OcrProcessError::Cancelled),
@@ -132,6 +139,7 @@ pub(crate) enum OcrProcessError {
     InvalidUtf8(&'static str),
     UnexpectedStderr(String),
     ChildExit { code: u32, stderr: String },
+    Document(String),
     System(String),
 }
 
@@ -144,6 +152,7 @@ impl fmt::Display for OcrProcessError {
             Self::InvalidAsset(message)
             | Self::AssetIntegrity(message)
             | Self::InvalidInput(message)
+            | Self::Document(message)
             | Self::System(message) => formatter.write_str(message),
             Self::OutputLimit(stream) => write!(formatter, "OCR {stream} exceeded its byte limit"),
             Self::InvalidUtf8(stream) => write!(formatter, "OCR {stream} was not valid UTF-8"),
@@ -207,21 +216,47 @@ impl OcrProcessRunner {
         cancellation: &OcrCancellation,
         options: RunOptions<'_>,
     ) -> Result<OcrProcessOutput, OcrProcessError> {
-        let result = self.recognize_inner(input, cancellation, options);
+        let operation = match OcrOperation::try_begin(cancellation) {
+            Ok(operation) => operation,
+            Err(error) => return cancellation.finish(Err(error)),
+        };
+        let result = self.recognize_inner_admitted(input, options, &operation);
         if let Some(hook) = options.before_finish {
             hook();
         }
-        cancellation.finish(result)
+        operation.finish(result)
     }
 
-    fn recognize_inner(
+    pub(crate) fn recognize_p6_admitted(
         &self,
         input: &[u8],
-        cancellation: &OcrCancellation,
-        options: RunOptions<'_>,
+        operation: &OcrOperation,
     ) -> Result<OcrProcessOutput, OcrProcessError> {
-        cancellation.ensure_runnable()?;
-        let _permit = OcrPermit::acquire()?;
+        self.recognize_inner_admitted(input, RunOptions::production(), operation)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recognize_p6_admitted_with_hooks(
+        &self,
+        input: &[u8],
+        operation: &OcrOperation,
+        before_resume: Option<&dyn Fn()>,
+        after_resume: Option<&dyn Fn()>,
+    ) -> Result<OcrProcessOutput, OcrProcessError> {
+        self.recognize_inner_admitted(
+            input,
+            RunOptions { before_resume, after_resume, ..RunOptions::production() },
+            operation,
+        )
+    }
+
+    fn recognize_inner_admitted(
+        &self,
+        input: &[u8],
+        options: RunOptions<'_>,
+        operation: &OcrOperation,
+    ) -> Result<OcrProcessOutput, OcrProcessError> {
+        let cancellation = &operation.cancellation;
         cancellation.ensure_runnable()?;
         validate_p6(input)?;
         run_child(
@@ -262,6 +297,33 @@ impl OcrPermit {
 impl Drop for OcrPermit {
     fn drop(&mut self) {
         OCR_SLOT.store(false, Ordering::Release);
+    }
+}
+
+pub(crate) struct OcrOperation {
+    permit: Arc<OcrPermit>,
+    cancellation: OcrCancellation,
+}
+
+pub(crate) struct OcrWorkerHold {
+    _permit: Arc<OcrPermit>,
+}
+
+impl OcrOperation {
+    pub(crate) fn try_begin(cancellation: &OcrCancellation) -> Result<Self, OcrProcessError> {
+        cancellation.ensure_runnable()?;
+        let permit = Arc::new(OcrPermit::acquire()?);
+        cancellation.ensure_runnable()?;
+        Ok(Self { permit, cancellation: cancellation.clone() })
+    }
+
+    pub(crate) fn worker_hold(&self) -> OcrWorkerHold { OcrWorkerHold { _permit: self.permit.clone() } }
+
+    pub(crate) fn finish<T>(
+        self,
+        result: Result<T, OcrProcessError>,
+    ) -> Result<T, OcrProcessError> {
+        self.cancellation.finish(result)
     }
 }
 
@@ -849,10 +911,9 @@ mod tests {
     use super::*;
     use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::OnceLock;
     use windows::Win32::System::Threading::{OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION};
 
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
     static CASE_NUMBER: AtomicUsize = AtomicUsize::new(0);
     static FAKE_EXECUTABLE: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 
@@ -867,10 +928,6 @@ mod tests {
     struct FakeCase {
         runner: OcrProcessRunner,
         directory: PathBuf,
-    }
-
-    fn test_lock() -> MutexGuard<'static, ()> {
-        TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn repository_root() -> PathBuf {
