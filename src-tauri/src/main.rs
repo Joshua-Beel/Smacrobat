@@ -13,6 +13,8 @@ mod page_labels;
 mod image_pdf;
 mod page_image;
 #[cfg(windows)]
+mod notices;
+#[cfg(windows)]
 #[allow(dead_code)]
 mod ocr_process;
 #[cfg(windows)]
@@ -101,8 +103,14 @@ async fn delete_comment(service: State<'_, PdfService>, id: u64, revision: u64, 
 
 #[tauri::command]
 async fn dependency_notices(app: tauri::AppHandle) -> Result<String, String> {
-    let path = app.path().resource_dir().map_err(|e| e.to_string())?.join("resources/third-party-licenses/THIRD-PARTY-NOTICES.txt");
-    tauri::async_runtime::spawn_blocking(move || std::fs::read_to_string(path).map_err(|e| format!("Could not read bundled notices: {e}"))).await.map_err(|e| e.to_string())?
+    let resource_dir = app.path().resource_dir().map_err(|e| e.to_string())?;
+    #[cfg(windows)]
+    return tauri::async_runtime::spawn_blocking(move || notices::load(&resource_dir)).await.map_err(|e| e.to_string())?;
+    #[cfg(not(windows))]
+    {
+        let path = resource_dir.join("resources/third-party-licenses/THIRD-PARTY-NOTICES.txt");
+        tauri::async_runtime::spawn_blocking(move || std::fs::read_to_string(path).map_err(|e| format!("Could not read bundled notices: {e}"))).await.map_err(|e| e.to_string())?
+    }
 }
 
 #[tauri::command]
