@@ -19,6 +19,8 @@ describe('signed OCR installer infrastructure', () => {
     expect(installer).toContain('New-SignedOcrSetup');
     expect(installer).toContain("cmd = 'artifact-signing-cli'");
     expect(installer).toContain('$env:PDF_WORKSTATION_EXPECTED_PUBLISHER = $ExpectedPublisher');
+    expect(installer).toContain('Artifact-only Azure OCR SourceRevision does not match the current git HEAD.');
+    expect(installer).toContain('sourceRevision = if ($ArtifactOnly) { $SourceRevision } else { $null }');
     expect(installer.match(/-ExpectedPublisher \$ExpectedPublisher/g)?.length).toBeGreaterThanOrEqual(5);
     expect(installer).toContain("$_.Name -CEQ 'latest.json' -or $_.Extension -CEQ '.sig'");
     expect(installer).toContain('($UnsignedLocal -or $ArtifactOnly) -and $unexpectedUpdaterArtifacts.Count -ne 0');
@@ -39,7 +41,10 @@ describe('signed OCR installer infrastructure', () => {
         @(@{ArtifactOnly=$true;OcrSetupRoot='missing'}, 'ArtifactOnly requires AzureSigning'),
         @(@{AzureSigning=$true;OcrSetupRoot='missing'}, 'Azure-signed OCR requires the explicit artifact-only mode.'),
         @(@{ExpectedPublisher='Test Publisher'}, 'ExpectedPublisher is supported only for artifact-only Azure OCR.'),
-        @(@{ArtifactOnly=$true;AzureSigning=$true;OcrSetupRoot='missing';OutputRoot='target/missing';ExpectedPublisher=' bad'}, 'valid explicit ExpectedPublisher')
+        @(@{SourceRevision=('a'*40)}, 'SourceRevision is supported only for artifact-only Azure OCR.'),
+        @(@{ArtifactOnly=$true;AzureSigning=$true;OcrSetupRoot='missing';OutputRoot='target/missing';ExpectedPublisher=' bad'}, 'valid explicit ExpectedPublisher'),
+        @(@{ArtifactOnly=$true;AzureSigning=$true;OcrSetupRoot='missing';OutputRoot='target/missing';ExpectedPublisher='Test Publisher';SourceRevision='bad'}, 'exact lowercase 40-character git HEAD'),
+        @(@{ArtifactOnly=$true;AzureSigning=$true;OcrSetupRoot='missing';OutputRoot='target/missing';ExpectedPublisher='Test Publisher';SourceRevision=('0'*40)}, 'does not match the current git HEAD')
       )
       foreach($case in $cases) {
         $message=$null
@@ -54,6 +59,39 @@ describe('signed OCR installer infrastructure', () => {
     expect(result.error).toBeUndefined();
     expect(result.status, result.stderr || result.stdout).toBe(0);
     expect(result.stdout).toContain('before signing configuration');
+  }, 35_000);
+
+  it('binds artifact-only source revision to a clean tracked tree and index', () => {
+    const check = String.raw`
+      $ErrorActionPreference = 'Stop'
+      $scriptPath = '${process.cwd().replaceAll("'", "''")}\\scripts\\build-installer.ps1'
+      $tokens=$null;$errors=$null
+      $ast=[Management.Automation.Language.Parser]::ParseFile($scriptPath,[ref]$tokens,[ref]$errors)
+      $function=$ast.Find({param($node)$node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Assert-ArtifactSourceRevision'},$true)
+      if(-not $function){throw 'Source revision guard is missing.'}
+      Invoke-Expression $function.Extent.Text
+      $repository=Join-Path ([IO.Path]::GetTempPath()) ('smacrobat-source-revision-'+[Guid]::NewGuid().ToString('N'))
+      [IO.Directory]::CreateDirectory($repository)|Out-Null
+      git -C $repository init --quiet
+      git -C $repository config user.name 'Smacrobat Test'
+      git -C $repository config user.email 'smacrobat-test@example.invalid'
+      [IO.File]::WriteAllText((Join-Path $repository 'tracked.txt'),'clean',[Text.UTF8Encoding]::new($false))
+      git -C $repository add -- tracked.txt
+      git -C $repository commit --quiet -m initial
+      $head=(git -C $repository rev-parse HEAD).Trim()
+      Assert-ArtifactSourceRevision -ProjectRoot $repository -SourceRevision $head
+      [IO.File]::WriteAllText((Join-Path $repository 'tracked.txt'),'dirty',[Text.UTF8Encoding]::new($false))
+      $rejected=$false;try{Assert-ArtifactSourceRevision -ProjectRoot $repository -SourceRevision $head}catch{$rejected=$_.Exception.Message.Contains('clean tracked working tree')}
+      if(-not $rejected){throw 'Dirty tracked working tree was accepted.'}
+      git -C $repository add -- tracked.txt
+      $rejected=$false;try{Assert-ArtifactSourceRevision -ProjectRoot $repository -SourceRevision $head}catch{$rejected=$_.Exception.Message.Contains('clean tracked index')}
+      if(-not $rejected){throw 'Dirty tracked index was accepted.'}
+      Write-Output 'PASS clean source revision guard'
+    `;
+    const result = runPowerShell(check);
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+    expect(result.stdout).toContain('PASS');
   }, 35_000);
 
   it('derives the signed identity before compile and skips only the exact trusted engine', () => {

@@ -1,0 +1,128 @@
+name: Manual signed OCR artifact validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_publisher:
+        description: Exact verified publisher name from the signing certificate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: signed-ocr-artifact-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  artifact:
+    runs-on: windows-latest
+    env:
+      OCR_SETUP_ROOT: target/ocr-signed-setup-${{ github.run_id }}-${{ github.run_attempt }}
+      BUILD_PROOF_ROOT: target/ocr-signed-build-${{ github.run_id }}-${{ github.run_attempt }}
+      EXPORT_ROOT: target/ocr-signed-export-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Require a manual master dispatch and explicit publisher
+        shell: pwsh
+        env:
+          EXPECTED_PUBLISHER: ${{ inputs.expected_publisher }}
+        run: |
+          if ($env:GITHUB_EVENT_NAME -cne 'workflow_dispatch' -or $env:GITHUB_REF -cne 'refs/heads/master') {
+            throw 'Dispatch this validation workflow only from the master branch.'
+          }
+          if ([string]::IsNullOrWhiteSpace($env:EXPECTED_PUBLISHER) -or
+              $env:EXPECTED_PUBLISHER -cnotmatch "^[A-Za-z0-9][A-Za-z0-9 .,&'()/-]{0,127}$") {
+            throw 'Provide the exact verified publisher certificate name as expected_publisher.'
+          }
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify the exact dispatched source
+        shell: pwsh
+        run: |
+          $headRevision = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $headRevision -cne $env:GITHUB_SHA) {
+            throw 'Checked-out HEAD does not match github.sha.'
+          }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - run: npm ci
+      - run: npm run fixtures
+
+      - name: Set up pinned PDFium
+        shell: pwsh
+        run: ./scripts/setup-pdfium.ps1
+
+      - name: Fetch locked Windows Cargo registry before frontend tests
+        run: cargo fetch --locked --target x86_64-pc-windows-msvc --manifest-path src-tauri/Cargo.toml
+
+      - run: npm test
+      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+
+      - name: Build the pinned unsigned OCR setup
+        shell: pwsh
+        run: ./scripts/setup-ocr.ps1 -OutputRoot $env:OCR_SETUP_ROOT -Jobs 4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Install pinned Azure Artifact Signing CLI
+        run: cargo install artifact-signing-cli --version 0.11.0 --locked
+
+      - name: Verify tracked source stayed clean before signing
+        shell: pwsh
+        run: |
+          git diff --quiet --
+          if ($LASTEXITCODE -ne 0) { throw 'Tracked working-tree files changed after checkout.' }
+          git diff --cached --quiet --
+          if ($LASTEXITCODE -ne 0) { throw 'The tracked index changed after checkout.' }
+
+      - name: Build and verify the publisher-signed artifact-only installer
+        shell: pwsh
+        env:
+          EXPECTED_PUBLISHER: ${{ inputs.expected_publisher }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_SIGNING_ENDPOINT: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          AZURE_SIGNING_PROFILE: ${{ secrets.AZURE_SIGNING_PROFILE }}
+        run: |
+          ./scripts/build-installer.ps1 `
+            -AzureSigning `
+            -ArtifactOnly `
+            -OcrSetupRoot $env:OCR_SETUP_ROOT `
+            -OutputRoot $env:BUILD_PROOF_ROOT `
+            -ExpectedPublisher $env:EXPECTED_PUBLISHER `
+            -SourceRevision $env:GITHUB_SHA
+
+      - name: Export only the installer and sanitized verification record
+        shell: pwsh
+        env:
+          EXPECTED_PUBLISHER: ${{ inputs.expected_publisher }}
+        run: |
+          ./scripts/export-signed-ocr-artifact.ps1 `
+            -SourceRoot $env:BUILD_PROOF_ROOT `
+            -OutputRoot $env:EXPORT_ROOT `
+            -ExpectedPublisher $env:EXPECTED_PUBLISHER `
+            -SourceRevision $env:GITHUB_SHA
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signed-ocr-installer-${{ github.sha }}
+          path: |
+            ${{ env.EXPORT_ROOT }}/*_x64-setup.exe
+            ${{ env.EXPORT_ROOT }}/artifact-verification.json
+          if-no-files-found: error

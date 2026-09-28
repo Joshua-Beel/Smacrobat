@@ -443,7 +443,7 @@ function Assert-ExtractedBaseResources {
                 throw 'Extracted signed base resource does not exactly match the staged signed file.'
             }
             $null = Assert-TrustedWindowsSignature -Path $match.FullName -SignatureProvider $SignatureProvider -ExpectedPublisher $ExpectedPublisher
-            $receipts += [pscustomobject]@{ path = $entry.Target; bytes = [uint64]$match.Length; sha256 = $stagedSha256; unsignedSha256 = $entry.Receipt.Sha256 }
+            $receipts += [pscustomobject]@{ path = $entry.Target; bytes = [uint64]$match.Length; sha256 = $stagedSha256; unsignedBytes = [uint64]$entry.Receipt.Bytes; unsignedSha256 = $entry.Receipt.Sha256 }
         } else {
             if ([uint64]$match.Length -ne [uint64]$entry.Receipt.Bytes -or (Get-ExactSha256 -Path $match.FullName) -cne $entry.Receipt.Sha256) {
                 throw 'Extracted base resource receipt mismatch.'

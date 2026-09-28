@@ -4,7 +4,8 @@ param(
     [switch]$ArtifactOnly,
     [string]$OcrSetupRoot,
     [string]$OutputRoot,
-    [string]$ExpectedPublisher
+    [string]$ExpectedPublisher,
+    [string]$SourceRevision
 )
 $ErrorActionPreference = 'Stop'
 
@@ -58,6 +59,21 @@ function Invoke-TauriInstallerBuild {
     }
 }
 
+function Assert-ArtifactSourceRevision {
+    param(
+        [Parameter(Mandatory = $true)][string]$ProjectRoot,
+        [Parameter(Mandatory = $true)][string]$SourceRevision
+    )
+    if ($SourceRevision -cnotmatch '^[a-f0-9]{40}$') { throw 'Artifact-only Azure OCR requires SourceRevision as the exact lowercase 40-character git HEAD.' }
+    $repository = [IO.Path]::GetFullPath($ProjectRoot)
+    $headRevision = (& git -C $repository rev-parse HEAD).Trim()
+    if ($LASTEXITCODE -ne 0 -or $headRevision -cne $SourceRevision) { throw 'Artifact-only Azure OCR SourceRevision does not match the current git HEAD.' }
+    & git -C $repository diff --quiet --
+    if ($LASTEXITCODE -ne 0) { throw 'Artifact-only Azure OCR requires a clean tracked working tree.' }
+    & git -C $repository diff --cached --quiet --
+    if ($LASTEXITCODE -ne 0) { throw 'Artifact-only Azure OCR requires a clean tracked index.' }
+}
+
 $projectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $projectRoot
 . (Join-Path $PSScriptRoot 'ocr/installer-package.ps1')
@@ -71,7 +87,9 @@ if ($AzureSigning -and $UnsignedLocal) { throw 'AzureSigning and UnsignedLocal c
 if ($ArtifactOnly -and (-not $AzureSigning -or [string]::IsNullOrWhiteSpace($OcrSetupRoot) -or $UnsignedLocal)) { throw 'ArtifactOnly requires AzureSigning with OcrSetupRoot and cannot be combined with UnsignedLocal.' }
 if ($AzureSigning -and $OcrSetupRoot -and -not $ArtifactOnly) { throw 'Azure-signed OCR requires the explicit artifact-only mode.' }
 if ($ExpectedPublisher -and -not $ArtifactOnly) { throw 'ExpectedPublisher is supported only for artifact-only Azure OCR.' }
+if ($SourceRevision -and -not $ArtifactOnly) { throw 'SourceRevision is supported only for artifact-only Azure OCR.' }
 if ($ArtifactOnly -and ([string]::IsNullOrWhiteSpace($ExpectedPublisher) -or $ExpectedPublisher -cnotmatch "^[A-Za-z0-9][A-Za-z0-9 .,&'()/-]{0,127}$")) { throw 'Artifact-only Azure OCR requires a valid explicit ExpectedPublisher.' }
+if ($ArtifactOnly) { Assert-ArtifactSourceRevision -ProjectRoot $projectRoot -SourceRevision $SourceRevision }
 if ($OcrSetupRoot -and -not ($AzureSigning -or $UnsignedLocal)) { throw 'OcrSetupRoot requires AzureSigning or UnsignedLocal.' }
 if ($OcrSetupRoot -and [string]::IsNullOrWhiteSpace($OutputRoot)) { throw 'OcrSetupRoot requires a fresh OutputRoot beneath target.' }
 if ($UnsignedLocal -and [string]::IsNullOrWhiteSpace($OutputRoot)) { throw 'UnsignedLocal requires a fresh OutputRoot beneath target.' }
@@ -288,6 +306,7 @@ try {
             schemaVersion = 1
             scope = if ($ArtifactOnly) { 'Artifact-only Azure OCR installer extraction proof; no install, launch, update, workflow, or release claim.' } elseif ($ocrPlan) { 'Opt-in OCR installer extraction proof; no install, launch, update, or release claim.' } else { 'Default installer extraction proof; no install, launch, update, or release claim.' }
             mode = if ($ArtifactOnly) { 'azure-signed-artifact-only-ocr' } elseif ($ocrPlan) { 'unsigned-local-ocr' } else { 'unsigned-local-default' }
+            sourceRevision = if ($ArtifactOnly) { $SourceRevision } else { $null }
             installer = @{ path = $installer.Substring($resolvedOutput.Length + 1).Replace('\', '/'); bytes = [uint64]$installers[0].Length; sha256 = Get-ExactSha256 -Path $installer }
             application = @{ path = $packagedApplication.Substring($resolvedOutput.Length + 1).Replace('\', '/'); bytes = [uint64]$packagedApplications[0].Length; sha256 = Get-ExactSha256 -Path $packagedApplication }
             archiveInventory = @{ path = 'installer-inventory.txt'; bytes = [uint64](Get-Item -LiteralPath $inventoryPath).Length; sha256 = Get-ExactSha256 -Path $inventoryPath }
