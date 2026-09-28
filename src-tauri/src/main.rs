@@ -59,11 +59,12 @@ async fn render_page(service: State<'_, PdfService>, id: u64, page: u16, width: 
     service.render(id, page, width).await.map(tauri::ipc::Response::new)
 }
 #[tauri::command]
-async fn export_page_image(app: tauri::AppHandle, service: State<'_, PdfService>, id: u64, revision: u64, page: u16, dpi: u16) -> Result<Option<service::PageImageReceipt>, String> {
-    let preflight = service.preflight_page_image(id, revision, page, dpi).await?;
+async fn export_page_image(app: tauri::AppHandle, service: State<'_, PdfService>, id: u64, revision: u64, page: u16, dpi: u16, format: Option<page_image::PageImageFormat>) -> Result<Option<service::PageImageReceipt>, String> {
+    let format = format.unwrap_or_default();
+    let preflight = service.preflight_page_image(id, revision, page, dpi, format).await?;
     let window = app.get_webview_window("main").ok_or("Application window is unavailable")?;
-    let path = tauri::async_runtime::spawn_blocking(move || rfd::FileDialog::new().set_parent(&window).set_title("Export page as PNG").add_filter("PNG images", &["png"]).set_file_name(preflight.suggested_name).save_file()).await.map_err(|error| error.to_string())?;
-    match path { Some(path) => service.export_page_image(id, revision, page, dpi, path).await.map(Some), None => Ok(None) }
+    let path = tauri::async_runtime::spawn_blocking(move || rfd::FileDialog::new().set_parent(&window).set_title(format.dialog_title()).add_filter(format.filter_name(), format.extensions()).set_file_name(preflight.suggested_name).save_file()).await.map_err(|error| error.to_string())?;
+    match path { Some(path) => service.export_page_image(id, revision, page, dpi, format, path).await.map(Some), None => Ok(None) }
 }
 #[tauri::command]
 async fn close_document(service: State<'_, PdfService>, id: u64) -> Result<(), String> { service.close(id).await }

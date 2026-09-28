@@ -20,16 +20,16 @@ async function mount() { let ui!: ReactTestRenderer; await act(async () => { ui 
 
 it('exports the captured physical page without creating a tab, recent entry, or source mutation', async () => {
   mocks.openDocument.mockResolvedValue({ status: 'opened', document: source });
-  mocks.exportPageImage.mockResolvedValue({ path: 'C:/exports/source-page-2.png', documentId: 1, revision: 4, page: 1, dpi: 150, width: 1250, height: 1667 });
+  mocks.exportPageImage.mockResolvedValue({ path: 'C:/exports/source-page-2.png', documentId: 1, revision: 4, page: 1, dpi: 150, width: 1250, height: 1667, format: 'png' });
   const ui = await mount();
   await act(async () => button(ui, 'Open a file').props.onClick());
   act(() => ui.root.findByProps({ 'aria-label': 'Next page' }).props.onClick());
   act(() => ui.root.findByProps({ 'aria-expanded': false }).props.onClick());
-  await act(async () => button(ui, 'Export page as PNG…').props.onClick());
+  await act(async () => button(ui, 'Export page as image…').props.onClick());
   await act(async () => button(ui, 'Export PNG').props.onClick());
-  expect(mocks.exportPageImage).toHaveBeenCalledWith({ id: 1, revision: 4, page: 1, dpi: 150 });
+  expect(mocks.exportPageImage).toHaveBeenCalledWith({ id: 1, revision: 4, page: 1, dpi: 150, format: 'png' });
   const rendered = JSON.stringify(ui.toJSON());
-  expect(rendered).toContain('PNG export complete');
+  expect(rendered).toContain('Image export complete');
   expect(rendered).toContain('source.pdf"," *');
   expect(ui.root.findAllByProps({ 'data-viewed-document': 1 })).toHaveLength(1);
   expect(ui.root.findAllByProps({ 'data-viewed-document': 2 })).toHaveLength(0);

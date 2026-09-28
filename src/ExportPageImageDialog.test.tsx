@@ -4,9 +4,10 @@ import ExportPageImageDialog, { DEFAULT_PNG_DPI, MAX_PNG_PIXELS, pageImageDimens
 import type { PageImageExport } from './bridge';
 
 const target: PageImageTarget = { id: 7, revision: 4, page: 2, size: { width: 612, height: 792 } };
-const receipt = (overrides: Partial<PageImageExport> = {}): PageImageExport => ({ path: 'C:/exports/source-page-3.png', documentId: 7, revision: 4, page: 2, dpi: 150, width: 1275, height: 1650, ...overrides });
+const receipt = (overrides: Partial<PageImageExport> = {}): PageImageExport => ({ path: 'C:/exports/source-page-3.png', documentId: 7, revision: 4, page: 2, dpi: 150, width: 1275, height: 1650, format: 'png', ...overrides });
 const button = (ui: ReactTestRenderer, text: string) => ui.root.findAllByType('button').find(item => item.children.join('') === text)!;
-const field = (ui: ReactTestRenderer) => ui.root.findByProps({ 'aria-label': 'PNG resolution' });
+const dpiField = (ui: ReactTestRenderer) => ui.root.findByProps({ 'aria-label': 'Image resolution' });
+const formatField = (ui: ReactTestRenderer) => ui.root.findByProps({ 'aria-label': 'Image format' });
 
 async function mount({ busy = false, exportPage = vi.fn().mockResolvedValue(receipt()), close = vi.fn() }: { busy?: boolean; exportPage?: ReturnType<typeof vi.fn>; close?: ReturnType<typeof vi.fn> } = {}) {
   let ui!: ReactTestRenderer;
@@ -22,6 +23,7 @@ it('derives bounded pixels from displayed points and accepts only exact receipts
   expect(validatePageImageDimensions({ width: 5_000, height: Math.floor(MAX_PNG_PIXELS / 5_000) + 1 })).toContain('32 megapixels');
   const request = { id: 7, revision: 4, page: 2, dpi: 150 } as const;
   expect(validPageImageReceipt(receipt(), request, { width: 1275, height: 1650 })).toBe(true);
+  expect(validPageImageReceipt(receipt({ format: 'jpeg' }), request, { width: 1275, height: 1650 })).toBe(false);
   expect(validPageImageReceipt(receipt({ page: 1 }), request, { width: 1275, height: 1650 })).toBe(false);
   expect(validPageImageReceipt(receipt({ width: 1274 }), request, { width: 1275, height: 1650 })).toBe(false);
 });
@@ -31,19 +33,33 @@ it('submits the current zero-based physical page and reports its pixel output', 
   expect(JSON.stringify(ui.toJSON())).toContain('physical page ","3');
   expect(JSON.stringify(ui.toJSON())).toContain('white-flattened 8-bit RGB');
   await act(async () => button(ui, 'Export PNG').props.onClick());
-  expect(exportPage).toHaveBeenCalledWith({ id: 7, revision: 4, page: 2, dpi: 150 });
-  expect(JSON.stringify(ui.toJSON())).toContain('1,275"," × ","1,650"," pixel PNG at ","150"," DPI');
+  expect(exportPage).toHaveBeenCalledWith({ id: 7, revision: 4, page: 2, dpi: 150, format: 'png' });
+  expect(ui.root.findAllByType('p')[0].children.join('')).toBe('Saved page 3 as a 1,275 × 1,650 pixel PNG at 150 DPI.');
   act(() => ui.unmount());
 });
 
 it('uses only the supported DPI values and previews exact dimensions', async () => {
   const { ui, exportPage } = await mount();
-  expect(field(ui).props.value).toBe(150);
-  expect(field(ui).findAllByType('option').map(option => option.props.value)).toEqual([72, 150, 300]);
-  act(() => field(ui).props.onChange({ target: { value: '72' } }));
+  expect(dpiField(ui).props.value).toBe(150);
+  expect(dpiField(ui).findAllByType('option').map(option => option.props.value)).toEqual([72, 150, 300]);
+  act(() => dpiField(ui).props.onChange({ target: { value: '72' } }));
   expect(JSON.stringify(ui.toJSON())).toContain('612 × 792 pixels at 72 DPI');
   await act(async () => button(ui, 'Export PNG').props.onClick());
-  expect(exportPage).toHaveBeenCalledWith({ id: 7, revision: 4, page: 2, dpi: 72 });
+  expect(exportPage).toHaveBeenCalledWith({ id: 7, revision: 4, page: 2, dpi: 72, format: 'png' });
+  act(() => ui.unmount());
+});
+
+it('uses JPEG only when selected and rejects a mismatched-format receipt', async () => {
+  const exportPage = vi.fn().mockResolvedValueOnce(receipt({ format: 'png' })).mockResolvedValueOnce(receipt({ path: 'C:/exports/source-page-3.jpg', format: 'jpeg' }));
+  const { ui } = await mount({ exportPage });
+  expect(formatField(ui).props.value).toBe('png');
+  act(() => formatField(ui).props.onChange({ target: { value: 'jpeg' } }));
+  expect(JSON.stringify(ui.toJSON())).toContain('JPEG is a lossy, white-flattened 8-bit RGB image at fixed quality 90; quality cannot be adjusted.');
+  await act(async () => button(ui, 'Export JPEG').props.onClick());
+  expect(exportPage).toHaveBeenCalledWith({ id: 7, revision: 4, page: 2, dpi: 150, format: 'jpeg' });
+  expect(ui.root.findByProps({ role: 'alert' }).children.join('')).toContain('exported JPEG did not match');
+  await act(async () => button(ui, 'Export JPEG').props.onClick());
+  expect(ui.root.findAllByType('p')[0].children.join('')).toBe('Saved page 3 as a 1,275 × 1,650 pixel JPEG at 150 DPI.');
   act(() => ui.unmount());
 });
 
@@ -58,7 +74,7 @@ it('keeps cancellation and errors retryable, rejecting stale or malformed native
   expect(ui.root.findByProps({ role: 'alert' }).children.join('')).toBe('Native export refused.');
   await act(async () => button(ui, 'Export PNG').props.onClick());
   expect(close).not.toHaveBeenCalled();
-  expect(JSON.stringify(ui.toJSON())).toContain('PNG export complete');
+  expect(JSON.stringify(ui.toJSON())).toContain('Image export complete');
   act(() => ui.unmount());
 });
 
@@ -68,7 +84,8 @@ it('blocks duplicate submits and dialog cancellation while work is in flight', a
   const { ui, close } = await mount({ exportPage });
   act(() => { button(ui, 'Export PNG').props.onClick(); button(ui, 'Export PNG').props.onClick(); });
   expect(exportPage).toHaveBeenCalledOnce();
-  expect(field(ui).props.disabled).toBe(true);
+  expect(dpiField(ui).props.disabled).toBe(true);
+  expect(formatField(ui).props.disabled).toBe(true);
   const preventDefault = vi.fn();
   act(() => ui.root.findByType('dialog').props.onCancel({ preventDefault }));
   expect(preventDefault).toHaveBeenCalledOnce();

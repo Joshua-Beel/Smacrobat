@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use crate::editor::{CropBox, EditSession, PageEdit, PageSpec, write_new_file};
 use crate::combine::CopyOperation;
+use crate::page_image::PageImageFormat;
 
 #[derive(Clone, Copy, Deserialize)]
 pub struct CropRect { pub x: f64, pub y: f64, pub width: f64, pub height: f64 }
@@ -29,7 +30,7 @@ pub struct SavedCopy { path: String, document: DocumentInfo }
 pub struct PageImagePreflight { pub suggested_name: String }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PageImageReceipt { path: String, document_id: u64, revision: u64, page: u16, dpi: u16, width: u32, height: u32 }
+pub struct PageImageReceipt { path: String, document_id: u64, revision: u64, page: u16, dpi: u16, width: u32, height: u32, format: PageImageFormat }
 #[derive(Serialize)]
 pub struct BookmarkInfo { title: String, page: Option<usize>, depth: usize }
 #[derive(Serialize)]
@@ -115,8 +116,8 @@ enum Request {
     BeginPrint(u64, u64, Reply<PrintSnapshotInfo>),
     PrintRender(u64, usize, u32, u32, Reply<PrintBitmap>),
     EndPrint(u64, Reply<()>),
-    PreflightPageImage(u64, u64, u16, u16, Reply<PageImagePreflight>),
-    ExportPageImage(u64, u64, u16, u16, PathBuf, Reply<PageImageReceipt>),
+    PreflightPageImage(u64, u64, u16, u16, PageImageFormat, Reply<PageImagePreflight>),
+    ExportPageImage(u64, u64, u16, u16, PageImageFormat, PathBuf, Reply<PageImageReceipt>),
     #[cfg(windows)]
     OcrRaster(crate::ocr::OcrPageRequest, crate::ocr_process::OcrCancellation, crate::ocr_process::OcrWorkerHold, Reply<crate::ocr::OcrPageRaster>),
     #[cfg(windows)]
@@ -316,39 +317,39 @@ impl PdfService {
                         })();
                         let _ = reply.send(result);
                     }
-                    Request::PreflightPageImage(id, revision, page, dpi, reply) => {
+                    Request::PreflightPageImage(id, revision, page, dpi, format, reply) => {
                         if reply.is_closed() { continue; }
                         let result = (|| {
                             let (session, info) = sessions.get(&id).ok_or("Document is closed")?;
                             let document = documents.get(&id).ok_or("Document is closed")?;
-                            let _ = checked_page_image_request(session, document, revision, page, dpi)?;
+                            let _ = checked_page_image_request(session, document, revision, page, dpi, format)?;
                             let source_path = PathBuf::from(&info.path);
                             let stem = source_path.file_stem().filter(|stem| !stem.is_empty()).unwrap_or_default().to_string_lossy().into_owned();
                             let stem = if stem.is_empty() { "document".to_owned() } else { stem };
-                            Ok(PageImagePreflight { suggested_name: format!("{stem}-page-{}.png", usize::from(page) + 1) })
+                            Ok(PageImagePreflight { suggested_name: format!("{stem}-page-{}.{}", usize::from(page) + 1, format.extension()) })
                         })();
                         let _ = reply.send(result);
                     }
-                    Request::ExportPageImage(id, revision, page, dpi, path, reply) => {
+                    Request::ExportPageImage(id, revision, page, dpi, format, path, reply) => {
                         if reply.is_closed() { continue; }
                         let result = (|| {
                             let (session, _) = sessions.get(&id).ok_or("Document is closed")?;
                             let original = documents.get(&id).ok_or("Document is closed")?;
-                            let (dimensions, spec) = checked_page_image_request(session, original, revision, page, dpi)?;
-                            if reply.is_closed() { return Err("PNG export was canceled.".into()); }
+                            let (dimensions, spec) = checked_page_image_request(session, original, revision, page, dpi, format)?;
+                            if reply.is_closed() { return Err(format!("{} export was canceled.", format.label())); }
                             let engine = pdfium.as_ref().map_err(Clone::clone)?;
                             let mut export_note_documents = HashMap::new();
                             let document = note_document(engine, original, session, &mut export_note_documents, id)?;
                             let bgra = with_planned_page(&document, &spec, |page| {
-                                let bitmap = page.render_with_config(&PdfRenderConfig::new().set_fixed_size(dimensions.width as i32, dimensions.height as i32).set_format(PdfBitmapFormat::BGRA).set_reverse_byte_order(false).clear_before_rendering(true).set_clear_color(PdfColor::WHITE).render_annotations(true).render_form_data(true).use_print_quality(true)).map_err(|error| format!("Could not render the PNG page: {error}"))?;
+                                let bitmap = page.render_with_config(&PdfRenderConfig::new().set_fixed_size(dimensions.width as i32, dimensions.height as i32).set_format(PdfBitmapFormat::BGRA).set_reverse_byte_order(false).clear_before_rendering(true).set_clear_color(PdfColor::WHITE).render_annotations(true).render_form_data(true).use_print_quality(true)).map_err(|error| format!("Could not render the {} page: {error}", format.label()))?;
                                 let bgra = bitmap.as_raw_bytes();
-                                let expected = usize::try_from(u64::from(dimensions.width) * u64::from(dimensions.height) * 4).map_err(|_| "The PNG bitmap size is out of range.")?;
-                                if bitmap.width() != dimensions.width as i32 || bitmap.height() != dimensions.height as i32 || bitmap.format().map_err(|error| format!("Could not inspect the PNG bitmap format: {error}"))? != PdfBitmapFormat::BGRA || bgra.len() != expected { return Err("Unexpected PNG export bitmap layout.".into()); }
+                                let expected = usize::try_from(u64::from(dimensions.width) * u64::from(dimensions.height) * 4).map_err(|_| format!("The {} bitmap size is out of range.", format.label()))?;
+                                if bitmap.width() != dimensions.width as i32 || bitmap.height() != dimensions.height as i32 || bitmap.format().map_err(|error| format!("Could not inspect the {} bitmap format: {error}", format.label()))? != PdfBitmapFormat::BGRA || bgra.len() != expected { return Err(format!("Unexpected {} export bitmap layout.", format.label())); }
                                 Ok(bgra)
                             })?;
-                            if reply.is_closed() { return Err("PNG export was canceled.".into()); }
-                            crate::page_image::write_png(&path, dimensions, dpi, &bgra, || reply.is_closed())?;
-                            Ok(PageImageReceipt { path: path.to_string_lossy().into_owned(), document_id: id, revision, page, dpi, width: dimensions.width, height: dimensions.height })
+                            if reply.is_closed() { return Err(format!("{} export was canceled.", format.label())); }
+                            crate::page_image::write_page_image(&path, dimensions, dpi, &bgra, format, || reply.is_closed())?;
+                            Ok(PageImageReceipt { path: path.to_string_lossy().into_owned(), document_id: id, revision, page, dpi, width: dimensions.width, height: dimensions.height, format })
                         })();
                         let _ = reply.send(result);
                     }
@@ -926,11 +927,11 @@ impl PdfService {
     pub async fn end_print(&self, token: u64) -> Result<(), String> {
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::EndPrint(token, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
     }
-    pub async fn preflight_page_image(&self, id: u64, revision: u64, page: u16, dpi: u16) -> Result<PageImagePreflight, String> {
-        let (tx, rx) = oneshot::channel(); self.sender.send(Request::PreflightPageImage(id, revision, page, dpi, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
+    pub async fn preflight_page_image(&self, id: u64, revision: u64, page: u16, dpi: u16, format: PageImageFormat) -> Result<PageImagePreflight, String> {
+        let (tx, rx) = oneshot::channel(); self.sender.send(Request::PreflightPageImage(id, revision, page, dpi, format, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
     }
-    pub async fn export_page_image(&self, id: u64, revision: u64, page: u16, dpi: u16, path: PathBuf) -> Result<PageImageReceipt, String> {
-        let (tx, rx) = oneshot::channel(); self.sender.send(Request::ExportPageImage(id, revision, page, dpi, path, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
+    pub async fn export_page_image(&self, id: u64, revision: u64, page: u16, dpi: u16, format: PageImageFormat, path: PathBuf) -> Result<PageImageReceipt, String> {
+        let (tx, rx) = oneshot::channel(); self.sender.send(Request::ExportPageImage(id, revision, page, dpi, format, path, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
     }
     #[cfg(windows)]
     pub(crate) async fn ocr_raster(&self, request: crate::ocr::OcrPageRequest, cancellation: crate::ocr_process::OcrCancellation, admission: crate::ocr_process::OcrWorkerHold) -> Result<crate::ocr::OcrPageRaster, String> {
@@ -1105,14 +1106,14 @@ fn checked_read_text_bytes(current: usize, additional: usize, message: &str) -> 
     Ok(total)
 }
 
-fn checked_page_image_request(session: &EditSession, document: &PdfDocument<'_>, revision: u64, page: u16, dpi: u16) -> Result<(crate::page_image::RasterDimensions, PageSpec), String> {
+fn checked_page_image_request(session: &EditSession, document: &PdfDocument<'_>, revision: u64, page: u16, dpi: u16, format: PageImageFormat) -> Result<(crate::page_image::RasterDimensions, PageSpec), String> {
     if session.revision != revision { return Err("Document changed. Export the page image again.".into()); }
     if !matches!(document.permissions().security_handler_revision(), Ok(PdfSecurityHandlerRevision::Unprotected)) {
         return Err("Exporting images from encrypted or restricted PDFs is not supported in this build.".into());
     }
     session.page_image_export_guard()?;
-    let spec = session.plan.get(usize::from(page)).ok_or("PNG export page is out of range")?.clone();
-    let dimensions = with_planned_page(document, &spec, |page| crate::page_image::dimensions(page.width().value, page.height().value, dpi))?;
+    let spec = session.plan.get(usize::from(page)).ok_or_else(|| format!("{} export page is out of range", format.label()))?.clone();
+    let dimensions = with_planned_page(document, &spec, |page| crate::page_image::dimensions(page.width().value, page.height().value, dpi, format))?;
     Ok((dimensions, spec))
 }
 
@@ -1299,6 +1300,7 @@ fn current_info(session: &EditSession, original: &DocumentInfo, document: &PdfDo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::ImageDecoder;
     // Print admission is a process-wide four-job resource; isolate only its tests, not the PDF worker or the full suite.
     static PRINT_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
     static PASSWORD_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -3904,7 +3906,7 @@ mod tests {
         let (width, height, pixels) = p6_pixels(&raster.p6);
         assert_eq!((width, height), (raster.width, raster.height));
         let output = folder.path().join("current-ocr-reference.png");
-        let png = call(&service, |reply| Request::ExportPageImage(info.id, info.revision, 0, 150, output.clone(), reply)).unwrap();
+        let png = call(&service, |reply| Request::ExportPageImage(info.id, info.revision, 0, 150, PageImageFormat::Png, output.clone(), reply)).unwrap();
         assert_eq!((png.width, png.height), (width, height));
         let decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(output).unwrap()));
         let mut reader = decoder.read_info().unwrap();
@@ -4045,16 +4047,21 @@ mod tests {
         info = call(&service, |reply| Request::Comment(info.id, info.revision, CommentMutation::CreateHighlight(0, CropRect { x: 0.15, y: 0.15, width: 0.4, height: 0.25 }, Some("PNG pixel proof".into())), reply)).unwrap();
         let revision = info.revision;
         let preview = call(&service, |reply| Request::Render(info.id, 0, 173, reply)).unwrap();
-        let preflight = call(&service, |reply| Request::PreflightPageImage(info.id, revision, 0, 72, reply)).unwrap();
+        let preflight = call(&service, |reply| Request::PreflightPageImage(info.id, revision, 0, 72, PageImageFormat::Png, reply)).unwrap();
         assert_eq!(preflight.suggested_name, "welcome-page-1.png");
-        for dpi in [72, 150, 300] { assert!(call(&service, |reply| Request::PreflightPageImage(info.id, revision, 0, dpi, reply)).is_ok()); }
-        for dpi in [0, 73, 600] { assert!(call(&service, |reply| Request::PreflightPageImage(info.id, revision, 0, dpi, reply)).is_err()); }
-        assert!(call(&service, |reply| Request::PreflightPageImage(info.id, revision - 1, 0, 72, reply)).is_err());
-        assert!(call(&service, |reply| Request::PreflightPageImage(info.id, revision, 6, 72, reply)).is_err());
+        let jpeg_preflight = call(&service, |reply| Request::PreflightPageImage(info.id, revision, 0, 72, PageImageFormat::Jpeg, reply)).unwrap();
+        assert_eq!(jpeg_preflight.suggested_name, "welcome-page-1.jpg");
+        for format in [PageImageFormat::Png, PageImageFormat::Jpeg] {
+            for dpi in [72, 150, 300] { assert!(call(&service, |reply| Request::PreflightPageImage(info.id, revision, 0, dpi, format, reply)).is_ok()); }
+            for dpi in [0, 73, 600] { assert!(call(&service, |reply| Request::PreflightPageImage(info.id, revision, 0, dpi, format, reply)).is_err()); }
+            assert!(call(&service, |reply| Request::PreflightPageImage(info.id, revision - 1, 0, 72, format, reply)).is_err());
+            assert!(call(&service, |reply| Request::PreflightPageImage(info.id, revision, 6, 72, format, reply)).is_err());
+        }
 
         let output = folder.path().join("current.png");
-        let receipt = call(&service, |reply| Request::ExportPageImage(info.id, revision, 0, 72, output.clone(), reply)).unwrap();
+        let receipt = call(&service, |reply| Request::ExportPageImage(info.id, revision, 0, 72, PageImageFormat::Png, output.clone(), reply)).unwrap();
         assert_eq!((receipt.document_id, receipt.revision, receipt.page, receipt.dpi, receipt.width, receipt.height), (info.id, revision, 0, 72, 792, 306));
+        assert_eq!(receipt.format, PageImageFormat::Png);
         assert_eq!(PathBuf::from(&receipt.path), output);
         let decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(&output).unwrap()));
         let mut reader = decoder.read_info().unwrap();
@@ -4070,33 +4077,69 @@ mod tests {
             [pixel[2], pixel[1], pixel[0]].map(|channel| ((u16::from(channel) * alpha + 255 * (255 - alpha) + 127) / 255) as u8)
         }).collect::<Vec<_>>();
         assert_eq!(rgb, expected, "PNG pixels must match an independent current print-quality render");
+
+        let jpeg_output = folder.path().join("current.jpg");
+        let jpeg_receipt = call(&service, |reply| Request::ExportPageImage(info.id, revision, 0, 72, PageImageFormat::Jpeg, jpeg_output.clone(), reply)).unwrap();
+        assert_eq!((jpeg_receipt.document_id, jpeg_receipt.revision, jpeg_receipt.page, jpeg_receipt.dpi, jpeg_receipt.width, jpeg_receipt.height, jpeg_receipt.format), (info.id, revision, 0, 72, receipt.width, receipt.height, PageImageFormat::Jpeg));
+        assert_eq!(PathBuf::from(&jpeg_receipt.path), jpeg_output);
+        assert_eq!(serde_json::to_value(&jpeg_receipt).unwrap()["format"], "jpeg");
+        let jpeg_bytes = std::fs::read(&jpeg_output).unwrap();
+        assert!(jpeg_bytes.starts_with(&[0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]));
+        assert_eq!((jpeg_bytes[13], u16::from_be_bytes([jpeg_bytes[14], jpeg_bytes[15]]), u16::from_be_bytes([jpeg_bytes[16], jpeg_bytes[17]])), (1, 72, 72));
+        let jpeg_decoder = image::codecs::jpeg::JpegDecoder::new(std::io::BufReader::new(std::fs::File::open(&jpeg_output).unwrap())).unwrap();
+        assert_eq!(jpeg_decoder.dimensions(), (receipt.width, receipt.height));
+        assert_eq!(jpeg_decoder.color_type(), image::ColorType::Rgb8);
+        let mut jpeg_rgb = vec![0; jpeg_decoder.total_bytes() as usize];
+        jpeg_decoder.read_image(&mut jpeg_rgb).unwrap();
+        let differences = jpeg_rgb.iter().zip(&rgb).map(|(jpeg, png)| jpeg.abs_diff(*png)).collect::<Vec<_>>();
+        let total_difference = differences.iter().map(|difference| u64::from(*difference)).sum::<u64>();
+        let mean_difference_milli = total_difference * 1_000 / differences.len() as u64;
+        let max_difference = differences.into_iter().max().unwrap();
+        assert!(total_difference <= rgb.len() as u64 * 12, "quality-90 JPEG mean channel difference exceeded 12");
+        assert!(max_difference <= 128, "quality-90 JPEG maximum channel difference was {max_difference}");
+        assert_ne!(jpeg_rgb, rgb, "JPEG output must remain explicitly lossy");
+        let jpeg_probe = root.join("../target/page-image-probe/current-edited-highlight-q90-72dpi.jpg");
+        if !jpeg_probe.exists() { std::fs::copy(&jpeg_output, &jpeg_probe).unwrap(); }
+        println!("PAGE_IMAGE_JPEG_PROBE path={} format=jpeg quality=90 density=72dpi dimensions={}x{} encoded_bytes={} mean_channel_difference_milli={} max_channel_difference={}", jpeg_probe.display(), jpeg_receipt.width, jpeg_receipt.height, jpeg_bytes.len(), mean_difference_milli, max_difference);
         assert_eq!(call(&service, |reply| Request::Render(info.id, 0, 173, reply)).unwrap(), preview);
-        let render_work = call(&service, |reply| Request::RenderWorkForDocument(info.id, reply)).unwrap(); assert_eq!(render_work.rendered, 1, "PNG export must not disturb the existing viewer render cache");
+        let render_work = call(&service, |reply| Request::RenderWorkForDocument(info.id, reply)).unwrap(); assert_eq!(render_work.rendered, 1, "page-image export must not disturb the existing viewer render cache");
         assert!(call(&service, |reply| Request::OpenDocumentsForPath(output.clone(), reply)).unwrap().is_empty(), "PNG export must not register an output session");
+        assert!(call(&service, |reply| Request::OpenDocumentsForPath(jpeg_output.clone(), reply)).unwrap().is_empty(), "JPEG export must not register an output session");
 
         let dropped_after_publish = folder.path().join("published-before-ipc-drop.png");
-        let (published_reply, published_receiver) = oneshot::channel(); service.sender.send(Request::ExportPageImage(info.id, revision, 0, 72, dropped_after_publish.clone(), published_reply)).unwrap();
-        call(&service, |reply| Request::PreflightPageImage(info.id, revision, 0, 72, reply)).unwrap();
+        let (published_reply, published_receiver) = oneshot::channel(); service.sender.send(Request::ExportPageImage(info.id, revision, 0, 72, PageImageFormat::Png, dropped_after_publish.clone(), published_reply)).unwrap();
+        call(&service, |reply| Request::PreflightPageImage(info.id, revision, 0, 72, PageImageFormat::Png, reply)).unwrap();
         assert!(!published_receiver.is_empty() && dropped_after_publish.exists()); drop(published_receiver);
         assert!(dropped_after_publish.exists(), "A successfully published PNG is user-owned after the IPC receiver drops");
         assert!(call(&service, |reply| Request::OpenDocumentsForPath(dropped_after_publish.clone(), reply)).unwrap().is_empty());
 
         let existing = std::fs::read(&output).unwrap();
-        assert!(call(&service, |reply| Request::ExportPageImage(info.id, revision, 0, 72, output.clone(), reply)).is_err());
+        assert!(call(&service, |reply| Request::ExportPageImage(info.id, revision, 0, 72, PageImageFormat::Png, output.clone(), reply)).is_err());
         assert_eq!(std::fs::read(&output).unwrap(), existing);
+        let existing_jpeg = std::fs::read(&jpeg_output).unwrap();
+        assert!(call(&service, |reply| Request::ExportPageImage(info.id, revision, 0, 72, PageImageFormat::Jpeg, jpeg_output.clone(), reply)).is_err());
+        assert_eq!(std::fs::read(&jpeg_output).unwrap(), existing_jpeg);
         let wrong = folder.path().join("wrong.jpg");
-        assert!(call(&service, |reply| Request::ExportPageImage(info.id, revision, 0, 72, wrong.clone(), reply)).is_err()); assert!(!wrong.exists());
+        assert!(call(&service, |reply| Request::ExportPageImage(info.id, revision, 0, 72, PageImageFormat::Png, wrong.clone(), reply)).is_err()); assert!(!wrong.exists());
+        let wrong_jpeg = folder.path().join("wrong-jpeg.png");
+        assert!(call(&service, |reply| Request::ExportPageImage(info.id, revision, 0, 72, PageImageFormat::Jpeg, wrong_jpeg.clone(), reply)).is_err()); assert!(!wrong_jpeg.exists());
         let stale = folder.path().join("stale.png");
-        assert!(call(&service, |reply| Request::ExportPageImage(info.id, revision - 1, 0, 72, stale.clone(), reply)).is_err()); assert!(!stale.exists());
+        assert!(call(&service, |reply| Request::ExportPageImage(info.id, revision - 1, 0, 72, PageImageFormat::Png, stale.clone(), reply)).is_err()); assert!(!stale.exists());
+        let stale_jpeg = folder.path().join("stale.jpg");
+        assert!(call(&service, |reply| Request::ExportPageImage(info.id, revision - 1, 0, 72, PageImageFormat::Jpeg, stale_jpeg.clone(), reply)).is_err()); assert!(!stale_jpeg.exists());
         let canceled = folder.path().join("closed-reply.png");
-        let (reply, receiver) = oneshot::channel(); drop(receiver); service.sender.send(Request::ExportPageImage(info.id, revision, 0, 72, canceled.clone(), reply)).unwrap();
+        let (reply, receiver) = oneshot::channel(); drop(receiver); service.sender.send(Request::ExportPageImage(info.id, revision, 0, 72, PageImageFormat::Png, canceled.clone(), reply)).unwrap();
         let stable = call(&service, |reply| Request::Edit(info.id, PageEdit::Move { from: 0, to: 0 }, reply)).unwrap();
         assert!(!canceled.exists());
+        let canceled_jpeg = folder.path().join("closed-reply.jpg");
+        let (jpeg_reply, jpeg_receiver) = oneshot::channel(); drop(jpeg_receiver); service.sender.send(Request::ExportPageImage(info.id, revision, 0, 72, PageImageFormat::Jpeg, canceled_jpeg.clone(), jpeg_reply)).unwrap();
+        call(&service, |reply| Request::PreflightPageImage(info.id, revision, 0, 72, PageImageFormat::Jpeg, reply)).unwrap();
+        assert!(!canceled_jpeg.exists());
         assert_eq!(stable.revision, revision); assert!(stable.dirty && stable.can_undo && !stable.can_redo);
         assert_eq!(std::fs::read(&source_path).unwrap(), source_bytes);
         call(&service, |reply| Request::Close(info.id, reply)).unwrap();
         let closed = folder.path().join("closed.png");
-        assert!(call(&service, |reply| Request::ExportPageImage(info.id, revision, 0, 72, closed.clone(), reply)).is_err()); assert!(!closed.exists());
+        assert!(call(&service, |reply| Request::ExportPageImage(info.id, revision, 0, 72, PageImageFormat::Png, closed.clone(), reply)).is_err()); assert!(!closed.exists());
         let probe = root.join("../target/page-image-probe/current-edited-highlight-72dpi.png"); std::fs::create_dir_all(probe.parent().unwrap()).unwrap(); if !probe.exists() { std::fs::copy(&output, &probe).unwrap(); }
         println!("PAGE_IMAGE_SERVICE_PROBE path={} document={} revision={} page=0 dpi=72 dimensions={}x{}", probe.display(), info.id, revision, receipt.width, receipt.height);
     }
@@ -4111,7 +4154,7 @@ mod tests {
             let info = call(&service, |reply| Request::Open(root.join(fixture), reply)).unwrap();
             for page in [0usize, count / 2, count - 1] {
                 let path = folder.path().join(format!("fixture-{count}-page-{}.png", page + 1));
-                let receipt = call(&service, |reply| Request::ExportPageImage(info.id, 0, page as u16, 72, path.clone(), reply)).unwrap();
+                let receipt = call(&service, |reply| Request::ExportPageImage(info.id, 0, page as u16, 72, PageImageFormat::Png, path.clone(), reply)).unwrap();
                 assert_eq!(receipt.page, page as u16); assert!(receipt.width > 0 && receipt.height > 0 && path.exists());
             }
             call(&service, |reply| Request::Close(info.id, reply)).unwrap();
@@ -4125,8 +4168,10 @@ mod tests {
             }
             let source = folder.path().join(format!("{kind}.pdf")); pdf.save(&source).unwrap();
             let info = call(&service, |reply| Request::Open(source, reply)).unwrap();
-            assert!(call(&service, |reply| Request::PreflightPageImage(info.id, 0, 0, 72, reply)).unwrap_err().contains("Signed or certified"));
-            let output = folder.path().join(format!("{kind}.png")); assert!(call(&service, |reply| Request::ExportPageImage(info.id, 0, 0, 72, output.clone(), reply)).is_err()); assert!(!output.exists());
+            for format in [PageImageFormat::Png, PageImageFormat::Jpeg] {
+                assert!(call(&service, |reply| Request::PreflightPageImage(info.id, 0, 0, 72, format, reply)).unwrap_err().contains("Signed or certified"));
+                let output = folder.path().join(format!("{kind}.{}", format.extension())); assert!(call(&service, |reply| Request::ExportPageImage(info.id, 0, 0, 72, format, output.clone(), reply)).is_err()); assert!(!output.exists());
+            }
         }
 
         for (kind, user_password, permissions) in [("encrypted", "test password", lopdf::Permissions::all()), ("restricted", "", lopdf::Permissions::empty())] {
@@ -4140,14 +4185,16 @@ mod tests {
                 OpenResult::Opened { document } => document,
                 OpenResult::PasswordRequired { request_id, .. } => match call(&service, |reply| Request::Unlock(request_id, user_password.to_owned(), reply)).unwrap() { OpenResult::Opened { document } => document, _ => panic!("{kind} did not unlock") },
             };
-            assert!(call(&service, |reply| Request::PreflightPageImage(info.id, 0, 0, 72, reply)).is_err(), "{kind}");
-            let output = folder.path().join(format!("{kind}.png")); assert!(call(&service, |reply| Request::ExportPageImage(info.id, 0, 0, 72, output.clone(), reply)).is_err(), "{kind}"); assert!(!output.exists());
+            for format in [PageImageFormat::Png, PageImageFormat::Jpeg] {
+                assert!(call(&service, |reply| Request::PreflightPageImage(info.id, 0, 0, 72, format, reply)).is_err(), "{kind} {format:?}");
+                let output = folder.path().join(format!("{kind}.{}", format.extension())); assert!(call(&service, |reply| Request::ExportPageImage(info.id, 0, 0, 72, format, output.clone(), reply)).is_err(), "{kind} {format:?}"); assert!(!output.exists());
+            }
         }
 
         let form = call(&service, |reply| Request::Open(root.join("tests/fixtures/reportlab-choice-fields.pdf"), reply)).unwrap();
         let fields = call(&service, |reply| Request::FormFields(form.id, 0, reply)).unwrap(); assert_eq!(fields.status, "supported"); assert_eq!(fields.fields.len(), 2);
         let form_png = folder.path().join("form-appearance.png");
-        let receipt = call(&service, |reply| Request::ExportPageImage(form.id, 0, 0, 72, form_png.clone(), reply)).unwrap();
+        let receipt = call(&service, |reply| Request::ExportPageImage(form.id, 0, 0, 72, PageImageFormat::Png, form_png.clone(), reply)).unwrap();
         let decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(&form_png).unwrap())); let mut reader = decoder.read_info().unwrap();
         let mut rgb = vec![0; reader.output_buffer_size().unwrap()]; reader.next_frame(&mut rgb).unwrap();
         let snapshot = call(&service, |reply| Request::BeginPrint(form.id, 0, reply)).unwrap();
@@ -4155,6 +4202,16 @@ mod tests {
         let expected = print.bgra.chunks_exact(4).flat_map(|pixel| { let alpha = u16::from(pixel[3]); [pixel[2], pixel[1], pixel[0]].map(|channel| ((u16::from(channel) * alpha + 255 * (255 - alpha) + 127) / 255) as u8) }).collect::<Vec<_>>();
         assert_eq!(rgb, expected, "PNG must retain the same form appearances as print rendering");
         assert!(rgb.chunks_exact(3).filter(|pixel| pixel.iter().any(|channel| *channel < 245)).count() > 1_000, "form fixture must contain independently visible appearance pixels");
+        let form_jpeg = folder.path().join("form-appearance.jpg");
+        let jpeg_receipt = call(&service, |reply| Request::ExportPageImage(form.id, 0, 0, 72, PageImageFormat::Jpeg, form_jpeg.clone(), reply)).unwrap();
+        assert_eq!((jpeg_receipt.width, jpeg_receipt.height, jpeg_receipt.format), (receipt.width, receipt.height, PageImageFormat::Jpeg));
+        let decoder = image::codecs::jpeg::JpegDecoder::new(std::io::BufReader::new(std::fs::File::open(form_jpeg).unwrap())).unwrap();
+        let mut jpeg = vec![0; decoder.total_bytes() as usize]; decoder.read_image(&mut jpeg).unwrap();
+        let differences = jpeg.iter().zip(&expected).map(|(actual, expected)| actual.abs_diff(*expected)).collect::<Vec<_>>();
+        let total_difference = differences.iter().map(|difference| u64::from(*difference)).sum::<u64>();
+        let max_difference = differences.into_iter().max().unwrap();
+        assert!(total_difference <= jpeg.len() as u64 * 12, "form JPEG mean channel difference exceeded 12");
+        assert!(max_difference <= 160, "form JPEG maximum channel difference was {max_difference}");
     }
     #[test]
     fn cache_evicts_and_clears_closed_documents() {
