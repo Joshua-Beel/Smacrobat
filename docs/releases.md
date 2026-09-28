@@ -22,6 +22,10 @@ The other repository Actions secrets are `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `
 
 The release workflow installs pinned `artifact-signing-cli` 0.11.0 and invokes `npm run installer -- -AzureSigning`. The Tauri signing hook applies Azure Authenticode signatures during bundling, before the final installer receives its Tauri updater signature. It then requires valid timestamped publisher signatures on both the app executable and installer before generating the manifest or uploading assets. Missing configuration or invalid signatures fail the release; the workflow never falls back to unsigned publishing. Local `npm run installer` remains a development build without Azure publisher signing. See [Tauri's Azure signing integration](https://v2.tauri.app/distribute/sign/windows/#azure-artifact-signing).
 
+### OCR signing status
+
+The active Azure release path still refuses an OCR setup before it reads credentials, builds, signs, or creates output. Inactive helpers now model a future safe sequence: sign a fresh staged engine before recording its identity, use that staged identity only after a trusted signature check, and let the Tauri signer skip only that exact canonical staged file. A synthetic PE comparison models the permitted certificate-related byte changes. The focused test injects a plan verifier and does not exercise the normal verifier. These helpers have not made an Azure request or produced a signed engine, installer, extraction, tag, workflow dispatch, draft, or release. A future base-PE staging implementation and a separate artifact-only workflow remain required before a signed OCR artifact can be tested.
+
 Publish publisher signing as a new version; do not replace the already published 0.2.0 installer, because its Tauri signature and manifest identify those exact bytes. Version 0.2.6 is tagged and has a verified signed draft. Installation and upgrade checks remain pending.
 
 ### Release steps
