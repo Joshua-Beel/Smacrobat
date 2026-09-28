@@ -55,10 +55,45 @@ describe('Azure signing configuration', () => {
     expect(workflow.indexOf('::add-mask::')).toBeLessThan(workflow.indexOf('npm ci'));
     expect(installer.indexOf('::add-mask::')).toBeLessThan(installer.indexOf('$azureConfig ='));
     expect(installer).toContain("'src-tauri/target/signing-config'");
-    expect(installer).toContain('--config $configPath');
-    expect(installer).toMatch(/finally\s*\{\s*if \(Test-Path -LiteralPath \$configPath -PathType Leaf\) \{ Remove-Item -LiteralPath \$configPath \}/);
-    expect(installer).toContain('$buildExitCode = $LASTEXITCODE');
+    expect(installer).toContain('--config $path');
+    expect(installer).toContain('Invoke-TauriInstallerBuild -ConfigPath $configPath -DeleteConfig:$deleteConfig');
+    expect(installer).toMatch(/function Invoke-TauriInstallerBuild[\s\S]*finally\s*\{[\s\S]*Remove-Item -LiteralPath \$ConfigPath/);
+    expect(installer).toContain('$buildExitCode = Invoke-TauriInstallerBuild');
     expect(installer).toContain('verify-windows-signatures.ps1');
     expect(existsSync('src-tauri/tauri.azure.conf.json')).toBe(false);
   });
+
+  it('keeps the OCR-aware override free of Azure settings and cleans it on build failure', () => {
+    const check = `
+      $ErrorActionPreference = 'Stop'
+      $tokens = $null; $parseErrors = $null
+      $path = Join-Path (Get-Location) 'scripts/build-installer.ps1'
+      $ast = [Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$parseErrors)
+      if ($parseErrors.Count) { throw 'Installer script has parse errors.' }
+      foreach($name in @('New-AzureOcrSigningConfig','Invoke-TauriInstallerBuild')) {
+        $function = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true)
+        if (-not $function) { throw ('Missing function: ' + $name) }
+        Invoke-Expression $function.Extent.Text
+      }
+      $helper = (Resolve-Path 'scripts/ocr/windows-signing.ps1').Path
+      $env:AZURE_SIGNING_ENDPOINT='sentinel-endpoint'; $env:AZURE_SIGNING_ACCOUNT='sentinel-account'; $env:AZURE_SIGNING_PROFILE='sentinel-profile'; $env:AZURE_CLIENT_SECRET='sentinel-credential'
+      $config = New-AzureOcrSigningConfig -HelperPath $helper | ConvertTo-Json -Depth 8
+      foreach($sentinel in @('sentinel-endpoint','sentinel-account','sentinel-profile','sentinel-credential')) {
+        if($config.Contains($sentinel)) { throw 'OCR-aware override retained an Azure value.' }
+      }
+      $roundtrip = $config | ConvertFrom-Json
+      $command = $roundtrip.bundle.windows.signCommand
+      if($command.cmd -cne 'powershell.exe' -or ($command.args -join '|') -cne ('-NoProfile|-NonInteractive|-ExecutionPolicy|Bypass|-File|' + $helper + '|-TauriSign|-Path|%1')) { throw 'OCR-aware wrapper command changed.' }
+      $ephemeral = Join-Path (Resolve-Path target) ('ephemeral-config-' + [Guid]::NewGuid().ToString('N') + '.json')
+      [IO.File]::WriteAllText($ephemeral,'{}')
+      $failed=$false
+      try { $null=Invoke-TauriInstallerBuild -ConfigPath $ephemeral -DeleteConfig -BuildCommand { param($ignored) throw 'mock build failed' } } catch { $failed=$true }
+      if(-not $failed -or (Test-Path -LiteralPath $ephemeral)) { throw 'Failed build retained its ephemeral override.' }
+      Write-Output 'Validated sanitized OCR override and failed-build cleanup.'
+    `;
+    const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(check, 'utf16le').toString('base64')], { encoding: 'utf8', timeout: 15_000 });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+    expect(result.stdout).toContain('failed-build cleanup');
+  }, 20_000);
 });

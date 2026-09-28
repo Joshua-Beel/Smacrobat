@@ -52,6 +52,7 @@ function Resolve-FreshInstallerOutput {
     } else {
         [IO.Path]::GetFullPath((Join-Path $repository $OutputRoot))
     }
+    $candidate = $candidate.TrimEnd('\')
     if (-not $candidate.StartsWith($target + '\', [StringComparison]::OrdinalIgnoreCase)) {
         throw 'Installer OutputRoot must be a new directory beneath this repository target directory.'
     }
@@ -167,8 +168,9 @@ function Open-OcrReadLocks {
     param([Parameter(Mandatory = $true)]$Plan)
     $locks = New-Object Collections.Generic.List[IO.FileStream]
     try {
-        foreach ($file in $Plan.Files) {
-            $locks.Add([IO.File]::Open($file.Source, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read))
+        $paths = @($Plan.ManifestPath) + @($Plan.Files | ForEach-Object Source)
+        foreach ($path in $paths) {
+            $locks.Add([IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read))
         }
         return ,$locks
     } catch {
@@ -287,6 +289,53 @@ function Assert-BaseResourceMapStable {
     }
 }
 
+function New-SignableBaseResourcePlan {
+    param(
+        [Parameter(Mandatory = $true)]$Base,
+        [Parameter(Mandatory = $true)][string]$OutputRoot
+    )
+    $pdfiumTarget = 'resources/pdfium/bin/pdfium.dll'
+    $pdfiumEntries = @($Base.Entries | Where-Object Target -CEQ $pdfiumTarget)
+    if ($pdfiumEntries.Count -ne 1) { throw 'Base resource map has no unique PDFium binary.' }
+    $stageRoot = Join-Path ([IO.Path]::GetFullPath($OutputRoot)) 'signable-base-resources'
+    Assert-NoReparseAncestors -Path $stageRoot
+    if (Test-Path -LiteralPath $stageRoot) { throw 'Signable base-resource staging root already exists.' }
+    $stagedPdfium = Join-Path $stageRoot $pdfiumTarget
+    [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($stagedPdfium)) | Out-Null
+    $originalPdfium = $pdfiumEntries[0]
+    $sourceItem = Get-Item -LiteralPath $originalPdfium.Source
+    if ([uint64]$sourceItem.Length -ne [uint64]$originalPdfium.Receipt.Bytes -or (Get-ExactSha256 -Path $originalPdfium.Source) -cne [string]$originalPdfium.Receipt.Sha256) {
+        throw 'Original PDFium resource changed before staging.'
+    }
+    [IO.File]::Copy($originalPdfium.Source, $stagedPdfium, $false)
+    if ([uint64](Get-Item -LiteralPath $stagedPdfium).Length -ne [uint64]$originalPdfium.Receipt.Bytes -or
+        (Get-ExactSha256 -Path $stagedPdfium) -cne [string]$originalPdfium.Receipt.Sha256) {
+        throw 'Staged PDFium resource does not match its locked source.'
+    }
+
+    $map = [ordered]@{}
+    $sourceKeys = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $targets = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $entries = @()
+    foreach ($entry in $Base.Entries) {
+        $source = if ($entry.Target -ceq $pdfiumTarget) { $stagedPdfium } else { $entry.Source }
+        $fullSource = [IO.Path]::GetFullPath($source)
+        if (-not $sourceKeys.Add($fullSource) -or -not $targets.Add([string]$entry.Target)) {
+            throw 'Signable base-resource map has a duplicate or case collision.'
+        }
+        $map[$fullSource] = [string]$entry.Target
+        $entries += [pscustomobject]@{
+            Source = $fullSource
+            OriginalSource = [IO.Path]::GetFullPath($entry.Source)
+            Target = [string]$entry.Target
+            Receipt = $entry.Receipt
+            IsSignablePe = [bool]($entry.Target -ceq $pdfiumTarget)
+        }
+    }
+    if ($map.Count -ne $Base.Count -or $targets.Count -ne $Base.Targets.Count) { throw 'Signable base-resource staging changed map cardinality.' }
+    return [pscustomobject]@{ Map = $map; SourceKeys = $sourceKeys; Targets = $targets; Count = $map.Count; Entries = $entries; StagedPdfium = $stagedPdfium }
+}
+
 function Add-OcrBundleResources {
     param(
         [Parameter(Mandatory = $true)]$Base,
@@ -306,9 +355,9 @@ function Add-OcrBundleResources {
 }
 
 function New-InstallerOverrideConfig {
-    param($SignCommand, [switch]$UnsignedLocal, $ResourceMap)
+    param($SignCommand, [switch]$UnsignedLocal, [switch]$ArtifactOnly, $ResourceMap)
     $bundle = [ordered]@{}
-    if ($UnsignedLocal) { $bundle.createUpdaterArtifacts = $false }
+    if ($UnsignedLocal -or $ArtifactOnly) { $bundle.createUpdaterArtifacts = $false }
     if ($SignCommand) { $bundle.windows = @{ signCommand = $SignCommand } }
     if ($ResourceMap) { $bundle.resources = $ResourceMap }
     return @{ bundle = $bundle }
@@ -376,15 +425,31 @@ function Find-ExtractedResource {
 }
 
 function Assert-ExtractedBaseResources {
-    param([Parameter(Mandatory = $true)][string]$ExtractionRoot, [Parameter(Mandatory = $true)][object[]]$Entries)
+    param(
+        [Parameter(Mandatory = $true)][string]$ExtractionRoot,
+        [Parameter(Mandatory = $true)][object[]]$Entries,
+        [switch]$PublisherSigned,
+        [scriptblock]$SignatureProvider,
+        [string]$ExpectedPublisher
+    )
     $all = @(Get-ChildItem -LiteralPath $ExtractionRoot -Recurse -File)
     $receipts = @()
     foreach ($entry in $Entries) {
         $match = Find-ExtractedResource -Files $all -Target $entry.Target
-        if ([uint64]$match.Length -ne [uint64]$entry.Receipt.Bytes -or (Get-ExactSha256 -Path $match.FullName) -cne $entry.Receipt.Sha256) {
-            throw 'Extracted base resource receipt mismatch.'
+        if ($PublisherSigned -and [bool]$entry.IsSignablePe) {
+            $stagedItem = Get-Item -LiteralPath $entry.Source
+            $stagedSha256 = Get-ExactSha256 -Path $entry.Source
+            if ([uint64]$match.Length -ne [uint64]$stagedItem.Length -or (Get-ExactSha256 -Path $match.FullName) -cne $stagedSha256) {
+                throw 'Extracted signed base resource does not exactly match the staged signed file.'
+            }
+            $null = Assert-TrustedWindowsSignature -Path $match.FullName -SignatureProvider $SignatureProvider -ExpectedPublisher $ExpectedPublisher
+            $receipts += [pscustomobject]@{ path = $entry.Target; bytes = [uint64]$match.Length; sha256 = $stagedSha256; unsignedSha256 = $entry.Receipt.Sha256 }
+        } else {
+            if ([uint64]$match.Length -ne [uint64]$entry.Receipt.Bytes -or (Get-ExactSha256 -Path $match.FullName) -cne $entry.Receipt.Sha256) {
+                throw 'Extracted base resource receipt mismatch.'
+            }
+            $receipts += [pscustomobject]@{ path = $entry.Target; bytes = [uint64]$match.Length; sha256 = $entry.Receipt.Sha256 }
         }
-        $receipts += [pscustomobject]@{ path = $entry.Target; bytes = [uint64]$match.Length; sha256 = $entry.Receipt.Sha256 }
     }
     return $receipts
 }

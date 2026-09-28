@@ -16,16 +16,17 @@ describe('opt-in OCR installer packaging', () => {
     expect(installer.indexOf('Remove-Item Env:PDF_WORKSTATION_OCR_SETUP_ROOT')).toBeLessThan(installer.indexOf('if ($OcrSetupRoot)'));
     expect(installer).toContain("if ($AzureSigning -and $UnsignedLocal)");
     expect(installer).toContain("if ($OcrSetupRoot -and -not ($AzureSigning -or $UnsignedLocal))");
-    expect(installer).toContain("if (-not $UnsignedLocal -and -not $env:TAURI_SIGNING_PRIVATE_KEY)");
+    expect(installer).toContain("if (-not $UnsignedLocal -and -not $ArtifactOnly -and -not $env:TAURI_SIGNING_PRIVATE_KEY)");
     expect(installer).toContain('Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY -ErrorAction SilentlyContinue');
     expect(installer).toContain('Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD -ErrorAction SilentlyContinue');
     expect(installer.indexOf('Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD')).toBeLessThan(installer.indexOf('npm.cmd run tauri'));
-    expect(installer).toContain("if (-not $UnsignedLocal -and -not $OcrSetupRoot)");
-    expect(installer).toContain('New-InstallerOverrideConfig -SignCommand $signCommand -UnsignedLocal:$UnsignedLocal');
-    expect(installer).toContain('if ($AzureSigning -and $OcrSetupRoot)');
-    expect(installer).toContain('Azure-signed OCR installers are disabled until');
+    expect(installer).toContain("if (-not $UnsignedLocal -and -not $ArtifactOnly -and -not $OcrSetupRoot)");
+    expect(installer).toContain('New-InstallerOverrideConfig -SignCommand $signCommand -UnsignedLocal:$UnsignedLocal -ArtifactOnly:$ArtifactOnly');
+    expect(installer).toContain('if ($AzureSigning -and $OcrSetupRoot -and -not $ArtifactOnly)');
+    expect(installer).toContain('Azure-signed OCR requires the explicit artifact-only mode.');
     expect(installer.indexOf('$env:PDF_WORKSTATION_OCR_SETUP_ROOT = $ocrPlan.Root')).toBeLessThan(installer.indexOf('npm.cmd run tauri'));
-    expect(installer).not.toContain('New-SignedOcrSetup');
+    expect(installer).toContain('New-SignedOcrSetup');
+    expect(installer).toContain('New-SignableBaseResourcePlan');
     expect(installer).not.toMatch(/AZURE_(TENANT|CLIENT|SIGNING)_[A-Z_]+\s*=\s*['"][^'"]+['"]/);
   });
 
@@ -34,8 +35,12 @@ describe('opt-in OCR installer packaging', () => {
       $ErrorActionPreference = 'Stop'
       Set-Location -LiteralPath '${process.cwd().replaceAll("'", "''")}'
       . ./scripts/ocr/installer-package.ps1
-      $evidence = Join-Path (Resolve-Path target) ('ocr-installer-focused-' + [Guid]::NewGuid().ToString('N'))
-      [IO.Directory]::CreateDirectory($evidence) | Out-Null
+      . ./scripts/ocr/windows-signing.ps1
+      $evidenceCandidate = Join-Path (Resolve-Path target) ('ocr-installer-focused-' + [Guid]::NewGuid().ToString('N'))
+      $evidence = Resolve-FreshInstallerOutput -ProjectRoot (Get-Location) -OutputRoot ($evidenceCandidate + '\')
+      if($evidence.EndsWith('\')) { throw 'Fresh installer output retained a trailing separator.' }
+      $receiptProbe = Join-Path $evidence 'cargo-target/release/bundle/nsis/setup.exe'
+      if($receiptProbe.Substring($evidence.Length + 1).Replace('\','/') -cne 'cargo-target/release/bundle/nsis/setup.exe') { throw 'Fresh installer output corrupted a relative receipt path.' }
       $source = Join-Path $evidence 'source'
       $items = @(
         @('engine','engine/bin/tesseract.exe','bin/tesseract.exe','engine'),
@@ -63,6 +68,20 @@ describe('opt-in OCR installer packaging', () => {
       $baseAgain.Entries[0].Target += '.changed'
       $rejected = $false; try { Assert-BaseResourceMapStable -Before $base -After $baseAgain } catch { $rejected=$true }
       if(-not $rejected) { throw 'Changed base resource map was accepted.' }
+      $signableInput = Get-BaseBundleResourceMap -ProjectRoot (Get-Location)
+      $pdfiumInput = @($signableInput.Entries | Where-Object Target -CEQ 'resources/pdfium/bin/pdfium.dll')
+      if($pdfiumInput.Count -ne 1) { throw 'Pinned PDFium input is not unique.' }
+      $pdfiumLayout=Get-PeSigningLayout -Bytes ([IO.File]::ReadAllBytes($pdfiumInput[0].Source))
+      if($pdfiumLayout.CertificateOffset -ne 0 -or $pdfiumLayout.CertificateBytes -ne 0) { throw 'Pinned PDFium input already has a PE certificate table.' }
+      $pdfiumHash = Get-ExactSha256 $pdfiumInput[0].Source
+      $signableOutput = Join-Path $evidence 'signable-output'; [IO.Directory]::CreateDirectory($signableOutput) | Out-Null
+      $signable = New-SignableBaseResourcePlan -Base $signableInput -OutputRoot $signableOutput
+      $signablePdfium = @($signable.Entries | Where-Object IsSignablePe)
+      if($signable.Count -ne $signableInput.Count -or $signable.Targets.Count -ne $signableInput.Targets.Count -or $signablePdfium.Count -ne 1) { throw 'Signable base-resource map changed target cardinality.' }
+      if($signable.Map.Contains([IO.Path]::GetFullPath($pdfiumInput[0].Source)) -or -not $signable.Map.Contains([IO.Path]::GetFullPath($signablePdfium[0].Source))) { throw 'Signable map retained the original PDFium source.' }
+      if($signablePdfium[0].Target -cne $pdfiumInput[0].Target -or (Get-ExactSha256 $signablePdfium[0].Source) -cne $pdfiumHash -or (Get-ExactSha256 $pdfiumInput[0].Source) -cne $pdfiumHash) { throw 'PDFium staging changed source bytes or target.' }
+      $artifactOverride = New-InstallerOverrideConfig -SignCommand @{cmd='mock';args=@('%1')} -ArtifactOnly -ResourceMap $signable.Map
+      if($artifactOverride.bundle.createUpdaterArtifacts -ne $false) { throw 'Artifact-only override did not disable updater artifacts.' }
       $baseCount = $base.Count
       $map = Add-OcrBundleResources -Base $base -Entries $entries -Identity $identity
       if($map.Count -ne $baseCount + 5 -or @($map.Values | Where-Object {$_ -like 'resources/ocr/*'}).Count -ne 5) { throw 'Resource map is incomplete.' }

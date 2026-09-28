@@ -1,4 +1,12 @@
+param(
+    [switch]$TauriSign,
+    [string]$Path
+)
 $ErrorActionPreference = 'Stop'
+
+if (-not (Get-Command Assert-NoReparseAncestors -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot 'installer-package.ps1')
+}
 
 function Get-SigningSha256 {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -36,7 +44,7 @@ function Assert-TrustedWindowsSignature {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
         [scriptblock]$SignatureProvider,
-        [string]$ExpectedPublisher = 'Joshua Beel'
+        [Parameter(Mandatory = $true)][string]$ExpectedPublisher
     )
     $facts = Get-WindowsSignatureFacts -Path $Path -SignatureProvider $SignatureProvider
     if ([string]$facts.Status -cne 'Valid') { throw 'Authenticode signature is not valid.' }
@@ -51,6 +59,12 @@ function Assert-UnsignedWindowsFile {
     if ([string]$facts.Status -cne 'NotSigned') { throw 'Original OCR engine must be exactly Authenticode NotSigned.' }
 }
 
+function Invoke-AzureArtifactSigningCli {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    & artifact-signing-cli -e $env:AZURE_SIGNING_ENDPOINT -a $env:AZURE_SIGNING_ACCOUNT -c $env:AZURE_SIGNING_PROFILE -d 'PDF Workstation' $Path | Out-Host
+    return [int]$LASTEXITCODE
+}
+
 function Invoke-OcrAwareTauriSigner {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -59,7 +73,7 @@ function Invoke-OcrAwareTauriSigner {
         [string]$ExpectedOcrEngineSha256,
         [scriptblock]$Signer,
         [scriptblock]$SignatureProvider,
-        [string]$ExpectedPublisher = 'Joshua Beel'
+        [Parameter(Mandatory = $true)][string]$ExpectedPublisher
     )
     $candidate = [IO.Path]::GetFullPath($Path)
     Assert-NoReparseAncestors -Path $candidate
@@ -103,7 +117,7 @@ function New-SignedOcrSetup {
         [Parameter(Mandatory = $true)][scriptblock]$Signer,
         [scriptblock]$SignatureProvider,
         [scriptblock]$PlanVerifier,
-        [string]$ExpectedPublisher = 'Joshua Beel'
+        [Parameter(Mandatory = $true)][string]$ExpectedPublisher
     )
     $output = [IO.Path]::GetFullPath($OutputRoot).TrimEnd('\')
     $stage = Join-Path $output 'signed-ocr-setup'
@@ -242,8 +256,54 @@ function Assert-SignedPdfiumEquivalent {
         [Parameter(Mandatory = $true)][string]$UnsignedPath,
         [Parameter(Mandatory = $true)][string]$SignedPath,
         [scriptblock]$SignatureProvider,
-        [string]$ExpectedPublisher = 'Joshua Beel'
+        [Parameter(Mandatory = $true)][string]$ExpectedPublisher
     )
     Assert-SignedPeBodyEquivalent -UnsignedPath $UnsignedPath -SignedPath $SignedPath
     $null = Assert-TrustedWindowsSignature -Path $SignedPath -SignatureProvider $SignatureProvider -ExpectedPublisher $ExpectedPublisher
+}
+
+function Assert-SignedBasePeSources {
+    param(
+        [Parameter(Mandatory = $true)]$Plan,
+        [scriptblock]$SignatureProvider,
+        [Parameter(Mandatory = $true)][string]$ExpectedPublisher
+    )
+    $entries = @($Plan.Entries | Where-Object IsSignablePe)
+    if ($entries.Count -ne 1 -or $entries[0].Target -cne 'resources/pdfium/bin/pdfium.dll') {
+        throw 'Signed base-resource plan has no unique PDFium binary.'
+    }
+    Assert-SignedPdfiumEquivalent `
+        -UnsignedPath $entries[0].OriginalSource `
+        -SignedPath $entries[0].Source `
+        -SignatureProvider $SignatureProvider `
+        -ExpectedPublisher $ExpectedPublisher
+}
+
+if ($TauriSign) {
+    foreach ($name in @(
+        'AZURE_SIGNING_ENDPOINT',
+        'AZURE_SIGNING_ACCOUNT',
+        'AZURE_SIGNING_PROFILE',
+        'PDF_WORKSTATION_SIGNED_OCR_ENGINE_PATH',
+        'PDF_WORKSTATION_SIGNED_OCR_ENGINE_BYTES',
+        'PDF_WORKSTATION_SIGNED_OCR_ENGINE_SHA256',
+        'PDF_WORKSTATION_EXPECTED_PUBLISHER'
+    )) {
+        if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+            throw 'OCR-aware Tauri signer configuration is incomplete.'
+        }
+    }
+    [uint64]$expectedBytes = 0
+    if (-not [uint64]::TryParse($env:PDF_WORKSTATION_SIGNED_OCR_ENGINE_BYTES, [ref]$expectedBytes) -or $expectedBytes -eq 0) {
+        throw 'OCR-aware Tauri signer byte receipt is invalid.'
+    }
+    $signer = { param($candidate) Invoke-AzureArtifactSigningCli -Path $candidate }
+    $decision = Invoke-OcrAwareTauriSigner `
+        -Path $Path `
+        -ExpectedOcrEnginePath $env:PDF_WORKSTATION_SIGNED_OCR_ENGINE_PATH `
+        -ExpectedOcrEngineBytes $expectedBytes `
+        -ExpectedOcrEngineSha256 $env:PDF_WORKSTATION_SIGNED_OCR_ENGINE_SHA256 `
+        -ExpectedPublisher $env:PDF_WORKSTATION_EXPECTED_PUBLISHER `
+        -Signer $signer
+    Write-Output $decision
 }

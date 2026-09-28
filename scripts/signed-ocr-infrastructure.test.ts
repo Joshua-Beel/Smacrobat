@@ -10,17 +10,51 @@ function runPowerShell(source: string) {
 }
 
 describe('signed OCR installer infrastructure', () => {
-  it('remains unreachable from the default Azure build and release workflow', () => {
+  it('keeps artifact-only OCR explicit and leaves the release workflow unchanged', () => {
     const installer = readFileSync('scripts/build-installer.ps1', 'utf8');
     const workflow = readFileSync('.github/workflows/release.yml', 'utf8');
-    expect(installer).toContain('if ($AzureSigning -and $OcrSetupRoot)');
-    expect(installer).toContain('Azure-signed OCR installers are disabled until');
-    expect(installer).not.toContain('windows-signing.ps1');
-    expect(installer).not.toContain('New-SignedOcrSetup');
+    expect(installer).toContain('if ($AzureSigning -and $OcrSetupRoot -and -not $ArtifactOnly)');
+    expect(installer).toContain('Azure-signed OCR requires the explicit artifact-only mode.');
+    expect(installer).toContain("Join-Path $PSScriptRoot 'ocr/windows-signing.ps1'");
+    expect(installer).toContain('New-SignedOcrSetup');
     expect(installer).toContain("cmd = 'artifact-signing-cli'");
+    expect(installer).toContain('$env:PDF_WORKSTATION_EXPECTED_PUBLISHER = $ExpectedPublisher');
+    expect(installer.match(/-ExpectedPublisher \$ExpectedPublisher/g)?.length).toBeGreaterThanOrEqual(5);
+    expect(installer).toContain("$_.Name -CEQ 'latest.json' -or $_.Extension -CEQ '.sig'");
+    expect(installer).toContain('($UnsignedLocal -or $ArtifactOnly) -and $unexpectedUpdaterArtifacts.Count -ne 0');
+    expect(installer).toMatch(/if \(\$ArtifactOnly\) \{[\s\S]*Assert-TrustedWindowsSignature -Path \$installer[\s\S]*\} else \{[\s\S]*Assert-NotPublisherSigned -Path \$installer/);
     expect(workflow).not.toContain('OcrSetupRoot');
+    expect(workflow).not.toContain('ArtifactOnly');
     expect(workflow).not.toContain('windows-signing.ps1');
   });
+
+  it('rejects the artifact-only mode matrix before reading Azure or updater configuration', () => {
+    const check = String.raw`
+      $ErrorActionPreference = 'Stop'
+      Set-Location -LiteralPath '${process.cwd().replaceAll("'", "''")}'
+      foreach($name in @('AZURE_SIGNING_ENDPOINT','AZURE_SIGNING_ACCOUNT','AZURE_SIGNING_PROFILE','AZURE_TENANT_ID','AZURE_CLIENT_ID','AZURE_CLIENT_SECRET','TAURI_SIGNING_PRIVATE_KEY','TAURI_SIGNING_PRIVATE_KEY_PASSWORD')) { Remove-Item "Env:$name" -ErrorAction SilentlyContinue }
+      $cases = @(
+        @(@{ArtifactOnly=$true}, 'ArtifactOnly requires AzureSigning'),
+        @(@{ArtifactOnly=$true;AzureSigning=$true}, 'ArtifactOnly requires AzureSigning'),
+        @(@{ArtifactOnly=$true;OcrSetupRoot='missing'}, 'ArtifactOnly requires AzureSigning'),
+        @(@{AzureSigning=$true;OcrSetupRoot='missing'}, 'Azure-signed OCR requires the explicit artifact-only mode.'),
+        @(@{ExpectedPublisher='Test Publisher'}, 'ExpectedPublisher is supported only for artifact-only Azure OCR.'),
+        @(@{ArtifactOnly=$true;AzureSigning=$true;OcrSetupRoot='missing';OutputRoot='target/missing';ExpectedPublisher=' bad'}, 'valid explicit ExpectedPublisher')
+      )
+      foreach($case in $cases) {
+        $message=$null
+        $arguments=$case[0]
+        try { & ./scripts/build-installer.ps1 @arguments; throw 'Mode was unexpectedly accepted.' } catch { $message=$_.Exception.Message }
+        if(-not $message.Contains($case[1])) { throw ('Unexpected mode rejection: ' + $message) }
+        if($message -like '*signing setting*' -or $message -like '*signing credential*' -or $message -like '*updater.key*') { throw 'Mode guard read signing configuration.' }
+      }
+      Write-Output 'Rejected the artifact-only mode matrix before signing configuration.'
+    `;
+    const result = runPowerShell(check);
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+    expect(result.stdout).toContain('before signing configuration');
+  }, 35_000);
 
   it('derives the signed identity before compile and skips only the exact trusted engine', () => {
     const check = String.raw`
@@ -90,7 +124,7 @@ describe('signed OCR installer infrastructure', () => {
         }
         return [pscustomobject]@{Root=$root;ManifestPath=(Join-Path $root 'engine/ocr-engine-manifest.json');Files=$derivedFiles;Engine=$derivedFiles[0].Receipt;Identity=$derivedFiles[0].Receipt.Sha256.ToLowerInvariant()}
       }
-      $derived = New-SignedOcrSetup -ProjectRoot (Get-Location) -OriginalPlan $plan -OutputRoot $output -Signer $signer -SignatureProvider $signatureProvider -PlanVerifier $verifier
+      $derived = New-SignedOcrSetup -ProjectRoot (Get-Location) -OriginalPlan $plan -OutputRoot $output -Signer $signer -SignatureProvider $signatureProvider -PlanVerifier $verifier -ExpectedPublisher 'Joshua Beel'
       $script:events.Add('compile-captured:' + $derived.Identity)
       $signIndex = $script:events.IndexOf('sign:tesseract.exe')
       $verifyIndex = $script:events.IndexOf('verify-derived-plan')
@@ -98,43 +132,49 @@ describe('signed OCR installer infrastructure', () => {
       if($signIndex -lt 0 -or $verifyIndex -le $signIndex -or $compileIndex -le $verifyIndex) { throw 'Signed OCR identity was not finalized before compile capture.' }
       if($derived.Identity -cne (Get-SigningSha256 $derived.Files[0].Source).ToLowerInvariant()) { throw 'Derived identity does not equal the signed engine hash.' }
       if((Get-SigningSha256 $files[0].Source) -cne $originalHash -or [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($files[0].Source)) -cne 'owned-engine') { throw 'Original engine changed.' }
+      $derivedLocks = Open-OcrReadLocks -Plan $derived
+      try {
+        $writeBlocked=$false
+        try { $probe=[IO.File]::Open($derived.ManifestPath,[IO.FileMode]::Open,[IO.FileAccess]::Write,[IO.FileShare]::None); $probe.Dispose() } catch { $writeBlocked=$true }
+        if(-not $writeBlocked) { throw 'Derived OCR manifest was not included in the read locks.' }
+      } finally { foreach($lock in $derivedLocks){$lock.Dispose()} }
 
       $tauriCalls = [Collections.Generic.List[string]]::new()
       $tauriSigner = { param($path) $tauriCalls.Add([IO.Path]::GetFullPath($path)); return 0 }.GetNewClosure()
       $trustedPath = $derived.Files[0].Source
-      $decision = Invoke-OcrAwareTauriSigner -Path $trustedPath -ExpectedOcrEnginePath $trustedPath -ExpectedOcrEngineBytes $derived.Engine.Bytes -ExpectedOcrEngineSha256 $derived.Engine.Sha256 -Signer $tauriSigner -SignatureProvider $signatureProvider
+      $decision = Invoke-OcrAwareTauriSigner -Path $trustedPath -ExpectedOcrEnginePath $trustedPath -ExpectedOcrEngineBytes $derived.Engine.Bytes -ExpectedOcrEngineSha256 $derived.Engine.Sha256 -Signer $tauriSigner -SignatureProvider $signatureProvider -ExpectedPublisher 'Joshua Beel'
       if($decision -cne 'SkippedTrustedOcrEngine' -or $tauriCalls.Count -ne 0) { throw 'Exact trusted engine was not skipped.' }
       $app = Join-Path $evidence 'pdf-workstation.exe'; [IO.File]::WriteAllText($app,'app')
-      $decision = Invoke-OcrAwareTauriSigner -Path $app -ExpectedOcrEnginePath $trustedPath -ExpectedOcrEngineBytes $derived.Engine.Bytes -ExpectedOcrEngineSha256 $derived.Engine.Sha256 -Signer $tauriSigner -SignatureProvider $signatureProvider
+      $decision = Invoke-OcrAwareTauriSigner -Path $app -ExpectedOcrEnginePath $trustedPath -ExpectedOcrEngineBytes $derived.Engine.Bytes -ExpectedOcrEngineSha256 $derived.Engine.Sha256 -Signer $tauriSigner -SignatureProvider $signatureProvider -ExpectedPublisher 'Joshua Beel'
       if($decision -cne 'Signed' -or $tauriCalls.Count -ne 1 -or $tauriCalls[0] -cne [IO.Path]::GetFullPath($app)) { throw 'Non-engine candidate was not forwarded unchanged.' }
 
       $wrongRoot = Join-Path $evidence 'wrong'; [IO.Directory]::CreateDirectory($wrongRoot) | Out-Null
       $wrongEngine = Join-Path $wrongRoot 'tesseract.exe'; [IO.File]::Copy($trustedPath,$wrongEngine)
       $script:validSignatures[[IO.Path]::GetFullPath($wrongEngine)] = $true
-      $rejected=$false; try { $null=Invoke-OcrAwareTauriSigner -Path $wrongEngine -ExpectedOcrEnginePath $trustedPath -ExpectedOcrEngineBytes $derived.Engine.Bytes -ExpectedOcrEngineSha256 $derived.Engine.Sha256 -Signer $tauriSigner -SignatureProvider $signatureProvider } catch { $rejected=$true }
+      $rejected=$false; try { $null=Invoke-OcrAwareTauriSigner -Path $wrongEngine -ExpectedOcrEnginePath $trustedPath -ExpectedOcrEngineBytes $derived.Engine.Bytes -ExpectedOcrEngineSha256 $derived.Engine.Sha256 -Signer $tauriSigner -SignatureProvider $signatureProvider -ExpectedPublisher 'Joshua Beel' } catch { $rejected=$true }
       if(-not $rejected -or $tauriCalls.Count -ne 1) { throw 'Same-name engine outside the trusted canonical path was accepted.' }
 
       $trustedBytes = [IO.File]::ReadAllBytes($trustedPath)
       [IO.File]::WriteAllBytes($trustedPath, ($trustedBytes + [byte]0x7f))
-      $rejected=$false; try { $null=Invoke-OcrAwareTauriSigner -Path $trustedPath -ExpectedOcrEnginePath $trustedPath -ExpectedOcrEngineBytes $derived.Engine.Bytes -ExpectedOcrEngineSha256 $derived.Engine.Sha256 -Signer $tauriSigner -SignatureProvider $signatureProvider } catch { $rejected=$true }
+      $rejected=$false; try { $null=Invoke-OcrAwareTauriSigner -Path $trustedPath -ExpectedOcrEnginePath $trustedPath -ExpectedOcrEngineBytes $derived.Engine.Bytes -ExpectedOcrEngineSha256 $derived.Engine.Sha256 -Signer $tauriSigner -SignatureProvider $signatureProvider -ExpectedPublisher 'Joshua Beel' } catch { $rejected=$true }
       if(-not $rejected) { throw 'Tampered trusted engine was accepted.' }
       [IO.File]::WriteAllBytes($trustedPath,$trustedBytes)
       $script:validSignatures[[IO.Path]::GetFullPath($trustedPath)] = $false
-      $rejected=$false; try { $null=Invoke-OcrAwareTauriSigner -Path $trustedPath -ExpectedOcrEnginePath $trustedPath -ExpectedOcrEngineBytes $derived.Engine.Bytes -ExpectedOcrEngineSha256 $derived.Engine.Sha256 -Signer $tauriSigner -SignatureProvider $signatureProvider } catch { $rejected=$true }
+      $rejected=$false; try { $null=Invoke-OcrAwareTauriSigner -Path $trustedPath -ExpectedOcrEnginePath $trustedPath -ExpectedOcrEngineBytes $derived.Engine.Bytes -ExpectedOcrEngineSha256 $derived.Engine.Sha256 -Signer $tauriSigner -SignatureProvider $signatureProvider -ExpectedPublisher 'Joshua Beel' } catch { $rejected=$true }
       if(-not $rejected) { throw 'Invalid trusted-engine signature was accepted.' }
       $wrongPublisher = { param($path) [pscustomobject]@{Status='Valid';Publisher='Someone Else';HasTimestamp=$true} }
-      $rejected=$false; try { $null=Invoke-OcrAwareTauriSigner -Path $trustedPath -ExpectedOcrEnginePath $trustedPath -ExpectedOcrEngineBytes $derived.Engine.Bytes -ExpectedOcrEngineSha256 $derived.Engine.Sha256 -Signer $tauriSigner -SignatureProvider $wrongPublisher } catch { $rejected=$true }
+      $rejected=$false; try { $null=Invoke-OcrAwareTauriSigner -Path $trustedPath -ExpectedOcrEnginePath $trustedPath -ExpectedOcrEngineBytes $derived.Engine.Bytes -ExpectedOcrEngineSha256 $derived.Engine.Sha256 -Signer $tauriSigner -SignatureProvider $wrongPublisher -ExpectedPublisher 'Joshua Beel' } catch { $rejected=$true }
       if(-not $rejected) { throw 'Wrong trusted-engine publisher was accepted.' }
       $missingTimestamp = { param($path) [pscustomobject]@{Status='Valid';Publisher='Joshua Beel';HasTimestamp=$false} }
-      $rejected=$false; try { $null=Invoke-OcrAwareTauriSigner -Path $trustedPath -ExpectedOcrEnginePath $trustedPath -ExpectedOcrEngineBytes $derived.Engine.Bytes -ExpectedOcrEngineSha256 $derived.Engine.Sha256 -Signer $tauriSigner -SignatureProvider $missingTimestamp } catch { $rejected=$true }
+      $rejected=$false; try { $null=Invoke-OcrAwareTauriSigner -Path $trustedPath -ExpectedOcrEnginePath $trustedPath -ExpectedOcrEngineBytes $derived.Engine.Bytes -ExpectedOcrEngineSha256 $derived.Engine.Sha256 -Signer $tauriSigner -SignatureProvider $missingTimestamp -ExpectedPublisher 'Joshua Beel' } catch { $rejected=$true }
       if(-not $rejected) { throw 'Untimestamped trusted-engine signature was accepted.' }
       $script:validSignatures[[IO.Path]::GetFullPath($trustedPath)] = $true
 
       $defaultEngine = Join-Path $evidence 'default-tesseract.exe'; [IO.File]::WriteAllText($defaultEngine,'default')
-      $decision = Invoke-OcrAwareTauriSigner -Path $defaultEngine -Signer $tauriSigner -SignatureProvider $signatureProvider
+      $decision = Invoke-OcrAwareTauriSigner -Path $defaultEngine -Signer $tauriSigner -SignatureProvider $signatureProvider -ExpectedPublisher 'Joshua Beel'
       if($decision -cne 'Signed' -or $tauriCalls.Count -ne 2) { throw 'Default signing behavior did not forward a file without an OCR expectation.' }
       $failingSigner = { param($path) return 17 }
-      $rejected=$false; try { $null=Invoke-OcrAwareTauriSigner -Path $app -Signer $failingSigner -SignatureProvider $signatureProvider } catch { $rejected=$true }
+      $rejected=$false; try { $null=Invoke-OcrAwareTauriSigner -Path $app -Signer $failingSigner -SignatureProvider $signatureProvider -ExpectedPublisher 'Joshua Beel' } catch { $rejected=$true }
       if(-not $rejected) { throw 'Signer failure did not propagate.' }
       Write-Output ('PASS ' + $evidence)
     `;
@@ -172,25 +212,38 @@ describe('signed OCR installer infrastructure', () => {
       for($i=528;$i -lt 540;$i++){ $signed[$i]=[byte](0xa0+$i-528) }
       $signedPath=Join-Path $evidence 'pdfium-signed.dll'; [IO.File]::WriteAllBytes($signedPath,$signed)
       $validSignature={ param($path) [pscustomobject]@{Status='Valid';Publisher='Joshua Beel';HasTimestamp=$true} }
-      Assert-SignedPdfiumEquivalent -UnsignedPath $unsignedPath -SignedPath $signedPath -SignatureProvider $validSignature
+      Assert-SignedPdfiumEquivalent -UnsignedPath $unsignedPath -SignedPath $signedPath -SignatureProvider $validSignature -ExpectedPublisher 'Joshua Beel'
+      $extractRoot=Join-Path $evidence 'extract/app'; $extractedPdfium=Join-Path $extractRoot 'resources/pdfium/bin/pdfium.dll'
+      [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($extractedPdfium))|Out-Null; [IO.File]::Copy($signedPath,$extractedPdfium)
+      $entry=[pscustomobject]@{Source=$signedPath;OriginalSource=$unsignedPath;Target='resources/pdfium/bin/pdfium.dll';Receipt=[pscustomobject]@{Bytes=[uint64](Get-Item $unsignedPath).Length;Sha256=Get-ExactSha256 $unsignedPath};IsSignablePe=$true}
+      $receipts=@(Assert-ExtractedBaseResources -ExtractionRoot (Join-Path $evidence 'extract') -Entries @($entry) -PublisherSigned -SignatureProvider $validSignature -ExpectedPublisher 'Joshua Beel')
+      if($receipts.Count -ne 1 -or $receipts[0].sha256 -cne (Get-ExactSha256 $signedPath) -or $receipts[0].unsignedSha256 -cne (Get-ExactSha256 $unsignedPath)) { throw 'Signed extraction receipt did not bind staged and original PDFium.' }
+      $tamperedExtract=[byte[]]$signed.Clone();$tamperedExtract[400]=$tamperedExtract[400]-bxor 1;[IO.File]::WriteAllBytes($extractedPdfium,$tamperedExtract)
+      $rejected=$false;try{$null=Assert-ExtractedBaseResources -ExtractionRoot (Join-Path $evidence 'extract') -Entries @($entry) -PublisherSigned -SignatureProvider $validSignature -ExpectedPublisher 'Joshua Beel'}catch{$rejected=$true};if(-not $rejected){throw 'Tampered extracted PDFium matched the staged receipt.'}
+      [IO.File]::Copy($signedPath,$extractedPdfium,$true)
+      $plainSource=Join-Path $evidence 'notice.txt';[IO.File]::WriteAllText($plainSource,'notice')
+      $plainExtract=Join-Path $evidence 'plain/app/resources/notice.txt';[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($plainExtract))|Out-Null;[IO.File]::Copy($plainSource,$plainExtract)
+      $plainEntry=[pscustomobject]@{Source=$plainSource;Target='resources/notice.txt';Receipt=[pscustomobject]@{Bytes=[uint64](Get-Item $plainSource).Length;Sha256=Get-ExactSha256 $plainSource}}
+      $mustNotVerifySignature={param($path) throw 'Unsigned extraction called signature verification.'}
+      $null=Assert-ExtractedBaseResources -ExtractionRoot (Join-Path $evidence 'plain') -Entries @($plainEntry) -SignatureProvider $mustNotVerifySignature -ExpectedPublisher 'Joshua Beel'
 
       $body=[byte[]]$signed.Clone(); $body[400]=$body[400]-bxor 1
       $bodyPath=Join-Path $evidence 'body.dll'; [IO.File]::WriteAllBytes($bodyPath,$body)
-      $rejected=$false;try{Assert-SignedPdfiumEquivalent -UnsignedPath $unsignedPath -SignedPath $bodyPath -SignatureProvider $validSignature}catch{$rejected=$true};if(-not $rejected){throw 'Changed PE body was accepted.'}
+      $rejected=$false;try{Assert-SignedPdfiumEquivalent -UnsignedPath $unsignedPath -SignedPath $bodyPath -SignatureProvider $validSignature -ExpectedPublisher 'Joshua Beel'}catch{$rejected=$true};if(-not $rejected){throw 'Changed PE body was accepted.'}
       $gap=[byte[]]$signed.Clone(); $gap[516]=1
       $gapPath=Join-Path $evidence 'gap.dll'; [IO.File]::WriteAllBytes($gapPath,$gap)
-      $rejected=$false;try{Assert-SignedPdfiumEquivalent -UnsignedPath $unsignedPath -SignedPath $gapPath -SignatureProvider $validSignature}catch{$rejected=$true};if(-not $rejected){throw 'Nonzero alignment gap was accepted.'}
+      $rejected=$false;try{Assert-SignedPdfiumEquivalent -UnsignedPath $unsignedPath -SignedPath $gapPath -SignatureProvider $validSignature -ExpectedPublisher 'Joshua Beel'}catch{$rejected=$true};if(-not $rejected){throw 'Nonzero alignment gap was accepted.'}
       $trailing=[byte[]]::new(545);[Array]::Copy($signed,$trailing,$signed.Length)
       $trailingPath=Join-Path $evidence 'trailing.dll';[IO.File]::WriteAllBytes($trailingPath,$trailing)
-      $rejected=$false;try{Assert-SignedPdfiumEquivalent -UnsignedPath $unsignedPath -SignedPath $trailingPath -SignatureProvider $validSignature}catch{$rejected=$true};if(-not $rejected){throw 'Trailing PE data was accepted.'}
+      $rejected=$false;try{Assert-SignedPdfiumEquivalent -UnsignedPath $unsignedPath -SignedPath $trailingPath -SignatureProvider $validSignature -ExpectedPublisher 'Joshua Beel'}catch{$rejected=$true};if(-not $rejected){throw 'Trailing PE data was accepted.'}
       $badCertificate=[byte[]]$signed.Clone();Set-U16 $badCertificate 526 1
       $badCertificatePath=Join-Path $evidence 'bad-certificate.dll';[IO.File]::WriteAllBytes($badCertificatePath,$badCertificate)
-      $rejected=$false;try{Assert-SignedPdfiumEquivalent -UnsignedPath $unsignedPath -SignedPath $badCertificatePath -SignatureProvider $validSignature}catch{$rejected=$true};if(-not $rejected){throw 'Malformed WIN_CERTIFICATE was accepted.'}
+      $rejected=$false;try{Assert-SignedPdfiumEquivalent -UnsignedPath $unsignedPath -SignedPath $badCertificatePath -SignatureProvider $validSignature -ExpectedPublisher 'Joshua Beel'}catch{$rejected=$true};if(-not $rejected){throw 'Malformed WIN_CERTIFICATE was accepted.'}
       $preexisting=[byte[]]$unsigned.Clone();Set-U32 $preexisting 0x128 504;Set-U32 $preexisting 0x12c 8
       $preexistingPath=Join-Path $evidence 'preexisting.dll';[IO.File]::WriteAllBytes($preexistingPath,$preexisting)
-      $rejected=$false;try{Assert-SignedPdfiumEquivalent -UnsignedPath $preexistingPath -SignedPath $signedPath -SignatureProvider $validSignature}catch{$rejected=$true};if(-not $rejected){throw 'Pre-signed input was accepted.'}
+      $rejected=$false;try{Assert-SignedPdfiumEquivalent -UnsignedPath $preexistingPath -SignedPath $signedPath -SignatureProvider $validSignature -ExpectedPublisher 'Joshua Beel'}catch{$rejected=$true};if(-not $rejected){throw 'Pre-signed input was accepted.'}
       $badSignature={ param($path) [pscustomobject]@{Status='Valid';Publisher='Joshua Beel';HasTimestamp=$false} }
-      $rejected=$false;try{Assert-SignedPdfiumEquivalent -UnsignedPath $unsignedPath -SignedPath $signedPath -SignatureProvider $badSignature}catch{$rejected=$true};if(-not $rejected){throw 'Untimestamped signature was accepted.'}
+      $rejected=$false;try{Assert-SignedPdfiumEquivalent -UnsignedPath $unsignedPath -SignedPath $signedPath -SignatureProvider $badSignature -ExpectedPublisher 'Joshua Beel'}catch{$rejected=$true};if(-not $rejected){throw 'Untimestamped signature was accepted.'}
       Write-Output ('PASS ' + $evidence)
     `;
     const result = runPowerShell(check);
