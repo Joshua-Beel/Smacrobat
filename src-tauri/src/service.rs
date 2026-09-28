@@ -34,6 +34,7 @@ pub struct PageImageReceipt { path: String, document_id: u64, revision: u64, pag
 pub struct BookmarkInfo { title: String, page: Option<usize>, depth: usize }
 #[derive(Serialize)]
 pub struct BookmarkList { items: Vec<BookmarkInfo>, truncated: bool }
+const MAX_READ_TEXT_BYTES: usize = 1_048_576;
 #[derive(Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum OpenResult {
@@ -52,6 +53,9 @@ type Reply<T> = oneshot::Sender<Result<T, String>>;
 #[cfg(test)]
 #[derive(Default, Debug)]
 struct RenderWork { dequeued: usize, skipped_closed: usize, rendered: usize }
+#[cfg(test)]
+#[derive(Default, Debug)]
+struct BookmarkWork { dequeued: usize, visited: usize }
 #[cfg(test)]
 #[derive(Default, Debug)]
 struct OcrWork { dequeued: usize, preflighted: usize, rendered: usize, converted: usize }
@@ -92,6 +96,8 @@ enum Request {
     BacklogGate(mpsc::Receiver<Vec<Request>>, Reply<()>),
     #[cfg(test)]
     RenderWorkForDocument(u64, Reply<RenderWork>),
+    #[cfg(test)]
+    BookmarkWorkForDocument(u64, Reply<BookmarkWork>),
     #[cfg(test)]
     OcrWorkForDocument(u64, Reply<OcrWork>),
     #[cfg(test)]
@@ -217,6 +223,8 @@ impl PdfService {
             #[cfg(test)]
             let mut render_work = HashMap::<u64, RenderWork>::new();
             #[cfg(test)]
+            let mut bookmark_work = HashMap::<u64, BookmarkWork>::new();
+            #[cfg(test)]
             let mut ocr_work = HashMap::<u64, OcrWork>::new();
             let mut requests = RequestQueue::default();
             while let Ok(request) = requests.next(&receiver) {
@@ -243,6 +251,8 @@ impl PdfService {
                     }
                     #[cfg(test)]
                     Request::RenderWorkForDocument(id, reply) => { let _ = reply.send(Ok(render_work.remove(&id).unwrap_or_default())); }
+                    #[cfg(test)]
+                    Request::BookmarkWorkForDocument(id, reply) => { let _ = reply.send(Ok(bookmark_work.remove(&id).unwrap_or_default())); }
                     #[cfg(test)]
                     Request::OcrWorkForDocument(id, reply) => { let _ = reply.send(Ok(ocr_work.remove(&id).unwrap_or_default())); }
                     #[cfg(test)]
@@ -351,6 +361,7 @@ impl PdfService {
                             cancellation.ensure_runnable().map_err(|error| error.to_string())?;
                             let (session, _) = sessions.get(&request.document_id).ok_or("Document is closed")?;
                             let original = documents.get(&request.document_id).ok_or("Document is closed")?;
+                            session.text_extraction_permission()?;
                             let (dimensions, spec) = checked_ocr_request(session, original, request)?;
                             #[cfg(test)]
                             { ocr_work.entry(request.document_id).or_default().preflighted += 1; }
@@ -428,7 +439,7 @@ impl PdfService {
                             let pages = page_sizes(&document)?;
                             let id = next_id; next_id += 1;
                             let info = DocumentInfo { id, name: path.file_name().unwrap_or_default().to_string_lossy().into_owned(), path: path.to_string_lossy().into_owned(), pages, revision: 0, dirty: false, can_undo: false, can_redo: false };
-                            sessions.insert(id, (EditSession::new(bytes, info.pages.len()), info.clone()));
+                            sessions.insert(id, (EditSession::new_with_password(bytes, info.pages.len(), &password), info.clone()));
                             documents.insert(id, std::rc::Rc::new(document));
                             Ok(OpenResult::Opened { document: info })
                         })();
@@ -511,6 +522,9 @@ impl PdfService {
                         let _ = reply.send(result);
                     }
                     Request::Bookmarks(id, revision, reply) => {
+                        #[cfg(test)]
+                        { bookmark_work.entry(id).or_default().dequeued += 1; }
+                        if reply.is_closed() { continue; }
                         let result = (|| {
                             let (session, _) = sessions.get(&id).ok_or("Document is closed")?;
                             if session.revision != revision { return Err("Document changed. Reopen bookmarks.".into()); }
@@ -518,13 +532,19 @@ impl PdfService {
                             let mut items = Vec::new();
                             let mut depths = HashMap::new();
                             let mut truncated = false;
+                            let mut title_bytes = 0usize;
                             for bookmark in document.bookmarks().iter().take(1001) {
+                                if reply.is_closed() { return Err("Bookmark reading was cancelled.".into()); }
                                 if items.len() == 1000 { truncated = true; break; }
+                                #[cfg(test)]
+                                { bookmark_work.entry(id).or_default().visited += 1; }
                                 let depth = bookmark.parent().and_then(|parent| depths.get(&parent).copied()).map_or(0, |depth: usize| depth + 1);
                                 depths.insert(bookmark.clone(), depth);
                                 let source = bookmark.destination().and_then(|destination| destination.page_index().ok());
                                 let page = source.and_then(|source| session.plan.iter().position(|spec| spec.source == source as usize));
-                                items.push(BookmarkInfo { title: bookmark.title().filter(|s| !s.is_empty()).unwrap_or_else(|| "Untitled bookmark".into()), page, depth });
+                                let title = bookmark.title().filter(|s| !s.is_empty()).unwrap_or_else(|| "Untitled bookmark".into());
+                                title_bytes = checked_read_text_bytes(title_bytes, title.len(), "Bookmarks contain too much text.")?;
+                                items.push(BookmarkInfo { title, page, depth });
                             }
                             Ok(BookmarkList { items, truncated })
                         })();
@@ -537,6 +557,7 @@ impl PdfService {
                             if session.revision != revision { return Err("Document changed. Select text again.".into()); }
                             let spec = session.plan.get(index as usize).ok_or("Page is out of range")?;
                             let document = documents.get(&id).ok_or("Document is closed")?;
+                            session.text_extraction_permission()?;
                             with_planned_page(document, spec, |page| crate::text_geometry::inspect(page, id, index, revision))
                         })();
                         let _ = reply.send(result);
@@ -548,10 +569,13 @@ impl PdfService {
                             if session.revision != revision { return Err("Document changed. Search again.".into()); }
                             let spec = session.plan.get(page as usize).ok_or("Page is out of range")?;
                             let document = documents.get(&id).ok_or("Document is closed")?;
+                            session.text_extraction_permission()?;
                             with_planned_page(document, spec, |source| {
                                 let text = source.text().map_err(|e| e.to_string())?;
                                 let visible = source.boundaries().bounding().map_err(|e| e.to_string())?.bounds;
-                                Ok(text.inside_rect(visible))
+                                let visible = text.inside_rect(visible);
+                                checked_read_text_bytes(0, visible.len(), "This page has too much embedded text to read or search.")?;
+                                Ok(visible)
                             })
                         })();
                         let _ = reply.send(result);
@@ -1075,6 +1099,12 @@ fn replacement_sessions(sessions: &HashMap<u64, (EditSession, DocumentInfo)>, ta
     Ok((target_session, donor_session))
 }
 
+fn checked_read_text_bytes(current: usize, additional: usize, message: &str) -> Result<usize, String> {
+    let total = current.checked_add(additional).ok_or_else(|| message.to_owned())?;
+    if total > MAX_READ_TEXT_BYTES { return Err(message.into()); }
+    Ok(total)
+}
+
 fn checked_page_image_request(session: &EditSession, document: &PdfDocument<'_>, revision: u64, page: u16, dpi: u16) -> Result<(crate::page_image::RasterDimensions, PageSpec), String> {
     if session.revision != revision { return Err("Document changed. Export the page image again.".into()); }
     if !matches!(document.permissions().security_handler_revision(), Ok(PdfSecurityHandlerRevision::Unprotected)) {
@@ -1093,13 +1123,7 @@ fn checked_ocr_request(
     request: crate::ocr::OcrPageRequest,
 ) -> Result<(crate::ocr::OcrRasterDimensions, PageSpec), String> {
     if session.revision != request.revision { return Err("Document changed. Start OCR again.".into()); }
-    let permissions = document.permissions();
-    match permissions.can_extract_text_and_graphics() {
-        Ok(true) => {}
-        Ok(false) => return Err("This PDF does not allow text and graphics extraction.".into()),
-        Err(_) => return Err("The PDF extraction permission could not be verified.".into()),
-    }
-    if !matches!(permissions.security_handler_revision(), Ok(PdfSecurityHandlerRevision::Unprotected)) {
+    if !matches!(document.permissions().security_handler_revision(), Ok(PdfSecurityHandlerRevision::Unprotected)) {
         return Err("OCR of encrypted or restricted PDFs is not supported in this build.".into());
     }
     session.page_image_export_guard()?;
@@ -1289,7 +1313,7 @@ mod tests {
     macro_rules! accepted_reply_values {
         ($($value:ty),* $(,)?) => { $(impl TestReplyValue for $value { type Accepted = Self; fn accept(self) -> Self { self } })* };
     }
-    accepted_reply_values!((), Vec<u8>, Vec<u64>, Vec<Option<String>>, String, DocumentInfo, SavedCopy, OpenResult, PrintSnapshotInfo, PrintBitmap, PageImagePreflight, PageImageReceipt, BookmarkList, RenderWork, OcrWork, OcrWorkerState, crate::ocr::OcrPageRaster, crate::page_labels::DocumentPageLabels, crate::document_properties::DocumentProperties, crate::text_geometry::PageTextGeometry, crate::split::SplitOutput, crate::comments::CommentList, crate::comments::AnnotationList, crate::forms::FormFields);
+    accepted_reply_values!((), Vec<u8>, Vec<u64>, Vec<Option<String>>, String, DocumentInfo, SavedCopy, OpenResult, PrintSnapshotInfo, PrintBitmap, PageImagePreflight, PageImageReceipt, BookmarkList, RenderWork, BookmarkWork, OcrWork, OcrWorkerState, crate::ocr::OcrPageRaster, crate::page_labels::DocumentPageLabels, crate::document_properties::DocumentProperties, crate::text_geometry::PageTextGeometry, crate::split::SplitOutput, crate::comments::CommentList, crate::comments::AnnotationList, crate::forms::FormFields);
     fn call<T: TestReplyValue>(service: &PdfService, request: impl FnOnce(Reply<T>) -> Request) -> Result<T::Accepted, String> {
         let (tx, rx) = oneshot::channel(); service.sender.send(request(tx)).unwrap(); rx.blocking_recv().unwrap().map(TestReplyValue::accept)
     }
@@ -3611,6 +3635,8 @@ mod tests {
             let (tx, rx) = oneshot::channel(); service.sender.send(Request::Properties(info.id, 0, tx)).unwrap(); let properties = rx.blocking_recv().unwrap().unwrap();
             assert_ne!(properties.security.encrypted, Some(false), "Encrypted v{version}-{kind} must never be reported unencrypted");
             assert_eq!(properties.page_count, 6); assert_eq!(properties.source_size_bytes, source.len());
+            assert!(call(&service, |reply| Request::Text(info.id, 0, 0, reply)).is_ok(), "v{version}-{kind} copy permission must allow Page text");
+            assert_eq!(call(&service, |reply| Request::TextGeometry(info.id, 0, 0, reply)).unwrap().status, "ok", "v{version}-{kind} copy permission must allow text geometry");
             let (tx, rx) = oneshot::channel(); service.sender.send(Request::BeginPrint(info.id, 0, tx)).unwrap(); assert!(rx.blocking_recv().unwrap().is_err(), "Encrypted v{version}-{kind} must not print");
             let comments = call(&service, |reply| Request::Comments(info.id, 0, reply)).unwrap(); assert_eq!(comments.status, "unsupported"); assert!(comments.notes.is_empty());
             assert_eq!(call(&service, |reply| Request::FormFields(info.id, 0, reply)).unwrap().status, "unsupported", "Encrypted v{version}-{kind} must not expose fillable fields");
@@ -3714,6 +3740,119 @@ mod tests {
             assert!(rx.blocking_recv().unwrap().is_ok());
             let (tx, rx) = oneshot::channel(); service.sender.send(Request::Close(info.id, tx)).unwrap(); rx.blocking_recv().unwrap().unwrap();
             let (tx, rx) = oneshot::channel(); service.sender.send(Request::Bookmarks(info.id, 0, tx)).unwrap(); assert!(rx.blocking_recv().unwrap().is_err());
+        }
+    }
+    #[test]
+    fn bookmarks_reject_unbounded_title_text() {
+        use lopdf::{dictionary, Object};
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let folder = tempfile::tempdir().unwrap();
+        let mut pdf = lopdf::Document::load(root.join("resources/welcome.pdf")).unwrap();
+        let page = pdf.get_pages()[&1];
+        let outlines = pdf.new_object_id();
+        let bookmark = pdf.new_object_id();
+        pdf.objects.insert(outlines, dictionary! { "Type" => "Outlines", "First" => bookmark, "Last" => bookmark, "Count" => 1 }.into());
+        pdf.objects.insert(bookmark, dictionary! { "Title" => Object::string_literal("B".repeat(1_048_577)), "Parent" => outlines, "Dest" => vec![Object::Reference(page), Object::Name(b"Fit".to_vec())] }.into());
+        pdf.catalog_mut().unwrap().set("Outlines", outlines);
+        let path = folder.path().join("oversized-bookmark-title.pdf");
+        pdf.save(&path).unwrap();
+        let service = PdfService::start(root.join("resources/pdfium/bin/pdfium.dll"));
+        let info = call(&service, |reply| Request::Open(path, reply)).unwrap();
+        let (reply, receiver) = oneshot::channel();
+        drop(receiver);
+        service.sender.send(Request::Bookmarks(info.id, info.revision, reply)).unwrap();
+        let skipped = call(&service, |reply| Request::BookmarkWorkForDocument(info.id, reply)).unwrap();
+        assert_eq!((skipped.dequeued, skipped.visited), (1, 0));
+        let error = match call(&service, |reply| Request::Bookmarks(info.id, info.revision, reply)) { Ok(_) => panic!("oversized bookmark text was returned"), Err(error) => error };
+        assert_eq!(error, "Bookmarks contain too much text.");
+        let bounded = call(&service, |reply| Request::BookmarkWorkForDocument(info.id, reply)).unwrap();
+        assert_eq!((bounded.dequeued, bounded.visited), (1, 1));
+    }
+    #[test]
+    fn page_text_rejects_unbounded_visible_text() {
+        use lopdf::Object;
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let folder = tempfile::tempdir().unwrap();
+        let line = "M".repeat(32_000);
+        let text = vec![line.as_str(); 40].join("\n");
+        let mut pdf = lopdf::Document::load_mem(&crate::text_geometry::tests::fixture(0, [1.0, 0.0, 0.0, 1.0, 100.0, 2_000_000.0], &text)).unwrap();
+        let page = pdf.get_pages()[&1];
+        let bounds = vec![0.into(), 0.into(), Object::Real(100_000_000.0), Object::Real(4_000_000.0)];
+        pdf.get_dictionary_mut(page).unwrap().set("MediaBox", bounds.clone());
+        pdf.get_dictionary_mut(page).unwrap().set("CropBox", bounds);
+        let path = folder.path().join("oversized-visible-page-text.pdf");
+        pdf.save(&path).unwrap();
+        let service = PdfService::start(root.join("resources/pdfium/bin/pdfium.dll"));
+        let info = call(&service, |reply| Request::Open(path, reply)).unwrap();
+        let error = call(&service, |reply| Request::Text(info.id, 0, info.revision, reply)).unwrap_err();
+        assert_eq!(error, "This page has too much embedded text to read or search.");
+        let cropped_path = folder.path().join("oversized-hidden-page-text.pdf");
+        pdf.get_dictionary_mut(page).unwrap().set("CropBox", vec![0.into(), Object::Real(1_999_990.0), Object::Real(1_000_000.0), Object::Real(2_000_030.0)]);
+        pdf.save(&cropped_path).unwrap();
+        let cropped = call(&service, |reply| Request::Open(cropped_path, reply)).unwrap();
+        let visible = call(&service, |reply| Request::Text(cropped.id, 0, cropped.revision, reply)).unwrap();
+        assert!(!visible.is_empty() && visible.len() < MAX_READ_TEXT_BYTES, "visible cropped bytes: {}", visible.len());
+        for id in [info.id, cropped.id] { call(&service, |reply| Request::Close(id, reply)).unwrap(); }
+    }
+    #[test]
+    fn text_reads_enforce_extraction_permission_without_rejecting_allowed_encryption() {
+        let _password_guard = password_test_lock();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let folder = tempfile::tempdir().unwrap();
+        let service = PdfService::start(root.join("resources/pdfium/bin/pdfium.dll"));
+        for (kind, permissions, user_password, allowed) in [
+            ("denied", lopdf::Permissions::empty(), "", false),
+            ("accessibility-only", lopdf::Permissions::COPYABLE_FOR_ACCESSIBILITY, "restricted", false),
+            ("copy-only", lopdf::Permissions::COPYABLE, "copy", true),
+            ("allowed", lopdf::Permissions::all(), "", true),
+        ] {
+            let mut pdf = lopdf::Document::load(root.join("resources/welcome.pdf")).unwrap();
+            pdf.trailer.set("ID", vec![lopdf::Object::string_literal(format!("text-{kind}")), lopdf::Object::string_literal(format!("text-{kind}"))]);
+            let encryption = lopdf::EncryptionVersion::V2 { document: &pdf, owner_password: "owner", user_password, key_length: 128, permissions };
+            pdf.encrypt(&lopdf::EncryptionState::try_from(encryption).unwrap()).unwrap();
+            let path = folder.path().join(format!("text-{kind}.pdf"));
+            pdf.save(&path).unwrap();
+            let source = std::fs::read(&path).unwrap();
+            let opened = call(&service, |reply| Request::BeginOpen(path.clone(), reply)).unwrap();
+            let info = match opened {
+                OpenResult::Opened { document } => document,
+                OpenResult::PasswordRequired { request_id, .. } => match call(&service, |reply| Request::Unlock(request_id, user_password.into(), reply)).unwrap() { OpenResult::Opened { document } => document, _ => panic!("{kind} did not unlock") },
+            };
+            if !allowed {
+                for error in [
+                    call(&service, |reply| Request::Text(info.id, 0, info.revision, reply)).unwrap_err(),
+                    call(&service, |reply| Request::TextGeometry(info.id, 0, info.revision, reply)).unwrap_err(),
+                ] { assert_eq!(error, "This PDF does not allow text and graphics extraction."); }
+            } else {
+                call(&service, |reply| Request::Text(info.id, 0, info.revision, reply)).unwrap();
+                assert_eq!(call(&service, |reply| Request::TextGeometry(info.id, 0, info.revision, reply)).unwrap().status, "ok");
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), source);
+            call(&service, |reply| Request::Close(info.id, reply)).unwrap();
+        }
+        let mut pdf = lopdf::Document::load(root.join("resources/welcome.pdf")).unwrap();
+        pdf.trailer.set("ID", vec![lopdf::Object::string_literal("text-owner"), lopdf::Object::string_literal("text-owner")]);
+        let encryption = lopdf::EncryptionVersion::V2 { document: &pdf, owner_password: "owner", user_password: "reader", key_length: 128, permissions: lopdf::Permissions::empty() };
+        pdf.encrypt(&lopdf::EncryptionState::try_from(encryption).unwrap()).unwrap();
+        let path = folder.path().join("text-owner.pdf");
+        pdf.save(&path).unwrap();
+        let source = std::fs::read(&path).unwrap();
+        for (password, owner_access) in [("reader", false), ("owner", true)] {
+            let opened = call(&service, |reply| Request::BeginOpen(path.clone(), reply)).unwrap();
+            let request_id = match opened { OpenResult::PasswordRequired { request_id, .. } => request_id, _ => panic!("protected fixture opened without a password") };
+            let info = match call(&service, |reply| Request::Unlock(request_id, password.into(), reply)).unwrap() { OpenResult::Opened { document } => document, _ => panic!("{password} did not unlock") };
+            let text = call(&service, |reply| Request::Text(info.id, 0, info.revision, reply));
+            let geometry = call(&service, |reply| Request::TextGeometry(info.id, 0, info.revision, reply));
+            if owner_access { assert!(text.is_ok() && geometry.is_ok()); } else { assert_eq!(text.unwrap_err(), "This PDF does not allow text and graphics extraction."); assert_eq!(geometry.unwrap_err(), "This PDF does not allow text and graphics extraction."); }
+            call(&service, |reply| Request::Close(info.id, reply)).unwrap();
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), source);
+    }
+    #[test]
+    fn read_text_byte_limit_is_checked_without_overflow() {
+        assert_eq!(checked_read_text_bytes(MAX_READ_TEXT_BYTES - 1, 1, "limit").unwrap(), MAX_READ_TEXT_BYTES);
+        for (current, additional) in [(MAX_READ_TEXT_BYTES, 1), (usize::MAX, 1)] {
+            assert_eq!(checked_read_text_bytes(current, additional, "limit").unwrap_err(), "limit");
         }
     }
     #[test]

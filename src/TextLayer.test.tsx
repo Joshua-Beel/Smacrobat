@@ -117,4 +117,15 @@ describe('on-page text layer', () => {
     expect(ui.root.findAllByProps({ 'data-testid': 'text-layer' })).toHaveLength(0);
     act(() => ui.unmount());
   });
+
+  it.each([
+    'This PDF does not allow text and graphics extraction.',
+    'The PDF extraction permission could not be verified.'
+  ])('does not direct a denied extraction request to Page text: %s', async error => {
+    vi.mocked(pageTextGeometry).mockRejectedValue(new Error(error));
+    const ui = await mount();
+    expect(JSON.stringify(ui.toJSON())).toContain(error);
+    expect(JSON.stringify(ui.toJSON())).not.toContain('Read and copy page text instead');
+    act(() => ui.unmount());
+  });
 });

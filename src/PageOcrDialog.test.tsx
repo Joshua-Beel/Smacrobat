@@ -8,6 +8,7 @@ vi.mock('./bridge', () => ({ recognizePageOcr: vi.fn(), cancelPageOcr: vi.fn() }
 const target: PageOcrTarget = { id: 7, revision: 4, page: 2, name: 'source.pdf' };
 const receipt = (overrides: Partial<OcrReceipt> = {}): OcrReceipt => ({ status: 'recognized', requestId: '11111111-1111-4111-8111-111111111111', documentId: 7, revision: 4, page: 2, dpi: 150, language: 'eng', width: 800, height: 600, text: 'Recognized text', ...overrides });
 const button = (ui: ReactTestRenderer, text: string) => ui.root.findAllByType('button').find(item => item.children.join('') === text)!;
+const processEvents = (globalThis as typeof globalThis & { process: { on: (event: 'unhandledRejection', listener: (reason: unknown) => void) => void; off: (event: 'unhandledRejection', listener: (reason: unknown) => void) => void } }).process;
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -96,7 +97,7 @@ it('suppresses a teardown-only cancellation rejection until the original request
   vi.mocked(cancelPageOcr).mockRejectedValue(new Error('IPC unavailable during teardown'));
   const rejections: unknown[] = [];
   const capture = (reason: unknown) => rejections.push(reason);
-  process.on('unhandledRejection', capture);
+  processEvents.on('unhandledRejection', capture);
   try {
     const { ui, setBusy } = await mount();
     act(() => ui.unmount());
@@ -105,6 +106,6 @@ it('suppresses a teardown-only cancellation rejection until the original request
     expect(setBusy.mock.calls).toEqual([[true], [false]]);
     expect(rejections).toEqual([]);
   } finally {
-    process.off('unhandledRejection', capture);
+    processEvents.off('unhandledRejection', capture);
   }
 });

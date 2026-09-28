@@ -1,0 +1,15 @@
+<!doctype html>
+<html><head><meta charset="UTF-8" /><title>Updates cleanup browser test</title><style>dialog{position:relative;margin:24px}</style></head><body><div id="root"></div><p id="proof"></p><script type="module">
+window.isTauri=true;
+window.addEventListener('unhandledrejection',event=>{document.body.dataset.rejection=String(event.reason)});
+window.__TAURI_INTERNALS__={invoke:async command=>{
+  if(command==='plugin:app|version')return'0.2.0';
+  if(command==='plugin:updater|check')return{rid:1,currentVersion:'0.2.0',version:'0.3.0',date:null,body:null,rawJson:'{}'};
+  if(command==='plugin:resources|close'){document.body.dataset.closeCalls=String(Number(document.body.dataset.closeCalls||0)+1);return Promise.reject(new Error('updater cleanup unavailable'))}
+  throw new Error(command);
+}};
+const[{default:Updates},React,{createRoot}]=await Promise.all([import('./Updates.tsx'),import('react'),import('react-dom/client')]);
+const root=createRoot(document.getElementById('root'));
+root.render(React.createElement(Updates,{dirty:false,busy:false,setBusy:()=>{},close:()=>{}}));
+setTimeout(()=>{document.body.dataset.unmounted='true';root.unmount()},50);
+</script></body></html>

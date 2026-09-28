@@ -5,7 +5,7 @@ import { textHighlightFromBrowserSelection, type TextHighlightSelection, type Te
 import styles from './TextLayer.module.css';
 
 const MAX_GLYPHS = 20_000;
-type State = { request: string; kind: 'loading' } | { request: string; kind: 'ready'; geometry: PageTextGeometry } | { request: string; kind: 'fallback'; message: string };
+type State = { request: string; kind: 'loading' } | { request: string; kind: 'ready'; geometry: PageTextGeometry } | { request: string; kind: 'fallback'; message: string; suggestPageText: boolean };
 type Bounds = NonNullable<PageTextGeometry['characters'][number]['bounds']>;
 
 function geometryProblem(geometry: PageTextGeometry): string | null {
@@ -74,8 +74,8 @@ export default function TextLayer({ id, page, revision, imageReady, enabled, pag
     pageTextGeometry(id, page, revision).then(geometry => {
       if (disposed || geometry.id !== id || geometry.page !== page || geometry.revision !== revision) return;
       const problem = geometryProblem(geometry);
-      setState(problem ? { request, kind: 'fallback', message: problem } : { request, kind: 'ready', geometry });
-    }).catch(() => { if (!disposed) setState({ request, kind: 'fallback', message: 'Positioned text is unavailable for this page.' }); });
+      setState(problem ? { request, kind: 'fallback', message: problem, suggestPageText: true } : { request, kind: 'ready', geometry });
+    }).catch(error => { if (!disposed) setState({ request, kind: 'fallback', message: String(error), suggestPageText: false }); });
     return () => { disposed = true; };
   }, [id, imageReady, needsGeometry, page, request, revision]);
 
@@ -97,7 +97,7 @@ export default function TextLayer({ id, page, revision, imageReady, enabled, pag
   }, [enabled, id, onTextSelection, page, request, revision, state]);
 
   if (!needsGeometry || !imageReady || state.request !== request || state.kind === 'loading') return null;
-  if (state.kind === 'fallback') return <div className={styles.fallback} role="status">{search ? 'On-page search highlights are unavailable.' : 'On-page text selection is unavailable.'} {state.message} Use Read and copy page text instead.</div>;
+  if (state.kind === 'fallback') return <div className={styles.fallback} role="status">{search ? 'On-page search highlights are unavailable.' : 'On-page text selection is unavailable.'} {state.message}{state.suggestPageText ? ' Use Read and copy page text instead.' : null}</div>;
   const highlightIndexes = search ? matchedCharacterIndexes(state.geometry.characters, search) : null;
   const hasPositionedHighlight = highlightIndexes ? [...highlightIndexes].some(index => Boolean(state.geometry.characters[index].bounds)) : false;
   return <>

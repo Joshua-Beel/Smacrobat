@@ -28,7 +28,7 @@ export default function Updates({ dirty, busy, setBusy, close }: { dirty: boolea
       } catch (e) { if (!disposed) { setError(`Could not check for updates: ${String(e)}`); setStatus('Close and try again when you are online.'); } }
       finally { if (!disposed) setChecking(false); }
     })();
-    return () => { disposed = true; void pending.current?.close(); };
+    return () => { disposed = true; const release = pending.current?.close(); if (release) void release.catch(() => {}); };
   }, []);
   const install = async () => {
     if (!available || dirty || busy || installing) return;

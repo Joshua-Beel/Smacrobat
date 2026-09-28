@@ -62,6 +62,25 @@ pub enum PageEdit {
     Redo,
 }
 
+fn source_text_extraction_permission(document: &Document) -> Result<(), String> {
+    let permissions = if let Some(state) = document.encryption_state.as_ref() {
+        state.permissions()
+    } else if document.is_encrypted() {
+        let bits = document.get_encrypted()
+            .and_then(|dictionary| dictionary.get(b"P"))
+            .and_then(Object::as_i64)
+            .map_err(|_| "The PDF extraction permission could not be verified.")?;
+        lopdf::Permissions::from_bits_truncate(bits as u64)
+    } else {
+        return Ok(());
+    };
+    if permissions.contains(lopdf::Permissions::COPYABLE) {
+        Ok(())
+    } else {
+        Err("This PDF does not allow text and graphics extraction.".into())
+    }
+}
+
 pub struct EditSession {
     pub source: Vec<u8>,
     source_page_count: usize,
@@ -74,12 +93,26 @@ pub struct EditSession {
     pub revision: u64,
     source_notes: Vec<Vec<crate::comments::Note>>,
     comments_reason: Option<String>,
+    text_extraction_permission: Result<(), String>,
     next_note: u64,
 }
 
 impl EditSession {
     pub fn new(source: Vec<u8>, count: usize) -> Self {
-        let imported = Document::load_mem(&source).map_err(|error| error.to_string()).and_then(|document| crate::comments::read(&document));
+        Self::new_with_open_password(source, count, None)
+    }
+    pub fn new_with_password(source: Vec<u8>, count: usize, password: &str) -> Self {
+        Self::new_with_open_password(source, count, Some(password))
+    }
+    fn new_with_open_password(source: Vec<u8>, count: usize, password: Option<&str>) -> Self {
+        let parsed = Document::load_mem(&source).map_err(|error| error.to_string());
+        let owner_access = parsed.as_ref().ok().is_some_and(|document| password.is_some_and(|password| document.authenticate_owner_password(password).is_ok()));
+        let text_extraction_permission = if owner_access {
+            Ok(())
+        } else {
+            parsed.as_ref().map_err(|_| "The PDF extraction permission could not be verified.".into()).and_then(|document| source_text_extraction_permission(document))
+        };
+        let imported = parsed.and_then(|document| crate::comments::read(&document));
         let (source_notes, comments_reason) = match imported {
             Ok(notes) if notes.len() == count => (notes, None),
             Ok(_) => (vec![Vec::new(); count], Some("The PDF engines disagree about the page count.".into())),
@@ -87,13 +120,14 @@ impl EditSession {
         };
         let next_note = source_notes.iter().flatten().filter_map(|note| crate::comments::number(&note.id).ok()).max().unwrap_or(0).saturating_add(1);
         let plan: Vec<_> = (0..count).map(|source| PageSpec { source, turns: 0, crop: None, notes: source_notes[source].clone() }).collect();
-        Self { source, source_page_count: count, saved: plan.clone(), plan, undo: VecDeque::new(), redo: VecDeque::new(), history_bytes: 0, history_budget: HISTORY_BUDGET, revision: 0, source_notes, comments_reason, next_note }
+        Self { source, source_page_count: count, saved: plan.clone(), plan, undo: VecDeque::new(), redo: VecDeque::new(), history_bytes: 0, history_budget: HISTORY_BUDGET, revision: 0, source_notes, comments_reason, text_extraction_permission, next_note }
     }
     pub fn dirty(&self) -> bool { self.plan != self.saved }
     pub fn can_undo(&self) -> bool { !self.undo.is_empty() }
     pub fn can_redo(&self) -> bool { !self.redo.is_empty() }
     pub fn mark_saved(&mut self) { self.saved = self.plan.clone(); }
     pub fn comments_reason(&self) -> Option<&str> { self.comments_reason.as_deref() }
+    pub fn text_extraction_permission(&self) -> Result<(), String> { self.text_extraction_permission.clone() }
     pub fn page_image_export_guard(&self) -> Result<(), String> {
         let document = self.load_source()?;
         check_supported(&document, false, false)

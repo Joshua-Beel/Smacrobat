@@ -31,6 +31,13 @@ describe('software updates', () => {
     expect(install).not.toHaveBeenCalled(); expect(setBusy).not.toHaveBeenCalled();
     act(() => ui.unmount()); expect(close).toHaveBeenCalledOnce();
   });
+  it('absorbs an asynchronous release failure while the dialog unmounts', async () => {
+    const release = vi.fn().mockRejectedValue(new Error('updater cleanup unavailable'));
+    vi.mocked(check).mockResolvedValue({ version: '0.3.0', downloadAndInstall: vi.fn(), close: release } as never);
+    const { ui } = await mount();
+    await act(async () => { ui.unmount(); await Promise.resolve(); });
+    expect(release).toHaveBeenCalledOnce();
+  });
   it('releases the busy guard and shows errors when signature verification fails', async () => {
     const install = vi.fn().mockRejectedValue(new Error('signature verification failed'));
     vi.mocked(check).mockResolvedValue({ version: '0.3.0', downloadAndInstall: install, close: vi.fn() } as never);
