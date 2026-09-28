@@ -21,6 +21,8 @@ describe('manual signed OCR artifact workflow', () => {
     const builder = readFileSync('scripts/build-installer.ps1', 'utf8');
 
     expect(workflow).toContain('workflow_dispatch:');
+    expect(workflow).toContain('runs-on: windows-2022');
+    expect(workflow).not.toContain('runs-on: windows-latest');
     expect(workflow).not.toMatch(/^\s*push:/m);
     expect(workflow).toContain('expected_publisher:');
     expect(workflow).toContain('required: true');
