@@ -189,9 +189,9 @@ function Get-ExactProfileBinding {
     if ($actual.Equals($requested,[StringComparison]::OrdinalIgnoreCase)) { return 'requested-profile' }
     if ($actual.Equals($settingsWebView,[StringComparison]::OrdinalIgnoreCase)) { return 'tauri-app-settings-ebwebview' }
     $requestedWebView = [IO.Path]::GetFullPath((Join-Path $requested 'EBWebView')).TrimEnd('\')
+    if ($actual.Equals($requestedWebView,[StringComparison]::OrdinalIgnoreCase) -and [IO.Path]::GetFileName($actual) -ceq 'EBWebView') { return 'requested-ebwebview' }
     $relation = if ($actual.Equals($settings,[StringComparison]::OrdinalIgnoreCase)) { 'exact-settings-root' }
         elseif ($actual.StartsWith($settings + '\',[StringComparison]::OrdinalIgnoreCase)) { 'settings-root-other' }
-        elseif ($actual.Equals($requestedWebView,[StringComparison]::OrdinalIgnoreCase)) { 'requested-ebwebview' }
         elseif ($actual.StartsWith($requested + '\',[StringComparison]::OrdinalIgnoreCase)) { 'requested-root-other' }
         elseif ($env:RUNNER_TEMP -and $actual.StartsWith([IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\') + '\',[StringComparison]::OrdinalIgnoreCase)) { 'runner-temp-other' }
         else { 'outside-known-roots' }
@@ -487,7 +487,9 @@ function Invoke-InstalledAppLaunchSmoke {
         throw 'The controlled application settings root must contain only the receipt-bound sentinel before launch.'
     }
     $applicationProfile = [IO.Path]::GetFullPath((Join-Path $settingsRoot 'EBWebView')).TrimEnd('\')
+    $requestedChildProfile = [IO.Path]::GetFullPath((Join-Path $profile 'EBWebView')).TrimEnd('\')
     if (Test-Path -LiteralPath $applicationProfile) { throw 'The exact Tauri application WebView profile must be absent before launch.' }
+    if (Test-Path -LiteralPath $requestedChildProfile) { throw 'The exact requested WebView child profile must be absent before launch.' }
     $ambient = @(Get-LaunchProcessSnapshot)
     if ($ambient.Count -ne 0) { throw 'The hosted runner already has an application or WebDriver process.' }
     $receiptPath = Join-Path $driverRoot 'webdriver-receipt.json'
@@ -512,7 +514,7 @@ function Invoke-InstalledAppLaunchSmoke {
     $capabilityKeys = @($result.sessionCapabilityKeys)
     if ([string]$result.nativeDriverVersion -cne $expectedEdgeDriverVersion -or [string]$result.driverVersionBinding -cne 'native-status' -or
         $returnedRuntimeParts.Count -ne 4 -or ($returnedRuntimeParts[0..2] -join '.') -cne ($expectedRuntimeParts[0..2] -join '.') -or
-        @('session-capability-requested-profile','session-capability-tauri-app-settings-ebwebview','owned-webview-requested-profile','owned-webview-tauri-app-settings-ebwebview') -cnotcontains [string]$result.profileBindingMethod -or
+        @('session-capability-requested-profile','session-capability-requested-ebwebview','session-capability-tauri-app-settings-ebwebview','owned-webview-requested-profile','owned-webview-requested-ebwebview','owned-webview-tauri-app-settings-ebwebview') -cnotcontains [string]$result.profileBindingMethod -or
         $capabilityKeys.Count -eq 0 -or $capabilityKeys.Count -gt 32 -or @($capabilityKeys | Where-Object { $_ -cnotmatch '^[A-Za-z0-9:._-]{1,64}$' }).Count -ne 0 -or
         [string]$result.title -cne 'PDF Workstation' -or $result.homeButton -isnot [bool] -or -not $result.homeButton -or
         [string]$result.ocrCapabilityStatus -cne 'Available' -or [string]$result.sampleName -cne 'welcome.pdf' -or
@@ -526,6 +528,7 @@ function Invoke-InstalledAppLaunchSmoke {
     Assert-NoReparseAncestors -Path $profile
     Assert-FileReceipt -Path $settingsSentinel -Bytes $SettingsSentinelBytes -Sha256 $SettingsSentinelSha256 -Kind 'Postlaunch synthetic settings sentinel'
     $usesTauriProfile = ([string]$result.profileBindingMethod).EndsWith('tauri-app-settings-ebwebview',[StringComparison]::Ordinal)
+    $usesRequestedChildProfile = ([string]$result.profileBindingMethod).EndsWith('requested-ebwebview',[StringComparison]::Ordinal)
     $requestedProfileEntries = @(Get-ChildItem -LiteralPath $profile -Force)
     $postlaunchSettingsEntries = @(Get-ChildItem -LiteralPath $settingsRoot -Force)
     if ($usesTauriProfile) {
@@ -540,6 +543,20 @@ function Invoke-InstalledAppLaunchSmoke {
         if ($applicationProfileEntry.Count -ne 1 -or -not $applicationProfileEntry[0].PSIsContainer -or
             ($applicationProfileEntry[0].Attributes -band [IO.FileAttributes]::ReparsePoint)) {
             throw 'The controlled settings root did not contain exactly the expected Tauri application profile.'
+        }
+    } elseif ($usesRequestedChildProfile) {
+        if (-not (Test-Path -LiteralPath $requestedChildProfile -PathType Container) -or
+            (Test-Path -LiteralPath $applicationProfile) -or $requestedProfileEntries.Count -ne 1 -or
+            $postlaunchSettingsEntries.Count -ne 1 -or
+            -not $postlaunchSettingsEntries[0].FullName.Equals($settingsSentinel,[StringComparison]::OrdinalIgnoreCase)) {
+            throw 'The requested WebView child profile or controlled settings root changed outside its exact contract.'
+        }
+        Assert-NoReparseAncestors -Path $requestedChildProfile
+        if (@(Get-ChildItem -LiteralPath $requestedChildProfile -Force).Count -eq 0 -or
+            -not $requestedProfileEntries[0].FullName.Equals($requestedChildProfile,[StringComparison]::OrdinalIgnoreCase) -or
+            -not $requestedProfileEntries[0].PSIsContainer -or
+            ($requestedProfileEntries[0].Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw 'The exact requested WebView child profile was empty, inexact, or reparse-backed.'
         }
     } else {
         if (Test-Path -LiteralPath $applicationProfile) { throw 'The unused Tauri application profile was unexpectedly created.' }
