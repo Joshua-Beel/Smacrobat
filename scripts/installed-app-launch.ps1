@@ -8,6 +8,7 @@ $script:LaunchPins = [ordered]@{
     RequestTimeoutMilliseconds = 10000
     SessionCreationTimeoutMilliseconds = 30000
     CleanupProcessTimeoutMilliseconds = 10000
+    OcrUiTextBytesMaximum = 65536
     RequestBytesMaximum = 1MB
     JsonDepthMaximum = 12
     JsonNodesMaximum = 512
@@ -222,7 +223,7 @@ function Get-OwnedProfileBinding {
 }
 
 function Assert-OwnedLaunchExecutables {
-    param([object[]]$Owned,[Parameter(Mandatory = $true)][string]$ApplicationPath,[Parameter(Mandatory = $true)][string]$EdgeDriverPath)
+    param([object[]]$Owned,[Parameter(Mandatory = $true)][string]$ApplicationPath,[Parameter(Mandatory = $true)][string]$EdgeDriverPath,[Parameter(Mandatory = $true)][string]$OcrEnginePath)
     $applications = @($Owned | Where-Object { [IO.Path]::GetFileName([string]$_.Path).Equals('pdf-workstation.exe',[StringComparison]::OrdinalIgnoreCase) })
     if ($applications.Count -ne 1 -or -not ([IO.Path]::GetFullPath([string]$applications[0].Path)).Equals([IO.Path]::GetFullPath($ApplicationPath),[StringComparison]::OrdinalIgnoreCase)) {
         throw 'WebDriver did not launch exactly the installed signed application.'
@@ -231,6 +232,21 @@ function Assert-OwnedLaunchExecutables {
     if ($nativeDrivers.Count -ne 1 -or -not ([IO.Path]::GetFullPath([string]$nativeDrivers[0].Path)).Equals([IO.Path]::GetFullPath($EdgeDriverPath),[StringComparison]::OrdinalIgnoreCase)) {
         throw 'tauri-driver did not own exactly the trusted native EdgeDriver executable.'
     }
+    $ocrEngines = @($Owned | Where-Object { [IO.Path]::GetFileName([string]$_.Path).Equals('tesseract.exe',[StringComparison]::OrdinalIgnoreCase) })
+    if (@($ocrEngines | Where-Object { -not ([IO.Path]::GetFullPath([string]$_.Path)).Equals([IO.Path]::GetFullPath($OcrEnginePath),[StringComparison]::OrdinalIgnoreCase) }).Count -ne 0) {
+        throw 'An owned OCR process did not use the exact trusted installed engine.'
+    }
+}
+
+function Get-UniqueOwnedLaunchProcesses {
+    param([object[]]$Processes)
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $unique = [Collections.Generic.List[object]]::new()
+    foreach ($process in @($Processes)) {
+        $key = '{0}|{1}|{2}' -f [int]$process.ProcessId,[long]$process.StartTicks,[IO.Path]::GetFullPath([string]$process.Path)
+        if ($seen.Add($key)) { $unique.Add($process) }
+    }
+    return @($unique)
 }
 
 function Invoke-WebDriverScript {
@@ -251,8 +267,20 @@ function Wait-WebDriverOracle {
     throw "$Kind did not become true before the shared launch deadline."
 }
 
+function Get-LaunchOcrTextReceipt {
+    param([Parameter(Mandatory = $true)][string]$Text,[Parameter(Mandatory = $true)][int]$ReportedUtf8Bytes)
+    $bytes = [Text.Encoding]::UTF8.GetBytes($Text)
+    if ([string]::IsNullOrWhiteSpace($Text) -or $bytes.Length -le 0 -or $bytes.Length -gt $script:LaunchPins.OcrUiTextBytesMaximum -or $ReportedUtf8Bytes -ne $bytes.Length) {
+        throw 'Current-page OCR text was empty, oversized, or changed across the bounded WebDriver response.'
+    }
+    return [pscustomobject]@{
+        utf8Bytes = $bytes.Length
+        sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
+    }
+}
+
 function Get-LaunchProcessSnapshot {
-    $names = @('pdf-workstation','tauri-driver','msedgedriver','msedgewebview2')
+    $names = @('pdf-workstation','tauri-driver','msedgedriver','msedgewebview2','tesseract')
     return @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $names.Contains($_.ProcessName.ToLowerInvariant()) })
 }
 
@@ -344,6 +372,7 @@ function Get-LaunchProcessCategory {
         'tauri-driver' { return 'tauri-driver' }
         'msedgedriver' { return 'edge-driver' }
         'msedgewebview2' { return 'webview' }
+        'tesseract' { return 'ocr-engine' }
         default { return 'other' }
     }
 }
@@ -362,7 +391,7 @@ function Stop-OwnedLaunchProcesses {
         $rootOutcome = Wait-BoundedOwnedProcessExit -Process $TauriDriver -Deadline $Deadline
     }
     $states = [ordered]@{}
-    foreach ($category in @('application','tauri-driver','edge-driver','webview','other')) {
+    foreach ($category in @('application','tauri-driver','edge-driver','webview','ocr-engine','other')) {
         $states[$category] = [Collections.Generic.List[bool]]::new()
     }
     $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -390,6 +419,7 @@ function Stop-OwnedLaunchProcesses {
         tauriDriver = Get-CapturedCategoryOutcome -States $states.'tauri-driver'
         edgeDriver = Get-CapturedCategoryOutcome -States $states.'edge-driver'
         webview = Get-CapturedCategoryOutcome -States $states.webview
+        ocrEngine = Get-CapturedCategoryOutcome -States $states.'ocr-engine'
         other = Get-CapturedCategoryOutcome -States $states.other
     }
 }
@@ -404,13 +434,14 @@ function Get-LaunchResidualCategory {
         'tauri-driver' { return 'tauri-driver' }
         'msedgedriver' { return 'edge-driver' }
         'msedgewebview2' { return 'webview' }
+        'tesseract' { return 'ocr-engine' }
         default { return 'multiple' }
     }
 }
 
 function Get-LaunchResidualFacts {
     param([object[]]$Processes,[object[]]$Captured)
-    $presence = [ordered]@{ application = $false; tauriDriver = $false; edgeDriver = $false; webview = $false; other = $false }
+    $presence = [ordered]@{ application = $false; tauriDriver = $false; edgeDriver = $false; webview = $false; ocrEngine = $false; other = $false }
     $items = @($Processes)
     $matched = 0
     foreach ($process in $items) {
@@ -420,6 +451,7 @@ function Get-LaunchResidualFacts {
             'tauri-driver' { $presence.tauriDriver = $true }
             'edge-driver' { $presence.edgeDriver = $true }
             'webview' { $presence.webview = $true }
+            'ocr-engine' { $presence.ocrEngine = $true }
             default { $presence.other = $true }
         }
         $exact = $false
@@ -444,6 +476,7 @@ function Get-LaunchResidualFacts {
         tauriDriver = [bool]$presence.tauriDriver
         edgeDriver = [bool]$presence.edgeDriver
         webview = [bool]$presence.webview
+        ocrEngine = [bool]$presence.ocrEngine
         other = [bool]$presence.other
     }
 }
@@ -466,17 +499,19 @@ function Assert-LaunchCleanupState {
         [bool]$DriverExited,
         [bool]$RelevantProcessesClear,
         [ValidateSet('not-invoked','already-exited','tree-kill-exited','fallback-exited','kill-failed','wait-failed','deadline')][string]$DriverStopOutcome,
-        [ValidateSet('none','application','tauri-driver','edge-driver','webview','multiple')][string]$ResidualCategory,
+        [ValidateSet('none','application','tauri-driver','edge-driver','webview','ocr-engine','multiple')][string]$ResidualCategory,
         [ValidateSet('absent','all-exited','incomplete')][string]$CapturedApplication,
         [ValidateSet('absent','all-exited','incomplete')][string]$CapturedTauriDriver,
         [ValidateSet('absent','all-exited','incomplete')][string]$CapturedEdgeDriver,
         [ValidateSet('absent','all-exited','incomplete')][string]$CapturedWebView,
+        [ValidateSet('absent','all-exited','incomplete')][string]$CapturedOcrEngine,
         [ValidateSet('absent','all-exited','incomplete')][string]$CapturedOther,
         [ValidateSet('none','captured','uncaptured','mixed')][string]$ResidualOwnership,
         [bool]$ResidualApplication,
         [bool]$ResidualTauriDriver,
         [bool]$ResidualEdgeDriver,
         [bool]$ResidualWebView,
+        [bool]$ResidualOcrEngine,
         [bool]$ResidualOther
     )
     $resultComplete = $null -ne $Result
@@ -488,12 +523,13 @@ function Assert-LaunchCleanupState {
     $residualTauriDriverLabel = if ($ResidualTauriDriver) { 'true' } else { 'false' }
     $residualEdgeDriverLabel = if ($ResidualEdgeDriver) { 'true' } else { 'false' }
     $residualWebViewLabel = if ($ResidualWebView) { 'true' } else { 'false' }
+    $residualOcrEngineLabel = if ($ResidualOcrEngine) { 'true' } else { 'false' }
     $residualOtherLabel = if ($ResidualOther) { 'true' } else { 'false' }
-    throw "Installed application launch cleanup state is unverified: sessionDeleteOutcome=$SessionDeleteOutcome;driverExited=$driverExitedLabel;relevantProcessesClear=$relevantProcessesClearLabel;resultComplete=$resultCompleteLabel;driverStopOutcome=$DriverStopOutcome;residualCategory=$ResidualCategory;captured=application:$CapturedApplication,tauri-driver:$CapturedTauriDriver,edge-driver:$CapturedEdgeDriver,webview:$CapturedWebView,other:$CapturedOther;residualOwnership=$ResidualOwnership;residualPresence=application:$residualApplicationLabel,tauri-driver:$residualTauriDriverLabel,edge-driver:$residualEdgeDriverLabel,webview:$residualWebViewLabel,other:$residualOtherLabel."
+    throw "Installed application launch cleanup state is unverified: sessionDeleteOutcome=$SessionDeleteOutcome;driverExited=$driverExitedLabel;relevantProcessesClear=$relevantProcessesClearLabel;resultComplete=$resultCompleteLabel;driverStopOutcome=$DriverStopOutcome;residualCategory=$ResidualCategory;captured=application:$CapturedApplication,tauri-driver:$CapturedTauriDriver,edge-driver:$CapturedEdgeDriver,webview:$CapturedWebView,ocr-engine:$CapturedOcrEngine,other:$CapturedOther;residualOwnership=$ResidualOwnership;residualPresence=application:$residualApplicationLabel,tauri-driver:$residualTauriDriverLabel,edge-driver:$residualEdgeDriverLabel,webview:$residualWebViewLabel,ocr-engine:$residualOcrEngineLabel,other:$residualOtherLabel."
 }
 
 function Invoke-RealInstalledAppLaunch {
-    param([string]$ApplicationPath,[string]$TauriDriverPath,[string]$EdgeDriverPath,[string]$ProfileRoot,[string]$SettingsRoot,[string]$ExpectedEdgeDriverVersion)
+    param([string]$ApplicationPath,[string]$TauriDriverPath,[string]$EdgeDriverPath,[string]$OcrEnginePath,[string]$ProfileRoot,[string]$SettingsRoot,[string]$ExpectedEdgeDriverVersion)
     $deadline = [datetime]::UtcNow.AddMilliseconds($script:LaunchPins.TotalTimeoutMilliseconds)
     $driverCapture = $null
     $driver = $null
@@ -508,8 +544,8 @@ function Invoke-RealInstalledAppLaunch {
     $driverExited = $false
     $driverStopOutcome = 'not-invoked'
     $residualCategory = 'multiple'
-    $capturedOutcomes = [pscustomobject]@{ application = 'absent'; tauriDriver = 'absent'; edgeDriver = 'absent'; webview = 'absent'; other = 'absent' }
-    $residualFacts = [pscustomobject]@{ ownership = 'none'; application = $false; tauriDriver = $false; edgeDriver = $false; webview = $false; other = $false }
+    $capturedOutcomes = [pscustomobject]@{ application = 'absent'; tauriDriver = 'absent'; edgeDriver = 'absent'; webview = 'absent'; ocrEngine = 'absent'; other = 'absent' }
+    $residualFacts = [pscustomobject]@{ ownership = 'none'; application = $false; tauriDriver = $false; edgeDriver = $false; webview = $false; ocrEngine = $false; other = $false }
     try {
         Assert-FixedWebDriverPortsFree
         $driverCapture = Start-BoundedDiscardProcess -Path $TauriDriverPath -Arguments @(
@@ -567,8 +603,39 @@ function Invoke-RealInstalledAppLaunch {
 const i=document.querySelector('img[alt="Page 1"]');return {tab:[...document.querySelectorAll('button')].some(x=>x.textContent.includes('welcome.pdf')),pages:[...document.querySelectorAll('span')].some(x=>x.textContent.trim()==='/ 6'),footer:[...document.querySelectorAll('footer span')].some(x=>x.textContent.trim()==='welcome.pdf · Source preserved'),image:!!i&&i.complete&&i.naturalWidth>0&&i.naturalHeight>0&&i.src.startsWith('blob:'),width:i?.naturalWidth||0,height:i?.naturalHeight||0};
 '@
         $sample = Wait-WebDriverOracle -SessionId $sessionId -Script $sampleScript -Deadline $deadline -Kind 'Installed sample PDF render' -Predicate { param($v) [bool]$v.tab -and [bool]$v.pages -and [bool]$v.footer -and [bool]$v.image -and [int]$v.width -gt 0 -and [int]$v.height -gt 0 }
-        $captured = @(Get-OwnedLaunchProcesses -RootProcessId $driver.Id -StartedAfter $startedAfter)
-        Assert-OwnedLaunchExecutables -Owned $captured -ApplicationPath $ApplicationPath -EdgeDriverPath $EdgeDriverPath
+        $menuClick = Invoke-WebDriverScript -SessionId $sessionId -Script "const m=[...document.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Menu'&&x.getAttribute('aria-expanded')==='false');if(m.length===1)m[0].click();return m.length===1;" -Deadline $deadline
+        if ($menuClick -isnot [bool] -or -not $menuClick) { throw 'The exact closed Menu control was unavailable before current-page OCR.' }
+        $ocrControl = Wait-WebDriverOracle -SessionId $sessionId -Script "const m=[...document.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Menu'&&x.getAttribute('aria-expanded')==='true'),p=m.length===1?m[0].closest('header')?.nextElementSibling:null,o=p?[...p.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Recognize current page…'):[];return {menu:m.length===1&&!!p,count:o.length,enabled:o.length===1&&!o[0].disabled,title:o.length===1?o[0].title:''};" -Deadline $deadline -Kind 'Current-page OCR menu control' -Predicate { param($v) [bool]$v.menu -and [int]$v.count -eq 1 -and [bool]$v.enabled -and [string]$v.title -ceq 'Recognize text on the current page in English' }
+        $ocrClick = Invoke-WebDriverScript -SessionId $sessionId -Script "const m=[...document.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Menu'&&x.getAttribute('aria-expanded')==='true'),p=m.length===1?m[0].closest('header')?.nextElementSibling:null,o=p?[...p.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Recognize current page…'&&!x.disabled):[];if(m.length===1&&p&&o.length===1)o[0].click();return m.length===1&&!!p&&o.length===1;" -Deadline $deadline
+        if ($ocrClick -isnot [bool] -or -not $ocrClick) { throw 'The exact enabled current-page OCR control was unavailable.' }
+        $ocrResultScript = @'
+const dialogs=[...document.querySelectorAll('dialog[aria-labelledby="page-ocr-title"]')];if(dialogs.length!==1)return {state:'waiting',title:'',context:false,readOnly:false,aria:'',utf8Bytes:0,text:''};const d=dialogs[0],title=d.querySelector('#page-ocr-title')?.textContent.trim()||'',paragraphs=[...d.querySelectorAll('p')].map(x=>x.textContent.trim()),context=paragraphs.includes('welcome.pdf · physical page 1. OCR reads this one page in English. Recognition may contain errors.')&&paragraphs.includes('It does not change the PDF, add searchable text, index the document, or send content to a service.'),closeReady=[...d.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Close'&&!x.disabled).length===1;if(d.querySelector('[role="alert"]'))return {state:'error',title,context,readOnly:false,aria:'',utf8Bytes:0,text:''};if(paragraphs.includes('No text was recognized on this page.'))return {state:'empty',title,context,readOnly:false,aria:'',utf8Bytes:0,text:''};const t=d.querySelector('textarea[aria-label="Recognized text on page 1"]');if(!t||!closeReady)return {state:'running',title,context,readOnly:false,aria:'',utf8Bytes:0,text:''};const text=t.value,utf8Bytes=new TextEncoder().encode(text).length;if(utf8Bytes>65536)return {state:'overflow',title,context,readOnly:t.readOnly,aria:t.getAttribute('aria-label')||'',utf8Bytes,text:''};return {state:'recognized',title,context,readOnly:t.readOnly,aria:t.getAttribute('aria-label')||'',utf8Bytes,text};
+'@
+        $ocrResult = $null
+        do {
+            $ocrResult = Invoke-WebDriverScript -SessionId $sessionId -Script $ocrResultScript -Deadline $deadline
+            try { $captured += @(Get-OwnedLaunchProcesses -RootProcessId $driver.Id -StartedAfter $startedAfter); $captured = @(Get-UniqueOwnedLaunchProcesses -Processes $captured) } catch { }
+            if ([string]$ocrResult.state -in @('error','empty','overflow')) { throw 'Installed current-page OCR did not produce bounded recognized text.' }
+            if ([string]$ocrResult.state -ceq 'recognized') { break }
+            Start-Sleep -Milliseconds 200
+        } while ([datetime]::UtcNow -lt $deadline)
+        if ($null -eq $ocrResult -or [string]$ocrResult.state -cne 'recognized' -or [string]$ocrResult.title -cne 'Recognize text on page 1' -or
+            $ocrResult.context -isnot [bool] -or -not $ocrResult.context -or $ocrResult.readOnly -isnot [bool] -or -not $ocrResult.readOnly -or
+            [string]$ocrResult.aria -cne 'Recognized text on page 1') {
+            throw 'Installed current-page OCR did not satisfy the exact signed UI receipt contract.'
+        }
+        $ocrTextReceipt = Get-LaunchOcrTextReceipt -Text ([string]$ocrResult.text) -ReportedUtf8Bytes ([int]$ocrResult.utf8Bytes)
+        $ocrResult.text = ''
+        $closeOcr = Invoke-WebDriverScript -SessionId $sessionId -Script "const d=[...document.querySelectorAll('dialog[aria-labelledby=\"page-ocr-title\"]')];const b=d.length===1?[...d[0].querySelectorAll('button')].filter(x=>x.textContent.trim()==='Close'&&!x.disabled):[];if(b.length===1)b[0].click();return d.length===1&&b.length===1;" -Deadline $deadline
+        if ($closeOcr -isnot [bool] -or -not $closeOcr) { throw 'The completed current-page OCR dialog could not be closed exactly.' }
+        $null = Wait-WebDriverOracle -SessionId $sessionId -Script "return document.querySelectorAll('dialog[aria-labelledby=\"page-ocr-title\"]').length===0;" -Deadline $deadline -Kind 'Current-page OCR dialog close' -Predicate { param($v) $v -is [bool] -and $v }
+        $postOcrScript = @'
+const tabs=[...document.querySelectorAll('button')].filter(x=>{const s=x.querySelector('span');return s&&s.textContent.trim()==='welcome.pdf'}),i=document.querySelector('img[alt="Page 1"]');return {tab:tabs.length===1,pages:[...document.querySelectorAll('span')].some(x=>x.textContent.trim()==='/ 6'),footer:[...document.querySelectorAll('footer span')].some(x=>x.textContent.trim()==='welcome.pdf · Source preserved'),image:!!i&&i.complete&&i.naturalWidth>0&&i.naturalHeight>0&&i.src.startsWith('blob:')};
+'@
+        $postOcr = Wait-WebDriverOracle -SessionId $sessionId -Script $postOcrScript -Deadline $deadline -Kind 'Post-OCR sample preservation' -Predicate { param($v) [bool]$v.tab -and [bool]$v.pages -and [bool]$v.footer -and [bool]$v.image }
+        $captured += @(Get-OwnedLaunchProcesses -RootProcessId $driver.Id -StartedAfter $startedAfter)
+        $captured = @(Get-UniqueOwnedLaunchProcesses -Processes $captured)
+        Assert-OwnedLaunchExecutables -Owned $captured -ApplicationPath $ApplicationPath -EdgeDriverPath $EdgeDriverPath -OcrEnginePath $OcrEnginePath
         $profileBinding = if (-not [string]::IsNullOrWhiteSpace($returnedUserData)) {
             'session-capability-' + (Get-ExactProfileBinding -Candidate $returnedUserData -RequestedProfile $ProfileRoot -SettingsRoot $SettingsRoot)
         } else {
@@ -589,6 +656,11 @@ const i=document.querySelector('img[alt="Page 1"]');return {tab:[...document.que
             renderedPageWidth = [int]$sample.width
             renderedPageHeight = [int]$sample.height
             renderedPageBlob = [bool]$sample.image
+            ocrPage = 1
+            ocrDialogTitle = [string]$ocrResult.title
+            ocrTextUtf8Bytes = [int]$ocrTextReceipt.utf8Bytes
+            ocrTextSha256 = [string]$ocrTextReceipt.sha256
+            ocrSourceUiPreserved = [bool]$postOcr.footer
         }
     } finally {
         $cleanupDeadline = [datetime]::UtcNow.AddSeconds(10)
@@ -597,7 +669,7 @@ const i=document.querySelector('img[alt="Page 1"]');return {tab:[...document.que
             $sessionDeleted = $sessionDeleteOutcome -ceq 'verified'
         }
         if ($driver) {
-            try { $captured += @(Get-OwnedLaunchProcesses -RootProcessId $driver.Id -StartedAfter $startedAfter) } catch { }
+            try { $captured += @(Get-OwnedLaunchProcesses -RootProcessId $driver.Id -StartedAfter $startedAfter); $captured = @(Get-UniqueOwnedLaunchProcesses -Processes $captured) } catch { }
             $processCleanupDeadline = [datetime]::UtcNow.AddMilliseconds($script:LaunchPins.CleanupProcessTimeoutMilliseconds)
             $capturedOutcomes = Stop-OwnedLaunchProcesses -TauriDriver $driver -Captured $captured -Deadline $processCleanupDeadline
             $driverStopOutcome = [string]$capturedOutcomes.rootOutcome
@@ -611,7 +683,7 @@ const i=document.querySelector('img[alt="Page 1"]');return {tab:[...document.que
         if ($driverCapture) { $driverCapture.Dispose() }
     }
     $relevantProcessesClear = $residualCategory -ceq 'none'
-    Assert-LaunchCleanupState -Result $result -SessionDeleteOutcome $sessionDeleteOutcome -DriverExited $driverExited -RelevantProcessesClear $relevantProcessesClear -DriverStopOutcome $driverStopOutcome -ResidualCategory $residualCategory -CapturedApplication $capturedOutcomes.application -CapturedTauriDriver $capturedOutcomes.tauriDriver -CapturedEdgeDriver $capturedOutcomes.edgeDriver -CapturedWebView $capturedOutcomes.webview -CapturedOther $capturedOutcomes.other -ResidualOwnership $residualFacts.ownership -ResidualApplication $residualFacts.application -ResidualTauriDriver $residualFacts.tauriDriver -ResidualEdgeDriver $residualFacts.edgeDriver -ResidualWebView $residualFacts.webview -ResidualOther $residualFacts.other
+    Assert-LaunchCleanupState -Result $result -SessionDeleteOutcome $sessionDeleteOutcome -DriverExited $driverExited -RelevantProcessesClear $relevantProcessesClear -DriverStopOutcome $driverStopOutcome -ResidualCategory $residualCategory -CapturedApplication $capturedOutcomes.application -CapturedTauriDriver $capturedOutcomes.tauriDriver -CapturedEdgeDriver $capturedOutcomes.edgeDriver -CapturedWebView $capturedOutcomes.webview -CapturedOcrEngine $capturedOutcomes.ocrEngine -CapturedOther $capturedOutcomes.other -ResidualOwnership $residualFacts.ownership -ResidualApplication $residualFacts.application -ResidualTauriDriver $residualFacts.tauriDriver -ResidualEdgeDriver $residualFacts.edgeDriver -ResidualWebView $residualFacts.webview -ResidualOcrEngine $residualFacts.ocrEngine -ResidualOther $residualFacts.other
     if ($null -eq $result -or -not $sessionDeleted -or -not $ownedStopped -or $remaining -ne 0) {
         throw 'Installed application launch cleanup did not delete the session and stop the owned process tree.'
     }
@@ -625,6 +697,10 @@ function Invoke-InstalledAppLaunchSmoke {
     param(
         [Parameter(Mandatory = $true)][string]$ApplicationPath,
         [Parameter(Mandatory = $true)]$ApplicationReceipt,
+        [Parameter(Mandatory = $true)][string]$OcrEnginePath,
+        [Parameter(Mandatory = $true)]$OcrEngineReceipt,
+        [Parameter(Mandatory = $true)][string]$WelcomePath,
+        [Parameter(Mandatory = $true)]$WelcomeReceipt,
         [Parameter(Mandatory = $true)][string]$WebDriverRoot,
         [Parameter(Mandatory = $true)][string]$ProfileRoot,
         [Parameter(Mandatory = $true)][string]$ApplicationSettingsRoot,
@@ -673,6 +749,9 @@ function Invoke-InstalledAppLaunchSmoke {
     $edgeDriver = Join-Path $driverRoot 'edge-driver/msedgedriver.exe'
     Assert-FileReceipt -Path $ApplicationPath -Bytes ([uint64]$ApplicationReceipt.bytes) -Sha256 ([string]$ApplicationReceipt.sha256) -Kind 'Installed signed launch application'
     $null = Assert-TrustedWindowsSignature -Path $ApplicationPath -ExpectedPublisher $ExpectedPublisher
+    Assert-FileReceipt -Path $OcrEnginePath -Bytes ([uint64]$OcrEngineReceipt.bytes) -Sha256 ([string]$OcrEngineReceipt.sha256) -Kind 'Installed signed launch OCR engine'
+    $null = Assert-TrustedWindowsSignature -Path $OcrEnginePath -ExpectedPublisher $ExpectedPublisher
+    Assert-FileReceipt -Path $WelcomePath -Bytes ([uint64]$WelcomeReceipt.bytes) -Sha256 ([string]$WelcomeReceipt.sha256) -Kind 'Installed launch sample PDF'
     Assert-FileReceipt -Path $tauriDriver -Bytes ([uint64]$receipt.tauriDriver.bytes) -Sha256 ([string]$receipt.tauriDriver.sha256) -Kind 'Pinned tauri-driver executable'
     Assert-FileReceipt -Path $edgeDriver -Bytes ([uint64]$receipt.edgeDriver.bytes) -Sha256 ([string]$receipt.edgeDriver.sha256) -Kind 'Exact EdgeDriver executable'
     $null = Assert-TrustedWindowsSignature -Path $edgeDriver -ExpectedPublisher $script:LaunchPins.EdgePublisher
@@ -680,8 +759,8 @@ function Invoke-InstalledAppLaunchSmoke {
     Assert-NoReparseAncestors -Path $profile
     if (@(Get-ChildItem -LiteralPath $profile -Force).Count -ne 0) { throw 'The requested WebDriver profile was not empty before launch.' }
     $expectedEdgeDriverVersion = [string]$receipt.edgeDriver.version
-    $result = if ($ProcessProvider) { & $ProcessProvider $ApplicationPath $tauriDriver $edgeDriver $profile $settingsRoot $applicationProfile $expectedEdgeDriverVersion } else { Invoke-RealInstalledAppLaunch -ApplicationPath $ApplicationPath -TauriDriverPath $tauriDriver -EdgeDriverPath $edgeDriver -ProfileRoot $profile -SettingsRoot $settingsRoot -ExpectedEdgeDriverVersion $expectedEdgeDriverVersion }
-    Assert-LaunchExactProperties -Value $result -Expected @('nativeDriverVersion','driverVersionBinding','returnedRuntimeVersion','profileBindingMethod','sessionCapabilityKeys','title','homeButton','ocrCapabilityStatus','sampleName','samplePages','renderedPageWidth','renderedPageHeight','renderedPageBlob','sessionDeleted','ownedProcessTreeStopped','relevantProcessesRemaining') -Kind 'Installed application launch result'
+    $result = if ($ProcessProvider) { & $ProcessProvider $ApplicationPath $tauriDriver $edgeDriver $OcrEnginePath $profile $settingsRoot $applicationProfile $expectedEdgeDriverVersion } else { Invoke-RealInstalledAppLaunch -ApplicationPath $ApplicationPath -TauriDriverPath $tauriDriver -EdgeDriverPath $edgeDriver -OcrEnginePath $OcrEnginePath -ProfileRoot $profile -SettingsRoot $settingsRoot -ExpectedEdgeDriverVersion $expectedEdgeDriverVersion }
+    Assert-LaunchExactProperties -Value $result -Expected @('nativeDriverVersion','driverVersionBinding','returnedRuntimeVersion','profileBindingMethod','sessionCapabilityKeys','title','homeButton','ocrCapabilityStatus','sampleName','samplePages','renderedPageWidth','renderedPageHeight','renderedPageBlob','ocrPage','ocrDialogTitle','ocrTextUtf8Bytes','ocrTextSha256','ocrSourceUiPreserved','sessionDeleted','ownedProcessTreeStopped','relevantProcessesRemaining') -Kind 'Installed application launch result'
     $returnedRuntimeParts = ([string]$result.returnedRuntimeVersion).Split('.')
     $expectedRuntimeParts = ([string]$receipt.webView2RuntimeVersion).Split('.')
     $capabilityKeys = @($result.sessionCapabilityKeys)
@@ -693,11 +772,17 @@ function Invoke-InstalledAppLaunchSmoke {
         [string]$result.ocrCapabilityStatus -cne 'Available' -or [string]$result.sampleName -cne 'welcome.pdf' -or
         [int]$result.samplePages -ne 6 -or [int]$result.renderedPageWidth -le 0 -or [int]$result.renderedPageHeight -le 0 -or
         $result.renderedPageBlob -isnot [bool] -or -not $result.renderedPageBlob -or
+        [int]$result.ocrPage -ne 1 -or [string]$result.ocrDialogTitle -cne 'Recognize text on page 1' -or
+        [int]$result.ocrTextUtf8Bytes -le 0 -or [int]$result.ocrTextUtf8Bytes -gt $script:LaunchPins.OcrUiTextBytesMaximum -or
+        [string]$result.ocrTextSha256 -cnotmatch '^[A-F0-9]{64}$' -or $result.ocrSourceUiPreserved -isnot [bool] -or -not $result.ocrSourceUiPreserved -or
         $result.sessionDeleted -isnot [bool] -or -not $result.sessionDeleted -or
         $result.ownedProcessTreeStopped -isnot [bool] -or -not $result.ownedProcessTreeStopped -or [int]$result.relevantProcessesRemaining -ne 0) {
         throw 'Installed application launch result did not match its exact native IPC and rendered-sample oracles.'
     }
     if (@(Get-LaunchProcessSnapshot).Count -ne 0) { throw 'Installed application launch cleanup left a relevant process running.' }
+    Assert-FileReceipt -Path $OcrEnginePath -Bytes ([uint64]$OcrEngineReceipt.bytes) -Sha256 ([string]$OcrEngineReceipt.sha256) -Kind 'Postlaunch installed signed OCR engine'
+    $null = Assert-TrustedWindowsSignature -Path $OcrEnginePath -ExpectedPublisher $ExpectedPublisher
+    Assert-FileReceipt -Path $WelcomePath -Bytes ([uint64]$WelcomeReceipt.bytes) -Sha256 ([string]$WelcomeReceipt.sha256) -Kind 'Postlaunch installed sample PDF'
     Assert-NoReparseAncestors -Path $profile
     Assert-FileReceipt -Path $settingsSentinel -Bytes $SettingsSentinelBytes -Sha256 $SettingsSentinelSha256 -Kind 'Postlaunch synthetic settings sentinel'
     $usesTauriProfile = ([string]$result.profileBindingMethod).EndsWith('tauri-app-settings-ebwebview',[StringComparison]::Ordinal)
@@ -751,6 +836,7 @@ function Invoke-InstalledAppLaunchSmoke {
         homeButton = 'Explore a sample PDF'
         ocrCapabilityStatus = 'Available'
         sample = [ordered]@{ name = 'welcome.pdf'; pages = 6; firstPageDecoded = $true; naturalWidth = [int]$result.renderedPageWidth; naturalHeight = [int]$result.renderedPageHeight; source = 'blob:' }
+        currentPageOcr = [ordered]@{ sampleName = 'welcome.pdf'; physicalPage = 1; dialogTitle = 'Recognize text on page 1'; status = 'recognized'; language = 'eng'; textUtf8Bytes = [int]$result.ocrTextUtf8Bytes; textSha256 = [string]$result.ocrTextSha256; sourceUiPreserved = $true; sourceFileReceiptPreserved = $true; accuracyVerified = $false }
         cleanup = [ordered]@{ sessionDeleted = $true; ownedProcessTreeStopped = $true; relevantProcessesRemaining = 0 }
     }
 }

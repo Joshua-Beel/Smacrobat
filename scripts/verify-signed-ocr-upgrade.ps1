@@ -528,13 +528,14 @@ function Assert-InstalledSignedResources {
     $identity = ([string]$ReceiptSets.Engine.sha256).ToLowerInvariant()
     $engine = Get-UniqueResource -Files $files -Suffix "resources/ocr/$identity/bin/tesseract.exe" -Kind 'Installed signed OCR engine'
     $model = Get-UniqueResource -Files $files -Suffix "resources/ocr/$identity/tessdata/eng.traineddata" -Kind 'Installed English OCR model'
+    $welcome = Get-UniqueResource -Files $files -Suffix 'resources/welcome.pdf' -Kind 'Installed welcome sample'
     $app = Get-UniqueResource -Files $files -Suffix 'pdf-workstation.exe' -Kind 'Installed application'
     $null = Assert-TrustedWindowsSignature -Path $app.FullName -SignatureProvider $SignatureProvider -ExpectedPublisher $script:Pins.ExpectedPublisher
     $null = Assert-TrustedWindowsSignature -Path $pdfium.FullName -SignatureProvider $SignatureProvider -ExpectedPublisher $script:Pins.ExpectedPublisher
     $null = Assert-TrustedWindowsSignature -Path $engine.FullName -SignatureProvider $SignatureProvider -ExpectedPublisher $script:Pins.ExpectedPublisher
     $updaters = @($files | Where-Object { $_.Name.Equals('latest.json', [StringComparison]::OrdinalIgnoreCase) -or $_.Extension.Equals('.sig', [StringComparison]::OrdinalIgnoreCase) })
     if ($updaters.Count -ne 0) { throw 'Installed application contains an updater artifact.' }
-    return [pscustomobject]@{ Application = $app; Pdfium = $pdfium; Engine = $engine; Model = $model }
+    return [pscustomobject]@{ Application = $app; Pdfium = $pdfium; Engine = $engine; Model = $model; Welcome = $welcome }
 }
 
 function Assert-SentinelReceipts {
@@ -678,8 +679,8 @@ function Write-SanitizedUpgradeRecord {
     [IO.Directory]::CreateDirectory($OutputRoot) | Out-Null
     Assert-NoReparseAncestors -Path $OutputRoot
     $record = [ordered]@{
-        schemaVersion = 3
-        scope = 'Ephemeral GitHub-hosted silent NSIS installation, manual upgrade, direct installed-engine OCR smoke, and installed signed application WebView launch/native IPC/sample-render verification; native dialogs, user documents, OCR recognition, printing, preferences, drag-and-drop, and updater behavior are not established.'
+        schemaVersion = 4
+        scope = 'Ephemeral GitHub-hosted silent NSIS installation, manual upgrade, direct installed-engine OCR smoke, and installed signed application WebView launch/native IPC/sample-render/current-page OCR completion verification; OCR accuracy, native dialogs, user documents, printing, preferences, drag-and-drop, and updater behavior are not established.'
         mode = 'ephemeral-current-user-silent-manual-upgrade'
         workflowSourceRevision = $WorkflowSourceRevision
         signedArtifactSourceRevision = $script:Pins.SignedSourceRevision
@@ -715,8 +716,10 @@ function Write-SanitizedUpgradeRecord {
             nativeWindowVisualVerified = $false
             realPreferencesVerified = $false
             installedEngineOcrSmokeVerified = $true
-            applicationOcrIntegrationVerified = $false
-            applicationOcrRecognitionVerified = $false
+            applicationOcrIntegrationVerified = $true
+            applicationCurrentPageOcrCompleted = $true
+            applicationOcrRecognitionVerified = $true
+            applicationOcrAccuracyVerified = $false
             nativeFilePickerVerified = $false
             userPdfVerified = $false
             printingVerified = $false
@@ -837,9 +840,15 @@ $installedEngineSmoke = Invoke-InstalledEngineOcrSmoke `
     -EngineReceipt $receiptSets.Engine `
     -ModelReceipt $modelReceipt[0]
 Assert-SentinelReceipts -SettingsPath $settingsSentinel -SettingsSha256 $settingsSentinelSha256 -DocumentPath $documentSentinel -DocumentSha256 $documentSentinelSha256
+$welcomeReceipt = @($receiptSets.Base | Where-Object { [string]$_.target -ceq 'resources/welcome.pdf' })
+if ($welcomeReceipt.Count -ne 1) { throw 'The installed launch sample receipt is not unique.' }
 $installedAppLaunch = Invoke-InstalledAppLaunchSmoke `
     -ApplicationPath $installedResources.Application.FullName `
     -ApplicationReceipt $receipt.packagedApplication `
+    -OcrEnginePath $installedResources.Engine.FullName `
+    -OcrEngineReceipt $receiptSets.Engine `
+    -WelcomePath $installedResources.Welcome.FullName `
+    -WelcomeReceipt $welcomeReceipt[0] `
     -WebDriverRoot $driverRoot `
     -ProfileRoot $profileRoot `
     -ApplicationSettingsRoot $settingsRoot `
