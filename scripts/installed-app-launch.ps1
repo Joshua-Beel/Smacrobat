@@ -173,8 +173,10 @@ function Get-ExactProfileBinding {
     $settingsWebView = [IO.Path]::GetFullPath((Join-Path $settings 'EBWebView')).TrimEnd('\')
     if ($actual.Equals($requested,[StringComparison]::OrdinalIgnoreCase)) { return 'requested-profile' }
     if ($actual.Equals($settingsWebView,[StringComparison]::OrdinalIgnoreCase)) { return 'tauri-app-settings-ebwebview' }
+    $requestedWebView = [IO.Path]::GetFullPath((Join-Path $requested 'EBWebView')).TrimEnd('\')
     $relation = if ($actual.Equals($settings,[StringComparison]::OrdinalIgnoreCase)) { 'exact-settings-root' }
         elseif ($actual.StartsWith($settings + '\',[StringComparison]::OrdinalIgnoreCase)) { 'settings-root-other' }
+        elseif ($actual.Equals($requestedWebView,[StringComparison]::OrdinalIgnoreCase)) { 'requested-ebwebview' }
         elseif ($actual.StartsWith($requested + '\',[StringComparison]::OrdinalIgnoreCase)) { 'requested-root-other' }
         elseif ($env:RUNNER_TEMP -and $actual.StartsWith([IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\') + '\',[StringComparison]::OrdinalIgnoreCase)) { 'runner-temp-other' }
         else { 'outside-known-roots' }
