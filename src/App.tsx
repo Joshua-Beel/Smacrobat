@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { Undo2, Redo2 } from 'lucide-react';
 import { ArrowDownToLine, ArrowUpRight, Bookmark, ChevronDown, ChevronLeft, ChevronRight, ChevronsUpDown, CircleHelp, Combine, File, FileCheck2, FileImage, FileOutput, FilePenLine, FilePlus2, Files, FolderOpen, Hand, Highlighter, Home, LayoutGrid, List, Maximize, Menu, MessageSquare, Minimize2, Minus, MoreHorizontal, MousePointer2, PanelLeftClose, Pencil, Plus, Printer, RotateCw, Save, ScanLine, Search, ShieldCheck, Signature, SlidersHorizontal, Star, Sun, Type, X, ZoomIn, ZoomOut, type LucideIcon } from 'lucide-react';
-import { closeDocument, native, openDocument, reopenDocument, editPages, saveCopy, splitDocument, cropPages, resetCrops, combineDocuments, insertPagesCopy, replacePagesCopy, documentFormFields, fillFormCopy, documentAnnotations, documentPageLabels, createPdfFromImage, exportPageImage, createComment, updateComment, deleteComment, createHighlight, createTextHighlight, updateHighlight, deleteHighlight, ocrCapability as getOcrCapability, type Annotation, type CommentRect, type CropInsets, type CreatePdfOptions, type DocumentAnnotations, type DocumentFormFields, type FormPatch, type OcrCapability, type OpenResult, type PageImageExport, type PageImageExportRequest, type SplitOutput, type SavedCopy } from './bridge';
+import { closeDocument, cancelPasswordRequest, native, openDocument, reopenDocument, editPages, saveCopy, splitDocument, cropPages, resetCrops, combineDocuments, insertPagesCopy, replacePagesCopy, documentFormFields, fillFormCopy, documentAnnotations, documentPageLabels, createPdfFromImage, exportPageImage, createComment, updateComment, deleteComment, createHighlight, createTextHighlight, updateHighlight, deleteHighlight, ocrCapability as getOcrCapability, type Annotation, type CommentRect, type CropInsets, type CreatePdfOptions, type DocumentAnnotations, type DocumentFormFields, type FormPatch, type OcrCapability, type OpenResult, type PageImageExport, type PageImageExportRequest, type SplitOutput, type SavedCopy } from './bridge';
 import { clampPage, toolGroups, type DocumentInfo, type PageEdit } from './model';
 import { pageLabelDescription, pageLabelFor, validatePageLabels, type DocumentPageLabels } from './pageLabels';
 import Viewer from './Viewer';
@@ -58,6 +58,7 @@ export default function App() {
   const [propertiesOpen, setPropertiesOpen] = useState(false);
   const [noticesOpen, setNoticesOpen] = useState(false);
   const [passwordRequest, setPasswordRequest] = useState<{ challenge: Extract<OpenResult, { status: 'password_required' }>; organize: boolean } | null>(null);
+  const passwordBlocking = useRef(false);
   useEffect(() => { if (searchOpen) setBookmarksOpen(false); }, [searchOpen]);
   const [menu, setMenu] = useState(false);
   const [updatesOpen, setUpdatesOpen] = useState(false);
@@ -92,6 +93,8 @@ export default function App() {
   const pointerTextHighlightSelection = useRef<TextHighlightSelection | null>(null);
   const [pendingClose, setPendingClose] = useState<number | 'window' | null>(null);
   const closingDocument = useRef<number | null>(null);
+  const mounted = useRef(true);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   useEffect(() => {
     if (!savePreferences({ dark, zoom, fit, hand, toolsOpen, nav })) setNotice('Your reading preferences could not be saved. They will last for this session only.');
   }, [dark, zoom, fit, hand, toolsOpen, nav]);
@@ -108,8 +111,11 @@ export default function App() {
     }).catch(() => { if (!disposed) setOcr({ available: false, reason: 'OCR is unavailable in this build.', language: null }); });
     return () => { disposed = true; };
   }, []);
-  const latest = useRef({ documents, busy, active });
-  latest.current = { documents, busy, active };
+  const latest = useRef({ documents, busy, active, dialogOpen: false });
+  latest.current = {
+    documents, busy, active,
+    dialogOpen: updatesOpen || pageTextOpen || pageOcrTarget !== null || printOpen || propertiesOpen || noticesOpen || passwordRequest !== null || pendingClose !== null || createOpen || pageImageTarget !== null || combineOpen || insertOpen || replaceOpen || formsOpen || commentEditor !== null,
+  };
   useEffect(() => {
     if (!native) return;
     const unlisten = getCurrentWindow().onCloseRequested(event => {
@@ -178,8 +184,13 @@ export default function App() {
     setActive(info.id); setView('document'); setPage(0); setTarget(value => ({ page: 0, token: value.token + 1 }));
   };
   const acceptOpen = (result: OpenResult | null, organize: boolean) => {
+    if (!mounted.current) {
+      if (result?.status === 'opened') void closeDocument(result.document.id).catch(() => {});
+      else if (result?.status === 'password_required') void cancelPasswordRequest(result.request_id).catch(() => {});
+      return;
+    }
     if (result?.status === 'opened') opened(result.document, organize);
-    else if (result?.status === 'password_required') setPasswordRequest({ challenge: result, organize });
+    else if (result?.status === 'password_required') { passwordBlocking.current = true; setPasswordRequest({ challenge: result, organize }); }
   };
   const open = useCallback(async (example = false, organize = false) => {
     if (busy || closingDocument.current !== null) return;
@@ -195,8 +206,8 @@ export default function App() {
     setBusy(true); setError('');
     try {
       acceptOpen(await reopenDocument(path), false);
-    } catch (e) { setError(`Could not reopen this file. It may have moved or been deleted. ${String(e)}`); }
-    finally { setBusy(false); }
+    } catch (e) { if (mounted.current) setError(`Could not reopen this file. It may have moved or been deleted. ${String(e)}`); }
+    finally { if (mounted.current) setBusy(false); }
   };
   const close = async (id: number, discard = false) => {
     if (busy || closingDocument.current !== null) return;
@@ -239,6 +250,39 @@ export default function App() {
     try { updateDocument(await cropPages(target.id, target.revision, target.pages, insets)); }
     finally { setBusy(false); }
   };
+  const reopenRef = useRef(reopen);
+  reopenRef.current = reopen;
+  const dropOpening = useRef(false);
+  useEffect(() => {
+    if (!native) return;
+    let disposed = false;
+    let stop: (() => void) | null = null;
+    const window = getCurrentWindow();
+    if (typeof window.onDragDropEvent !== 'function') return;
+    void window.onDragDropEvent(event => {
+      if (disposed || event.payload.type !== 'drop') return;
+      const paths = event.payload.paths;
+      if (dropOpening.current || passwordBlocking.current || latest.current.busy || closingDocument.current !== null || latest.current.dialogOpen) {
+        setNotice('Finish the current operation or dialog before opening a dropped PDF.');
+        return;
+      }
+      if (paths.length !== 1 || !paths[0] || paths[0].trim().length === 0) {
+        setError('Drop exactly one PDF file at a time.');
+        return;
+      }
+      const path = paths[0];
+      if (!path.toLowerCase().endsWith('.pdf')) {
+        setError('Drop a PDF file to open it.');
+        return;
+      }
+      dropOpening.current = true;
+      void reopenRef.current(path).finally(() => { dropOpening.current = false; });
+    }).then(unlisten => {
+      if (disposed) unlisten();
+      else stop = unlisten;
+    }).catch(() => {});
+    return () => { disposed = true; stop?.(); };
+  }, []);
   useEffect(() => {
     if (pageOcrTarget && !documents.some(document => document.id === pageOcrTarget.id && document.revision === pageOcrTarget.revision)) setPageOcrTarget(null);
   }, [documents, pageOcrTarget]);
@@ -499,7 +543,7 @@ export default function App() {
     {updatesOpen && <Updates dirty={documents.some(document => document.dirty)} busy={busy} setBusy={setBusy} close={() => setUpdatesOpen(false)} />}
     {pageTextOpen && doc && <PageText key={`${doc.id}-${doc.revision}-${page}`} document={doc} page={page} close={() => setPageTextOpen(false)} />}
     {pageOcrTarget && <PageOcrDialog key={`${pageOcrTarget.id}-${pageOcrTarget.revision}-${pageOcrTarget.page}`} target={pageOcrTarget} setBusy={setBusy} close={() => setPageOcrTarget(null)} />}
-    {passwordRequest && <PasswordDialog key={passwordRequest.challenge.request_id} challenge={passwordRequest.challenge} onOpened={info => { opened(info, passwordRequest.organize); setPasswordRequest(null); }} onClose={() => setPasswordRequest(null)} />}
+    {passwordRequest && <PasswordDialog key={passwordRequest.challenge.request_id} challenge={passwordRequest.challenge} onOpened={info => { passwordBlocking.current = false; opened(info, passwordRequest.organize); setPasswordRequest(null); }} onClose={() => { passwordBlocking.current = false; setPasswordRequest(null); }} />}
     {printOpen && doc && <PrintDialog document={doc} page={page} setBusy={setBusy} close={() => setPrintOpen(false)} />}
     {propertiesOpen && doc && <DocumentProperties key={`${doc.id}-${doc.revision}`} document={doc} close={() => setPropertiesOpen(false)} />}
     {noticesOpen && <DependencyNotices close={() => setNoticesOpen(false)} />}
