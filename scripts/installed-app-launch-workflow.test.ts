@@ -168,6 +168,10 @@ describe('hosted installed signed application launch proof', () => {
     expect(launch).toContain("$capabilities.browserVersion");
     expect(launch).toContain("$capabilities.PSObject.Properties['msedge.userDataDir']");
     expect(launch).toContain('Get-OwnedProfileBinding');
+    expect(launch).toContain('$homeOracle = Wait-WebDriverOracle');
+    expect(launch).toContain('title = [string]$homeOracle.title');
+    expect(launch).toContain('homeButton = [bool]$homeOracle.home');
+    expect(launch).not.toMatch(/\$home\b/i);
     expect(launch).toContain("x.textContent.trim()==='Scan & OCR'");
     expect(launch).toContain("o?.nextElementSibling");
     expect(launch).toContain("img[alt=\"Page 1\"]");
@@ -178,6 +182,22 @@ describe('hosted installed signed application launch proof', () => {
     expect(launch).toContain('Get-OwnedLaunchProcesses');
     expect(launch).toContain('relevantProcessesRemaining -ne 0');
     expect(launch).not.toMatch(/Start-Process|Remove-Item|\.Delete\(/);
+  });
+
+  it('does not assign to PowerShell automatic or read-only variables in the real launch path', () => {
+    const source = String.raw`
+      $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
+      $tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile('${process.cwd().replaceAll("'", "''")}\\scripts\\installed-app-launch.ps1',[ref]$tokens,[ref]$errors)
+      if($errors.Count){throw 'Launch helper did not parse.'}
+      $function=$ast.Find({param($node)$node-is[Management.Automation.Language.FunctionDefinitionAst]-and$node.Name-ceq'Invoke-RealInstalledAppLaunch'},$true)
+      if($null-eq$function){throw 'Real launch function was not found.'}
+      $forbidden=@('args','error','executioncontext','foreach','home','host','input','lastexitcode','matches','myinvocation','nestedpromptlevel','ofs','pid','pscommandpath','psscriptroot','psversiontable','pwd','shellid','stacktrace','this')
+      $assigned=@($function.FindAll({param($node)$node-is[Management.Automation.Language.AssignmentStatementAst]-and$node.Left-is[Management.Automation.Language.VariableExpressionAst]},$true)|ForEach-Object{$_.Left.VariablePath.UserPath.ToLowerInvariant()})
+      $collisions=@($assigned|Where-Object{$forbidden-contains$_})
+      if($collisions.Count){throw ('Real launch assigns automatic/read-only variables: '+($collisions-join','))}
+    `;
+    const result = runPowerShell(source);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
   });
 
   it('rejects occupied ports, over-deep JSON, and every native endpoint except fixed GET status', () => {

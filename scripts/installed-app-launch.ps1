@@ -173,10 +173,10 @@ function Get-OwnedProfileBinding {
     $matched = 0
     foreach ($process in $webViews) {
         $commandLine = [string]$process.CommandLine
-        $matches = [regex]::Matches($commandLine, '(?i)(?:^|\s)"?--user-data-dir=(?:"(?<quoted>[^"]+)"|(?<plain>[^\s"]+))"?(?=\s|$)')
-        if ($matches.Count -gt 1) { throw 'An owned WebView2 process has multiple user-data-dir switches.' }
-        if ($matches.Count -eq 1) {
-            $candidate = if ($matches[0].Groups['quoted'].Success) { $matches[0].Groups['quoted'].Value } else { $matches[0].Groups['plain'].Value }
+        $userDataSwitches = [regex]::Matches($commandLine, '(?i)(?:^|\s)"?--user-data-dir=(?:"(?<quoted>[^"]+)"|(?<plain>[^\s"]+))"?(?=\s|$)')
+        if ($userDataSwitches.Count -gt 1) { throw 'An owned WebView2 process has multiple user-data-dir switches.' }
+        if ($userDataSwitches.Count -eq 1) {
+            $candidate = if ($userDataSwitches[0].Groups['quoted'].Success) { $userDataSwitches[0].Groups['quoted'].Value } else { $userDataSwitches[0].Groups['plain'].Value }
             $canonical = [IO.Path]::GetFullPath($candidate).TrimEnd('\')
             if (-not $canonical.Equals($expected,[StringComparison]::OrdinalIgnoreCase)) { throw 'An owned WebView2 process used a different profile path.' }
             $matched++
@@ -353,7 +353,7 @@ function Invoke-RealInstalledAppLaunch {
         $returnedUserData = if ($null -ne $userDataProperty) { [string]$userDataProperty.Value } else { '' }
 
         $homeScript = "return {ready:document.readyState==='complete',title:document.title,home:[...document.querySelectorAll('button')].some(b=>b.textContent.trim()==='Explore a sample PDF')};"
-        $home = Wait-WebDriverOracle -SessionId $sessionId -Script $homeScript -Deadline $deadline -Kind 'Home UI' -Predicate { param($v) [bool]$v.ready -and [string]$v.title -ceq 'PDF Workstation' -and [bool]$v.home }
+        $homeOracle = Wait-WebDriverOracle -SessionId $sessionId -Script $homeScript -Deadline $deadline -Kind 'Home UI' -Predicate { param($v) [bool]$v.ready -and [string]$v.title -ceq 'PDF Workstation' -and [bool]$v.home }
         $ocrScript = "const b=[...document.querySelectorAll('button')].find(x=>x.textContent.trim()==='All tools');if(b)b.click();const o=[...document.querySelectorAll('button')].find(x=>x.textContent.trim()==='Scan & OCR');const s=o?.nextElementSibling;return {heading:[...document.querySelectorAll('h1')].some(x=>x.textContent.trim()==='All tools'),status:s?.tagName==='SPAN'&&o?.parentElement?.lastElementChild===s?s.textContent.trim():''};"
         $ocr = Wait-WebDriverOracle -SessionId $sessionId -Script $ocrScript -Deadline $deadline -Kind 'Native OCR capability UI' -Predicate { param($v) [bool]$v.heading -and [string]$v.status -ceq 'Available' }
         $homeClick = Invoke-WebDriverScript -SessionId $sessionId -Script "const a=[...document.querySelectorAll('button')].filter(x=>x.getAttribute('aria-label')==='Home'||x.textContent.trim()==='Home');if(a.length===1)a[0].click();return a.length===1;" -Deadline $deadline
@@ -383,8 +383,8 @@ const i=document.querySelector('img[alt="Page 1"]');return {tab:[...document.que
             returnedRuntimeVersion = $returnedRuntimeVersion
             profileBindingMethod = $profileBinding
             sessionCapabilityKeys = $capabilityKeys
-            title = [string]$home.title
-            homeButton = [bool]$home.home
+            title = [string]$homeOracle.title
+            homeButton = [bool]$homeOracle.home
             ocrCapabilityStatus = [string]$ocr.status
             sampleName = 'welcome.pdf'
             samplePages = 6
