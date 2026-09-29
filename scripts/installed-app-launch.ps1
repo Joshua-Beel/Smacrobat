@@ -315,23 +315,32 @@ public sealed class BoundedDiscardProcess : IDisposable {
 
 function Wait-BoundedOwnedProcessExit {
     param([Parameter(Mandatory = $true)]$Process,[Parameter(Mandatory = $true)][datetime]$Deadline)
-    if ($Process.HasExited) { return $true }
-    if ([datetime]::UtcNow -ge $Deadline) { return $false }
-    try { $Process.Kill($true) } catch { try { $Process.Kill($false) } catch { } }
+    if ($Process.HasExited) { return 'already-exited' }
+    if ([datetime]::UtcNow -ge $Deadline) { return 'deadline' }
+    $killKind = 'tree-kill'
+    try {
+        $Process.Kill($true)
+    } catch {
+        $killKind = 'fallback-kill'
+        try { $Process.Kill($false) } catch { return 'kill-failed' }
+    }
     while (-not $Process.HasExited -and [datetime]::UtcNow -lt $Deadline) {
         $remaining = [int][Math]::Floor(($Deadline - [datetime]::UtcNow).TotalMilliseconds)
         if ($remaining -le 0) { break }
         try {
             if ($Process.WaitForExit([Math]::Min($remaining, 250))) { break }
-        } catch { break }
+        } catch { return 'wait-failed' }
     }
-    return [bool]$Process.HasExited
+    if (-not $Process.HasExited) { return 'deadline' }
+    if ($killKind -ceq 'fallback-kill') { return 'fallback-exited' }
+    return 'tree-kill-exited'
 }
 
 function Stop-OwnedLaunchProcesses {
     param([Diagnostics.Process]$TauriDriver,[object[]]$Captured,[Parameter(Mandatory = $true)][datetime]$Deadline,[scriptblock]$ProcessProvider)
+    $rootOutcome = 'not-invoked'
     if ($null -ne $TauriDriver) {
-        $null = Wait-BoundedOwnedProcessExit -Process $TauriDriver -Deadline $Deadline
+        $rootOutcome = Wait-BoundedOwnedProcessExit -Process $TauriDriver -Deadline $Deadline
     }
     foreach ($owned in @($Captured | Sort-Object ProcessId -Descending)) {
         try {
@@ -342,6 +351,21 @@ function Stop-OwnedLaunchProcesses {
                 $null = Wait-BoundedOwnedProcessExit -Process $process -Deadline $Deadline
             }
         } catch { }
+    }
+    return $rootOutcome
+}
+
+function Get-LaunchResidualCategory {
+    param([object[]]$Processes)
+    $items = @($Processes)
+    if ($items.Count -eq 0) { return 'none' }
+    if ($items.Count -ne 1) { return 'multiple' }
+    switch ([string]$items[0].ProcessName.ToLowerInvariant()) {
+        'pdf-workstation' { return 'application' }
+        'tauri-driver' { return 'tauri-driver' }
+        'msedgedriver' { return 'edge-driver' }
+        'msedgewebview2' { return 'webview' }
+        default { return 'multiple' }
     }
 }
 
@@ -357,13 +381,20 @@ function Invoke-SessionDeleteOutcome {
 }
 
 function Assert-LaunchCleanupState {
-    param($Result,[ValidateSet('verified','requestfailed','invalidresponse')][string]$SessionDeleteOutcome,[bool]$DriverExited,[bool]$RelevantProcessesClear)
+    param(
+        $Result,
+        [ValidateSet('verified','requestfailed','invalidresponse')][string]$SessionDeleteOutcome,
+        [bool]$DriverExited,
+        [bool]$RelevantProcessesClear,
+        [ValidateSet('not-invoked','already-exited','tree-kill-exited','fallback-exited','kill-failed','wait-failed','deadline')][string]$DriverStopOutcome,
+        [ValidateSet('none','application','tauri-driver','edge-driver','webview','multiple')][string]$ResidualCategory
+    )
     $resultComplete = $null -ne $Result
     if ($resultComplete -and $SessionDeleteOutcome -ceq 'verified' -and $DriverExited -and $RelevantProcessesClear) { return }
     $driverExitedLabel = if ($DriverExited) { 'true' } else { 'false' }
     $relevantProcessesClearLabel = if ($RelevantProcessesClear) { 'true' } else { 'false' }
     $resultCompleteLabel = if ($resultComplete) { 'true' } else { 'false' }
-    throw "Installed application launch cleanup state is unverified: sessionDeleteOutcome=$SessionDeleteOutcome;driverExited=$driverExitedLabel;relevantProcessesClear=$relevantProcessesClearLabel;resultComplete=$resultCompleteLabel."
+    throw "Installed application launch cleanup state is unverified: sessionDeleteOutcome=$SessionDeleteOutcome;driverExited=$driverExitedLabel;relevantProcessesClear=$relevantProcessesClearLabel;resultComplete=$resultCompleteLabel;driverStopOutcome=$DriverStopOutcome;residualCategory=$ResidualCategory."
 }
 
 function Invoke-RealInstalledAppLaunch {
@@ -379,6 +410,9 @@ function Invoke-RealInstalledAppLaunch {
     $sessionDeleteOutcome = 'requestfailed'
     $ownedStopped = $false
     $remaining = -1
+    $driverExited = $false
+    $driverStopOutcome = 'not-invoked'
+    $residualCategory = 'multiple'
     try {
         Assert-FixedWebDriverPortsFree
         $driverCapture = Start-BoundedDiscardProcess -Path $TauriDriverPath -Arguments @(
@@ -468,15 +502,17 @@ const i=document.querySelector('img[alt="Page 1"]');return {tab:[...document.que
         if ($driver) {
             try { $captured += @(Get-OwnedLaunchProcesses -RootProcessId $driver.Id -StartedAfter $startedAfter) } catch { }
             $processCleanupDeadline = [datetime]::UtcNow.AddMilliseconds($script:LaunchPins.CleanupProcessTimeoutMilliseconds)
-            Stop-OwnedLaunchProcesses -TauriDriver $driver -Captured $captured -Deadline $processCleanupDeadline
-            $remaining = @(Get-LaunchProcessSnapshot).Count
-            $ownedStopped = $driver.HasExited -and $remaining -eq 0
+            $driverStopOutcome = Stop-OwnedLaunchProcesses -TauriDriver $driver -Captured $captured -Deadline $processCleanupDeadline
+            $remainingProcesses = @(Get-LaunchProcessSnapshot)
+            $remaining = $remainingProcesses.Count
+            $residualCategory = Get-LaunchResidualCategory -Processes $remainingProcesses
+            $driverExited = [bool]$driver.HasExited
+            $ownedStopped = $driverExited -and $residualCategory -ceq 'none'
         }
         if ($driverCapture) { $driverCapture.Dispose() }
     }
-    $driverExited = $null -ne $driver -and $driver.HasExited
-    $relevantProcessesClear = $remaining -eq 0
-    Assert-LaunchCleanupState -Result $result -SessionDeleteOutcome $sessionDeleteOutcome -DriverExited $driverExited -RelevantProcessesClear $relevantProcessesClear
+    $relevantProcessesClear = $residualCategory -ceq 'none'
+    Assert-LaunchCleanupState -Result $result -SessionDeleteOutcome $sessionDeleteOutcome -DriverExited $driverExited -RelevantProcessesClear $relevantProcessesClear -DriverStopOutcome $driverStopOutcome -ResidualCategory $residualCategory
     if ($null -eq $result -or -not $sessionDeleted -or -not $ownedStopped -or $remaining -ne 0) {
         throw 'Installed application launch cleanup did not delete the session and stop the owned process tree.'
     }
