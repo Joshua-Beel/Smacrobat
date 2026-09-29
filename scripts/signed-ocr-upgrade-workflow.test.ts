@@ -222,6 +222,62 @@ describe('manual signed OCR installer upgrade workflow', () => {
     expect(result.status, result.stderr || result.stdout).toBe(0);
   });
 
+  it('accepts only the receipt-bound payload and proven 7-Zip 24 or 26 NSIS inventory', () => {
+    const check = functionHarness(
+      ['Assert-ExtractedInstallerInventory'],
+      String.raw`
+        $target=(Resolve-Path target).Path
+        $identity=('B'*64).ToLowerInvariant()
+        $receipt=[pscustomobject]@{ocr=[pscustomobject]@{originalEngine=[pscustomobject]@{sha256=('A'*64)}}}
+        $sets=[pscustomobject]@{
+          Base=@([pscustomobject]@{target='resources/base/a.txt'},[pscustomobject]@{target='resources/base/b.txt'})
+          Ocr=@([pscustomobject]@{suffix='bin/tesseract.exe'},[pscustomobject]@{suffix='tessdata/eng.traineddata'})
+          Engine=[pscustomobject]@{sha256=('B'*64)}
+        }
+        $required=@(
+          'pdf-workstation.exe','resources/base/a.txt','resources/base/b.txt',
+          ('resources/ocr/'+$identity+'/bin/tesseract.exe'),('resources/ocr/'+$identity+'/tessdata/eng.traineddata'),
+          '$PLUGINSDIR/modern-wizard.bmp','$PLUGINSDIR/nsDialogs.dll','$PLUGINSDIR/nsis_tauri_utils.dll',
+          '$PLUGINSDIR/NSISdl.dll','$PLUGINSDIR/StartMenu.dll','$PLUGINSDIR/System.dll'
+        )
+        function New-Inventory {
+          param([string]$Name,[bool]$IncludeUninstaller=$false,[string]$Extra,[string]$Omit)
+          $root=Join-Path $target ($Name+'-'+[Guid]::NewGuid().ToString('N'))
+          [IO.Directory]::CreateDirectory($root)|Out-Null
+          foreach($relative in $required){
+            if($relative -ceq $Omit){continue}
+            $path=Join-Path $root $relative
+            [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($path))|Out-Null
+            [IO.File]::WriteAllText($path,'fixture',[Text.UTF8Encoding]::new($false))
+          }
+          if($IncludeUninstaller){[IO.File]::WriteAllText((Join-Path $root 'uninstall.exe'),'fixture',[Text.UTF8Encoding]::new($false))}
+          if($Extra){
+            $path=Join-Path $root $Extra
+            [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($path))|Out-Null
+            [IO.File]::WriteAllText($path,'fixture',[Text.UTF8Encoding]::new($false))
+          }
+          return [pscustomobject]@{Root=$root;Files=@(Get-ChildItem -LiteralPath $root -Recurse -File -Force)}
+        }
+        $v24=New-Inventory -Name 'v24'
+        Assert-ExtractedInstallerInventory -Files $v24.Files -ExtractionRoot $v24.Root -Receipt $receipt -ReceiptSets $sets
+        $v26=New-Inventory -Name 'v26' -IncludeUninstaller $true
+        Assert-ExtractedInstallerInventory -Files $v26.Files -ExtractionRoot $v26.Root -Receipt $receipt -ReceiptSets $sets
+        foreach($case in @(
+          (New-Inventory -Name 'extra-root' -Extra 'surprise.exe'),
+          (New-Inventory -Name 'extra-plugin' -Extra '$PLUGINSDIR/surprise.dll'),
+          (New-Inventory -Name 'updater-json' -Extra 'latest.json'),
+          (New-Inventory -Name 'updater-signature' -Extra 'setup.SIG'),
+          (New-Inventory -Name 'missing' -Omit '$PLUGINSDIR/System.dll')
+        )){
+          $rejected=$false;try{Assert-ExtractedInstallerInventory -Files $case.Files -ExtractionRoot $case.Root -Receipt $receipt -ReceiptSets $sets}catch{$rejected=$true}
+          if(-not $rejected){throw 'Unsafe or incomplete extracted inventory was accepted.'}
+        }
+      `,
+    );
+    const result = runPowerShell(check);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
   it('enforces bounded process and installed-registry facts and writes one sanitized record', () => {
     const check = functionHarness(
       ['Assert-ExactProperties', 'Invoke-BoundedSilentInstaller', 'Assert-InstallFacts', 'Write-SanitizedUpgradeRecord'],

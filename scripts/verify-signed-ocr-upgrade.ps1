@@ -316,14 +316,64 @@ function Assert-ReceiptFileObject {
     }
 }
 
+function Assert-ExtractedInstallerInventory {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Files,
+        [Parameter(Mandatory = $true)][string]$ExtractionRoot,
+        [Parameter(Mandatory = $true)]$Receipt,
+        [Parameter(Mandatory = $true)]$ReceiptSets
+    )
+    $root = [IO.Path]::GetFullPath($ExtractionRoot).TrimEnd('\')
+    Assert-NoReparseAncestors -Path $root
+    $actual = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($file in $Files) {
+        $path = [IO.Path]::GetFullPath([string]$file.FullName)
+        if (-not $path.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Extracted installer inventory escaped its proof root.'
+        }
+        Assert-NoReparseAncestors -Path $path
+        $relative = $path.Substring($root.Length + 1).Replace('\','/')
+        if ([string]::IsNullOrWhiteSpace($relative) -or $relative.Contains('..') -or -not $actual.Add($relative)) {
+            throw 'Extracted installer inventory contains an unsafe or duplicated path.'
+        }
+    }
+
+    $required = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $null = $required.Add('pdf-workstation.exe')
+    foreach ($entry in $ReceiptSets.Base) { $null = $required.Add([string]$entry.target) }
+    $identity = ([string]$ReceiptSets.Engine.sha256).ToLowerInvariant()
+    foreach ($entry in $ReceiptSets.Ocr) { $null = $required.Add("resources/ocr/$identity/$([string]$entry.suffix)") }
+    foreach ($path in @(
+        '$PLUGINSDIR/modern-wizard.bmp',
+        '$PLUGINSDIR/nsDialogs.dll',
+        '$PLUGINSDIR/nsis_tauri_utils.dll',
+        '$PLUGINSDIR/NSISdl.dll',
+        '$PLUGINSDIR/StartMenu.dll',
+        '$PLUGINSDIR/System.dll'
+    )) { $null = $required.Add($path) }
+
+    foreach ($path in $required) {
+        if (-not $actual.Contains($path)) { throw 'Extracted installer inventory is missing a required payload or NSIS support file.' }
+    }
+    foreach ($path in $actual) {
+        if (-not $required.Contains($path) -and -not $path.Equals('uninstall.exe', [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Extracted installer inventory contains an unexpected file.'
+        }
+    }
+    if ($actual.Count -ne $required.Count -and $actual.Count -ne ($required.Count + 1)) {
+        throw 'Extracted installer inventory has an unsupported cardinality.'
+    }
+}
+
 function Assert-ExtractedSignedArtifact {
     param(
         [Parameter(Mandatory = $true)][object[]]$Files,
+        [Parameter(Mandatory = $true)][string]$ExtractionRoot,
         [Parameter(Mandatory = $true)]$Receipt,
         [Parameter(Mandatory = $true)]$ReceiptSets,
         [scriptblock]$SignatureProvider
     )
-    if ($Files.Count -ne 38) { throw 'Signed installer extraction must contain exactly 38 files.' }
+    Assert-ExtractedInstallerInventory -Files $Files -ExtractionRoot $ExtractionRoot -Receipt $Receipt -ReceiptSets $ReceiptSets
     $updaters = @($Files | Where-Object { $_.Name.Equals('latest.json', [StringComparison]::OrdinalIgnoreCase) -or $_.Extension.Equals('.sig', [StringComparison]::OrdinalIgnoreCase) })
     if ($updaters.Count -ne 0) { throw 'Signed installer extraction contains an updater artifact.' }
     $app = Get-UniqueResource -Files $Files -Suffix 'pdf-workstation.exe' -Kind 'Packaged application'
@@ -591,8 +641,9 @@ $baselineApp = Get-UniqueResource -Files $baselineFiles -Suffix 'pdf-workstation
 $baselineAppSignature = Get-WindowsSignatureFacts -Path $baselineApp.FullName
 if ([string]$baselineAppSignature.Status -cne 'NotSigned') { throw 'Baseline packaged application is not exactly Authenticode NotSigned.' }
 $baselineAppReceipt = [pscustomobject]@{ bytes = [uint64]$baselineApp.Length; sha256 = Get-ExactSha256 -Path $baselineApp.FullName }
-$signedExtracted = Expand-InstallerProof -Installer $signedInstaller -Destination (Join-Path $work 'signed-extracted')
-$null = Assert-ExtractedSignedArtifact -Files $signedExtracted -Receipt $receipt -ReceiptSets $receiptSets
+$signedExtractedRoot = Join-Path $work 'signed-extracted'
+$signedExtracted = Expand-InstallerProof -Installer $signedInstaller -Destination $signedExtractedRoot
+$null = Assert-ExtractedSignedArtifact -Files $signedExtracted -ExtractionRoot $signedExtractedRoot -Receipt $receipt -ReceiptSets $receiptSets
 
 Invoke-BoundedSilentInstaller -Path $baselinePath
 $processFacts = Get-ConflictingProcessFacts -InstallerPaths @($baselinePath,$signedInstaller)
