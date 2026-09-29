@@ -230,22 +230,22 @@ describe('hosted installed signed application launch proof', () => {
       $requestFailed=Invoke-SessionDeleteOutcome -SessionId 'session-id' -Deadline ([datetime]::UtcNow.AddSeconds(1)) -RequestProvider {throw 'private failure detail'}
       $invalidResponse=Invoke-SessionDeleteOutcome -SessionId 'session-id' -Deadline ([datetime]::UtcNow.AddSeconds(1)) -RequestProvider {param($id,$deadline)[pscustomobject]@{value='unexpected private body'}}
       if($verified-cne'verified'-or$requestFailed-cne'requestfailed'-or$invalidResponse-cne'invalidresponse'){throw 'Session delete outcome classification changed.'}
-      $result=[pscustomobject]@{complete=$true};Assert-LaunchCleanupState -Result $result -SessionDeleteOutcome verified -DriverExited $true -RelevantProcessesClear $true -DriverStopOutcome tree-kill-exited -ResidualCategory none
+      $result=[pscustomobject]@{complete=$true};Assert-LaunchCleanupState -Result $result -SessionDeleteOutcome verified -DriverExited $true -RelevantProcessesClear $true -DriverStopOutcome tree-kill-exited -ResidualCategory none -CapturedApplication absent -CapturedTauriDriver absent -CapturedEdgeDriver absent -CapturedWebView absent -CapturedOther absent -ResidualOwnership none -ResidualApplication $false -ResidualTauriDriver $false -ResidualEdgeDriver $false -ResidualWebView $false -ResidualOther $false
       $cases=@(
-        [pscustomobject]@{result=$result;outcome='requestfailed';driver=$true;clear=$true;stop='tree-kill-exited';residual='none';expected='sessionDeleteOutcome=requestfailed;driverExited=true;relevantProcessesClear=true;resultComplete=true;driverStopOutcome=tree-kill-exited;residualCategory=none.'},
-        [pscustomobject]@{result=$result;outcome='invalidresponse';driver=$true;clear=$true;stop='fallback-exited';residual='none';expected='sessionDeleteOutcome=invalidresponse;driverExited=true;relevantProcessesClear=true;resultComplete=true;driverStopOutcome=fallback-exited;residualCategory=none.'},
-        [pscustomobject]@{result=$result;outcome='verified';driver=$false;clear=$true;stop='wait-failed';residual='none';expected='sessionDeleteOutcome=verified;driverExited=false;relevantProcessesClear=true;resultComplete=true;driverStopOutcome=wait-failed;residualCategory=none.'},
-        [pscustomobject]@{result=$result;outcome='verified';driver=$true;clear=$false;stop='tree-kill-exited';residual='webview';expected='sessionDeleteOutcome=verified;driverExited=true;relevantProcessesClear=false;resultComplete=true;driverStopOutcome=tree-kill-exited;residualCategory=webview.'},
-        [pscustomobject]@{result=$null;outcome='verified';driver=$true;clear=$true;stop='not-invoked';residual='multiple';expected='sessionDeleteOutcome=verified;driverExited=true;relevantProcessesClear=true;resultComplete=false;driverStopOutcome=not-invoked;residualCategory=multiple.'}
+        [pscustomobject]@{result=$result;outcome='requestfailed';driver=$true;clear=$true;stop='tree-kill-exited';residual='none';ownership='none';presence=@($false,$false,$false,$false,$false)},
+        [pscustomobject]@{result=$result;outcome='invalidresponse';driver=$true;clear=$true;stop='fallback-exited';residual='none';ownership='none';presence=@($false,$false,$false,$false,$false)},
+        [pscustomobject]@{result=$result;outcome='verified';driver=$false;clear=$true;stop='wait-failed';residual='none';ownership='none';presence=@($false,$false,$false,$false,$false)},
+        [pscustomobject]@{result=$result;outcome='verified';driver=$true;clear=$false;stop='tree-kill-exited';residual='webview';ownership='uncaptured';presence=@($false,$false,$false,$true,$false)},
+        [pscustomobject]@{result=$null;outcome='verified';driver=$true;clear=$true;stop='not-invoked';residual='multiple';ownership='mixed';presence=@($true,$false,$true,$false,$true)}
       )
-      foreach($case in $cases){$rejected=$false;try{Assert-LaunchCleanupState -Result $case.result -SessionDeleteOutcome $case.outcome -DriverExited $case.driver -RelevantProcessesClear $case.clear -DriverStopOutcome $case.stop -ResidualCategory $case.residual}catch{$rejected=$true;$expected='Installed application launch cleanup state is unverified: '+$case.expected;if($_.Exception.Message-cne$expected-or$_.Exception.Message-match'private|session-id|unexpected'){throw 'Cleanup diagnostic leaked or changed.'}};if(-not$rejected){throw 'Unverified cleanup state was accepted.'}}
+      foreach($case in $cases){$rejected=$false;try{Assert-LaunchCleanupState -Result $case.result -SessionDeleteOutcome $case.outcome -DriverExited $case.driver -RelevantProcessesClear $case.clear -DriverStopOutcome $case.stop -ResidualCategory $case.residual -CapturedApplication absent -CapturedTauriDriver all-exited -CapturedEdgeDriver all-exited -CapturedWebView incomplete -CapturedOther absent -ResidualOwnership $case.ownership -ResidualApplication $case.presence[0] -ResidualTauriDriver $case.presence[1] -ResidualEdgeDriver $case.presence[2] -ResidualWebView $case.presence[3] -ResidualOther $case.presence[4]}catch{$rejected=$true;$prefix="Installed application launch cleanup state is unverified: sessionDeleteOutcome=$($case.outcome);driverExited=$(([string]$case.driver).ToLowerInvariant());relevantProcessesClear=$(([string]$case.clear).ToLowerInvariant());";if(-not$_.Exception.Message.StartsWith($prefix,[StringComparison]::Ordinal)-or$_.Exception.Message-cnotmatch'captured=application:absent,tauri-driver:all-exited,edge-driver:all-exited,webview:incomplete,other:absent;residualOwnership=(none|uncaptured|mixed);residualPresence=application:(true|false),tauri-driver:(true|false),edge-driver:(true|false),webview:(true|false),other:(true|false)\.$'-or$_.Exception.Message-match'private|session-id|unexpected'){throw 'Cleanup diagnostic leaked or changed.'}};if(-not$rejected){throw 'Unverified cleanup state was accepted.'}}
     `);
     const result = runPowerShell(source);
     expect(result.status, result.stderr || result.stdout).toBe(0);
   });
 
   it('waits boundedly for an inert owned process tree and never kills mismatched identities', () => {
-    const source = extractFunctions('scripts/installed-app-launch.ps1', ['Wait-BoundedOwnedProcessExit', 'Stop-OwnedLaunchProcesses'], String.raw`
+    const source = extractFunctions('scripts/installed-app-launch.ps1', ['Wait-BoundedOwnedProcessExit', 'Get-LaunchProcessCategory', 'Get-CapturedCategoryOutcome', 'Stop-OwnedLaunchProcesses'], String.raw`
       $root=Join-Path (Resolve-Path target) ('owned-cleanup-'+[Guid]::NewGuid().ToString('N'));[IO.Directory]::CreateDirectory($root)|Out-Null
       $pidPath=Join-Path $root 'child.pid';$rootScript=Join-Path $root 'root.ps1';$pwsh=(Get-Process -Id $PID).Path
       $rootSource=@'
@@ -260,7 +260,7 @@ $child=[Diagnostics.Process]::Start($info);[IO.File]::WriteAllText($ChildPidPath
         $ready=[datetime]::UtcNow.AddSeconds(5);while(-not(Test-Path -LiteralPath $pidPath) -and [datetime]::UtcNow -lt $ready){Start-Sleep -Milliseconds 50};if(-not(Test-Path -LiteralPath $pidPath)){throw 'Inert child PID receipt was not created.'}
         $childProcess=Get-Process -Id ([int](Get-Content -LiteralPath $pidPath -Raw));$captured=@([pscustomobject]@{ProcessId=$childProcess.Id;Path=[string]$childProcess.Path;StartTicks=$childProcess.StartTime.ToUniversalTime().Ticks})
         $rootOutcome=Stop-OwnedLaunchProcesses -TauriDriver $rootProcess -Captured $captured -Deadline ([datetime]::UtcNow.AddSeconds(8))
-        if($rootOutcome-cne'tree-kill-exited'){throw 'Owned root stop outcome was not exact.'}
+        if($rootOutcome.rootOutcome-cne'tree-kill-exited'-or$rootOutcome.other-cne'all-exited'){throw 'Owned root stop outcome was not exact.'}
         if(-not$rootProcess.HasExited){throw 'Owned root did not exit within its bounded cleanup deadline.'};$childAlive=$true;try{$null=Get-Process -Id $childProcess.Id -ErrorAction Stop}catch{$childAlive=$false};if($childAlive){throw 'Inert owned child remained alive.'}
       }finally{try{if(-not$rootProcess.HasExited){$rootProcess.Kill($true);$rootProcess.WaitForExit(5000)|Out-Null}}catch{};try{if($childProcess -and -not $childProcess.HasExited){$childProcess.Kill();$childProcess.WaitForExit(5000)|Out-Null}}catch{}}
       $script:fakeKills=0;$started=[datetime]::UtcNow;$fake=[pscustomobject]@{HasExited=$false;Path='C:\fixture\owned.exe';StartTime=$started};$fake|Add-Member ScriptMethod Kill {param([bool]$tree)$script:fakeKills++};$fake|Add-Member ScriptMethod WaitForExit {param([int]$milliseconds)$false}
@@ -280,16 +280,16 @@ $child=[Diagnostics.Process]::Start($info);[IO.File]::WriteAllText($ChildPidPath
     const disposeOffset = launchSource.indexOf('$driverCapture.Dispose()', snapshotOffset);
     expect(snapshotOffset).toBeGreaterThan(0);
     expect(disposeOffset).toBeGreaterThan(snapshotOffset);
-    const source = extractFunctions('scripts/installed-app-launch.ps1', ['Start-BoundedDiscardProcess', 'Wait-BoundedOwnedProcessExit', 'Stop-OwnedLaunchProcesses'], String.raw`
+    const source = extractFunctions('scripts/installed-app-launch.ps1', ['Start-BoundedDiscardProcess', 'Wait-BoundedOwnedProcessExit', 'Get-LaunchProcessCategory', 'Get-CapturedCategoryOutcome', 'Stop-OwnedLaunchProcesses'], String.raw`
       $pwsh=(Get-Process -Id $PID).Path;$capture=Start-BoundedDiscardProcess -Path $pwsh -Arguments @('-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30');$process=$capture.Process
-      try{$capture.Start();$outcome=Stop-OwnedLaunchProcesses -TauriDriver $process -Captured @() -Deadline ([datetime]::UtcNow.AddSeconds(5));$driverExited=[bool]$process.HasExited;if(-not$driverExited-or$outcome-cne'tree-kill-exited'){throw 'Exact bounded capture did not stop before disposal.'};$capture.Dispose();$capture=$null;if($null-ne$process.HasExited){throw 'Disposed Process unexpectedly retained a reliable HasExited value.'};if(-not$driverExited){throw 'The pre-disposal exit snapshot was lost.'}}finally{try{if($capture){$capture.Dispose()}}catch{}}
+      try{$capture.Start();$outcome=Stop-OwnedLaunchProcesses -TauriDriver $process -Captured @() -Deadline ([datetime]::UtcNow.AddSeconds(5));$driverExited=[bool]$process.HasExited;if(-not$driverExited-or$outcome.rootOutcome-cne'tree-kill-exited'){throw 'Exact bounded capture did not stop before disposal.'};$capture.Dispose();$capture=$null;if($null-ne$process.HasExited){throw 'Disposed Process unexpectedly retained a reliable HasExited value.'};if(-not$driverExited){throw 'The pre-disposal exit snapshot was lost.'}}finally{try{if($capture){$capture.Dispose()}}catch{}}
     `);
     const result = runPowerShell(source);
     expect(result.status, result.stderr || result.stdout).toBe(0);
   });
 
   it('classifies only fixed residual process categories and fails closed for unknown or multiple entries', () => {
-    const source = extractFunctions('scripts/installed-app-launch.ps1', ['Get-LaunchResidualCategory'], String.raw`
+    const source = extractFunctions('scripts/installed-app-launch.ps1', ['Get-LaunchProcessCategory', 'Get-LaunchResidualCategory', 'Get-LaunchResidualFacts'], String.raw`
       $cases=@(
         [pscustomobject]@{items=@();expected='none'},
         [pscustomobject]@{items=@([pscustomobject]@{ProcessName='pdf-workstation'});expected='application'},
@@ -299,6 +299,27 @@ $child=[Diagnostics.Process]::Start($info);[IO.File]::WriteAllText($ChildPidPath
         [pscustomobject]@{items=@([pscustomobject]@{ProcessName='private-name'});expected='multiple'},
         [pscustomobject]@{items=@([pscustomobject]@{ProcessName='tauri-driver'},[pscustomobject]@{ProcessName='msedgewebview2'});expected='multiple'}
       );foreach($case in $cases){$actual=Get-LaunchResidualCategory -Processes $case.items;if($actual-cne$case.expected-or$actual-match'private'){throw 'Residual category escaped its fixed allowlist.'}}
+      $started=[datetime]::UtcNow;$captured=[pscustomobject]@{ProcessId=71;Path='C:\fixture\msedgedriver.exe';StartTicks=$started.ToUniversalTime().Ticks};$exact=[pscustomobject]@{Id=71;ProcessName='msedgedriver';Path='C:\fixture\msedgedriver.exe';StartTime=$started};$unknown=[pscustomobject]@{Id=72;ProcessName='private-name';Path='C:\private\secret.exe';StartTime=$started};$facts=Get-LaunchResidualFacts -Processes @($exact,$unknown) -Captured @($captured);if($facts.ownership-cne'mixed'-or-not$facts.edgeDriver-or-not$facts.other-or$facts.application-or$facts.tauriDriver-or$facts.webview){throw 'Residual identity facts escaped the fixed contract.'};if(($facts|ConvertTo-Json -Compress)-match'private|secret|fixture|71|72'){throw 'Residual facts leaked identifying data.'}
+    `);
+    const result = runPowerShell(source);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
+  it('reports a newly orphaned descendant as uncaptured without weakening identity-bound cleanup', () => {
+    const source = extractFunctions('scripts/installed-app-launch.ps1', ['Get-OwnedLaunchProcesses', 'Wait-BoundedOwnedProcessExit', 'Get-LaunchProcessCategory', 'Get-CapturedCategoryOutcome', 'Stop-OwnedLaunchProcesses', 'Get-LaunchResidualFacts', 'Assert-LaunchCleanupState'], String.raw`
+      $root=Join-Path (Resolve-Path target) ('orphan-diagnostic-'+[Guid]::NewGuid().ToString('N'));[IO.Directory]::CreateDirectory($root)|Out-Null;$gate=Join-Path $root 'spawn.gate';$middlePid=Join-Path $root 'middle.pid';$grandPid=Join-Path $root 'grand.pid';$middleScript=Join-Path $root 'middle.ps1';$rootScript=Join-Path $root 'root.ps1';$pwsh=(Get-Process -Id $PID).Path
+      $middleSource=@'
+param([string]$Gate,[string]$GrandPid,[string]$Pwsh)
+while(-not(Test-Path -LiteralPath $Gate)){Start-Sleep -Milliseconds 25}
+$info=[Diagnostics.ProcessStartInfo]::new();$info.FileName=$Pwsh;$info.UseShellExecute=$false;$info.CreateNoWindow=$true;$info.ArgumentList.Add('-NoProfile');$info.ArgumentList.Add('-NonInteractive');$info.ArgumentList.Add('-Command');$info.ArgumentList.Add('Start-Sleep -Seconds 30');$grand=[Diagnostics.Process]::Start($info);[IO.File]::WriteAllText($GrandPid,[string]$grand.Id,[Text.UTF8Encoding]::new($false))
+'@
+      $rootSource=@'
+param([string]$MiddleScript,[string]$Gate,[string]$MiddlePid,[string]$GrandPid,[string]$Pwsh)
+$info=[Diagnostics.ProcessStartInfo]::new();$info.FileName=$Pwsh;$info.UseShellExecute=$false;$info.CreateNoWindow=$true;foreach($argument in @('-NoProfile','-NonInteractive','-File',$MiddleScript,$Gate,$GrandPid,$Pwsh)){$info.ArgumentList.Add($argument)};$middle=[Diagnostics.Process]::Start($info);[IO.File]::WriteAllText($MiddlePid,[string]$middle.Id,[Text.UTF8Encoding]::new($false));Start-Sleep -Seconds 30
+'@
+      [IO.File]::WriteAllText($middleScript,$middleSource,[Text.UTF8Encoding]::new($false));[IO.File]::WriteAllText($rootScript,$rootSource,[Text.UTF8Encoding]::new($false));$info=[Diagnostics.ProcessStartInfo]::new();$info.FileName=$pwsh;$info.UseShellExecute=$false;$info.CreateNoWindow=$true;foreach($argument in @('-NoProfile','-NonInteractive','-File',$rootScript,$middleScript,$gate,$middlePid,$grandPid,$pwsh)){$info.ArgumentList.Add($argument)};$driver=[Diagnostics.Process]::Start($info);$grand=$null
+      try{$ready=[datetime]::UtcNow.AddSeconds(5);while(-not(Test-Path -LiteralPath $middlePid)-and[datetime]::UtcNow-lt$ready){Start-Sleep -Milliseconds 25};if(-not(Test-Path -LiteralPath $middlePid)){throw 'Intermediate receipt was not created.'};$captured=@(Get-OwnedLaunchProcesses -RootProcessId $driver.Id -StartedAfter $driver.StartTime.ToUniversalTime().AddSeconds(-1));[IO.File]::WriteAllText($gate,'go',[Text.UTF8Encoding]::new($false));while(-not(Test-Path -LiteralPath $grandPid)-and[datetime]::UtcNow-lt$ready){Start-Sleep -Milliseconds 25};if(-not(Test-Path -LiteralPath $grandPid)){throw 'Grandchild receipt was not created.'};$grand=Get-Process -Id ([int](Get-Content -LiteralPath $grandPid -Raw));Start-Sleep -Milliseconds 300;$captured+=@(Get-OwnedLaunchProcesses -RootProcessId $driver.Id -StartedAfter $driver.StartTime.ToUniversalTime().AddSeconds(-1));if(@($captured.ProcessId)-contains$grand.Id){throw 'The reproduction did not create an orphan outside the root-only traversal.'};$stop=Stop-OwnedLaunchProcesses -TauriDriver $driver -Captured $captured -Deadline ([datetime]::UtcNow.AddSeconds(5));$residual=@(Get-Process -Id $grand.Id -ErrorAction Stop);$facts=Get-LaunchResidualFacts -Processes $residual -Captured $captured;if($stop.rootOutcome-cne'tree-kill-exited'-or$stop.other-cne'all-exited'-or$facts.ownership-cne'uncaptured'-or-not$facts.other){throw 'Orphan diagnostics did not distinguish captured cleanup from the uncaptured residual.'};$rejected=$false;try{Assert-LaunchCleanupState -Result ([pscustomobject]@{complete=$true}) -SessionDeleteOutcome verified -DriverExited $true -RelevantProcessesClear $false -DriverStopOutcome $stop.rootOutcome -ResidualCategory multiple -CapturedApplication $stop.application -CapturedTauriDriver $stop.tauriDriver -CapturedEdgeDriver $stop.edgeDriver -CapturedWebView $stop.webview -CapturedOther $stop.other -ResidualOwnership $facts.ownership -ResidualApplication $facts.application -ResidualTauriDriver $facts.tauriDriver -ResidualEdgeDriver $facts.edgeDriver -ResidualWebView $facts.webview -ResidualOther $facts.other}catch{if($_.Exception.Message-match'residualOwnership=uncaptured'-and$_.Exception.Message-match'other:true'){$rejected=$true}};if(-not$rejected){throw 'The uncaptured orphan escaped the global zero-process gate.'}}
+      finally{try{if(-not$driver.HasExited){$driver.Kill($true);$driver.WaitForExit(3000)|Out-Null}}catch{};try{if($grand-and-not$grand.HasExited){$grand.Kill();$grand.WaitForExit(3000)|Out-Null}}catch{}}
     `);
     const result = runPowerShell(source);
     expect(result.status, result.stderr || result.stdout).toBe(0);
@@ -315,9 +336,10 @@ $child=[Diagnostics.Process]::Start($info);[IO.File]::WriteAllText($ChildPidPath
       function Invoke-BoundedLoopbackJson{param([string]$Method,[string]$Path,$Body,[datetime]$Deadline,[int]$Port=4444);if($Method-ceq'GET'-and$Path-ceq'/status'){return [pscustomobject]@{value=[pscustomobject]@{ready=$true}}};if($Method-ceq'POST'-and$Path-ceq'/session'){$script:sessionPosts++;throw 'session-timeout'};if($Method-ceq'DELETE'){$script:deleteRequests++};throw 'unexpected-loopback-request'}
       function Wait-NativeDriverStatus{param([string]$ExpectedVersion,[datetime]$Deadline,$TauriDriver);$ExpectedVersion}
       function Get-OwnedLaunchProcesses{param([int]$RootProcessId,[datetime]$StartedAfter);@()}
-      function Stop-OwnedLaunchProcesses{param($TauriDriver,[object[]]$Captured,[datetime]$Deadline);$script:driverStopped=$true;$TauriDriver.HasExited=$true}
+      function Stop-OwnedLaunchProcesses{param($TauriDriver,[object[]]$Captured,[datetime]$Deadline);$script:driverStopped=$true;$TauriDriver.HasExited=$true;[pscustomobject]@{rootOutcome='tree-kill-exited';application='absent';tauriDriver='absent';edgeDriver='absent';webview='absent';other='absent'}}
       function Get-LaunchProcessSnapshot{@()}
       function Get-LaunchResidualCategory{param([object[]]$Processes);'none'}
+      function Get-LaunchResidualFacts{param([object[]]$Processes,[object[]]$Captured);[pscustomobject]@{ownership='none';application=$false;tauriDriver=$false;edgeDriver=$false;webview=$false;other=$false}}
       $rejected=$false;try{Invoke-RealInstalledAppLaunch -ApplicationPath 'app.exe' -TauriDriverPath 'tauri-driver.exe' -EdgeDriverPath 'msedgedriver.exe' -ProfileRoot 'profile' -SettingsRoot 'settings' -ExpectedEdgeDriverVersion '151.0.1.2'}catch{if($_.Exception.Message-ceq'session-timeout'){$rejected=$true}else{throw}}
       if(-not$rejected-or$script:sessionPosts-ne1-or$script:deleteRequests-ne0-or-not$script:driverStopped-or-not$driver.HasExited){throw 'Session-timeout cleanup or no-retry contract changed.'}
     `);
