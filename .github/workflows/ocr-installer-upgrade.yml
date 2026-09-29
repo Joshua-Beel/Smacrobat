@@ -15,11 +15,6 @@ jobs:
   upgrade:
     runs-on: windows-2022
     timeout-minutes: 45
-    env:
-      BASELINE_ROOT: ${{ runner.temp }}/pdf-workstation-baseline
-      SIGNED_ARTIFACT_ROOT: ${{ runner.temp }}/pdf-workstation-signed-artifact
-      UPGRADE_WORK_ROOT: ${{ runner.temp }}/pdf-workstation-upgrade-work
-      UPGRADE_OUTPUT_ROOT: ${{ runner.temp }}/pdf-workstation-upgrade-output
     steps:
       - name: Require a manual master dispatch
         shell: pwsh
@@ -29,6 +24,21 @@ jobs:
               $env:GITHUB_REF -cne 'refs/heads/master') {
             throw 'Dispatch this upgrade verification only from the master branch.'
           }
+
+      - name: Initialize fresh runner paths
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP) -or [string]::IsNullOrWhiteSpace($env:GITHUB_ENV)) {
+            throw 'GitHub-hosted runner path variables are unavailable.'
+          }
+          $root = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\')
+          $values = @(
+            "BASELINE_ROOT=$root\pdf-workstation-baseline"
+            "SIGNED_ARTIFACT_ROOT=$root\pdf-workstation-signed-artifact"
+            "UPGRADE_WORK_ROOT=$root\pdf-workstation-upgrade-work"
+            "UPGRADE_OUTPUT_ROOT=$root\pdf-workstation-upgrade-output"
+          )
+          [IO.File]::AppendAllLines($env:GITHUB_ENV, $values, [Text.UTF8Encoding]::new($false))
 
       - uses: actions/checkout@v4
         with:

@@ -55,6 +55,16 @@ describe('manual signed OCR installer upgrade workflow', () => {
     expect(workflow).toContain('timeout-minutes: 45');
     expect(workflow).toContain('contents: read');
     expect(workflow).toContain('actions: read');
+    const jobHeader = workflow.slice(workflow.indexOf('jobs:'), workflow.indexOf('    steps:'));
+    expect(jobHeader).not.toContain('${{ runner.temp }}');
+    expect(jobHeader).not.toMatch(/^\s{4}env:/m);
+    expect(workflow).toContain('- name: Initialize fresh runner paths');
+    expect(workflow).toContain('$env:RUNNER_TEMP');
+    expect(workflow).toContain('[IO.File]::AppendAllLines($env:GITHUB_ENV');
+    const initStep = workflow.slice(workflow.indexOf('- name: Initialize fresh runner paths'), workflow.indexOf('- uses: actions/checkout@v4'));
+    expect(initStep).toContain('IsNullOrWhiteSpace($env:RUNNER_TEMP)');
+    expect(initStep).toContain('IsNullOrWhiteSpace($env:GITHUB_ENV)');
+    expect(initStep.match(/^[ ]{12}"(BASELINE_ROOT|SIGNED_ARTIFACT_ROOT|UPGRADE_WORK_ROOT|UPGRADE_OUTPUT_ROOT)=/gm)).toHaveLength(4);
     expect(workflow).toContain("$env:GITHUB_REPOSITORY -cne 'Joshua-Beel/Smacrobat'");
     expect(workflow).toContain("$env:GITHUB_REF -cne 'refs/heads/master'");
     expect(workflow).toContain('ref: ${{ github.sha }}');
