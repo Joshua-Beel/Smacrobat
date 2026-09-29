@@ -165,25 +165,42 @@ function Wait-NativeDriverStatus {
     throw 'Native EdgeDriver did not become ready before the shared launch deadline.'
 }
 
+function Get-ExactProfileBinding {
+    param([Parameter(Mandatory = $true)][string]$Candidate,[Parameter(Mandatory = $true)][string]$RequestedProfile,[Parameter(Mandatory = $true)][string]$SettingsRoot)
+    $actual = [IO.Path]::GetFullPath($Candidate).TrimEnd('\')
+    $requested = [IO.Path]::GetFullPath($RequestedProfile).TrimEnd('\')
+    $settings = [IO.Path]::GetFullPath($SettingsRoot).TrimEnd('\')
+    $settingsWebView = [IO.Path]::GetFullPath((Join-Path $settings 'EBWebView')).TrimEnd('\')
+    if ($actual.Equals($requested,[StringComparison]::OrdinalIgnoreCase)) { return 'requested-profile' }
+    if ($actual.Equals($settingsWebView,[StringComparison]::OrdinalIgnoreCase)) { return 'tauri-app-settings-ebwebview' }
+    $relation = if ($actual.Equals($settings,[StringComparison]::OrdinalIgnoreCase)) { 'exact-settings-root' }
+        elseif ($actual.StartsWith($settings + '\',[StringComparison]::OrdinalIgnoreCase)) { 'settings-root-other' }
+        elseif ($actual.StartsWith($requested + '\',[StringComparison]::OrdinalIgnoreCase)) { 'requested-root-other' }
+        elseif ($env:RUNNER_TEMP -and $actual.StartsWith([IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\') + '\',[StringComparison]::OrdinalIgnoreCase)) { 'runner-temp-other' }
+        else { 'outside-known-roots' }
+    throw "Owned WebView2 profile relation '$relation' is outside the exact controlled profile contract."
+}
+
 function Get-OwnedProfileBinding {
-    param([object[]]$Owned,[Parameter(Mandatory = $true)][string]$ExpectedProfile)
-    $expected = [IO.Path]::GetFullPath($ExpectedProfile).TrimEnd('\')
+    param([object[]]$Owned,[Parameter(Mandatory = $true)][string]$RequestedProfile,[Parameter(Mandatory = $true)][string]$SettingsRoot)
     $webViews = @($Owned | Where-Object { [IO.Path]::GetFileName([string]$_.Path).Equals('msedgewebview2.exe',[StringComparison]::OrdinalIgnoreCase) })
     if ($webViews.Count -eq 0) { throw 'No owned WebView2 process was available to bind the fresh profile.' }
     $matched = 0
+    $binding = $null
     foreach ($process in $webViews) {
         $commandLine = [string]$process.CommandLine
         $userDataSwitches = [regex]::Matches($commandLine, '(?i)(?:^|\s)"?--user-data-dir=(?:"(?<quoted>[^"]+)"|(?<plain>[^\s"]+))"?(?=\s|$)')
         if ($userDataSwitches.Count -gt 1) { throw 'An owned WebView2 process has multiple user-data-dir switches.' }
         if ($userDataSwitches.Count -eq 1) {
             $candidate = if ($userDataSwitches[0].Groups['quoted'].Success) { $userDataSwitches[0].Groups['quoted'].Value } else { $userDataSwitches[0].Groups['plain'].Value }
-            $canonical = [IO.Path]::GetFullPath($candidate).TrimEnd('\')
-            if (-not $canonical.Equals($expected,[StringComparison]::OrdinalIgnoreCase)) { throw 'An owned WebView2 process used a different profile path.' }
+            $candidateBinding = Get-ExactProfileBinding -Candidate $candidate -RequestedProfile $RequestedProfile -SettingsRoot $SettingsRoot
+            if ($null -ne $binding -and $binding -cne $candidateBinding) { throw 'Owned WebView2 processes used inconsistent controlled profiles.' }
+            $binding = $candidateBinding
             $matched++
         }
     }
     if ($matched -eq 0) { throw 'No owned WebView2 command line bound the fresh profile path.' }
-    return 'owned-webview-command-line'
+    return "owned-webview-$binding"
 }
 
 function Assert-OwnedLaunchExecutables {
@@ -298,7 +315,7 @@ function Stop-OwnedLaunchProcesses {
 }
 
 function Invoke-RealInstalledAppLaunch {
-    param([string]$ApplicationPath,[string]$TauriDriverPath,[string]$EdgeDriverPath,[string]$ProfileRoot,[string]$ExpectedEdgeDriverVersion)
+    param([string]$ApplicationPath,[string]$TauriDriverPath,[string]$EdgeDriverPath,[string]$ProfileRoot,[string]$SettingsRoot,[string]$ExpectedEdgeDriverVersion)
     $deadline = [datetime]::UtcNow.AddMilliseconds($script:LaunchPins.TotalTimeoutMilliseconds)
     $driverCapture = $null
     $driver = $null
@@ -369,12 +386,9 @@ const i=document.querySelector('img[alt="Page 1"]');return {tab:[...document.que
         $captured = @(Get-OwnedLaunchProcesses -RootProcessId $driver.Id -StartedAfter $startedAfter)
         Assert-OwnedLaunchExecutables -Owned $captured -ApplicationPath $ApplicationPath -EdgeDriverPath $EdgeDriverPath
         $profileBinding = if (-not [string]::IsNullOrWhiteSpace($returnedUserData)) {
-            if (-not ([IO.Path]::GetFullPath($returnedUserData).TrimEnd('\')).Equals([IO.Path]::GetFullPath($ProfileRoot).TrimEnd('\'),[StringComparison]::OrdinalIgnoreCase)) {
-                throw 'The session returned a different WebView profile path.'
-            }
-            'session-capability'
+            'session-capability-' + (Get-ExactProfileBinding -Candidate $returnedUserData -RequestedProfile $ProfileRoot -SettingsRoot $SettingsRoot)
         } else {
-            Get-OwnedProfileBinding -Owned $captured -ExpectedProfile $ProfileRoot
+            Get-OwnedProfileBinding -Owned $captured -RequestedProfile $ProfileRoot -SettingsRoot $SettingsRoot
         }
         if ($driverCapture.Exceeded) { throw 'WebDriver diagnostic output exceeded its discarded character cap.' }
         $result = [pscustomobject]@{
@@ -423,6 +437,10 @@ function Invoke-InstalledAppLaunchSmoke {
         [Parameter(Mandatory = $true)]$ApplicationReceipt,
         [Parameter(Mandatory = $true)][string]$WebDriverRoot,
         [Parameter(Mandatory = $true)][string]$ProfileRoot,
+        [Parameter(Mandatory = $true)][string]$ApplicationSettingsRoot,
+        [Parameter(Mandatory = $true)][string]$SettingsSentinelPath,
+        [Parameter(Mandatory = $true)][uint64]$SettingsSentinelBytes,
+        [Parameter(Mandatory = $true)][string]$SettingsSentinelSha256,
         [Parameter(Mandatory = $true)][string]$RunnerTemp,
         [Parameter(Mandatory = $true)][string]$ExpectedPublisher,
         [scriptblock]$ProcessProvider
@@ -430,11 +448,29 @@ function Invoke-InstalledAppLaunchSmoke {
     $runner = [IO.Path]::GetFullPath($RunnerTemp).TrimEnd('\')
     $driverRoot = [IO.Path]::GetFullPath($WebDriverRoot).TrimEnd('\')
     $profile = [IO.Path]::GetFullPath($ProfileRoot).TrimEnd('\')
+    $settingsRoot = [IO.Path]::GetFullPath($ApplicationSettingsRoot).TrimEnd('\')
+    $settingsSentinel = [IO.Path]::GetFullPath($SettingsSentinelPath)
     foreach ($candidate in @($driverRoot,$profile)) {
         if (-not $candidate.StartsWith($runner + '\',[StringComparison]::OrdinalIgnoreCase)) { throw 'Launch-smoke paths must stay beneath RUNNER_TEMP.' }
         Assert-NoReparseAncestors -Path $candidate
     }
     if (-not (Test-Path -LiteralPath $driverRoot -PathType Container) -or (Test-Path -LiteralPath $profile)) { throw 'WebDriver inputs must exist and the WebView profile must be fresh.' }
+    $expectedSettingsRoot = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'local.pdfworkstation.desktop')).TrimEnd('\')
+    $expectedSettingsSentinel = [IO.Path]::GetFullPath((Join-Path $settingsRoot 'upgrade-sentinel.json'))
+    if (-not $settingsRoot.Equals($expectedSettingsRoot,[StringComparison]::OrdinalIgnoreCase) -or
+        -not $settingsSentinel.Equals($expectedSettingsSentinel,[StringComparison]::OrdinalIgnoreCase)) {
+        throw 'The launch settings root or sentinel is outside the exact application identity.'
+    }
+    Assert-NoReparseAncestors -Path $settingsRoot
+    Assert-NoReparseAncestors -Path $settingsSentinel
+    Assert-FileReceipt -Path $settingsSentinel -Bytes $SettingsSentinelBytes -Sha256 $SettingsSentinelSha256 -Kind 'Prelaunch synthetic settings sentinel'
+    $settingsEntries = @(Get-ChildItem -LiteralPath $settingsRoot -Force)
+    if ($settingsEntries.Count -ne 1 -or -not $settingsEntries[0].FullName.Equals($settingsSentinel,[StringComparison]::OrdinalIgnoreCase) -or
+        $settingsEntries[0].PSIsContainer -or ($settingsEntries[0].Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw 'The controlled application settings root must contain only the receipt-bound sentinel before launch.'
+    }
+    $applicationProfile = [IO.Path]::GetFullPath((Join-Path $settingsRoot 'EBWebView')).TrimEnd('\')
+    if (Test-Path -LiteralPath $applicationProfile) { throw 'The exact Tauri application WebView profile must be absent before launch.' }
     $ambient = @(Get-LaunchProcessSnapshot)
     if ($ambient.Count -ne 0) { throw 'The hosted runner already has an application or WebDriver process.' }
     $receiptPath = Join-Path $driverRoot 'webdriver-receipt.json'
@@ -450,15 +486,16 @@ function Invoke-InstalledAppLaunchSmoke {
     $null = Assert-TrustedWindowsSignature -Path $edgeDriver -ExpectedPublisher $script:LaunchPins.EdgePublisher
     [IO.Directory]::CreateDirectory($profile) | Out-Null
     Assert-NoReparseAncestors -Path $profile
+    if (@(Get-ChildItem -LiteralPath $profile -Force).Count -ne 0) { throw 'The requested WebDriver profile was not empty before launch.' }
     $expectedEdgeDriverVersion = [string]$receipt.edgeDriver.version
-    $result = if ($ProcessProvider) { & $ProcessProvider $ApplicationPath $tauriDriver $edgeDriver $profile $expectedEdgeDriverVersion } else { Invoke-RealInstalledAppLaunch -ApplicationPath $ApplicationPath -TauriDriverPath $tauriDriver -EdgeDriverPath $edgeDriver -ProfileRoot $profile -ExpectedEdgeDriverVersion $expectedEdgeDriverVersion }
+    $result = if ($ProcessProvider) { & $ProcessProvider $ApplicationPath $tauriDriver $edgeDriver $profile $settingsRoot $applicationProfile $expectedEdgeDriverVersion } else { Invoke-RealInstalledAppLaunch -ApplicationPath $ApplicationPath -TauriDriverPath $tauriDriver -EdgeDriverPath $edgeDriver -ProfileRoot $profile -SettingsRoot $settingsRoot -ExpectedEdgeDriverVersion $expectedEdgeDriverVersion }
     Assert-LaunchExactProperties -Value $result -Expected @('nativeDriverVersion','driverVersionBinding','returnedRuntimeVersion','profileBindingMethod','sessionCapabilityKeys','title','homeButton','ocrCapabilityStatus','sampleName','samplePages','renderedPageWidth','renderedPageHeight','renderedPageBlob','sessionDeleted','ownedProcessTreeStopped','relevantProcessesRemaining') -Kind 'Installed application launch result'
     $returnedRuntimeParts = ([string]$result.returnedRuntimeVersion).Split('.')
     $expectedRuntimeParts = ([string]$receipt.webView2RuntimeVersion).Split('.')
     $capabilityKeys = @($result.sessionCapabilityKeys)
     if ([string]$result.nativeDriverVersion -cne $expectedEdgeDriverVersion -or [string]$result.driverVersionBinding -cne 'native-status' -or
         $returnedRuntimeParts.Count -ne 4 -or ($returnedRuntimeParts[0..2] -join '.') -cne ($expectedRuntimeParts[0..2] -join '.') -or
-        @('session-capability','owned-webview-command-line') -cnotcontains [string]$result.profileBindingMethod -or
+        @('session-capability-requested-profile','session-capability-tauri-app-settings-ebwebview','owned-webview-requested-profile','owned-webview-tauri-app-settings-ebwebview') -cnotcontains [string]$result.profileBindingMethod -or
         $capabilityKeys.Count -eq 0 -or $capabilityKeys.Count -gt 32 -or @($capabilityKeys | Where-Object { $_ -cnotmatch '^[A-Za-z0-9:._-]{1,64}$' }).Count -ne 0 -or
         [string]$result.title -cne 'PDF Workstation' -or $result.homeButton -isnot [bool] -or -not $result.homeButton -or
         [string]$result.ocrCapabilityStatus -cne 'Available' -or [string]$result.sampleName -cne 'welcome.pdf' -or
@@ -469,6 +506,31 @@ function Invoke-InstalledAppLaunchSmoke {
         throw 'Installed application launch result did not match its exact native IPC and rendered-sample oracles.'
     }
     if (@(Get-LaunchProcessSnapshot).Count -ne 0) { throw 'Installed application launch cleanup left a relevant process running.' }
+    Assert-NoReparseAncestors -Path $profile
+    Assert-FileReceipt -Path $settingsSentinel -Bytes $SettingsSentinelBytes -Sha256 $SettingsSentinelSha256 -Kind 'Postlaunch synthetic settings sentinel'
+    $usesTauriProfile = ([string]$result.profileBindingMethod).EndsWith('tauri-app-settings-ebwebview',[StringComparison]::Ordinal)
+    $requestedProfileEntries = @(Get-ChildItem -LiteralPath $profile -Force)
+    $postlaunchSettingsEntries = @(Get-ChildItem -LiteralPath $settingsRoot -Force)
+    if ($usesTauriProfile) {
+        if (-not (Test-Path -LiteralPath $applicationProfile -PathType Container) -or $requestedProfileEntries.Count -ne 0) {
+            throw 'The Tauri application profile was not created while the unused requested profile remained empty.'
+        }
+        Assert-NoReparseAncestors -Path $applicationProfile
+        if (@(Get-ChildItem -LiteralPath $applicationProfile -Force).Count -eq 0 -or $postlaunchSettingsEntries.Count -ne 2) {
+            throw 'The active Tauri application profile was empty or the controlled settings root gained an unexpected entry.'
+        }
+        $applicationProfileEntry = @($postlaunchSettingsEntries | Where-Object { $_.FullName.Equals($applicationProfile,[StringComparison]::OrdinalIgnoreCase) })
+        if ($applicationProfileEntry.Count -ne 1 -or -not $applicationProfileEntry[0].PSIsContainer -or
+            ($applicationProfileEntry[0].Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw 'The controlled settings root did not contain exactly the expected Tauri application profile.'
+        }
+    } else {
+        if (Test-Path -LiteralPath $applicationProfile) { throw 'The unused Tauri application profile was unexpectedly created.' }
+        if ($requestedProfileEntries.Count -eq 0 -or $postlaunchSettingsEntries.Count -ne 1 -or
+            -not $postlaunchSettingsEntries[0].FullName.Equals($settingsSentinel,[StringComparison]::OrdinalIgnoreCase)) {
+            throw 'The requested profile was empty or the controlled settings root changed unexpectedly.'
+        }
+    }
     return [ordered]@{
         drivers = [ordered]@{
             tauriDriver = [ordered]@{ version = $script:LaunchPins.TauriDriverVersion; bytes = [uint64]$receipt.tauriDriver.bytes; sha256 = [string]$receipt.tauriDriver.sha256; sourceSha256 = $script:LaunchPins.TauriDriverPackageSha256 }
@@ -477,7 +539,7 @@ function Invoke-InstalledAppLaunchSmoke {
             edgeDriver = [ordered]@{ version = [string]$receipt.edgeDriver.version; bytes = [uint64]$receipt.edgeDriver.bytes; sha256 = [string]$receipt.edgeDriver.sha256; publisher = $script:LaunchPins.EdgePublisher; trustedTimestamp = $true; versionBinding = 'native-status' }
             sessionCapabilityKeys = $capabilityKeys
         }
-        profile = [ordered]@{ state = 'fresh-runner-owned'; binding = [string]$result.profileBindingMethod }
+        profile = [ordered]@{ state = 'controlled-runner-owned'; binding = [string]$result.profileBindingMethod; prelaunchSettingsEntries = 1; sentinelPreserved = $true }
         title = 'PDF Workstation'
         homeButton = 'Explore a sample PDF'
         ocrCapabilityStatus = 'Available'

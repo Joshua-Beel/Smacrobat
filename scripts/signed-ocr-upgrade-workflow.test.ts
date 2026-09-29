@@ -103,6 +103,11 @@ describe('manual signed OCR installer upgrade workflow', () => {
     expect(workflow).toContain('./scripts/setup-installed-app-webdriver.ps1 -OutputRoot $env:WEBDRIVER_ROOT');
     expect(workflow).toContain('-WebDriverRoot $env:WEBDRIVER_ROOT');
     expect(workflow).toContain('-WebViewProfileRoot $env:WEBVIEW_PROFILE_ROOT');
+    const verifier = readFileSync('scripts/verify-signed-ocr-upgrade.ps1', 'utf8');
+    expect(verifier).toContain('-ApplicationSettingsRoot $settingsRoot');
+    expect(verifier).toContain('-SettingsSentinelPath $settingsSentinel');
+    expect(verifier).toContain('-SettingsSentinelBytes $settingsSentinelBytes');
+    expect(verifier).toContain('-SettingsSentinelSha256 $settingsSentinelSha256');
     expect(workflow).toContain("$env:GITHUB_REPOSITORY -cne 'Joshua-Beel/Smacrobat'");
     expect(workflow).toContain("$env:GITHUB_REF -cne 'refs/heads/master'");
     expect(workflow).toContain('ref: ${{ github.sha }}');
@@ -404,7 +409,7 @@ describe('manual signed OCR installer upgrade workflow', () => {
         $output=Join-Path (Resolve-Path target) ('ocr-upgrade-output-'+[Guid]::NewGuid().ToString('N'))
         $receipt=[pscustomobject]@{packagedApplication=$app}
         $smoke=[ordered]@{generator=[ordered]@{target='scripts/ocr/generate-smoke.ps1';bytes=[uint64]1;sha256=('B'*64)};input=[ordered]@{format='P6';width=1200;height=240;bytes=[uint64]1;sha256=('C'*64)};engine=[ordered]@{bytes=[uint64]1;sha256=('D'*64)};model=[ordered]@{bytes=[uint64]1;sha256=('E'*64)};profile=[ordered]@{language='eng';engineMode=1;pageSegmentationMode=6;dpi=150;logLevel='ERROR'};limits=[ordered]@{inputBytesMaximum=16777216;stdoutCharactersMaximum=1048576;stderrCharactersMaximum=65536;timeoutMilliseconds=30000};expectedTextSha256=('F'*64);actualTextSha256=('F'*64);exitCode=0;stderrEmpty=$true;matched=$true}
-        $launch=[ordered]@{drivers=[ordered]@{tauriDriver=[ordered]@{version='2.0.6';bytes=[uint64]1;sha256=('1'*64);sourceSha256=('2'*64)};webView2RuntimeVersion='151.0.1.2';edgeDriver=[ordered]@{version='151.0.1.3';bytes=[uint64]1;sha256=('3'*64);publisher='Microsoft Corporation';trustedTimestamp=$true}};profile='fresh-runner-owned';title='PDF Workstation';homeButton='Explore a sample PDF';ocrCapabilityStatus='Available';sample=[ordered]@{name='welcome.pdf';pages=6;firstPageDecoded=$true;naturalWidth=100;naturalHeight=100;source='blob:'};cleanup=[ordered]@{sessionDeleted=$true;ownedProcessTreeStopped=$true;relevantProcessesRemaining=0}}
+        $launch=[ordered]@{drivers=[ordered]@{tauriDriver=[ordered]@{version='2.0.6';bytes=[uint64]1;sha256=('1'*64);sourceSha256=('2'*64)};webView2RuntimeVersion='151.0.1.2';edgeDriver=[ordered]@{version='151.0.1.3';bytes=[uint64]1;sha256=('3'*64);publisher='Microsoft Corporation';trustedTimestamp=$true}};profile=[ordered]@{state='controlled-runner-owned';binding='owned-webview-tauri-app-settings-ebwebview';prelaunchSettingsEntries=1;sentinelPreserved=$true};title='PDF Workstation';homeButton='Explore a sample PDF';ocrCapabilityStatus='Available';sample=[ordered]@{name='welcome.pdf';pages=6;firstPageDecoded=$true;naturalWidth=100;naturalHeight=100;source='blob:'};cleanup=[ordered]@{sessionDeleted=$true;ownedProcessTreeStopped=$true;relevantProcessesRemaining=0}}
         $path=Write-SanitizedUpgradeRecord -OutputRoot $output -WorkflowSourceRevision ('b'*40) -Receipt $receipt -InstalledEngineSmoke $smoke -InstalledAppLaunch $launch
         $json=Get-Content -LiteralPath $path -Raw -Encoding UTF8
         $value=$json|ConvertFrom-Json

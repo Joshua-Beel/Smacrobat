@@ -800,6 +800,7 @@ if (Test-Path -LiteralPath $settingsRoot) { throw 'Baseline installer unexpected
 Assert-NoReparseAncestors -Path $settingsRoot
 $settingsSentinel = Join-Path $settingsRoot 'upgrade-sentinel.json'
 [IO.File]::WriteAllText($settingsSentinel, '{"kind":"ephemeral-upgrade-sentinel","version":1}', [Text.UTF8Encoding]::new($false))
+$settingsSentinelBytes = [uint64](Get-Item -LiteralPath $settingsSentinel).Length
 $settingsSentinelSha256 = Get-ExactSha256 -Path $settingsSentinel
 $documentSentinel = Join-Path $work 'document-sentinel.pdf'
 $fixture = Join-Path $projectRoot 'src-tauri/tests/fixtures/reportlab-plain-fields.pdf'
@@ -841,6 +842,10 @@ $installedAppLaunch = Invoke-InstalledAppLaunchSmoke `
     -ApplicationReceipt $receipt.packagedApplication `
     -WebDriverRoot $driverRoot `
     -ProfileRoot $profileRoot `
+    -ApplicationSettingsRoot $settingsRoot `
+    -SettingsSentinelPath $settingsSentinel `
+    -SettingsSentinelBytes $settingsSentinelBytes `
+    -SettingsSentinelSha256 $settingsSentinelSha256 `
     -RunnerTemp $runnerTemp `
     -ExpectedPublisher $script:Pins.ExpectedPublisher
 Assert-SentinelReceipts -SettingsPath $settingsSentinel -SettingsSha256 $settingsSentinelSha256 -DocumentPath $documentSentinel -DocumentSha256 $documentSentinelSha256
