@@ -7,6 +7,7 @@ $script:LaunchPins = [ordered]@{
     TotalTimeoutMilliseconds = 60000
     RequestTimeoutMilliseconds = 10000
     SessionCreationTimeoutMilliseconds = 30000
+    CleanupProcessTimeoutMilliseconds = 10000
     RequestBytesMaximum = 1MB
     JsonDepthMaximum = 12
     JsonNodesMaximum = 512
@@ -312,20 +313,33 @@ public sealed class BoundedDiscardProcess : IDisposable {
     return [BoundedDiscardProcess]::new($Path, $Arguments, $MaximumCharacters)
 }
 
+function Wait-BoundedOwnedProcessExit {
+    param([Parameter(Mandatory = $true)]$Process,[Parameter(Mandatory = $true)][datetime]$Deadline)
+    if ($Process.HasExited) { return $true }
+    if ([datetime]::UtcNow -ge $Deadline) { return $false }
+    try { $Process.Kill($true) } catch { try { $Process.Kill($false) } catch { } }
+    while (-not $Process.HasExited -and [datetime]::UtcNow -lt $Deadline) {
+        $remaining = [int][Math]::Floor(($Deadline - [datetime]::UtcNow).TotalMilliseconds)
+        if ($remaining -le 0) { break }
+        try {
+            if ($Process.WaitForExit([Math]::Min($remaining, 250))) { break }
+        } catch { break }
+    }
+    return [bool]$Process.HasExited
+}
+
 function Stop-OwnedLaunchProcesses {
-    param([Diagnostics.Process]$TauriDriver,[object[]]$Captured)
-    if ($null -ne $TauriDriver -and -not $TauriDriver.HasExited) {
-        try { $TauriDriver.Kill($true) } catch { }
-        try { $TauriDriver.WaitForExit(5000) | Out-Null } catch { }
+    param([Diagnostics.Process]$TauriDriver,[object[]]$Captured,[Parameter(Mandatory = $true)][datetime]$Deadline,[scriptblock]$ProcessProvider)
+    if ($null -ne $TauriDriver) {
+        $null = Wait-BoundedOwnedProcessExit -Process $TauriDriver -Deadline $Deadline
     }
     foreach ($owned in @($Captured | Sort-Object ProcessId -Descending)) {
         try {
-            $process = Get-Process -Id ([int]$owned.ProcessId) -ErrorAction Stop
+            $process = if ($ProcessProvider) { & $ProcessProvider ([int]$owned.ProcessId) } else { Get-Process -Id ([int]$owned.ProcessId) -ErrorAction Stop }
             $path = [string]$process.Path
             $started = $process.StartTime.ToUniversalTime().Ticks
             if ($path.Equals([string]$owned.Path, [StringComparison]::OrdinalIgnoreCase) -and $started -eq [int64]$owned.StartTicks) {
-                $process.Kill($true)
-                $process.WaitForExit(5000) | Out-Null
+                $null = Wait-BoundedOwnedProcessExit -Process $process -Deadline $Deadline
             }
         } catch { }
     }
@@ -453,7 +467,8 @@ const i=document.querySelector('img[alt="Page 1"]');return {tab:[...document.que
         }
         if ($driver) {
             try { $captured += @(Get-OwnedLaunchProcesses -RootProcessId $driver.Id -StartedAfter $startedAfter) } catch { }
-            Stop-OwnedLaunchProcesses -TauriDriver $driver -Captured $captured
+            $processCleanupDeadline = [datetime]::UtcNow.AddMilliseconds($script:LaunchPins.CleanupProcessTimeoutMilliseconds)
+            Stop-OwnedLaunchProcesses -TauriDriver $driver -Captured $captured -Deadline $processCleanupDeadline
             $remaining = @(Get-LaunchProcessSnapshot).Count
             $ownedStopped = $driver.HasExited -and $remaining -eq 0
         }

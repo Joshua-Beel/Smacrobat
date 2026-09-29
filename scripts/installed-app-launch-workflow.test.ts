@@ -244,9 +244,38 @@ describe('hosted installed signed application launch proof', () => {
     expect(result.status, result.stderr || result.stdout).toBe(0);
   });
 
+  it('waits boundedly for an inert owned process tree and never kills mismatched identities', () => {
+    const source = extractFunctions('scripts/installed-app-launch.ps1', ['Wait-BoundedOwnedProcessExit', 'Stop-OwnedLaunchProcesses'], String.raw`
+      $root=Join-Path (Resolve-Path target) ('owned-cleanup-'+[Guid]::NewGuid().ToString('N'));[IO.Directory]::CreateDirectory($root)|Out-Null
+      $pidPath=Join-Path $root 'child.pid';$rootScript=Join-Path $root 'root.ps1';$pwsh=(Get-Process -Id $PID).Path
+      $rootSource=@'
+param([string]$ChildPidPath,[string]$PwshPath)
+$info=[Diagnostics.ProcessStartInfo]::new();$info.FileName=$PwshPath;$info.UseShellExecute=$false;$info.CreateNoWindow=$true;$info.ArgumentList.Add('-NoProfile');$info.ArgumentList.Add('-NonInteractive');$info.ArgumentList.Add('-Command');$info.ArgumentList.Add('Start-Sleep -Seconds 30')
+$child=[Diagnostics.Process]::Start($info);[IO.File]::WriteAllText($ChildPidPath,[string]$child.Id,[Text.UTF8Encoding]::new($false));Start-Sleep -Seconds 30
+'@
+      [IO.File]::WriteAllText($rootScript,$rootSource,[Text.UTF8Encoding]::new($false))
+      $rootInfo=[Diagnostics.ProcessStartInfo]::new();$rootInfo.FileName=$pwsh;$rootInfo.UseShellExecute=$false;$rootInfo.CreateNoWindow=$true;foreach($argument in @('-NoProfile','-NonInteractive','-File',$rootScript,$pidPath,$pwsh)){$rootInfo.ArgumentList.Add($argument)}
+      $rootProcess=[Diagnostics.Process]::Start($rootInfo);$childProcess=$null
+      try{
+        $ready=[datetime]::UtcNow.AddSeconds(5);while(-not(Test-Path -LiteralPath $pidPath) -and [datetime]::UtcNow -lt $ready){Start-Sleep -Milliseconds 50};if(-not(Test-Path -LiteralPath $pidPath)){throw 'Inert child PID receipt was not created.'}
+        $childProcess=Get-Process -Id ([int](Get-Content -LiteralPath $pidPath -Raw));$captured=@([pscustomobject]@{ProcessId=$childProcess.Id;Path=[string]$childProcess.Path;StartTicks=$childProcess.StartTime.ToUniversalTime().Ticks})
+        Stop-OwnedLaunchProcesses -TauriDriver $rootProcess -Captured $captured -Deadline ([datetime]::UtcNow.AddSeconds(8))
+        if(-not$rootProcess.HasExited){throw 'Owned root did not exit within its bounded cleanup deadline.'};$childAlive=$true;try{$null=Get-Process -Id $childProcess.Id -ErrorAction Stop}catch{$childAlive=$false};if($childAlive){throw 'Inert owned child remained alive.'}
+      }finally{try{if(-not$rootProcess.HasExited){$rootProcess.Kill($true);$rootProcess.WaitForExit(5000)|Out-Null}}catch{};try{if($childProcess -and -not $childProcess.HasExited){$childProcess.Kill();$childProcess.WaitForExit(5000)|Out-Null}}catch{}}
+      $script:fakeKills=0;$started=[datetime]::UtcNow;$fake=[pscustomobject]@{HasExited=$false;Path='C:\fixture\owned.exe';StartTime=$started};$fake|Add-Member ScriptMethod Kill {param([bool]$tree)$script:fakeKills++};$fake|Add-Member ScriptMethod WaitForExit {param([int]$milliseconds)$false}
+      $provider={param($id)$fake}.GetNewClosure();$deadline=[datetime]::UtcNow.AddSeconds(1)
+      Stop-OwnedLaunchProcesses -TauriDriver $null -Captured @([pscustomobject]@{ProcessId=77;Path='C:\fixture\other.exe';StartTicks=$started.ToUniversalTime().Ticks}) -Deadline $deadline -ProcessProvider $provider
+      Stop-OwnedLaunchProcesses -TauriDriver $null -Captured @([pscustomobject]@{ProcessId=77;Path='C:\fixture\owned.exe';StartTicks=($started.ToUniversalTime().Ticks+1)}) -Deadline $deadline -ProcessProvider $provider
+      if($script:fakeKills-ne0){throw 'A path/start identity mismatch was killed.'}
+      if((Wait-BoundedOwnedProcessExit -Process $fake -Deadline ([datetime]::UtcNow.AddMilliseconds(-1)))-or$script:fakeKills-ne0){throw 'Expired cleanup deadline killed or accepted a live process.'}
+    `);
+    const result = runPowerShell(source);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
   it('does not retry a timed-out session POST and still stops the owned process tree', () => {
     const source = extractFunctions('scripts/installed-app-launch.ps1', ['Invoke-RealInstalledAppLaunch'], String.raw`
-      $script:LaunchPins=[ordered]@{TotalTimeoutMilliseconds=60000;WebDriverPort=4444;NativeDriverPort=4445}
+      $script:LaunchPins=[ordered]@{TotalTimeoutMilliseconds=60000;CleanupProcessTimeoutMilliseconds=10000;WebDriverPort=4444;NativeDriverPort=4445}
       $script:sessionPosts=0;$script:deleteRequests=0;$script:driverStopped=$false
       $driver=[pscustomobject]@{HasExited=$false;Id=1234}
       $capture=[pscustomobject]@{Process=$driver;Exceeded=$false};$capture|Add-Member ScriptMethod Start {};$capture|Add-Member ScriptMethod Dispose {}
@@ -255,7 +284,7 @@ describe('hosted installed signed application launch proof', () => {
       function Invoke-BoundedLoopbackJson{param([string]$Method,[string]$Path,$Body,[datetime]$Deadline,[int]$Port=4444);if($Method-ceq'GET'-and$Path-ceq'/status'){return [pscustomobject]@{value=[pscustomobject]@{ready=$true}}};if($Method-ceq'POST'-and$Path-ceq'/session'){$script:sessionPosts++;throw 'session-timeout'};if($Method-ceq'DELETE'){$script:deleteRequests++};throw 'unexpected-loopback-request'}
       function Wait-NativeDriverStatus{param([string]$ExpectedVersion,[datetime]$Deadline,$TauriDriver);$ExpectedVersion}
       function Get-OwnedLaunchProcesses{param([int]$RootProcessId,[datetime]$StartedAfter);@()}
-      function Stop-OwnedLaunchProcesses{param($TauriDriver,[object[]]$Captured);$script:driverStopped=$true;$TauriDriver.HasExited=$true}
+      function Stop-OwnedLaunchProcesses{param($TauriDriver,[object[]]$Captured,[datetime]$Deadline);$script:driverStopped=$true;$TauriDriver.HasExited=$true}
       function Get-LaunchProcessSnapshot{@()}
       $rejected=$false;try{Invoke-RealInstalledAppLaunch -ApplicationPath 'app.exe' -TauriDriverPath 'tauri-driver.exe' -EdgeDriverPath 'msedgedriver.exe' -ProfileRoot 'profile' -SettingsRoot 'settings' -ExpectedEdgeDriverVersion '151.0.1.2'}catch{if($_.Exception.Message-ceq'session-timeout'){$rejected=$true}else{throw}}
       if(-not$rejected-or$script:sessionPosts-ne1-or$script:deleteRequests-ne0-or-not$script:driverStopped-or-not$driver.HasExited){throw 'Session-timeout cleanup or no-retry contract changed.'}
