@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { resolve } from 'node:path';
 
 function runPowerShell(source: string) {
   const root = `target/ocr-upgrade-test-script-${randomUUID()}`;
@@ -12,6 +13,22 @@ function runPowerShell(source: string) {
     encoding: 'utf8',
     timeout: 45_000,
   });
+}
+
+function workflowRunBlock(workflow: string, stepName: string) {
+  const lines = workflow.split(/\r?\n/);
+  const step = lines.findIndex((line) => line.trim() === `- name: ${stepName}`);
+  if (step < 0) throw new Error(`Missing workflow step: ${stepName}`);
+  const run = lines.findIndex((line, index) => index > step && line.trim() === 'run: |');
+  if (run < 0) throw new Error(`Missing run block: ${stepName}`);
+  const body: string[] = [];
+  for (let index = run + 1; index < lines.length; index += 1) {
+    if (/^ {6}- (name:|uses:)/.test(lines[index])) break;
+    if (lines[index] === '') break;
+    if (!lines[index].startsWith('          ')) throw new Error(`Unexpected workflow indentation in ${stepName}`);
+    body.push(lines[index].slice(10));
+  }
+  return `${body.join('\n')}\n`;
 }
 
 function functionHarness(names: string[], body: string) {
@@ -60,7 +77,7 @@ describe('manual signed OCR installer upgrade workflow', () => {
     expect(jobHeader).not.toMatch(/^\s{4}env:/m);
     expect(workflow).toContain('- name: Initialize fresh runner paths');
     expect(workflow).toContain('$env:RUNNER_TEMP');
-    expect(workflow).toContain('[IO.File]::AppendAllLines($env:GITHUB_ENV');
+    expect(workflow).toContain('[IO.StreamWriter]::new($env:GITHUB_ENV, $true, [Text.UTF8Encoding]::new($false))');
     const initStep = workflow.slice(workflow.indexOf('- name: Initialize fresh runner paths'), workflow.indexOf('- uses: actions/checkout@v4'));
     expect(initStep).toContain('IsNullOrWhiteSpace($env:RUNNER_TEMP)');
     expect(initStep).toContain('IsNullOrWhiteSpace($env:GITHUB_ENV)');
@@ -87,6 +104,29 @@ describe('manual signed OCR installer upgrade workflow', () => {
     const uploadStep = workflow.slice(workflow.indexOf('- name: Upload only'));
     expect(uploadStep).toContain('/upgrade-verification.json');
     expect(uploadStep).not.toMatch(/\.exe|SIGNED_ARTIFACT_ROOT|BASELINE_ROOT|UPGRADE_WORK_ROOT/);
+  });
+
+  it('executes the exact path initialization block under PowerShell 7', () => {
+    const workflow = readFileSync('.github/workflows/ocr-installer-upgrade.yml', 'utf8');
+    const block = workflowRunBlock(workflow, 'Initialize fresh runner paths');
+    const root = resolve(`target/ocr-upgrade-init-${randomUUID()}`);
+    const runnerTemp = resolve(root, 'runner-temp');
+    const githubEnv = resolve(root, 'github-env');
+    mkdirSync(runnerTemp, { recursive: true });
+    const result = spawnSync('pwsh.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(block, 'utf16le').toString('base64')], {
+      encoding: 'utf8',
+      timeout: 30_000,
+      env: { ...process.env, RUNNER_TEMP: runnerTemp, GITHUB_ENV: githubEnv },
+    });
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+    const bytes = readFileSync(githubEnv);
+    expect([...bytes.slice(0, 3)]).not.toEqual([0xef, 0xbb, 0xbf]);
+    expect(bytes.toString('utf8').trimEnd().split(/\r?\n/)).toEqual([
+      `BASELINE_ROOT=${runnerTemp}\\pdf-workstation-baseline`,
+      `SIGNED_ARTIFACT_ROOT=${runnerTemp}\\pdf-workstation-signed-artifact`,
+      `UPGRADE_WORK_ROOT=${runnerTemp}\\pdf-workstation-upgrade-work`,
+      `UPGRADE_OUTPUT_ROOT=${runnerTemp}\\pdf-workstation-upgrade-output`,
+    ]);
   });
 
   it('keeps installer execution bounded, hidden, silent, and runner-only', () => {

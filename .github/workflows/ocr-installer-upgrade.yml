@@ -38,7 +38,12 @@ jobs:
             "UPGRADE_WORK_ROOT=$root\pdf-workstation-upgrade-work"
             "UPGRADE_OUTPUT_ROOT=$root\pdf-workstation-upgrade-output"
           )
-          [IO.File]::AppendAllLines($env:GITHUB_ENV, $values, [Text.UTF8Encoding]::new($false))
+          $writer = [IO.StreamWriter]::new($env:GITHUB_ENV, $true, [Text.UTF8Encoding]::new($false))
+          try {
+            foreach ($value in $values) { $writer.WriteLine([string]$value) }
+          } finally {
+            $writer.Dispose()
+          }
 
       - uses: actions/checkout@v4
         with:
