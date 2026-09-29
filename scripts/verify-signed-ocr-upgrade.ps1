@@ -27,6 +27,13 @@ $script:Pins = [ordered]@{
     SignedRecordBytes = [uint64]7386
     SignedRecordSha256 = '4ED82057155877F2677262479FF4F2B00398CF5F524C51302DB50275D315E205'
     ExpectedPublisher = 'Joshua Beel'
+    SmokeWidth = 1200
+    SmokeHeight = 240
+    SmokeInputBytesMaximum = 16MB
+    SmokeStdoutCharactersMaximum = 1MB
+    SmokeStderrCharactersMaximum = 64KB
+    SmokeTimeoutMilliseconds = 30000
+    SmokeExpectedText = "Receipt #A-17: Coffee & Tea, `$12.50.`nMixed case: 3rd Avenue; ready."
 }
 
 function Assert-ExactProperties {
@@ -515,14 +522,16 @@ function Assert-InstalledSignedResources {
         Assert-ReceiptFileObject -File $matches[0] -Receipt $entry -Kind 'Installed OCR resource'
     }
     $pdfium = Get-UniqueResource -Files $files -Suffix 'resources/pdfium/bin/pdfium.dll' -Kind 'Installed PDFium'
-    $engine = @($files | Where-Object { $_.FullName.Replace('\','/') -match '/resources/ocr/[a-f0-9]{64}/bin/tesseract\.exe$' })
-    if ($engine.Count -ne 1) { throw 'Installed signed OCR engine is missing or duplicated.' }
+    $identity = ([string]$ReceiptSets.Engine.sha256).ToLowerInvariant()
+    $engine = Get-UniqueResource -Files $files -Suffix "resources/ocr/$identity/bin/tesseract.exe" -Kind 'Installed signed OCR engine'
+    $model = Get-UniqueResource -Files $files -Suffix "resources/ocr/$identity/tessdata/eng.traineddata" -Kind 'Installed English OCR model'
     $app = Get-UniqueResource -Files $files -Suffix 'pdf-workstation.exe' -Kind 'Installed application'
     $null = Assert-TrustedWindowsSignature -Path $app.FullName -SignatureProvider $SignatureProvider -ExpectedPublisher $script:Pins.ExpectedPublisher
     $null = Assert-TrustedWindowsSignature -Path $pdfium.FullName -SignatureProvider $SignatureProvider -ExpectedPublisher $script:Pins.ExpectedPublisher
-    $null = Assert-TrustedWindowsSignature -Path $engine[0].FullName -SignatureProvider $SignatureProvider -ExpectedPublisher $script:Pins.ExpectedPublisher
+    $null = Assert-TrustedWindowsSignature -Path $engine.FullName -SignatureProvider $SignatureProvider -ExpectedPublisher $script:Pins.ExpectedPublisher
     $updaters = @($files | Where-Object { $_.Name.Equals('latest.json', [StringComparison]::OrdinalIgnoreCase) -or $_.Extension.Equals('.sig', [StringComparison]::OrdinalIgnoreCase) })
     if ($updaters.Count -ne 0) { throw 'Installed application contains an updater artifact.' }
+    return [pscustomobject]@{ Application = $app; Pdfium = $pdfium; Engine = $engine; Model = $model }
 }
 
 function Assert-SentinelReceipts {
@@ -540,18 +549,133 @@ function Assert-SentinelReceipts {
     }
 }
 
+function Import-BoundedOcrProcess {
+    param([Parameter(Mandatory = $true)][string]$SetupScriptPath)
+    if ('OcrBoundedProcess' -as [type]) { return }
+    Assert-NoReparseAncestors -Path $SetupScriptPath
+    if (-not (Test-Path -LiteralPath $SetupScriptPath -PathType Leaf)) { throw 'The tracked OCR setup script is missing.' }
+    $tokens = $null
+    $errors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile($SetupScriptPath, [ref]$tokens, [ref]$errors)
+    if ($errors.Count -ne 0) { throw 'The tracked OCR setup script did not parse.' }
+    $definitions = @($ast.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.CommandAst] -and
+            $node.GetCommandName() -ceq 'Add-Type' -and
+            $node.Extent.Text.IndexOf('public static class OcrBoundedProcess', [StringComparison]::Ordinal) -ge 0
+    }, $true))
+    if ($definitions.Count -ne 1) { throw 'The tracked OCR setup script must contain exactly one bounded-process definition.' }
+    Invoke-Expression $definitions[0].Extent.Text
+    if (-not ('OcrBoundedProcess' -as [type])) { throw 'The bounded OCR process helper did not load.' }
+}
+
+function Get-Utf8TextSha256 {
+    param([Parameter(Mandatory = $true)][string]$Text)
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($algorithm.ComputeHash([Text.UTF8Encoding]::new($false).GetBytes($Text)))).Replace('-','') }
+    finally { $algorithm.Dispose() }
+}
+
+function Normalize-OcrSmokeText {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text)
+    return ($Text -replace '\r\n?', [string][char]10).Trim()
+}
+
+function Invoke-InstalledEngineOcrSmoke {
+    param(
+        [Parameter(Mandatory = $true)][string]$EnginePath,
+        [Parameter(Mandatory = $true)][string]$ModelPath,
+        [Parameter(Mandatory = $true)][string]$InputPath,
+        [Parameter(Mandatory = $true)][string]$GeneratorPath,
+        [Parameter(Mandatory = $true)][string]$RepositoryRoot,
+        [Parameter(Mandatory = $true)]$GeneratorReceipt,
+        [Parameter(Mandatory = $true)]$GeneratorMetadata,
+        [Parameter(Mandatory = $true)]$EngineReceipt,
+        [Parameter(Mandatory = $true)]$ModelReceipt,
+        [scriptblock]$SignatureProvider,
+        [scriptblock]$ProcessProvider
+    )
+    Assert-FileReceipt -Path $EnginePath -Bytes ([uint64]$EngineReceipt.bytes) -Sha256 ([string]$EngineReceipt.sha256) -Kind 'Installed OCR smoke engine'
+    Assert-FileReceipt -Path $ModelPath -Bytes ([uint64]$ModelReceipt.bytes) -Sha256 ([string]$ModelReceipt.sha256) -Kind 'Installed OCR smoke model'
+    $null = Assert-TrustedWindowsSignature -Path $EnginePath -SignatureProvider $SignatureProvider -ExpectedPublisher $script:Pins.ExpectedPublisher
+    Assert-NoReparseAncestors -Path $InputPath
+    Assert-NoReparseAncestors -Path $GeneratorPath
+    $expectedGenerator = [IO.Path]::GetFullPath((Join-Path $RepositoryRoot 'scripts/ocr/generate-smoke.ps1'))
+    if (-not ([IO.Path]::GetFullPath($GeneratorPath)).Equals($expectedGenerator, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'The OCR smoke generator is not the canonical tracked recipe input.'
+    }
+    Assert-FileReceipt -Path $GeneratorPath -Bytes ([uint64]$GeneratorReceipt.bytes) -Sha256 ([string]$GeneratorReceipt.sha256) -Kind 'Tracked OCR smoke generator'
+    if ([string]$GeneratorMetadata.path -cne $InputPath -or
+        [int]$GeneratorMetadata.width -ne $script:Pins.SmokeWidth -or
+        [int]$GeneratorMetadata.height -ne $script:Pins.SmokeHeight -or
+        [string]$GeneratorMetadata.font -cne 'Arial 28pt rendered by System.Drawing; no font file is copied or redistributed' -or
+        [string]$GeneratorMetadata.expectedText -cne $script:Pins.SmokeExpectedText) {
+        throw 'The OCR smoke generator metadata does not match the fixed independent oracle.'
+    }
+    if (-not (Test-Path -LiteralPath $InputPath -PathType Leaf)) { throw 'The generated OCR smoke input is missing.' }
+    $input = [IO.File]::ReadAllBytes($InputPath)
+    if ($input.Length -gt $script:Pins.SmokeInputBytesMaximum) { throw 'The generated OCR smoke input exceeds its byte limit.' }
+    $header = [Text.Encoding]::ASCII.GetBytes("P6`n$($script:Pins.SmokeWidth) $($script:Pins.SmokeHeight)`n255`n")
+    $expectedBytes = $header.Length + ($script:Pins.SmokeWidth * $script:Pins.SmokeHeight * 3)
+    if ($input.Length -ne $expectedBytes) { throw 'The generated OCR smoke input has an unexpected length.' }
+    for ($index = 0; $index -lt $header.Length; $index++) {
+        if ($input[$index] -ne $header[$index]) { throw 'The generated OCR smoke input is not the exact fixed P6 shape.' }
+    }
+    $arguments = @('stdin','stdout','--tessdata-dir',(Split-Path -Parent $ModelPath),'-l','eng','--oem','1','--psm','6','--dpi','150','--loglevel','ERROR')
+    $request = [pscustomobject]@{
+        FilePath = $EnginePath
+        Arguments = [string[]]$arguments
+        WorkingDirectory = Split-Path -Parent $EnginePath
+        TimeoutMilliseconds = $script:Pins.SmokeTimeoutMilliseconds
+        MaximumStdoutCharacters = $script:Pins.SmokeStdoutCharactersMaximum
+        MaximumStderrCharacters = $script:Pins.SmokeStderrCharactersMaximum
+        StandardInput = [byte[]]$input
+    }
+    if ($ProcessProvider) {
+        $result = & $ProcessProvider $request
+    } else {
+        Import-BoundedOcrProcess -SetupScriptPath (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts/setup-ocr.ps1')
+        $sanitized = [string[]]@('CC','CL','_CL_','CFLAGS','CPPFLAGS','CXX','CXXFLAGS','LDFLAGS','CMAKE_GENERATOR','CMAKE_GENERATOR_INSTANCE','CMAKE_GENERATOR_PLATFORM','CMAKE_GENERATOR_TOOLSET','CMAKE_PREFIX_PATH','CMAKE_TOOLCHAIN_FILE','VCPKG_FEATURE_FLAGS','VCPKG_ROOT')
+        $result = [OcrBoundedProcess]::Run($request.FilePath,$request.Arguments,$request.WorkingDirectory,$sanitized,$request.TimeoutMilliseconds,$request.MaximumStdoutCharacters,$request.MaximumStderrCharacters,$request.StandardInput)
+    }
+    Assert-ExactProperties -Value $result -Expected @('Stdout','Stderr','ExitCode','ElapsedMilliseconds','TimedOut','StdoutExceeded','StderrExceeded') -Kind 'Installed OCR smoke process result'
+    if ($result.TimedOut -isnot [bool] -or $result.StdoutExceeded -isnot [bool] -or $result.StderrExceeded -isnot [bool] -or
+        $result.ExitCode -isnot [int] -or $result.ElapsedMilliseconds -isnot [int] -or
+        $result.TimedOut -or $result.StdoutExceeded -or $result.StderrExceeded -or $result.ExitCode -ne 0 -or
+        -not [string]::IsNullOrEmpty([string]$result.Stderr)) {
+        throw 'Installed OCR smoke process did not complete within its exact bounded contract.'
+    }
+    $actual = Normalize-OcrSmokeText -Text ([string]$result.Stdout)
+    $expected = Normalize-OcrSmokeText -Text $script:Pins.SmokeExpectedText
+    if ($actual -cne $expected) { throw 'Installed OCR smoke output did not match the fixed independent oracle.' }
+    return [ordered]@{
+        generator = [ordered]@{ target = 'scripts/ocr/generate-smoke.ps1'; bytes = [uint64]$GeneratorReceipt.bytes; sha256 = [string]$GeneratorReceipt.sha256 }
+        input = [ordered]@{ format = 'P6'; width = $script:Pins.SmokeWidth; height = $script:Pins.SmokeHeight; bytes = [uint64]$input.Length; sha256 = Get-ExactSha256 -Path $InputPath }
+        engine = [ordered]@{ bytes = [uint64]$EngineReceipt.bytes; sha256 = [string]$EngineReceipt.sha256 }
+        model = [ordered]@{ bytes = [uint64]$ModelReceipt.bytes; sha256 = [string]$ModelReceipt.sha256 }
+        profile = [ordered]@{ language = 'eng'; engineMode = 1; pageSegmentationMode = 6; dpi = 150; logLevel = 'ERROR' }
+        limits = [ordered]@{ inputBytesMaximum = $script:Pins.SmokeInputBytesMaximum; stdoutCharactersMaximum = $script:Pins.SmokeStdoutCharactersMaximum; stderrCharactersMaximum = $script:Pins.SmokeStderrCharactersMaximum; timeoutMilliseconds = $script:Pins.SmokeTimeoutMilliseconds }
+        expectedTextSha256 = Get-Utf8TextSha256 -Text $expected
+        actualTextSha256 = Get-Utf8TextSha256 -Text $actual
+        exitCode = 0
+        stderrEmpty = $true
+        matched = $true
+    }
+}
+
 function Write-SanitizedUpgradeRecord {
     param(
         [Parameter(Mandatory = $true)][string]$OutputRoot,
         [Parameter(Mandatory = $true)][string]$WorkflowSourceRevision,
-        [Parameter(Mandatory = $true)]$Receipt
+        [Parameter(Mandatory = $true)]$Receipt,
+        [Parameter(Mandatory = $true)]$InstalledEngineSmoke
     )
     if (Test-Path -LiteralPath $OutputRoot) { throw 'Sanitized output root must be fresh.' }
     [IO.Directory]::CreateDirectory($OutputRoot) | Out-Null
     Assert-NoReparseAncestors -Path $OutputRoot
     $record = [ordered]@{
-        schemaVersion = 1
-        scope = 'Ephemeral GitHub-hosted silent NSIS installation and manual upgrade verification; application launch and updater behavior are not established.'
+        schemaVersion = 2
+        scope = 'Ephemeral GitHub-hosted silent NSIS installation, manual upgrade, and direct installed-engine OCR smoke verification; application launch, OCR coordinator/UI, and updater behavior are not established.'
         mode = 'ephemeral-current-user-silent-manual-upgrade'
         workflowSourceRevision = $WorkflowSourceRevision
         signedArtifactSourceRevision = $script:Pins.SignedSourceRevision
@@ -563,6 +687,7 @@ function Write-SanitizedUpgradeRecord {
             version = '0.2.6'
             installer = [ordered]@{ fileName = $script:Pins.SignedInstallerName; bytes = $script:Pins.SignedInstallerBytes; sha256 = $script:Pins.SignedInstallerSha256 }
             installedApplication = [ordered]@{ bytes = [uint64]$Receipt.packagedApplication.bytes; sha256 = [string]$Receipt.packagedApplication.sha256 }
+            installedEngineOcrSmoke = $InstalledEngineSmoke
             publisher = $script:Pins.ExpectedPublisher
             signatures = [ordered]@{ installer = 'Valid'; application = 'Valid'; pdfium = 'Valid'; engine = 'Valid'; trustedTimestampsRequired = $true }
         }
@@ -578,7 +703,8 @@ function Write-SanitizedUpgradeRecord {
             applicationProcessStarted = $false
             guiVerified = $false
             realPreferencesVerified = $false
-            ocrExecutionVerified = $false
+            installedEngineOcrSmokeVerified = $true
+            applicationOcrIntegrationVerified = $false
             inAppUpdaterVerified = $false
             updaterArtifacts = @()
         }
@@ -668,9 +794,31 @@ $processFacts = Get-ConflictingProcessFacts -InstallerPaths @($baselinePath,$sig
 if ($processFacts.applicationProcessPresent -or $processFacts.installerProcessPresent) { throw 'Signed silent upgrade left an application or installer process running.' }
 $upgraded = Get-InstallFacts -RegistryPath $registryPath -ExpectedInstallRoot $installRoot
 Assert-InstallFacts -Facts $upgraded -ExpectedVersion '0.2.6' -ExpectedInstallRoot $installRoot -ExpectedApplication $receipt.packagedApplication -ExpectedSignatureStatus 'Valid' -ExpectedPublisher $script:Pins.ExpectedPublisher -ExpectedTimestamp $true
-Assert-InstalledSignedResources -InstallRoot $installRoot -Receipt $receipt -ReceiptSets $receiptSets
+$installedResources = Assert-InstalledSignedResources -InstallRoot $installRoot -Receipt $receipt -ReceiptSets $receiptSets
+$smokeRoot = Join-Path $work 'installed-engine-ocr-smoke'
+[IO.Directory]::CreateDirectory($smokeRoot) | Out-Null
+Assert-NoReparseAncestors -Path $smokeRoot
+$smokeInput = Join-Path $smokeRoot 'known-text.pnm'
+$smokeGenerator = Join-Path $projectRoot 'scripts/ocr/generate-smoke.ps1'
+Assert-NoReparseAncestors -Path $smokeGenerator
+if (-not (Test-Path -LiteralPath $smokeGenerator -PathType Leaf)) { throw 'The tracked OCR smoke generator is missing.' }
+$smokeGeneratorItem = Get-Item -LiteralPath $smokeGenerator
+$smokeGeneratorReceipt = [pscustomobject]@{ bytes = [uint64]$smokeGeneratorItem.Length; sha256 = Get-ExactSha256 -Path $smokeGenerator }
+$smokeMetadata = & $smokeGenerator -OutputPath $smokeInput
+$modelReceipt = @($receiptSets.Ocr | Where-Object { [string]$_.suffix -ceq 'tessdata/eng.traineddata' })
+if ($modelReceipt.Count -ne 1) { throw 'The installed OCR smoke model receipt is not unique.' }
+$installedEngineSmoke = Invoke-InstalledEngineOcrSmoke `
+    -EnginePath $installedResources.Engine.FullName `
+    -ModelPath $installedResources.Model.FullName `
+    -InputPath $smokeInput `
+    -GeneratorPath $smokeGenerator `
+    -RepositoryRoot $projectRoot `
+    -GeneratorReceipt $smokeGeneratorReceipt `
+    -GeneratorMetadata $smokeMetadata `
+    -EngineReceipt $receiptSets.Engine `
+    -ModelReceipt $modelReceipt[0]
 Assert-SentinelReceipts -SettingsPath $settingsSentinel -SettingsSha256 $settingsSentinelSha256 -DocumentPath $documentSentinel -DocumentSha256 $documentSentinelSha256
 
-$record = Write-SanitizedUpgradeRecord -OutputRoot $output -WorkflowSourceRevision ([string]$runnerFacts.githubSha) -Receipt $receipt
+$record = Write-SanitizedUpgradeRecord -OutputRoot $output -WorkflowSourceRevision ([string]$runnerFacts.githubSha) -Receipt $receipt -InstalledEngineSmoke $installedEngineSmoke
 Write-Output 'Ephemeral silent installer upgrade verification succeeded.'
 Write-Output ('Sanitized record SHA-256: ' + (Get-ExactSha256 -Path $record))

@@ -15,6 +15,17 @@ function runPowerShell(source: string) {
   });
 }
 
+function runPowerShell7(source: string) {
+  const root = `target/ocr-upgrade-pwsh7-${randomUUID()}`;
+  mkdirSync(root, { recursive: true });
+  const path = `${root}/run.ps1`;
+  writeFileSync(path, source, 'utf8');
+  return spawnSync('pwsh.exe', ['-NoProfile', '-NonInteractive', '-File', path], {
+    encoding: 'utf8',
+    timeout: 45_000,
+  });
+}
+
 function workflowRunBlock(workflow: string, stepName: string) {
   const lines = workflow.split(/\r?\n/);
   const step = lines.findIndex((line) => line.trim() === `- name: ${stepName}`);
@@ -57,6 +68,13 @@ function functionHarness(names: string[], body: string) {
       SignedInstallerBytes = [uint64]10456616
       SignedInstallerSha256 = '8F7A167D1AED369D1A28B7C91692BAD8770E774FE9D8AFBBED970654144E428C'
       ExpectedPublisher = 'Joshua Beel'
+      SmokeWidth = 1200
+      SmokeHeight = 240
+      SmokeInputBytesMaximum = 16MB
+      SmokeStdoutCharactersMaximum = 1MB
+      SmokeStderrCharactersMaximum = 64KB
+      SmokeTimeoutMilliseconds = 30000
+      SmokeExpectedText = @('Receipt #A-17: Coffee & Tea, $12.50.','Mixed case: 3rd Avenue; ready.') -join [string][char]10
     }
     ${body}
   `;
@@ -145,8 +163,18 @@ describe('manual signed OCR installer upgrade workflow', () => {
     expect(script).toContain('applicationProcessStarted = $false');
     expect(script).toContain('guiVerified = $false');
     expect(script).toContain('realPreferencesVerified = $false');
-    expect(script).toContain('ocrExecutionVerified = $false');
+    expect(script).toContain('installedEngineOcrSmokeVerified = $true');
+    expect(script).toContain('applicationOcrIntegrationVerified = $false');
+    expect(script).not.toContain('ocrExecutionVerified');
     expect(script).toContain('inAppUpdaterVerified = $false');
+    expect(script).toContain('public static class OcrBoundedProcess');
+    expect(readFileSync('scripts/setup-ocr.ps1', 'utf8')).toContain('process.Kill(true)');
+    const generatorGuard = script.indexOf('Assert-NoReparseAncestors -Path $smokeGenerator');
+    const generatorReceipt = script.indexOf('$smokeGeneratorReceipt = [pscustomobject]');
+    const generatorExecution = script.indexOf('$smokeMetadata = & $smokeGenerator');
+    expect(generatorGuard).toBeGreaterThan(-1);
+    expect(generatorReceipt).toBeGreaterThan(generatorGuard);
+    expect(generatorExecution).toBeGreaterThan(generatorReceipt);
   });
 
   it('rejects untrusted runner state, ambient credentials, and nonfresh machines', () => {
@@ -278,6 +306,77 @@ describe('manual signed OCR installer upgrade workflow', () => {
     expect(result.status, result.stderr || result.stdout).toBe(0);
   });
 
+  it('reuses the bounded setup runner and enforces its live timeout and output cap', () => {
+    const check = functionHarness(
+      ['Import-BoundedOcrProcess'],
+      String.raw`
+        Import-BoundedOcrProcess -SetupScriptPath (Resolve-Path ./scripts/setup-ocr.ps1)
+        $pwsh=(Get-Command pwsh.exe).Source
+        $empty=[string[]]@()
+        $echo=[OcrBoundedProcess]::Run($pwsh,[string[]]@('-NoProfile','-NonInteractive','-Command','$value=[Console]::In.ReadToEnd();[Console]::Out.Write($value)'),$null,$empty,5000,64,64,[Text.Encoding]::UTF8.GetBytes('probe'))
+        if($echo.TimedOut -or $echo.StdoutExceeded -or $echo.StderrExceeded -or $echo.ExitCode -ne 0 -or $echo.Stdout -cne 'probe' -or $echo.Stderr){throw 'Bounded stdin/stdout probe failed.'}
+        $cap=[OcrBoundedProcess]::Run($pwsh,[string[]]@('-NoProfile','-NonInteractive','-Command','[Console]::Out.Write((''X''*1024));Start-Sleep -Seconds 30'),$null,$empty,5000,32,64,$null)
+        if(-not $cap.StdoutExceeded -or $cap.TimedOut -or $cap.ElapsedMilliseconds -ge 5000){throw 'Live stdout cap did not terminate the fake child.'}
+        $timeout=[OcrBoundedProcess]::Run($pwsh,[string[]]@('-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30'),$null,$empty,200,64,64,$null)
+        if(-not $timeout.TimedOut -or $timeout.ElapsedMilliseconds -ge 5000){throw 'Live timeout did not terminate the fake child.'}
+      `,
+    );
+    const result = runPowerShell7(check);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
+  it('binds direct installed-engine smoke to exact trusted assets, oracle, profile, and caps', () => {
+    const check = functionHarness(
+      ['Assert-ExactProperties', 'Assert-FileReceipt', 'Get-Utf8TextSha256', 'Normalize-OcrSmokeText', 'Invoke-InstalledEngineOcrSmoke'],
+      String.raw`
+        $root=Join-Path (Resolve-Path target) ('installed-engine-smoke-'+[Guid]::NewGuid().ToString('N'))
+        $engine=Join-Path $root 'resources/ocr/identity/bin/tesseract.exe'
+        $model=Join-Path $root 'resources/ocr/identity/tessdata/eng.traineddata'
+        $input=Join-Path $root 'smoke/known-text.pnm'
+        foreach($path in @($engine,$model,$input)){[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($path))|Out-Null}
+        [IO.File]::WriteAllText($engine,'engine',[Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText($model,'model',[Text.UTF8Encoding]::new($false))
+        $generator=(Resolve-Path ./scripts/ocr/generate-smoke.ps1).Path
+        $metadata=& $generator -OutputPath $input
+        $engineItem=Get-Item $engine;$modelItem=Get-Item $model;$generatorItem=Get-Item $generator
+        $engineReceipt=[pscustomobject]@{bytes=[uint64]$engineItem.Length;sha256=Get-ExactSha256 $engine}
+        $modelReceipt=[pscustomobject]@{bytes=[uint64]$modelItem.Length;sha256=Get-ExactSha256 $model}
+        $generatorReceipt=[pscustomobject]@{bytes=[uint64]$generatorItem.Length;sha256=Get-ExactSha256 $generator}
+        $signature={param($path)[pscustomobject]@{Status='Valid';Publisher='Joshua Beel';HasTimestamp=$true}}
+        $calls=0
+        $provider={param($request)$script:calls++;$expectedArguments='stdin|stdout|--tessdata-dir|'+[IO.Path]::GetDirectoryName($model)+'|-l|eng|--oem|1|--psm|6|--dpi|150|--loglevel|ERROR';if(($request.Arguments -join '|') -cne $expectedArguments){throw 'OCR smoke arguments changed.'};if($request.TimeoutMilliseconds-ne30000-or$request.MaximumStdoutCharacters-ne1MB-or$request.MaximumStderrCharacters-ne64KB-or$request.StandardInput.Length-gt16MB-or-not([Text.Encoding]::ASCII.GetString($request.StandardInput,0,2)-ceq'P6')){throw 'OCR smoke caps or input changed.'};[pscustomobject]@{Stdout=($script:Pins.SmokeExpectedText+[string][char]13+[char]10);Stderr='';ExitCode=[int]0;ElapsedMilliseconds=[int]20;TimedOut=$false;StdoutExceeded=$false;StderrExceeded=$false}}
+        $parameters=@{EnginePath=$engine;ModelPath=$model;InputPath=$input;GeneratorPath=$generator;RepositoryRoot=(Get-Location).Path;GeneratorReceipt=$generatorReceipt;GeneratorMetadata=$metadata;EngineReceipt=$engineReceipt;ModelReceipt=$modelReceipt;SignatureProvider=$signature;ProcessProvider=$provider}
+        $proof=Invoke-InstalledEngineOcrSmoke @parameters
+        if($calls-ne1-or-not$proof.matched-or-not$proof.stderrEmpty-or$proof.expectedTextSha256-cne$proof.actualTextSha256-or$proof.profile.language-cne'eng'-or$proof.limits.timeoutMilliseconds-ne30000){throw 'Installed-engine smoke proof mismatch.'}
+        $badResults=@(
+          [pscustomobject]@{Stdout=$script:Pins.SmokeExpectedText;Stderr='';ExitCode=[int]0;ElapsedMilliseconds=[int]20;TimedOut=$true;StdoutExceeded=$false;StderrExceeded=$false},
+          [pscustomobject]@{Stdout=$script:Pins.SmokeExpectedText;Stderr='';ExitCode=[int]0;ElapsedMilliseconds=[int]20;TimedOut=$false;StdoutExceeded=$true;StderrExceeded=$false},
+          [pscustomobject]@{Stdout=$script:Pins.SmokeExpectedText;Stderr='warning';ExitCode=[int]0;ElapsedMilliseconds=[int]20;TimedOut=$false;StdoutExceeded=$false;StderrExceeded=$false},
+          [pscustomobject]@{Stdout='wrong';Stderr='';ExitCode=[int]0;ElapsedMilliseconds=[int]20;TimedOut=$false;StdoutExceeded=$false;StderrExceeded=$false},
+          [pscustomobject]@{Stdout=$script:Pins.SmokeExpectedText;Stderr='';ExitCode=[int]7;ElapsedMilliseconds=[int]20;TimedOut=$false;StdoutExceeded=$false;StderrExceeded=$false}
+        )
+        foreach($bad in $badResults){$badParameters=$parameters.Clone();$badParameters.ProcessProvider={param($request)$bad}.GetNewClosure();$rejected=$false;try{Invoke-InstalledEngineOcrSmoke @badParameters}catch{$rejected=$true};if(-not$rejected){throw 'Unsafe installed-engine smoke result accepted.'}}
+        $callsBeforeValidation=$calls
+        $badMetadata=[pscustomobject]@{path=$metadata.path;width=$metadata.width;height=$metadata.height;font=$metadata.font;expectedText='wrong oracle'}
+        $badMetadataParameters=$parameters.Clone();$badMetadataParameters.GeneratorMetadata=$badMetadata
+        $rejected=$false;try{Invoke-InstalledEngineOcrSmoke @badMetadataParameters}catch{$rejected=$true};if(-not$rejected-or$calls-ne$callsBeforeValidation){throw 'Generator metadata mismatch was not rejected before OCR execution.'}
+        $alternateGenerator=Join-Path $root 'alternate-generator.ps1'
+        [IO.File]::Copy($generator,$alternateGenerator)
+        $alternateGeneratorItem=Get-Item $alternateGenerator
+        $alternateGeneratorParameters=$parameters.Clone();$alternateGeneratorParameters.GeneratorPath=$alternateGenerator;$alternateGeneratorParameters.GeneratorReceipt=[pscustomobject]@{bytes=[uint64]$alternateGeneratorItem.Length;sha256=Get-ExactSha256 $alternateGenerator}
+        $rejected=$false;try{Invoke-InstalledEngineOcrSmoke @alternateGeneratorParameters}catch{$rejected=$true};if(-not$rejected-or$calls-ne$callsBeforeValidation){throw 'Alternate generator path was not rejected before OCR execution.'}
+        [IO.File]::WriteAllText($model,'tampered',[Text.UTF8Encoding]::new($false))
+        $rejected=$false;try{Invoke-InstalledEngineOcrSmoke @parameters}catch{$rejected=$true};if(-not$rejected-or$calls-ne$callsBeforeValidation){throw 'Tampered model passed immediate pre-execution receipt check.'}
+        [IO.File]::WriteAllText($model,'model',[Text.UTF8Encoding]::new($false))
+        if((Get-ExactSha256 $model)-cne$modelReceipt.sha256){throw 'Model fixture restoration failed.'}
+        [IO.File]::WriteAllText($engine,'tampered',[Text.UTF8Encoding]::new($false))
+        $rejected=$false;try{Invoke-InstalledEngineOcrSmoke @parameters}catch{$rejected=$true};if(-not$rejected-or$calls-ne$callsBeforeValidation){throw 'Tampered engine passed immediate pre-execution receipt check.'}
+      `,
+    );
+    const result = runPowerShell7(check);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
   it('enforces bounded process and installed-registry facts and writes one sanitized record', () => {
     const check = functionHarness(
       ['Assert-ExactProperties', 'Invoke-BoundedSilentInstaller', 'Assert-InstallFacts', 'Write-SanitizedUpgradeRecord'],
@@ -297,10 +396,11 @@ describe('manual signed OCR installer upgrade workflow', () => {
         $rejected=$false;try{Assert-InstallFacts -Facts $wrong -ExpectedVersion '0.2.6' -ExpectedInstallRoot $root -ExpectedApplication $app -ExpectedSignatureStatus 'Valid' -ExpectedPublisher 'Joshua Beel' -ExpectedTimestamp $true}catch{$rejected=$true};if(-not $rejected){throw 'Wrong uninstall registry value accepted.'}
         $output=Join-Path (Resolve-Path target) ('ocr-upgrade-output-'+[Guid]::NewGuid().ToString('N'))
         $receipt=[pscustomobject]@{packagedApplication=$app}
-        $path=Write-SanitizedUpgradeRecord -OutputRoot $output -WorkflowSourceRevision ('b'*40) -Receipt $receipt
+        $smoke=[ordered]@{generator=[ordered]@{target='scripts/ocr/generate-smoke.ps1';bytes=[uint64]1;sha256=('B'*64)};input=[ordered]@{format='P6';width=1200;height=240;bytes=[uint64]1;sha256=('C'*64)};engine=[ordered]@{bytes=[uint64]1;sha256=('D'*64)};model=[ordered]@{bytes=[uint64]1;sha256=('E'*64)};profile=[ordered]@{language='eng';engineMode=1;pageSegmentationMode=6;dpi=150;logLevel='ERROR'};limits=[ordered]@{inputBytesMaximum=16777216;stdoutCharactersMaximum=1048576;stderrCharactersMaximum=65536;timeoutMilliseconds=30000};expectedTextSha256=('F'*64);actualTextSha256=('F'*64);exitCode=0;stderrEmpty=$true;matched=$true}
+        $path=Write-SanitizedUpgradeRecord -OutputRoot $output -WorkflowSourceRevision ('b'*40) -Receipt $receipt -InstalledEngineSmoke $smoke
         $json=Get-Content -LiteralPath $path -Raw -Encoding UTF8
         $value=$json|ConvertFrom-Json
-        if(@(Get-ChildItem -LiteralPath $output -File -Force).Count -ne 1 -or $value.verification.guiVerified -ne $false -or $value.verification.realPreferencesVerified -ne $false -or $value.verification.ocrExecutionVerified -ne $false -or $value.verification.inAppUpdaterVerified -ne $false){throw 'Sanitized output contract failed.'}
+        if($value.schemaVersion-ne2-or@(Get-ChildItem -LiteralPath $output -File -Force).Count -ne 1 -or-not$value.verification.installedEngineOcrSmokeVerified -or$value.verification.applicationOcrIntegrationVerified -ne $false -or $value.verification.guiVerified -ne $false -or $value.verification.realPreferencesVerified -ne $false -or $value.verification.inAppUpdaterVerified -ne $false -or-not$value.upgrade.installedEngineOcrSmoke.matched){throw 'Sanitized output contract failed.'}
         if($json -match '(?i)([A-Z]:\\|\\Users\\|11005152678|36499724415|569181842|GITHUB_TOKEN|AZURE_)'){throw 'Sanitized output leaked restricted evidence.'}
       `,
     );
