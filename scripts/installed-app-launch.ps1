@@ -331,6 +331,27 @@ function Stop-OwnedLaunchProcesses {
     }
 }
 
+function Invoke-SessionDeleteOutcome {
+    param([Parameter(Mandatory = $true)][string]$SessionId,[Parameter(Mandatory = $true)][datetime]$Deadline,[scriptblock]$RequestProvider)
+    try {
+        $delete = if ($RequestProvider) { & $RequestProvider $SessionId $Deadline } else { Invoke-BoundedLoopbackJson -Method DELETE -Path "/session/$SessionId" -Deadline $Deadline }
+        if ($null -ne $delete.PSObject.Properties['value'] -and $null -eq $delete.value) { return 'verified' }
+        return 'invalidresponse'
+    } catch {
+        return 'requestfailed'
+    }
+}
+
+function Assert-LaunchCleanupState {
+    param($Result,[ValidateSet('verified','requestfailed','invalidresponse')][string]$SessionDeleteOutcome,[bool]$DriverExited,[bool]$RelevantProcessesClear)
+    $resultComplete = $null -ne $Result
+    if ($resultComplete -and $SessionDeleteOutcome -ceq 'verified' -and $DriverExited -and $RelevantProcessesClear) { return }
+    $driverExitedLabel = if ($DriverExited) { 'true' } else { 'false' }
+    $relevantProcessesClearLabel = if ($RelevantProcessesClear) { 'true' } else { 'false' }
+    $resultCompleteLabel = if ($resultComplete) { 'true' } else { 'false' }
+    throw "Installed application launch cleanup state is unverified: sessionDeleteOutcome=$SessionDeleteOutcome;driverExited=$driverExitedLabel;relevantProcessesClear=$relevantProcessesClearLabel;resultComplete=$resultCompleteLabel."
+}
+
 function Invoke-RealInstalledAppLaunch {
     param([string]$ApplicationPath,[string]$TauriDriverPath,[string]$EdgeDriverPath,[string]$ProfileRoot,[string]$SettingsRoot,[string]$ExpectedEdgeDriverVersion)
     $deadline = [datetime]::UtcNow.AddMilliseconds($script:LaunchPins.TotalTimeoutMilliseconds)
@@ -341,6 +362,7 @@ function Invoke-RealInstalledAppLaunch {
     $startedAfter = [datetime]::UtcNow
     $result = $null
     $sessionDeleted = $false
+    $sessionDeleteOutcome = 'requestfailed'
     $ownedStopped = $false
     $remaining = -1
     try {
@@ -426,10 +448,8 @@ const i=document.querySelector('img[alt="Page 1"]');return {tab:[...document.que
     } finally {
         $cleanupDeadline = [datetime]::UtcNow.AddSeconds(10)
         if ($sessionId) {
-            try {
-                $delete = Invoke-BoundedLoopbackJson -Method DELETE -Path "/session/$sessionId" -Deadline $cleanupDeadline
-                if ($null -ne $delete.PSObject.Properties['value'] -and $null -eq $delete.value) { $sessionDeleted = $true }
-            } catch { }
+            $sessionDeleteOutcome = Invoke-SessionDeleteOutcome -SessionId $sessionId -Deadline $cleanupDeadline
+            $sessionDeleted = $sessionDeleteOutcome -ceq 'verified'
         }
         if ($driver) {
             try { $captured += @(Get-OwnedLaunchProcesses -RootProcessId $driver.Id -StartedAfter $startedAfter) } catch { }
@@ -439,6 +459,9 @@ const i=document.querySelector('img[alt="Page 1"]');return {tab:[...document.que
         }
         if ($driverCapture) { $driverCapture.Dispose() }
     }
+    $driverExited = $null -ne $driver -and $driver.HasExited
+    $relevantProcessesClear = $remaining -eq 0
+    Assert-LaunchCleanupState -Result $result -SessionDeleteOutcome $sessionDeleteOutcome -DriverExited $driverExited -RelevantProcessesClear $relevantProcessesClear
     if ($null -eq $result -or -not $sessionDeleted -or -not $ownedStopped -or $remaining -ne 0) {
         throw 'Installed application launch cleanup did not delete the session and stop the owned process tree.'
     }

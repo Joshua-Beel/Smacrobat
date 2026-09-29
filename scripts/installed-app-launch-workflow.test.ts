@@ -224,6 +224,26 @@ describe('hosted installed signed application launch proof', () => {
     expect(result.status, result.stderr || result.stdout).toBe(0);
   });
 
+  it('reports only fixed cleanup outcomes and booleans while keeping every failure rejected', () => {
+    const source = extractFunctions('scripts/installed-app-launch.ps1', ['Invoke-SessionDeleteOutcome', 'Assert-LaunchCleanupState'], String.raw`
+      $verified=Invoke-SessionDeleteOutcome -SessionId 'session-id' -Deadline ([datetime]::UtcNow.AddSeconds(1)) -RequestProvider {param($id,$deadline)[pscustomobject]@{value=$null}}
+      $requestFailed=Invoke-SessionDeleteOutcome -SessionId 'session-id' -Deadline ([datetime]::UtcNow.AddSeconds(1)) -RequestProvider {throw 'private failure detail'}
+      $invalidResponse=Invoke-SessionDeleteOutcome -SessionId 'session-id' -Deadline ([datetime]::UtcNow.AddSeconds(1)) -RequestProvider {param($id,$deadline)[pscustomobject]@{value='unexpected private body'}}
+      if($verified-cne'verified'-or$requestFailed-cne'requestfailed'-or$invalidResponse-cne'invalidresponse'){throw 'Session delete outcome classification changed.'}
+      $result=[pscustomobject]@{complete=$true};Assert-LaunchCleanupState -Result $result -SessionDeleteOutcome verified -DriverExited $true -RelevantProcessesClear $true
+      $cases=@(
+        [pscustomobject]@{result=$result;outcome='requestfailed';driver=$true;clear=$true;expected='sessionDeleteOutcome=requestfailed;driverExited=true;relevantProcessesClear=true;resultComplete=true.'},
+        [pscustomobject]@{result=$result;outcome='invalidresponse';driver=$true;clear=$true;expected='sessionDeleteOutcome=invalidresponse;driverExited=true;relevantProcessesClear=true;resultComplete=true.'},
+        [pscustomobject]@{result=$result;outcome='verified';driver=$false;clear=$true;expected='sessionDeleteOutcome=verified;driverExited=false;relevantProcessesClear=true;resultComplete=true.'},
+        [pscustomobject]@{result=$result;outcome='verified';driver=$true;clear=$false;expected='sessionDeleteOutcome=verified;driverExited=true;relevantProcessesClear=false;resultComplete=true.'},
+        [pscustomobject]@{result=$null;outcome='verified';driver=$true;clear=$true;expected='sessionDeleteOutcome=verified;driverExited=true;relevantProcessesClear=true;resultComplete=false.'}
+      )
+      foreach($case in $cases){$rejected=$false;try{Assert-LaunchCleanupState -Result $case.result -SessionDeleteOutcome $case.outcome -DriverExited $case.driver -RelevantProcessesClear $case.clear}catch{$rejected=$true;$expected='Installed application launch cleanup state is unverified: '+$case.expected;if($_.Exception.Message-cne$expected-or$_.Exception.Message-match'private|session-id|unexpected'){throw 'Cleanup diagnostic leaked or changed.'}};if(-not$rejected){throw 'Unverified cleanup state was accepted.'}}
+    `);
+    const result = runPowerShell(source);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
   it('does not retry a timed-out session POST and still stops the owned process tree', () => {
     const source = extractFunctions('scripts/installed-app-launch.ps1', ['Invoke-RealInstalledAppLaunch'], String.raw`
       $script:LaunchPins=[ordered]@{TotalTimeoutMilliseconds=60000;WebDriverPort=4444;NativeDriverPort=4445}
