@@ -119,6 +119,29 @@ describe('hosted installed signed application launch proof', () => {
     expect(result.status, result.stderr || result.stdout).toBe(0);
   });
 
+  it('binds the live native-driver status and fresh profile when vendor capabilities are absent', () => {
+    const source = extractFunctions('scripts/installed-app-launch.ps1', ['Assert-NativeDriverStatus', 'Wait-NativeDriverStatus', 'Get-OwnedProfileBinding', 'Assert-OwnedLaunchExecutables'], String.raw`
+      $version='151.0.4129.78';$status=[pscustomobject]@{value=[pscustomobject]@{ready=$true;build=[pscustomobject]@{version=($version+' (trusted-build)')}}}
+      if((Assert-NativeDriverStatus -Status $status -ExpectedVersion $version)-cne$version){throw 'Native status version was not bound.'}
+      foreach($bad in @(
+        [pscustomobject]@{value=[pscustomobject]@{ready=$true;build=[pscustomobject]@{version='150.0.1.1'}}},
+        [pscustomobject]@{value=[pscustomobject]@{ready=$false;build=[pscustomobject]@{version=$version}}},
+        [pscustomobject]@{value=[pscustomobject]@{ready=$true}}
+      )){$rejected=$false;try{Assert-NativeDriverStatus -Status $bad -ExpectedVersion $version}catch{$rejected=$true};if(-not$rejected){throw 'Unsafe native status accepted.'}}
+      $responses=[Collections.Generic.Queue[object]]::new();$responses.Enqueue('not-ready');$responses.Enqueue($status);$provider={param($deadline)$next=$responses.Dequeue();if($next-is[string]){throw $next};$next}.GetNewClosure()
+      if((Wait-NativeDriverStatus -ExpectedVersion $version -Deadline ([datetime]::UtcNow.AddSeconds(2)) -TauriDriver ([pscustomobject]@{HasExited=$false}) -StatusProvider $provider)-cne$version-or$responses.Count-ne0){throw 'Native readiness retry changed.'}
+      $profile=Join-Path (Resolve-Path target) ('profile-binding-'+[Guid]::NewGuid().ToString('N'))
+      $owned=@([pscustomobject]@{Path='C:\Program Files (x86)\Microsoft\EdgeWebView\Application\msedgewebview2.exe';CommandLine=('msedgewebview2.exe --user-data-dir="'+$profile+'" --type=renderer')},[pscustomobject]@{Path='C:\Program Files (x86)\Microsoft\EdgeWebView\Application\msedgewebview2.exe';CommandLine='msedgewebview2.exe --type=gpu-process'})
+      if((Get-OwnedProfileBinding -Owned $owned -ExpectedProfile $profile)-cne'owned-webview-command-line'){throw 'Owned profile was not bound.'}
+      foreach($badOwned in @(@(),@([pscustomobject]@{Path='C:\msedgewebview2.exe';CommandLine='msedgewebview2.exe --type=renderer'}),@([pscustomobject]@{Path='C:\msedgewebview2.exe';CommandLine='msedgewebview2.exe --user-data-dir=C:\wrong'}),@([pscustomobject]@{Path='C:\msedgewebview2.exe';CommandLine=('msedgewebview2.exe --user-data-dir="'+$profile+'" --user-data-dir="'+$profile+'"')}))){$rejected=$false;try{Get-OwnedProfileBinding -Owned $badOwned -ExpectedProfile $profile}catch{$rejected=$true};if(-not$rejected){throw 'Missing, wrong, or duplicate owned profile evidence accepted.'}}
+      $app=Join-Path $profile 'pdf-workstation.exe';$edge=Join-Path $profile 'msedgedriver.exe';$executables=@([pscustomobject]@{Path=$app},[pscustomobject]@{Path=$edge})
+      Assert-OwnedLaunchExecutables -Owned $executables -ApplicationPath $app -EdgeDriverPath $edge
+      foreach($badExecutables in @(@([pscustomobject]@{Path=$app},[pscustomobject]@{Path='C:\wrong\msedgedriver.exe'}),@([pscustomobject]@{Path=$app},[pscustomobject]@{Path=$edge},[pscustomobject]@{Path=$edge}))){$rejected=$false;try{Assert-OwnedLaunchExecutables -Owned $badExecutables -ApplicationPath $app -EdgeDriverPath $edge}catch{$rejected=$true};if(-not$rejected){throw 'Wrong or duplicate owned EdgeDriver accepted.'}}
+    `);
+    const result = runPowerShell(source);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
   it('validates exact UI/runtime/cleanup results before producing sanitized launch evidence', () => {
     const source = extractFunctions('scripts/installed-app-launch.ps1', ['Assert-LaunchExactProperties', 'Assert-LaunchReceiptValue', 'Assert-WebDriverReceipt', 'Invoke-InstalledAppLaunchSmoke'], String.raw`
       function Assert-NoReparseAncestors{param([string]$Path)};function Assert-FileReceipt{param([string]$Path,[uint64]$Bytes,[string]$Sha256,[string]$Kind)};function Assert-TrustedWindowsSignature{param([string]$Path,[string]$ExpectedPublisher);[pscustomobject]@{}};function Get-LaunchProcessSnapshot{return @()}
@@ -126,11 +149,10 @@ describe('hosted installed signed application launch proof', () => {
       $root=Join-Path (Resolve-Path target) ('launch-wrapper-'+[Guid]::NewGuid().ToString('N'));$drivers=Join-Path $root 'drivers';[IO.Directory]::CreateDirectory((Join-Path $drivers 'tauri-driver-install/bin'))|Out-Null;[IO.Directory]::CreateDirectory((Join-Path $drivers 'edge-driver'))|Out-Null
       $receipt=[ordered]@{schemaVersion=1;tauriDriverSource=[ordered]@{version='2.0.6';origin='static.crates.io';bytes=[uint64]1;sha256=$script:LaunchPins.TauriDriverPackageSha256};tauriDriver=[ordered]@{version='2.0.6';cargoVersion='cargo 1.91.0 (abc 2026-01-01)';rustcVersion='rustc 1.91.0 (abc 2026-01-01)';bytes=[uint64]2;sha256=('A'*64)};webView2RuntimeVersion='151.0.4129.50';edgeDriverArchive=[ordered]@{origin='msedgedriver.microsoft.com';bytes=[uint64]3;sha256=('B'*64)};edgeDriver=[ordered]@{version='151.0.4129.78';bytes=[uint64]4;sha256=('C'*64);signatureStatus='Valid';publisher='Microsoft Corporation';hasTimestamp=$true}}
       [IO.File]::WriteAllText((Join-Path $drivers 'webdriver-receipt.json'),($receipt|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
-      $provider={param($app,$tauri,$edge,$profile)[pscustomobject]@{returnedDriverVersion='151.0.4129.78';returnedRuntimeVersion='151.0.4129.50';returnedUserDataFolder=$profile;title='PDF Workstation';homeButton=$true;ocrCapabilityStatus='Available';sampleName='welcome.pdf';samplePages=6;renderedPageWidth=800;renderedPageHeight=1000;renderedPageBlob=$true;sessionDeleted=$true;ownedProcessTreeStopped=$true;relevantProcessesRemaining=0}}
+      $provider={param($app,$tauri,$edge,$profile,$expectedVersion)[pscustomobject]@{nativeDriverVersion=$expectedVersion;driverVersionBinding='native-status';returnedRuntimeVersion='151.0.4129.50';profileBindingMethod='owned-webview-command-line';sessionCapabilityKeys=@('browserName','browserVersion');title='PDF Workstation';homeButton=$true;ocrCapabilityStatus='Available';sampleName='welcome.pdf';samplePages=6;renderedPageWidth=800;renderedPageHeight=1000;renderedPageBlob=$true;sessionDeleted=$true;ownedProcessTreeStopped=$true;relevantProcessesRemaining=0}}
       $result=Invoke-InstalledAppLaunchSmoke -ApplicationPath (Join-Path $root 'app.exe') -ApplicationReceipt ([pscustomobject]@{bytes=[uint64]5;sha256=('D'*64)}) -WebDriverRoot $drivers -ProfileRoot (Join-Path $root 'profile-good') -RunnerTemp $root -ExpectedPublisher 'Joshua Beel' -ProcessProvider $provider
-      if($result.profile-cne'fresh-runner-owned'-or$result.sample.pages-ne6-or-not$result.cleanup.sessionDeleted){throw 'Sanitized launch result changed.'}
-      $bad={param($app,$tauri,$edge,$profile)[pscustomobject]@{returnedDriverVersion='151.0.4129.78';returnedRuntimeVersion='150.0.1.1';returnedUserDataFolder=$profile;title='PDF Workstation';homeButton=$true;ocrCapabilityStatus='Available';sampleName='welcome.pdf';samplePages=6;renderedPageWidth=800;renderedPageHeight=1000;renderedPageBlob=$true;sessionDeleted=$true;ownedProcessTreeStopped=$true;relevantProcessesRemaining=0}}
-      $rejected=$false;try{Invoke-InstalledAppLaunchSmoke -ApplicationPath (Join-Path $root 'app.exe') -ApplicationReceipt ([pscustomobject]@{bytes=[uint64]5;sha256=('D'*64)}) -WebDriverRoot $drivers -ProfileRoot (Join-Path $root 'profile-bad') -RunnerTemp $root -ExpectedPublisher 'Joshua Beel' -ProcessProvider $bad}catch{$rejected=$true};if(-not$rejected){throw 'Wrong runtime capability accepted.'}
+      if($result.profile.state-cne'fresh-runner-owned'-or$result.profile.binding-cne'owned-webview-command-line'-or$result.drivers.edgeDriver.versionBinding-cne'native-status'-or$result.sample.pages-ne6-or-not$result.cleanup.sessionDeleted){throw 'Sanitized launch result changed.'}
+      foreach($mutation in @('runtime','native-version','profile')){$bad={param($app,$tauri,$edge,$profile,$expectedVersion)$value=[pscustomobject]@{nativeDriverVersion=$expectedVersion;driverVersionBinding='native-status';returnedRuntimeVersion='151.0.4129.50';profileBindingMethod='session-capability';sessionCapabilityKeys=@('browserVersion');title='PDF Workstation';homeButton=$true;ocrCapabilityStatus='Available';sampleName='welcome.pdf';samplePages=6;renderedPageWidth=800;renderedPageHeight=1000;renderedPageBlob=$true;sessionDeleted=$true;ownedProcessTreeStopped=$true;relevantProcessesRemaining=0};if($mutation-ceq'runtime'){$value.returnedRuntimeVersion='150.0.1.1'}elseif($mutation-ceq'native-version'){$value.nativeDriverVersion='150.0.1.1'}else{$value.profileBindingMethod='missing'};$value}.GetNewClosure();$rejected=$false;try{Invoke-InstalledAppLaunchSmoke -ApplicationPath (Join-Path $root 'app.exe') -ApplicationReceipt ([pscustomobject]@{bytes=[uint64]5;sha256=('D'*64)}) -WebDriverRoot $drivers -ProfileRoot (Join-Path $root ('profile-bad-'+$mutation)) -RunnerTemp $root -ExpectedPublisher 'Joshua Beel' -ProcessProvider $bad}catch{$rejected=$true};if(-not$rejected){throw ('Unsafe launch result accepted: '+$mutation)}}
     `);
     const result = runPowerShell(source);
     expect(result.status, result.stderr || result.stdout).toBe(0);
@@ -141,8 +163,11 @@ describe('hosted installed signed application launch proof', () => {
     expect(launch).toContain('Assert-FixedWebDriverPortsFree');
     expect(launch).toContain("--native-driver=$EdgeDriverPath");
     expect(launch).toContain("webviewOptions = [ordered]@{ userDataFolder = $ProfileRoot }");
+    expect(launch).toContain("-Port $script:LaunchPins.NativeDriverPort");
+    expect(launch).toContain('Assert-NativeDriverStatus');
     expect(launch).toContain("$capabilities.browserVersion");
-    expect(launch).toContain("$capabilities.'msedge.userDataDir'");
+    expect(launch).toContain("$capabilities.PSObject.Properties['msedge.userDataDir']");
+    expect(launch).toContain('Get-OwnedProfileBinding');
     expect(launch).toContain("x.textContent.trim()==='Scan & OCR'");
     expect(launch).toContain("o?.nextElementSibling");
     expect(launch).toContain("img[alt=\"Page 1\"]");
@@ -155,10 +180,12 @@ describe('hosted installed signed application launch proof', () => {
     expect(launch).not.toMatch(/Start-Process|Remove-Item|\.Delete\(/);
   });
 
-  it('rejects occupied fixed ports and over-deep WebDriver JSON without starting a driver', () => {
-    const source = extractFunctions('scripts/installed-app-launch.ps1', ['Assert-BoundedJsonShape', 'Assert-FixedWebDriverPortsFree'], String.raw`
-      $script:LaunchPins=[ordered]@{WebDriverPort=4444;NativeDriverPort=4445;JsonDepthMaximum=2;JsonNodesMaximum=8}
+  it('rejects occupied ports, over-deep JSON, and every native endpoint except fixed GET status', () => {
+    const source = extractFunctions('scripts/installed-app-launch.ps1', ['Assert-BoundedJsonShape', 'Get-LaunchRemainingMilliseconds', 'Invoke-BoundedLoopbackJson', 'Assert-FixedWebDriverPortsFree'], String.raw`
+      $script:LaunchPins=[ordered]@{WebDriverPort=4444;NativeDriverPort=4445;JsonDepthMaximum=2;JsonNodesMaximum=8;RequestBytesMaximum=1MB}
       $nodes=0;$rejected=$false;try{Assert-BoundedJsonShape -Value ([pscustomobject]@{a=[pscustomobject]@{b=[pscustomobject]@{c=1}}}) -Nodes ([ref]$nodes)}catch{$rejected=$true};if(-not$rejected){throw 'Deep JSON accepted.'}
+      foreach($request in @([pscustomobject]@{method='POST';path='/status';port=4445},[pscustomobject]@{method='GET';path='/session';port=4445},[pscustomobject]@{method='GET';path='/status';port=4446})){$rejected=$false;try{Invoke-BoundedLoopbackJson -Method $request.method -Path $request.path -Port $request.port -Deadline ([datetime]::UtcNow.AddSeconds(1))}catch{if($_.Exception.Message -ceq'WebDriver requests are restricted to the fixed loopback endpoint and command allowlist.'){$rejected=$true}};if(-not$rejected){throw 'Unsafe native endpoint escaped its allowlist.'}}
+      $allowed=$false;try{Invoke-BoundedLoopbackJson -Method GET -Path '/status' -Port 4445 -Deadline ([datetime]::UtcNow.AddSeconds(1))}catch{if($_.Exception.Message -cne'WebDriver requests are restricted to the fixed loopback endpoint and command allowlist.'){$allowed=$true}};if(-not$allowed){throw 'Exact native status endpoint was not allowed.'}
       $listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,4444);$listener.Start();try{$rejected=$false;try{Assert-FixedWebDriverPortsFree}catch{$rejected=$true};if(-not$rejected){throw 'Occupied fixed port accepted.'}}finally{$listener.Stop()}
     `);
     const result = runPowerShell(source);

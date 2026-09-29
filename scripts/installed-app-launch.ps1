@@ -89,7 +89,9 @@ function Invoke-BoundedLoopbackJson {
         [Parameter(Mandatory = $true)][datetime]$Deadline,
         [int]$Port = $script:LaunchPins.WebDriverPort
     )
-    if ($Port -ne $script:LaunchPins.WebDriverPort -or $Path -cnotmatch '^/(status|session(?:/[-A-Za-z0-9]+(?:/execute/sync)?)?)$') {
+    $webDriverRequest = $Port -eq $script:LaunchPins.WebDriverPort -and $Path -cmatch '^/(status|session(?:/[-A-Za-z0-9]+(?:/execute/sync)?)?)$'
+    $nativeStatusRequest = $Port -eq $script:LaunchPins.NativeDriverPort -and $Method -ceq 'GET' -and $Path -ceq '/status' -and $null -eq $Body
+    if (-not $webDriverRequest -and -not $nativeStatusRequest) {
         throw 'WebDriver requests are restricted to the fixed loopback endpoint and command allowlist.'
     }
     $uri = [Uri]::new("http://127.0.0.1:$Port$Path")
@@ -132,6 +134,68 @@ function Invoke-BoundedLoopbackJson {
     $nodes = 0
     Assert-BoundedJsonShape -Value $value -Nodes ([ref]$nodes)
     return $value
+}
+
+function Assert-NativeDriverStatus {
+    param($Status,[Parameter(Mandatory = $true)][string]$ExpectedVersion)
+    if ($ExpectedVersion -cnotmatch '^\d+\.\d+\.\d+\.\d+$' -or
+        $null -eq $Status.PSObject.Properties['value'] -or
+        $null -eq $Status.value.PSObject.Properties['ready'] -or $Status.value.ready -isnot [bool] -or -not $Status.value.ready -or
+        $null -eq $Status.value.PSObject.Properties['build'] -or
+        $null -eq $Status.value.build.PSObject.Properties['version']) {
+        throw 'Native EdgeDriver status is incomplete.'
+    }
+    $reported = ([string]$Status.value.build.version -split '\s+')[0]
+    if ($reported -cne $ExpectedVersion) { throw 'The live native EdgeDriver version does not match its trusted receipt.' }
+    return $reported
+}
+
+function Wait-NativeDriverStatus {
+    param([Parameter(Mandatory = $true)][string]$ExpectedVersion,[Parameter(Mandatory = $true)][datetime]$Deadline,[Parameter(Mandatory = $true)]$TauriDriver,[scriptblock]$StatusProvider)
+    do {
+        try {
+            $status = if ($StatusProvider) { & $StatusProvider $Deadline } else { Invoke-BoundedLoopbackJson -Method GET -Path '/status' -Port $script:LaunchPins.NativeDriverPort -Deadline $Deadline }
+        } catch {
+            if ($TauriDriver.HasExited) { throw 'Pinned tauri-driver exited before the native EdgeDriver became ready.' }
+            Start-Sleep -Milliseconds 200
+            continue
+        }
+        return Assert-NativeDriverStatus -Status $status -ExpectedVersion $ExpectedVersion
+    } while ([datetime]::UtcNow -lt $Deadline)
+    throw 'Native EdgeDriver did not become ready before the shared launch deadline.'
+}
+
+function Get-OwnedProfileBinding {
+    param([object[]]$Owned,[Parameter(Mandatory = $true)][string]$ExpectedProfile)
+    $expected = [IO.Path]::GetFullPath($ExpectedProfile).TrimEnd('\')
+    $webViews = @($Owned | Where-Object { [IO.Path]::GetFileName([string]$_.Path).Equals('msedgewebview2.exe',[StringComparison]::OrdinalIgnoreCase) })
+    if ($webViews.Count -eq 0) { throw 'No owned WebView2 process was available to bind the fresh profile.' }
+    $matched = 0
+    foreach ($process in $webViews) {
+        $commandLine = [string]$process.CommandLine
+        $matches = [regex]::Matches($commandLine, '(?i)(?:^|\s)"?--user-data-dir=(?:"(?<quoted>[^"]+)"|(?<plain>[^\s"]+))"?(?=\s|$)')
+        if ($matches.Count -gt 1) { throw 'An owned WebView2 process has multiple user-data-dir switches.' }
+        if ($matches.Count -eq 1) {
+            $candidate = if ($matches[0].Groups['quoted'].Success) { $matches[0].Groups['quoted'].Value } else { $matches[0].Groups['plain'].Value }
+            $canonical = [IO.Path]::GetFullPath($candidate).TrimEnd('\')
+            if (-not $canonical.Equals($expected,[StringComparison]::OrdinalIgnoreCase)) { throw 'An owned WebView2 process used a different profile path.' }
+            $matched++
+        }
+    }
+    if ($matched -eq 0) { throw 'No owned WebView2 command line bound the fresh profile path.' }
+    return 'owned-webview-command-line'
+}
+
+function Assert-OwnedLaunchExecutables {
+    param([object[]]$Owned,[Parameter(Mandatory = $true)][string]$ApplicationPath,[Parameter(Mandatory = $true)][string]$EdgeDriverPath)
+    $applications = @($Owned | Where-Object { [IO.Path]::GetFileName([string]$_.Path).Equals('pdf-workstation.exe',[StringComparison]::OrdinalIgnoreCase) })
+    if ($applications.Count -ne 1 -or -not ([IO.Path]::GetFullPath([string]$applications[0].Path)).Equals([IO.Path]::GetFullPath($ApplicationPath),[StringComparison]::OrdinalIgnoreCase)) {
+        throw 'WebDriver did not launch exactly the installed signed application.'
+    }
+    $nativeDrivers = @($Owned | Where-Object { [IO.Path]::GetFileName([string]$_.Path).Equals('msedgedriver.exe',[StringComparison]::OrdinalIgnoreCase) })
+    if ($nativeDrivers.Count -ne 1 -or -not ([IO.Path]::GetFullPath([string]$nativeDrivers[0].Path)).Equals([IO.Path]::GetFullPath($EdgeDriverPath),[StringComparison]::OrdinalIgnoreCase)) {
+        throw 'tauri-driver did not own exactly the trusted native EdgeDriver executable.'
+    }
 }
 
 function Invoke-WebDriverScript {
@@ -180,7 +244,7 @@ function Get-OwnedLaunchProcesses {
     return @($all | Where-Object { $owned.Contains([uint32]$_.ProcessId) -and [uint32]$_.ProcessId -ne [uint32]$RootProcessId } | ForEach-Object {
         $process = Get-Process -Id ([int]$_.ProcessId) -ErrorAction Stop
         if ($process.StartTime.ToUniversalTime() -lt $StartedAfter) { throw 'A purported launch descendant predates the owned tauri-driver process.' }
-        [pscustomobject]@{ ProcessId = $process.Id; Path = [string]$process.Path; StartTicks = $process.StartTime.ToUniversalTime().Ticks }
+        [pscustomobject]@{ ProcessId = $process.Id; Path = [string]$process.Path; StartTicks = $process.StartTime.ToUniversalTime().Ticks; CommandLine = [string]$_.CommandLine }
     })
 }
 
@@ -234,7 +298,7 @@ function Stop-OwnedLaunchProcesses {
 }
 
 function Invoke-RealInstalledAppLaunch {
-    param([string]$ApplicationPath,[string]$TauriDriverPath,[string]$EdgeDriverPath,[string]$ProfileRoot)
+    param([string]$ApplicationPath,[string]$TauriDriverPath,[string]$EdgeDriverPath,[string]$ProfileRoot,[string]$ExpectedEdgeDriverVersion)
     $deadline = [datetime]::UtcNow.AddMilliseconds($script:LaunchPins.TotalTimeoutMilliseconds)
     $driverCapture = $null
     $driver = $null
@@ -264,6 +328,8 @@ function Invoke-RealInstalledAppLaunch {
         } while ([datetime]::UtcNow -lt $deadline)
         if ($null -eq $status -or -not [bool]$status.value.ready) { throw 'Pinned tauri-driver did not become ready.' }
         if ($driver.HasExited) { throw 'Pinned tauri-driver exited after reporting readiness.' }
+        $nativeDriverVersion = Wait-NativeDriverStatus -ExpectedVersion $ExpectedEdgeDriverVersion -Deadline $deadline -TauriDriver $driver
+        if ($driver.HasExited) { throw 'Pinned tauri-driver exited while binding the native EdgeDriver status.' }
 
         $sessionBody = [ordered]@{ capabilities = [ordered]@{ alwaysMatch = [ordered]@{
             browserName = 'wry'
@@ -274,9 +340,17 @@ function Invoke-RealInstalledAppLaunch {
         if ($driver.HasExited) { throw 'Pinned tauri-driver exited during session creation.' }
         $sessionId = [string]$session.value.sessionId
         $capabilities = $session.value.capabilities
-        $returnedDriverVersion = [string]$capabilities.'msedge.msedgedriverVersion'
+        $capabilityKeys = @($capabilities.PSObject.Properties.Name | Sort-Object -CaseSensitive)
+        if ($capabilityKeys.Count -eq 0 -or $capabilityKeys.Count -gt 32 -or @($capabilityKeys | Where-Object { $_ -cnotmatch '^[A-Za-z0-9:._-]{1,64}$' }).Count -ne 0) {
+            throw 'WebDriver returned an unsafe capability-key set.'
+        }
+        $vendorDriverProperty = $capabilities.PSObject.Properties['msedge.msedgedriverVersion']
+        if ($null -ne $vendorDriverProperty -and ([string]$vendorDriverProperty.Value -split '\s+')[0] -cne $nativeDriverVersion) {
+            throw 'The optional session EdgeDriver version disagrees with the live native status.'
+        }
         $returnedRuntimeVersion = [string]$capabilities.browserVersion
-        $returnedUserData = [string]$capabilities.'msedge.userDataDir'
+        $userDataProperty = $capabilities.PSObject.Properties['msedge.userDataDir']
+        $returnedUserData = if ($null -ne $userDataProperty) { [string]$userDataProperty.Value } else { '' }
 
         $homeScript = "return {ready:document.readyState==='complete',title:document.title,home:[...document.querySelectorAll('button')].some(b=>b.textContent.trim()==='Explore a sample PDF')};"
         $home = Wait-WebDriverOracle -SessionId $sessionId -Script $homeScript -Deadline $deadline -Kind 'Home UI' -Predicate { param($v) [bool]$v.ready -and [string]$v.title -ceq 'PDF Workstation' -and [bool]$v.home }
@@ -293,15 +367,22 @@ const i=document.querySelector('img[alt="Page 1"]');return {tab:[...document.que
 '@
         $sample = Wait-WebDriverOracle -SessionId $sessionId -Script $sampleScript -Deadline $deadline -Kind 'Installed sample PDF render' -Predicate { param($v) [bool]$v.tab -and [bool]$v.pages -and [bool]$v.footer -and [bool]$v.image -and [int]$v.width -gt 0 -and [int]$v.height -gt 0 }
         $captured = @(Get-OwnedLaunchProcesses -RootProcessId $driver.Id -StartedAfter $startedAfter)
-        $appProcesses = @($captured | Where-Object { [IO.Path]::GetFileName([string]$_.Path).Equals('pdf-workstation.exe',[StringComparison]::OrdinalIgnoreCase) })
-        if ($appProcesses.Count -ne 1 -or -not ([string]$appProcesses[0].Path).Equals($ApplicationPath,[StringComparison]::OrdinalIgnoreCase)) {
-            throw 'WebDriver did not launch exactly the installed signed application.'
+        Assert-OwnedLaunchExecutables -Owned $captured -ApplicationPath $ApplicationPath -EdgeDriverPath $EdgeDriverPath
+        $profileBinding = if (-not [string]::IsNullOrWhiteSpace($returnedUserData)) {
+            if (-not ([IO.Path]::GetFullPath($returnedUserData).TrimEnd('\')).Equals([IO.Path]::GetFullPath($ProfileRoot).TrimEnd('\'),[StringComparison]::OrdinalIgnoreCase)) {
+                throw 'The session returned a different WebView profile path.'
+            }
+            'session-capability'
+        } else {
+            Get-OwnedProfileBinding -Owned $captured -ExpectedProfile $ProfileRoot
         }
         if ($driverCapture.Exceeded) { throw 'WebDriver diagnostic output exceeded its discarded character cap.' }
         $result = [pscustomobject]@{
-            returnedDriverVersion = $returnedDriverVersion
+            nativeDriverVersion = $nativeDriverVersion
+            driverVersionBinding = 'native-status'
             returnedRuntimeVersion = $returnedRuntimeVersion
-            returnedUserDataFolder = $returnedUserData
+            profileBindingMethod = $profileBinding
+            sessionCapabilityKeys = $capabilityKeys
             title = [string]$home.title
             homeButton = [bool]$home.home
             ocrCapabilityStatus = [string]$ocr.status
@@ -369,14 +450,16 @@ function Invoke-InstalledAppLaunchSmoke {
     $null = Assert-TrustedWindowsSignature -Path $edgeDriver -ExpectedPublisher $script:LaunchPins.EdgePublisher
     [IO.Directory]::CreateDirectory($profile) | Out-Null
     Assert-NoReparseAncestors -Path $profile
-    $result = if ($ProcessProvider) { & $ProcessProvider $ApplicationPath $tauriDriver $edgeDriver $profile } else { Invoke-RealInstalledAppLaunch -ApplicationPath $ApplicationPath -TauriDriverPath $tauriDriver -EdgeDriverPath $edgeDriver -ProfileRoot $profile }
-    Assert-LaunchExactProperties -Value $result -Expected @('returnedDriverVersion','returnedRuntimeVersion','returnedUserDataFolder','title','homeButton','ocrCapabilityStatus','sampleName','samplePages','renderedPageWidth','renderedPageHeight','renderedPageBlob','sessionDeleted','ownedProcessTreeStopped','relevantProcessesRemaining') -Kind 'Installed application launch result'
-    $returnedVersion = ([string]$result.returnedDriverVersion -split ' ')[0]
+    $expectedEdgeDriverVersion = [string]$receipt.edgeDriver.version
+    $result = if ($ProcessProvider) { & $ProcessProvider $ApplicationPath $tauriDriver $edgeDriver $profile $expectedEdgeDriverVersion } else { Invoke-RealInstalledAppLaunch -ApplicationPath $ApplicationPath -TauriDriverPath $tauriDriver -EdgeDriverPath $edgeDriver -ProfileRoot $profile -ExpectedEdgeDriverVersion $expectedEdgeDriverVersion }
+    Assert-LaunchExactProperties -Value $result -Expected @('nativeDriverVersion','driverVersionBinding','returnedRuntimeVersion','profileBindingMethod','sessionCapabilityKeys','title','homeButton','ocrCapabilityStatus','sampleName','samplePages','renderedPageWidth','renderedPageHeight','renderedPageBlob','sessionDeleted','ownedProcessTreeStopped','relevantProcessesRemaining') -Kind 'Installed application launch result'
     $returnedRuntimeParts = ([string]$result.returnedRuntimeVersion).Split('.')
     $expectedRuntimeParts = ([string]$receipt.webView2RuntimeVersion).Split('.')
-    if ($returnedVersion -cne [string]$receipt.edgeDriver.version -or
+    $capabilityKeys = @($result.sessionCapabilityKeys)
+    if ([string]$result.nativeDriverVersion -cne $expectedEdgeDriverVersion -or [string]$result.driverVersionBinding -cne 'native-status' -or
         $returnedRuntimeParts.Count -ne 4 -or ($returnedRuntimeParts[0..2] -join '.') -cne ($expectedRuntimeParts[0..2] -join '.') -or
-        -not ([IO.Path]::GetFullPath([string]$result.returnedUserDataFolder).TrimEnd('\')).Equals($profile,[StringComparison]::OrdinalIgnoreCase) -or
+        @('session-capability','owned-webview-command-line') -cnotcontains [string]$result.profileBindingMethod -or
+        $capabilityKeys.Count -eq 0 -or $capabilityKeys.Count -gt 32 -or @($capabilityKeys | Where-Object { $_ -cnotmatch '^[A-Za-z0-9:._-]{1,64}$' }).Count -ne 0 -or
         [string]$result.title -cne 'PDF Workstation' -or $result.homeButton -isnot [bool] -or -not $result.homeButton -or
         [string]$result.ocrCapabilityStatus -cne 'Available' -or [string]$result.sampleName -cne 'welcome.pdf' -or
         [int]$result.samplePages -ne 6 -or [int]$result.renderedPageWidth -le 0 -or [int]$result.renderedPageHeight -le 0 -or
@@ -391,9 +474,10 @@ function Invoke-InstalledAppLaunchSmoke {
             tauriDriver = [ordered]@{ version = $script:LaunchPins.TauriDriverVersion; bytes = [uint64]$receipt.tauriDriver.bytes; sha256 = [string]$receipt.tauriDriver.sha256; sourceSha256 = $script:LaunchPins.TauriDriverPackageSha256 }
             webView2RuntimeVersion = [string]$receipt.webView2RuntimeVersion
             testedSessionRuntimeVersion = [string]$result.returnedRuntimeVersion
-            edgeDriver = [ordered]@{ version = [string]$receipt.edgeDriver.version; bytes = [uint64]$receipt.edgeDriver.bytes; sha256 = [string]$receipt.edgeDriver.sha256; publisher = $script:LaunchPins.EdgePublisher; trustedTimestamp = $true }
+            edgeDriver = [ordered]@{ version = [string]$receipt.edgeDriver.version; bytes = [uint64]$receipt.edgeDriver.bytes; sha256 = [string]$receipt.edgeDriver.sha256; publisher = $script:LaunchPins.EdgePublisher; trustedTimestamp = $true; versionBinding = 'native-status' }
+            sessionCapabilityKeys = $capabilityKeys
         }
-        profile = 'fresh-runner-owned'
+        profile = [ordered]@{ state = 'fresh-runner-owned'; binding = [string]$result.profileBindingMethod }
         title = 'PDF Workstation'
         homeButton = 'Explore a sample PDF'
         ocrCapabilityStatus = 'Available'
