@@ -192,6 +192,7 @@ describe('hosted installed signed application launch proof', () => {
     expect(launch).toContain("$null -eq $delete.value");
     expect(launch).toContain('Get-OwnedLaunchProcesses');
     expect(launch).toContain('relevantProcessesRemaining -ne 0');
+    expect(launch.match(/Invoke-BoundedLoopbackJson -Method POST -Path '\/session'/g)).toHaveLength(1);
     expect(launch).not.toMatch(/Start-Process|Remove-Item|\.Delete\(/);
   });
 
@@ -211,10 +212,34 @@ describe('hosted installed signed application launch proof', () => {
     expect(result.status, result.stderr || result.stdout).toBe(0);
   });
 
+  it('does not retry a timed-out session POST and still stops the owned process tree', () => {
+    const source = extractFunctions('scripts/installed-app-launch.ps1', ['Invoke-RealInstalledAppLaunch'], String.raw`
+      $script:LaunchPins=[ordered]@{TotalTimeoutMilliseconds=60000;WebDriverPort=4444;NativeDriverPort=4445}
+      $script:sessionPosts=0;$script:deleteRequests=0;$script:driverStopped=$false
+      $driver=[pscustomobject]@{HasExited=$false;Id=1234}
+      $capture=[pscustomobject]@{Process=$driver;Exceeded=$false};$capture|Add-Member ScriptMethod Start {};$capture|Add-Member ScriptMethod Dispose {}
+      function Assert-FixedWebDriverPortsFree{}
+      function Start-BoundedDiscardProcess{param([string]$Path,[object[]]$Arguments);$capture}
+      function Invoke-BoundedLoopbackJson{param([string]$Method,[string]$Path,$Body,[datetime]$Deadline,[int]$Port=4444);if($Method-ceq'GET'-and$Path-ceq'/status'){return [pscustomobject]@{value=[pscustomobject]@{ready=$true}}};if($Method-ceq'POST'-and$Path-ceq'/session'){$script:sessionPosts++;throw 'session-timeout'};if($Method-ceq'DELETE'){$script:deleteRequests++};throw 'unexpected-loopback-request'}
+      function Wait-NativeDriverStatus{param([string]$ExpectedVersion,[datetime]$Deadline,$TauriDriver);$ExpectedVersion}
+      function Get-OwnedLaunchProcesses{param([int]$RootProcessId,[datetime]$StartedAfter);@()}
+      function Stop-OwnedLaunchProcesses{param($TauriDriver,[object[]]$Captured);$script:driverStopped=$true;$TauriDriver.HasExited=$true}
+      function Get-LaunchProcessSnapshot{@()}
+      $rejected=$false;try{Invoke-RealInstalledAppLaunch -ApplicationPath 'app.exe' -TauriDriverPath 'tauri-driver.exe' -EdgeDriverPath 'msedgedriver.exe' -ProfileRoot 'profile' -SettingsRoot 'settings' -ExpectedEdgeDriverVersion '151.0.1.2'}catch{if($_.Exception.Message-ceq'session-timeout'){$rejected=$true}else{throw}}
+      if(-not$rejected-or$script:sessionPosts-ne1-or$script:deleteRequests-ne0-or-not$script:driverStopped-or-not$driver.HasExited){throw 'Session-timeout cleanup or no-retry contract changed.'}
+    `);
+    const result = runPowerShell(source);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
   it('rejects occupied ports, over-deep JSON, and every native endpoint except fixed GET status', () => {
-    const source = extractFunctions('scripts/installed-app-launch.ps1', ['Assert-BoundedJsonShape', 'Get-LaunchRemainingMilliseconds', 'Invoke-BoundedLoopbackJson', 'Assert-FixedWebDriverPortsFree'], String.raw`
-      $script:LaunchPins=[ordered]@{WebDriverPort=4444;NativeDriverPort=4445;JsonDepthMaximum=2;JsonNodesMaximum=8;RequestBytesMaximum=1MB}
+    const source = extractFunctions('scripts/installed-app-launch.ps1', ['Assert-BoundedJsonShape', 'Get-LaunchRemainingMilliseconds', 'Get-LoopbackRequestTimeoutMilliseconds', 'Invoke-BoundedLoopbackJson', 'Assert-FixedWebDriverPortsFree'], String.raw`
+      $script:LaunchPins=[ordered]@{WebDriverPort=4444;NativeDriverPort=4445;JsonDepthMaximum=2;JsonNodesMaximum=8;RequestBytesMaximum=1MB;RequestTimeoutMilliseconds=10000;SessionCreationTimeoutMilliseconds=30000}
       $nodes=0;$rejected=$false;try{Assert-BoundedJsonShape -Value ([pscustomobject]@{a=[pscustomobject]@{b=[pscustomobject]@{c=1}}}) -Nodes ([ref]$nodes)}catch{$rejected=$true};if(-not$rejected){throw 'Deep JSON accepted.'}
+      $farDeadline=[datetime]::UtcNow.AddSeconds(45)
+      if((Get-LoopbackRequestTimeoutMilliseconds -Method POST -Path '/session' -Port 4444 -Deadline $farDeadline)-ne30000){throw 'Exact session creation did not receive its bounded cold-start allowance.'}
+      foreach($ordinary in @([pscustomobject]@{method='GET';path='/status';port=4444},[pscustomobject]@{method='GET';path='/status';port=4445},[pscustomobject]@{method='POST';path='/session/id/execute/sync';port=4444},[pscustomobject]@{method='DELETE';path='/session/id';port=4444})){if((Get-LoopbackRequestTimeoutMilliseconds -Method $ordinary.method -Path $ordinary.path -Port $ordinary.port -Deadline $farDeadline)-ne10000){throw 'An ordinary loopback operation escaped the 10-second cap.'}}
+      $nearDeadline=[datetime]::UtcNow.AddMilliseconds(750);$clamped=Get-LoopbackRequestTimeoutMilliseconds -Method POST -Path '/session' -Port 4444 -Deadline $nearDeadline;if($clamped-le0-or$clamped-gt750){throw 'Shared remaining deadline did not clamp session creation.'}
       foreach($request in @([pscustomobject]@{method='POST';path='/status';port=4445},[pscustomobject]@{method='GET';path='/session';port=4445},[pscustomobject]@{method='GET';path='/status';port=4446})){$rejected=$false;try{Invoke-BoundedLoopbackJson -Method $request.method -Path $request.path -Port $request.port -Deadline ([datetime]::UtcNow.AddSeconds(1))}catch{if($_.Exception.Message -ceq'WebDriver requests are restricted to the fixed loopback endpoint and command allowlist.'){$rejected=$true}};if(-not$rejected){throw 'Unsafe native endpoint escaped its allowlist.'}}
       $allowed=$false;try{Invoke-BoundedLoopbackJson -Method GET -Path '/status' -Port 4445 -Deadline ([datetime]::UtcNow.AddSeconds(1))}catch{if($_.Exception.Message -cne'WebDriver requests are restricted to the fixed loopback endpoint and command allowlist.'){$allowed=$true}};if(-not$allowed){throw 'Exact native status endpoint was not allowed.'}
       $listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,4444);$listener.Start();try{$rejected=$false;try{Assert-FixedWebDriverPortsFree}catch{$rejected=$true};if(-not$rejected){throw 'Occupied fixed port accepted.'}}finally{$listener.Stop()}

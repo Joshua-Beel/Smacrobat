@@ -5,6 +5,8 @@ $script:LaunchPins = [ordered]@{
     WebDriverPort = 4444
     NativeDriverPort = 4445
     TotalTimeoutMilliseconds = 60000
+    RequestTimeoutMilliseconds = 10000
+    SessionCreationTimeoutMilliseconds = 30000
     RequestBytesMaximum = 1MB
     JsonDepthMaximum = 12
     JsonNodesMaximum = 512
@@ -75,10 +77,23 @@ function Assert-BoundedJsonShape {
 }
 
 function Get-LaunchRemainingMilliseconds {
-    param([datetime]$Deadline)
+    param([datetime]$Deadline,[Parameter(Mandatory = $true)][int]$MaximumMilliseconds)
     $remaining = [int][Math]::Floor(($Deadline - [datetime]::UtcNow).TotalMilliseconds)
     if ($remaining -le 0) { throw 'Installed application launch smoke exceeded its total deadline.' }
-    return [Math]::Min($remaining, 10000)
+    if ($MaximumMilliseconds -le 0 -or $MaximumMilliseconds -gt $script:LaunchPins.SessionCreationTimeoutMilliseconds) {
+        throw 'Loopback request timeout maximum is outside the bounded launch contract.'
+    }
+    return [Math]::Min($remaining, $MaximumMilliseconds)
+}
+
+function Get-LoopbackRequestTimeoutMilliseconds {
+    param([string]$Method,[string]$Path,[int]$Port,[datetime]$Deadline)
+    $maximum = if ($Port -eq $script:LaunchPins.WebDriverPort -and $Method -ceq 'POST' -and $Path -ceq '/session') {
+        $script:LaunchPins.SessionCreationTimeoutMilliseconds
+    } else {
+        $script:LaunchPins.RequestTimeoutMilliseconds
+    }
+    return Get-LaunchRemainingMilliseconds -Deadline $Deadline -MaximumMilliseconds $maximum
 }
 
 function Invoke-BoundedLoopbackJson {
@@ -96,7 +111,7 @@ function Invoke-BoundedLoopbackJson {
     }
     $uri = [Uri]::new("http://127.0.0.1:$Port$Path")
     if (-not $uri.IsLoopback -or $uri.Scheme -cne 'http') { throw 'WebDriver URI is not fixed loopback HTTP.' }
-    $timeout = Get-LaunchRemainingMilliseconds -Deadline $Deadline
+    $timeout = Get-LoopbackRequestTimeoutMilliseconds -Method $Method -Path $Path -Port $Port -Deadline $Deadline
     $request = [Net.HttpWebRequest]::CreateHttp($uri)
     $request.Method = $Method
     $request.AllowAutoRedirect = $false
