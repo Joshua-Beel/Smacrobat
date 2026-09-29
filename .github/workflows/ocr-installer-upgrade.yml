@@ -37,6 +37,8 @@ jobs:
             "SIGNED_ARTIFACT_ROOT=$root\pdf-workstation-signed-artifact"
             "UPGRADE_WORK_ROOT=$root\pdf-workstation-upgrade-work"
             "UPGRADE_OUTPUT_ROOT=$root\pdf-workstation-upgrade-output"
+            "WEBDRIVER_ROOT=$root\pdf-workstation-webdriver"
+            "WEBVIEW_PROFILE_ROOT=$root\pdf-workstation-webview-profile"
           )
           $writer = [IO.StreamWriter]::new($env:GITHUB_ENV, $true, [Text.UTF8Encoding]::new($false))
           try {
@@ -62,6 +64,23 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Tracked working-tree files changed after checkout.' }
           git diff --cached --quiet --
           if ($LASTEXITCODE -ne 0) { throw 'The tracked index changed after checkout.' }
+
+      - name: Prepare exact hosted WebDriver inputs
+        shell: pwsh
+        run: |
+          ./scripts/setup-installed-app-webdriver.ps1 -OutputRoot $env:WEBDRIVER_ROOT
+
+      - name: Recheck clean source after driver preparation
+        shell: pwsh
+        run: |
+          $headRevision = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $headRevision -cne $env:GITHUB_SHA) {
+            throw 'Checked-out HEAD changed during WebDriver preparation.'
+          }
+          git diff --quiet --
+          if ($LASTEXITCODE -ne 0) { throw 'Tracked working-tree files changed during WebDriver preparation.' }
+          git diff --cached --quiet --
+          if ($LASTEXITCODE -ne 0) { throw 'The tracked index changed during WebDriver preparation.' }
 
       - name: Download the exact published 0.2.0 baseline asset
         shell: pwsh
@@ -129,7 +148,9 @@ jobs:
             -BaselineInstaller (Join-Path $env:BASELINE_ROOT 'PDF.Workstation_0.2.0_x64-setup.exe') `
             -SignedArtifactRoot $env:SIGNED_ARTIFACT_ROOT `
             -WorkRoot $env:UPGRADE_WORK_ROOT `
-            -OutputRoot $env:UPGRADE_OUTPUT_ROOT
+            -OutputRoot $env:UPGRADE_OUTPUT_ROOT `
+            -WebDriverRoot $env:WEBDRIVER_ROOT `
+            -WebViewProfileRoot $env:WEBVIEW_PROFILE_ROOT
 
       - name: Upload only the sanitized upgrade verification record
         uses: actions/upload-artifact@v4

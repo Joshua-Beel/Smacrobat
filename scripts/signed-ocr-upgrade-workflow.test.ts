@@ -99,7 +99,10 @@ describe('manual signed OCR installer upgrade workflow', () => {
     const initStep = workflow.slice(workflow.indexOf('- name: Initialize fresh runner paths'), workflow.indexOf('- uses: actions/checkout@v4'));
     expect(initStep).toContain('IsNullOrWhiteSpace($env:RUNNER_TEMP)');
     expect(initStep).toContain('IsNullOrWhiteSpace($env:GITHUB_ENV)');
-    expect(initStep.match(/^[ ]{12}"(BASELINE_ROOT|SIGNED_ARTIFACT_ROOT|UPGRADE_WORK_ROOT|UPGRADE_OUTPUT_ROOT)=/gm)).toHaveLength(4);
+    expect(initStep.match(/^[ ]{12}"(BASELINE_ROOT|SIGNED_ARTIFACT_ROOT|UPGRADE_WORK_ROOT|UPGRADE_OUTPUT_ROOT|WEBDRIVER_ROOT|WEBVIEW_PROFILE_ROOT)=/gm)).toHaveLength(6);
+    expect(workflow).toContain('./scripts/setup-installed-app-webdriver.ps1 -OutputRoot $env:WEBDRIVER_ROOT');
+    expect(workflow).toContain('-WebDriverRoot $env:WEBDRIVER_ROOT');
+    expect(workflow).toContain('-WebViewProfileRoot $env:WEBVIEW_PROFILE_ROOT');
     expect(workflow).toContain("$env:GITHUB_REPOSITORY -cne 'Joshua-Beel/Smacrobat'");
     expect(workflow).toContain("$env:GITHUB_REF -cne 'refs/heads/master'");
     expect(workflow).toContain('ref: ${{ github.sha }}');
@@ -144,6 +147,8 @@ describe('manual signed OCR installer upgrade workflow', () => {
       `SIGNED_ARTIFACT_ROOT=${runnerTemp}\\pdf-workstation-signed-artifact`,
       `UPGRADE_WORK_ROOT=${runnerTemp}\\pdf-workstation-upgrade-work`,
       `UPGRADE_OUTPUT_ROOT=${runnerTemp}\\pdf-workstation-upgrade-output`,
+      `WEBDRIVER_ROOT=${runnerTemp}\\pdf-workstation-webdriver`,
+      `WEBVIEW_PROFILE_ROOT=${runnerTemp}\\pdf-workstation-webview-profile`,
     ]);
   });
 
@@ -160,8 +165,10 @@ describe('manual signed OCR installer upgrade workflow', () => {
     expect(script).toContain("Registry::HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\PDF Workstation");
     expect(script).toContain("Join-Path $env:LOCALAPPDATA 'PDF Workstation'");
     expect(script).not.toMatch(/Start-Process|Remove-Item|\.Delete\(|uninstall\.exe['\"]?\s+\/S/i);
-    expect(script).toContain('applicationProcessStarted = $false');
-    expect(script).toContain('guiVerified = $false');
+    expect(script).toContain('applicationProcessStarted = $true');
+    expect(script).toContain('applicationLaunchVerified = $true');
+    expect(script).toContain('webViewDomVerified = $true');
+    expect(script).toContain('nativeWindowVisualVerified = $false');
     expect(script).toContain('realPreferencesVerified = $false');
     expect(script).toContain('installedEngineOcrSmokeVerified = $true');
     expect(script).toContain('applicationOcrIntegrationVerified = $false');
@@ -397,10 +404,11 @@ describe('manual signed OCR installer upgrade workflow', () => {
         $output=Join-Path (Resolve-Path target) ('ocr-upgrade-output-'+[Guid]::NewGuid().ToString('N'))
         $receipt=[pscustomobject]@{packagedApplication=$app}
         $smoke=[ordered]@{generator=[ordered]@{target='scripts/ocr/generate-smoke.ps1';bytes=[uint64]1;sha256=('B'*64)};input=[ordered]@{format='P6';width=1200;height=240;bytes=[uint64]1;sha256=('C'*64)};engine=[ordered]@{bytes=[uint64]1;sha256=('D'*64)};model=[ordered]@{bytes=[uint64]1;sha256=('E'*64)};profile=[ordered]@{language='eng';engineMode=1;pageSegmentationMode=6;dpi=150;logLevel='ERROR'};limits=[ordered]@{inputBytesMaximum=16777216;stdoutCharactersMaximum=1048576;stderrCharactersMaximum=65536;timeoutMilliseconds=30000};expectedTextSha256=('F'*64);actualTextSha256=('F'*64);exitCode=0;stderrEmpty=$true;matched=$true}
-        $path=Write-SanitizedUpgradeRecord -OutputRoot $output -WorkflowSourceRevision ('b'*40) -Receipt $receipt -InstalledEngineSmoke $smoke
+        $launch=[ordered]@{drivers=[ordered]@{tauriDriver=[ordered]@{version='2.0.6';bytes=[uint64]1;sha256=('1'*64);sourceSha256=('2'*64)};webView2RuntimeVersion='151.0.1.2';edgeDriver=[ordered]@{version='151.0.1.3';bytes=[uint64]1;sha256=('3'*64);publisher='Microsoft Corporation';trustedTimestamp=$true}};profile='fresh-runner-owned';title='PDF Workstation';homeButton='Explore a sample PDF';ocrCapabilityStatus='Available';sample=[ordered]@{name='welcome.pdf';pages=6;firstPageDecoded=$true;naturalWidth=100;naturalHeight=100;source='blob:'};cleanup=[ordered]@{sessionDeleted=$true;ownedProcessTreeStopped=$true;relevantProcessesRemaining=0}}
+        $path=Write-SanitizedUpgradeRecord -OutputRoot $output -WorkflowSourceRevision ('b'*40) -Receipt $receipt -InstalledEngineSmoke $smoke -InstalledAppLaunch $launch
         $json=Get-Content -LiteralPath $path -Raw -Encoding UTF8
         $value=$json|ConvertFrom-Json
-        if($value.schemaVersion-ne2-or@(Get-ChildItem -LiteralPath $output -File -Force).Count -ne 1 -or-not$value.verification.installedEngineOcrSmokeVerified -or$value.verification.applicationOcrIntegrationVerified -ne $false -or $value.verification.guiVerified -ne $false -or $value.verification.realPreferencesVerified -ne $false -or $value.verification.inAppUpdaterVerified -ne $false -or-not$value.upgrade.installedEngineOcrSmoke.matched){throw 'Sanitized output contract failed.'}
+        if($value.schemaVersion-ne3-or@(Get-ChildItem -LiteralPath $output -File -Force).Count -ne 1 -or-not$value.verification.installedEngineOcrSmokeVerified -or-not$value.verification.applicationLaunchVerified -or-not$value.verification.webViewDomVerified -or-not$value.verification.nativeOcrCapabilityVerified -or$value.verification.applicationOcrIntegrationVerified -ne $false -or$value.verification.applicationOcrRecognitionVerified -ne $false -or$value.verification.nativeWindowVisualVerified -ne $false -or$value.verification.nativeFilePickerVerified -ne $false -or$value.verification.userPdfVerified -ne $false -or$value.verification.printingVerified -ne $false -or$value.verification.nativeDragDropVerified -ne $false -or$value.verification.realPreferencesVerified -ne $false -or$value.verification.inAppUpdaterVerified -ne $false -or-not$value.upgrade.installedEngineOcrSmoke.matched -or$value.upgrade.installedApplicationLaunch.sample.pages-ne6){throw 'Sanitized output contract failed.'}
         if($json -match '(?i)([A-Z]:\\|\\Users\\|11005152678|36499724415|569181842|GITHUB_TOKEN|AZURE_)'){throw 'Sanitized output leaked restricted evidence.'}
       `,
     );

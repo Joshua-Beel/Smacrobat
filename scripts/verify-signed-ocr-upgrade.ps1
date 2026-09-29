@@ -3,13 +3,16 @@ param(
     [Parameter(Mandatory = $true)][string]$BaselineInstaller,
     [Parameter(Mandatory = $true)][string]$SignedArtifactRoot,
     [Parameter(Mandatory = $true)][string]$WorkRoot,
-    [Parameter(Mandatory = $true)][string]$OutputRoot
+    [Parameter(Mandatory = $true)][string]$OutputRoot,
+    [Parameter(Mandatory = $true)][string]$WebDriverRoot,
+    [Parameter(Mandatory = $true)][string]$WebViewProfileRoot
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 . (Join-Path $PSScriptRoot 'ocr/installer-package.ps1')
 . (Join-Path $PSScriptRoot 'ocr/windows-signing.ps1')
+. (Join-Path $PSScriptRoot 'installed-app-launch.ps1')
 
 $script:Pins = [ordered]@{
     Repository = 'Joshua-Beel/Smacrobat'
@@ -668,14 +671,15 @@ function Write-SanitizedUpgradeRecord {
         [Parameter(Mandatory = $true)][string]$OutputRoot,
         [Parameter(Mandatory = $true)][string]$WorkflowSourceRevision,
         [Parameter(Mandatory = $true)]$Receipt,
-        [Parameter(Mandatory = $true)]$InstalledEngineSmoke
+        [Parameter(Mandatory = $true)]$InstalledEngineSmoke,
+        [Parameter(Mandatory = $true)]$InstalledAppLaunch
     )
     if (Test-Path -LiteralPath $OutputRoot) { throw 'Sanitized output root must be fresh.' }
     [IO.Directory]::CreateDirectory($OutputRoot) | Out-Null
     Assert-NoReparseAncestors -Path $OutputRoot
     $record = [ordered]@{
-        schemaVersion = 2
-        scope = 'Ephemeral GitHub-hosted silent NSIS installation, manual upgrade, and direct installed-engine OCR smoke verification; application launch, OCR coordinator/UI, and updater behavior are not established.'
+        schemaVersion = 3
+        scope = 'Ephemeral GitHub-hosted silent NSIS installation, manual upgrade, direct installed-engine OCR smoke, and installed signed application WebView launch/native IPC/sample-render verification; native dialogs, user documents, OCR recognition, printing, preferences, drag-and-drop, and updater behavior are not established.'
         mode = 'ephemeral-current-user-silent-manual-upgrade'
         workflowSourceRevision = $WorkflowSourceRevision
         signedArtifactSourceRevision = $script:Pins.SignedSourceRevision
@@ -688,6 +692,7 @@ function Write-SanitizedUpgradeRecord {
             installer = [ordered]@{ fileName = $script:Pins.SignedInstallerName; bytes = $script:Pins.SignedInstallerBytes; sha256 = $script:Pins.SignedInstallerSha256 }
             installedApplication = [ordered]@{ bytes = [uint64]$Receipt.packagedApplication.bytes; sha256 = [string]$Receipt.packagedApplication.sha256 }
             installedEngineOcrSmoke = $InstalledEngineSmoke
+            installedApplicationLaunch = $InstalledAppLaunch
             publisher = $script:Pins.ExpectedPublisher
             signatures = [ordered]@{ installer = 'Valid'; application = 'Valid'; pdfium = 'Valid'; engine = 'Valid'; trustedTimestampsRequired = $true }
         }
@@ -700,11 +705,22 @@ function Write-SanitizedUpgradeRecord {
             installedReceiptsMatched = $true
             settingsSentinelPreserved = $true
             documentSentinelPreserved = $true
-            applicationProcessStarted = $false
-            guiVerified = $false
+            applicationProcessStarted = $true
+            applicationLaunchVerified = $true
+            webViewDomVerified = $true
+            nativeOcrCapabilityVerified = $true
+            samplePdfOpened = $true
+            samplePdfiumRenderVerified = $true
+            launchProcessCleanupVerified = $true
+            nativeWindowVisualVerified = $false
             realPreferencesVerified = $false
             installedEngineOcrSmokeVerified = $true
             applicationOcrIntegrationVerified = $false
+            applicationOcrRecognitionVerified = $false
+            nativeFilePickerVerified = $false
+            userPdfVerified = $false
+            printingVerified = $false
+            nativeDragDropVerified = $false
             inAppUpdaterVerified = $false
             updaterArtifacts = @()
         }
@@ -732,6 +748,8 @@ $baselinePath = Resolve-RunnerPath -Path $BaselineInstaller -RunnerTemp $runnerT
 $signedRoot = Resolve-RunnerPath -Path $SignedArtifactRoot -RunnerTemp $runnerTemp -MustExist
 $work = Resolve-RunnerPath -Path $WorkRoot -RunnerTemp $runnerTemp -MustBeFresh
 $output = Resolve-RunnerPath -Path $OutputRoot -RunnerTemp $runnerTemp -MustBeFresh
+$driverRoot = Resolve-RunnerPath -Path $WebDriverRoot -RunnerTemp $runnerTemp -MustExist
+$profileRoot = Resolve-RunnerPath -Path $WebViewProfileRoot -RunnerTemp $runnerTemp -MustBeFresh
 
 $installRoot = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'PDF Workstation')).TrimEnd('\')
 $settingsRoot = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'local.pdfworkstation.desktop')).TrimEnd('\')
@@ -818,7 +836,15 @@ $installedEngineSmoke = Invoke-InstalledEngineOcrSmoke `
     -EngineReceipt $receiptSets.Engine `
     -ModelReceipt $modelReceipt[0]
 Assert-SentinelReceipts -SettingsPath $settingsSentinel -SettingsSha256 $settingsSentinelSha256 -DocumentPath $documentSentinel -DocumentSha256 $documentSentinelSha256
+$installedAppLaunch = Invoke-InstalledAppLaunchSmoke `
+    -ApplicationPath $installedResources.Application.FullName `
+    -ApplicationReceipt $receipt.packagedApplication `
+    -WebDriverRoot $driverRoot `
+    -ProfileRoot $profileRoot `
+    -RunnerTemp $runnerTemp `
+    -ExpectedPublisher $script:Pins.ExpectedPublisher
+Assert-SentinelReceipts -SettingsPath $settingsSentinel -SettingsSha256 $settingsSentinelSha256 -DocumentPath $documentSentinel -DocumentSha256 $documentSentinelSha256
 
-$record = Write-SanitizedUpgradeRecord -OutputRoot $output -WorkflowSourceRevision ([string]$runnerFacts.githubSha) -Receipt $receipt -InstalledEngineSmoke $installedEngineSmoke
+$record = Write-SanitizedUpgradeRecord -OutputRoot $output -WorkflowSourceRevision ([string]$runnerFacts.githubSha) -Receipt $receipt -InstalledEngineSmoke $installedEngineSmoke -InstalledAppLaunch $installedAppLaunch
 Write-Output 'Ephemeral silent installer upgrade verification succeeded.'
 Write-Output ('Sanitized record SHA-256: ' + (Get-ExactSha256 -Path $record))
