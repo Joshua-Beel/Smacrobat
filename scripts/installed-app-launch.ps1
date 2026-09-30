@@ -13,6 +13,7 @@ $script:LaunchPins = [ordered]@{
     RequestBytesMaximum = 1MB
     JsonDepthMaximum = 12
     JsonNodesMaximum = 512
+    ProcessTimestampToleranceTicks = 10
 }
 
 function Assert-LaunchExactProperties {
@@ -358,20 +359,58 @@ function Assert-FixedWebDriverPortsFree {
 }
 
 function Get-OwnedLaunchProcesses {
-    param([Parameter(Mandatory = $true)][int]$RootProcessId,[Parameter(Mandatory = $true)][datetime]$StartedAfter)
-    $all = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+    param(
+        [Parameter(Mandatory = $true)][int]$RootProcessId,
+        [Parameter(Mandatory = $true)][datetime]$StartedAfter,
+        [scriptblock]$CimProvider,
+        [scriptblock]$ProcessProvider
+    )
+    $all = @(if ($CimProvider) { & $CimProvider } else { Get-CimInstance Win32_Process -ErrorAction Stop })
+    $rootRecords = @($all | Where-Object { [uint32]$_.ProcessId -eq [uint32]$RootProcessId })
+    if ($rootRecords.Count -ne 1) { throw 'The owned tauri-driver process was absent from the process snapshot.' }
+    $rootRecord = $rootRecords[0]
+    $rootProcess = if ($ProcessProvider) { & $ProcessProvider $RootProcessId } else { Get-Process -Id $RootProcessId -ErrorAction Stop }
+    if ($null -eq $rootProcess -or [uint32]$rootProcess.Id -ne [uint32]$RootProcessId) { throw 'The owned tauri-driver process identity changed during capture.' }
+    try {
+        $rootCimTicks = ([datetime]$rootRecord.CreationDate).ToUniversalTime().Ticks
+        $rootLiveTicks = ([datetime]$rootProcess.StartTime).ToUniversalTime().Ticks
+    } catch {
+        throw 'The owned tauri-driver process timestamps were unavailable during capture.'
+    }
+    $tolerance = [int64]$script:LaunchPins.ProcessTimestampToleranceTicks
+    $rootDifference = if ($rootLiveTicks -ge $rootCimTicks) { $rootLiveTicks - $rootCimTicks } else { $rootCimTicks - $rootLiveTicks }
+    if ($tolerance -ne 10 -or $rootDifference -gt $tolerance) { throw 'The owned tauri-driver process identity changed during capture.' }
+    if ($rootLiveTicks + $tolerance -lt $StartedAfter.ToUniversalTime().Ticks) { throw 'The owned tauri-driver process predates its launch boundary.' }
     $owned = [Collections.Generic.HashSet[uint32]]::new()
     $null = $owned.Add([uint32]$RootProcessId)
+    $ownedStartTicks = @{}
+    $ownedStartTicks[[uint32]$RootProcessId] = $rootCimTicks
     do {
         $added = $false
         foreach ($process in $all) {
-            if ($owned.Contains([uint32]$process.ParentProcessId) -and $owned.Add([uint32]$process.ProcessId)) { $added = $true }
+            $processId = [uint32]$process.ProcessId
+            $parentProcessId = [uint32]$process.ParentProcessId
+            if ($owned.Contains($processId) -or -not $owned.Contains($parentProcessId)) { continue }
+            try { $candidateTicks = ([datetime]$process.CreationDate).ToUniversalTime().Ticks } catch { throw 'A launch descendant timestamp was unavailable during capture.' }
+            if ($candidateTicks + $tolerance -lt [int64]$ownedStartTicks[$parentProcessId] -or $candidateTicks + $tolerance -lt $rootCimTicks) { continue }
+            if ($owned.Add($processId)) {
+                $ownedStartTicks[$processId] = $candidateTicks
+                $added = $true
+            }
         }
     } while ($added)
     return @($all | Where-Object { $owned.Contains([uint32]$_.ProcessId) -and [uint32]$_.ProcessId -ne [uint32]$RootProcessId } | ForEach-Object {
-        $process = Get-Process -Id ([int]$_.ProcessId) -ErrorAction Stop
-        if ($process.StartTime.ToUniversalTime() -lt $StartedAfter) { throw 'A purported launch descendant predates the owned tauri-driver process.' }
-        [pscustomobject]@{ ProcessId = $process.Id; Path = [string]$process.Path; StartTicks = $process.StartTime.ToUniversalTime().Ticks; CommandLine = [string]$_.CommandLine }
+        $process = if ($ProcessProvider) { & $ProcessProvider ([int]$_.ProcessId) } else { Get-Process -Id ([int]$_.ProcessId) -ErrorAction Stop }
+        if ($null -eq $process -or [uint32]$process.Id -ne [uint32]$_.ProcessId) { throw 'A launch descendant identity changed during capture.' }
+        try {
+            $cimTicks = ([datetime]$_.CreationDate).ToUniversalTime().Ticks
+            $liveTicks = ([datetime]$process.StartTime).ToUniversalTime().Ticks
+        } catch {
+            throw 'A launch descendant timestamp was unavailable during capture.'
+        }
+        $difference = if ($liveTicks -ge $cimTicks) { $liveTicks - $cimTicks } else { $cimTicks - $liveTicks }
+        if ($difference -gt $tolerance -or $liveTicks + $tolerance -lt $rootLiveTicks) { throw 'A launch descendant identity changed during capture.' }
+        [pscustomobject]@{ ProcessId = $process.Id; ParentProcessId = [int]$_.ParentProcessId; Path = [string]$process.Path; StartTicks = $liveTicks; CommandLine = [string]$_.CommandLine }
     })
 }
 

@@ -411,6 +411,42 @@ $child=[Diagnostics.Process]::Start($info);[IO.File]::WriteAllText($ChildPidPath
     expect(result.status, result.stderr || result.stdout).toBe(0);
   });
 
+  it('uses one-microsecond process timestamp precision without capturing stale parent-PID collisions', () => {
+    const source = extractFunctions('scripts/installed-app-launch.ps1', ['Get-OwnedLaunchProcesses'], String.raw`
+      $script:LaunchPins=[ordered]@{ProcessTimestampToleranceTicks=10}
+      $base=[datetime]::SpecifyKind([datetime]'2026-01-01T00:00:00',[DateTimeKind]::Utc)
+      $records=@(
+        [pscustomobject]@{ProcessId=100;ParentProcessId=1;CreationDate=$base;CommandLine='root'},
+        [pscustomobject]@{ProcessId=101;ParentProcessId=100;CreationDate=$base.AddTicks(-9);CommandLine='rounded-child'},
+        [pscustomobject]@{ProcessId=102;ParentProcessId=101;CreationDate=$base.AddTicks(20);CommandLine='grandchild'},
+        [pscustomobject]@{ProcessId=200;ParentProcessId=100;CreationDate=$base.AddTicks(-11);CommandLine='stale'},
+        [pscustomobject]@{ProcessId=201;ParentProcessId=200;CreationDate=$base.AddTicks(30);CommandLine='stale-child'}
+      )
+      $live=@{
+        100=[pscustomobject]@{Id=100;StartTime=$base.AddTicks(9);Path='C:\fixture\root.exe'}
+        101=[pscustomobject]@{Id=101;StartTime=$base;Path='C:\fixture\child.exe'}
+        102=[pscustomobject]@{Id=102;StartTime=$base.AddTicks(29);Path='C:\fixture\grand.exe'}
+        200=[pscustomobject]@{Id=200;StartTime=$base.AddTicks(-2);Path='C:\fixture\stale.exe'}
+        201=[pscustomobject]@{Id=201;StartTime=$base.AddTicks(39);Path='C:\fixture\stale-child.exe'}
+      }
+      $owned=@(Get-OwnedLaunchProcesses -RootProcessId 100 -StartedAfter $base.AddTicks(10) -CimProvider {$records}.GetNewClosure() -ProcessProvider {param($id)$live[[int]$id]}.GetNewClosure())
+      if(($owned.ProcessId-join',')-cne'101,102'-or($owned.ParentProcessId-join',')-cne'100,101'){throw 'Temporal parent-chain filtering changed.'}
+      foreach($bad in @(
+        [pscustomobject]@{records=$records;live=@{100=[pscustomobject]@{Id=100;StartTime=$base.AddTicks(9);Path='root'}};started=$base.AddTicks(20);message='predates its launch boundary'},
+        [pscustomobject]@{records=$records;live=@{100=[pscustomobject]@{Id=100;StartTime=$base.AddTicks(11);Path='root'}};started=$base;message='identity changed during capture'}
+      )){
+        if($bad.message-ceq'identity changed during capture'){$bad.records=@($records|ForEach-Object{if($_.ProcessId-eq100){[pscustomobject]@{ProcessId=100;ParentProcessId=1;CreationDate=$base.AddTicks(-1);CommandLine='root'}}else{$_}})}
+        $rejected=$false;try{Get-OwnedLaunchProcesses -RootProcessId 100 -StartedAfter $bad.started -CimProvider {$bad.records}.GetNewClosure() -ProcessProvider {param($id)$bad.live[[int]$id]}.GetNewClosure()|Out-Null}catch{if($_.Exception.Message-match[regex]::Escape($bad.message)){$rejected=$true}}
+        if(-not$rejected){throw ('Timestamp boundary was not rejected: '+$bad.message)}
+      }
+      $reused=@{}+$live;$reused[102]=[pscustomobject]@{Id=102;StartTime=$base.AddTicks(31);Path='C:\fixture\reused.exe'}
+      $rejected=$false;try{Get-OwnedLaunchProcesses -RootProcessId 100 -StartedAfter $base -CimProvider {$records}.GetNewClosure() -ProcessProvider {param($id)$reused[[int]$id]}.GetNewClosure()|Out-Null}catch{if($_.Exception.Message-ceq'A launch descendant identity changed during capture.'){$rejected=$true}}
+      if(-not$rejected){throw 'A live/CIM PID-reuse mismatch was accepted.'}
+    `);
+    const result = runPowerShell(source);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
   it('classifies only fixed residual process categories and fails closed for unknown or multiple entries', () => {
     const source = extractFunctions('scripts/installed-app-launch.ps1', ['Get-LaunchProcessCategory', 'Get-LaunchResidualCategory', 'Get-LaunchResidualFacts'], String.raw`
       $cases=@(
@@ -431,6 +467,7 @@ $child=[Diagnostics.Process]::Start($info);[IO.File]::WriteAllText($ChildPidPath
 
   it('reports a newly orphaned descendant as uncaptured without weakening identity-bound cleanup', () => {
     const source = extractFunctions('scripts/installed-app-launch.ps1', ['Get-OwnedLaunchProcesses', 'Wait-BoundedOwnedProcessExit', 'Get-LaunchProcessCategory', 'Get-CapturedCategoryOutcome', 'Stop-OwnedLaunchProcesses', 'Get-LaunchResidualFacts', 'Assert-LaunchCleanupState'], String.raw`
+      $script:LaunchPins=[ordered]@{ProcessTimestampToleranceTicks=10}
       $root=Join-Path (Resolve-Path target) ('orphan-diagnostic-'+[Guid]::NewGuid().ToString('N'));[IO.Directory]::CreateDirectory($root)|Out-Null;$gate=Join-Path $root 'spawn.gate';$middlePid=Join-Path $root 'middle.pid';$grandPid=Join-Path $root 'grand.pid';$middleScript=Join-Path $root 'middle.ps1';$rootScript=Join-Path $root 'root.ps1';$pwsh=(Get-Process -Id $PID).Path
       $middleSource=@'
 param([string]$Gate,[string]$GrandPid,[string]$Pwsh)

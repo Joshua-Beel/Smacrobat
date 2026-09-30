@@ -127,6 +127,8 @@ describe('installed persistence WebDriver proof', () => {
   });
 
   it('allows only the exact captured app, driver, and at least one WebView descendant', () => {
+    const launchSource = readFileSync('scripts/installed-app-launch.ps1', 'utf8');
+    expect(launchSource).toContain('ParentProcessId = [int]$_.ParentProcessId');
     const check = String.raw`
       $tokens=$null;$errors=$null
       $ast=[Management.Automation.Language.Parser]::ParseFile('${process.cwd().replaceAll("'", "''")}\scripts\installed-persistence.ps1',[ref]$tokens,[ref]$errors)
