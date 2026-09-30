@@ -90,6 +90,67 @@ function Get-UiControlTypeName {
     try { return [string]$Element.Current.ControlType.ProgrammaticName } catch { return '' }
 }
 
+function Get-SanitizedProcessUiStructureReceipt {
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)][scriptblock]$ElementProvider
+    )
+    $topLevel = @(& $ElementProvider $ProcessId $true)
+    $elements = @(& $ElementProvider $ProcessId $false)
+    if ($topLevel.Count -gt $script:PrintPins.UiElementMaximum -or $elements.Count -gt $script:PrintPins.UiElementMaximum) {
+        throw 'Native print UI diagnostics exceeded the bounded element count.'
+    }
+    foreach ($element in $topLevel) { Assert-ProcessUiElement -Element $element -ProcessId $ProcessId }
+    $counts = [ordered]@{
+        window = 0; pane = 0; button = 0; radioButton = 0; comboBox = 0
+        edit = 0; list = 0; listItem = 0; other = 0
+    }
+    foreach ($element in $elements) {
+        Assert-ProcessUiElement -Element $element -ProcessId $ProcessId
+        switch (Get-UiControlTypeName -Element $element) {
+            'ControlType.Window' { $counts.window++; break }
+            'ControlType.Pane' { $counts.pane++; break }
+            'ControlType.Button' { $counts.button++; break }
+            'ControlType.RadioButton' { $counts.radioButton++; break }
+            'ControlType.ComboBox' { $counts.comboBox++; break }
+            'ControlType.Edit' { $counts.edit++; break }
+            'ControlType.List' { $counts.list++; break }
+            'ControlType.ListItem' { $counts.listItem++; break }
+            default { $counts.other++ }
+        }
+    }
+    return [pscustomobject][ordered]@{
+        inventoryStatus = 'available'
+        topLevelWindowCount = [int]$topLevel.Count
+        processElementCount = [int]$elements.Count
+        windowCount = [int]$counts.window
+        paneCount = [int]$counts.pane
+        buttonCount = [int]$counts.button
+        radioButtonCount = [int]$counts.radioButton
+        comboBoxCount = [int]$counts.comboBox
+        editCount = [int]$counts.edit
+        listCount = [int]$counts.list
+        listItemCount = [int]$counts.listItem
+        otherCount = [int]$counts.other
+    }
+}
+
+function Get-SanitizedProcessUiStructureJson {
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [scriptblock]$ElementProvider,
+        [switch]$DeadlineExpired
+    )
+    $unavailable = '{"inventoryStatus":"unavailable","topLevelWindowCount":-1,"processElementCount":-1,"windowCount":-1,"paneCount":-1,"buttonCount":-1,"radioButtonCount":-1,"comboBoxCount":-1,"editCount":-1,"listCount":-1,"listItemCount":-1,"otherCount":-1}'
+    if ($DeadlineExpired) { return $unavailable }
+    try {
+        if (-not $ElementProvider) { throw 'A bounded UI element provider is required before the deadline.' }
+        return (Get-SanitizedProcessUiStructureReceipt -ProcessId $ProcessId -ElementProvider $ElementProvider | ConvertTo-Json -Compress)
+    } catch {
+        return $unavailable
+    }
+}
+
 function Find-ProcessUiElement {
     param(
         [Parameter(Mandatory = $true)][int]$ProcessId,
@@ -136,6 +197,7 @@ function Wait-ProcessUiElement {
         [Parameter(Mandatory = $true)][string[]]$Names,
         [string[]]$ControlTypes = @(),
         [switch]$WindowsOnly,
+        [Parameter(Mandatory = $true)][ValidateSet('first-print-dialog','second-print-dialog','current-page-control','save-output-dialog')][string]$Stage,
         [Parameter(Mandatory = $true)][datetime]$Deadline
     )
     do {
@@ -143,11 +205,12 @@ function Wait-ProcessUiElement {
             $match = Find-ProcessUiElement -ProcessId $ProcessId -Names $Names -ControlTypes $ControlTypes -WindowsOnly:$WindowsOnly -AllowNone
             if ($null -ne $match) { return $match }
         } catch {
-            if ([datetime]::UtcNow -ge $Deadline) { throw }
+            if ([datetime]::UtcNow -ge $Deadline) { break }
         }
         Start-Sleep -Milliseconds 150
     } while ([datetime]::UtcNow -lt $Deadline)
-    throw 'Native print UI target did not appear before its bounded deadline.'
+    $structure = Get-SanitizedProcessUiStructureJson -ProcessId $ProcessId -DeadlineExpired
+    throw "Native print UI stage '$Stage' timed out; uiStructure=$structure."
 }
 
 function Invoke-ProcessUiElement {
@@ -189,7 +252,12 @@ function Set-ProcessUiElementValue {
 }
 
 function Wait-ProcessUiWindowClosed {
-    param([Parameter(Mandatory = $true)][int]$ProcessId,[Parameter(Mandatory = $true)][string[]]$Names,[Parameter(Mandatory = $true)][datetime]$Deadline)
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)][string[]]$Names,
+        [Parameter(Mandatory = $true)][ValidateSet('first-print-dialog','second-print-dialog','save-output-dialog','final-native-cleanup')][string]$Stage,
+        [Parameter(Mandatory = $true)][datetime]$Deadline
+    )
     do {
         $foundWindows = @()
         foreach ($element in @(Get-ProcessUiElements -ProcessId $ProcessId -WindowsOnly)) {
@@ -201,7 +269,8 @@ function Wait-ProcessUiWindowClosed {
         if ($foundWindows.Count -eq 0) { return }
         Start-Sleep -Milliseconds 150
     } while ([datetime]::UtcNow -lt $Deadline)
-    throw 'Native print UI window remained open after its bounded close action.'
+    $structure = Get-SanitizedProcessUiStructureJson -ProcessId $ProcessId -DeadlineExpired
+    throw "Native print UI stage '$Stage' remained open after its bounded close action; uiStructure=$structure."
 }
 
 function Open-NativePrintDialogFromWebView {
@@ -247,17 +316,21 @@ return document.querySelectorAll('dialog[aria-labelledby="print-title"]').length
 }
 
 function Cancel-NativePrintDialog {
-    param([Parameter(Mandatory = $true)][int]$ProcessId,[Parameter(Mandatory = $true)][datetime]$Deadline)
-    $window = Wait-ProcessUiElement -ProcessId $ProcessId -Names @('Print') -ControlTypes @('ControlType.Window') -WindowsOnly -Deadline $Deadline
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)][ValidateSet('first-print-dialog','second-print-dialog')][string]$Stage,
+        [Parameter(Mandatory = $true)][datetime]$Deadline
+    )
+    $window = Wait-ProcessUiElement -ProcessId $ProcessId -Names @('Print') -ControlTypes @('ControlType.Window') -WindowsOnly -Stage $Stage -Deadline $Deadline
     $cancel = Find-ProcessUiElement -ProcessId $ProcessId -Names @('Cancel') -ControlTypes @('ControlType.Button')
     Invoke-ProcessUiElement -Element $cancel -ProcessId $ProcessId
-    Wait-ProcessUiWindowClosed -ProcessId $ProcessId -Names @('Print') -Deadline $Deadline
+    Wait-ProcessUiWindowClosed -ProcessId $ProcessId -Names @('Print') -Stage $Stage -Deadline $Deadline
     return $window
 }
 
 function Select-PdfPrinterAndCurrentPage {
     param([Parameter(Mandatory = $true)][int]$ProcessId,[Parameter(Mandatory = $true)][datetime]$Deadline)
-    $null = Wait-ProcessUiElement -ProcessId $ProcessId -Names @('Print') -ControlTypes @('ControlType.Window') -WindowsOnly -Deadline $Deadline
+    $null = Wait-ProcessUiElement -ProcessId $ProcessId -Names @('Print') -ControlTypes @('ControlType.Window') -WindowsOnly -Stage 'second-print-dialog' -Deadline $Deadline
     $printer = $null
     try { $printer = Find-ProcessUiElement -ProcessId $ProcessId -Names @($script:PrintPins.PrinterName) } catch {
         $combos = @(Get-ProcessUiElements -ProcessId $ProcessId | Where-Object { (Get-UiControlTypeName -Element $_) -ceq 'ControlType.ComboBox' })
@@ -275,7 +348,7 @@ function Select-PdfPrinterAndCurrentPage {
     }
     if ($null -eq $printer) { throw 'Microsoft Print to PDF was not exposed by the process-bound native dialog.' }
     Select-ProcessUiElement -Element $printer -ProcessId $ProcessId
-    $current = Wait-ProcessUiElement -ProcessId $ProcessId -Names @('Current Page','Current page') -ControlTypes @('ControlType.RadioButton') -Deadline $Deadline
+    $current = Wait-ProcessUiElement -ProcessId $ProcessId -Names @('Current Page','Current page') -ControlTypes @('ControlType.RadioButton') -Stage 'current-page-control' -Deadline $Deadline
     Select-ProcessUiElement -Element $current -ProcessId $ProcessId
 }
 
@@ -288,8 +361,8 @@ function Submit-NativePrintToPdf {
     Select-PdfPrinterAndCurrentPage -ProcessId $ProcessId -Deadline $Deadline
     $print = Find-ProcessUiElement -ProcessId $ProcessId -Names @('Print') -ControlTypes @('ControlType.Button')
     Invoke-ProcessUiElement -Element $print -ProcessId $ProcessId
-    Wait-ProcessUiWindowClosed -ProcessId $ProcessId -Names @('Print') -Deadline $Deadline
-    $null = Wait-ProcessUiElement -ProcessId $ProcessId -Names @('Save Print Output As','Save As') -ControlTypes @('ControlType.Window') -WindowsOnly -Deadline $Deadline
+    Wait-ProcessUiWindowClosed -ProcessId $ProcessId -Names @('Print') -Stage 'second-print-dialog' -Deadline $Deadline
+    $null = Wait-ProcessUiElement -ProcessId $ProcessId -Names @('Save Print Output As','Save As') -ControlTypes @('ControlType.Window') -WindowsOnly -Stage 'save-output-dialog' -Deadline $Deadline
     try {
         $filename = Find-ProcessUiElementByAutomationId -ProcessId $ProcessId -AutomationIds @('1001','FileNameControlHost') -ControlTypes @('ControlType.Edit')
     } catch {
@@ -298,7 +371,7 @@ function Submit-NativePrintToPdf {
     Set-ProcessUiElementValue -Element $filename -ProcessId $ProcessId -Value $OutputPath
     $save = Find-ProcessUiElement -ProcessId $ProcessId -Names @('Save') -ControlTypes @('ControlType.Button')
     Invoke-ProcessUiElement -Element $save -ProcessId $ProcessId
-    Wait-ProcessUiWindowClosed -ProcessId $ProcessId -Names @('Save Print Output As','Save As') -Deadline $Deadline
+    Wait-ProcessUiWindowClosed -ProcessId $ProcessId -Names @('Save Print Output As','Save As') -Stage 'save-output-dialog' -Deadline $Deadline
 }
 
 function Wait-StablePrintFile {
@@ -534,7 +607,7 @@ return document.querySelectorAll('dialog[aria-labelledby="print-title"]').length
 
         Open-NativePrintDialogFromWebView -SessionId $sessionId -Deadline $deadline
         $nativeDeadline = Get-PrintPhaseDeadline -TotalDeadline $deadline -MaximumMilliseconds $script:PrintPins.NativeDialogTimeoutMilliseconds
-        $null = Cancel-NativePrintDialog -ProcessId $appProcessId -Deadline $nativeDeadline
+        $null = Cancel-NativePrintDialog -ProcessId $appProcessId -Stage 'first-print-dialog' -Deadline $nativeDeadline
         $cancelStatus = Wait-WebPrintStatus -SessionId $sessionId -Prefix 'Printing canceled.' -Deadline $deadline
 
         Open-NativePrintDialogFromWebView -SessionId $sessionId -Deadline $deadline
@@ -554,11 +627,11 @@ return document.querySelectorAll('dialog[aria-labelledby="print-title"]').length
                 correlation=[double]$comparison.correlation;meanAbsoluteDifference=[double]$comparison.meanAbsoluteDifference
             }
         } else {
-            $null = Cancel-NativePrintDialog -ProcessId $appProcessId -Deadline $nativeDeadline
+            $null = Cancel-NativePrintDialog -ProcessId $appProcessId -Stage 'second-print-dialog' -Deadline $nativeDeadline
             $null = Wait-WebPrintStatus -SessionId $sessionId -Prefix 'Printing canceled.' -Deadline $deadline
         }
         Close-WebPrintDialog -SessionId $sessionId -Deadline $deadline
-        Wait-ProcessUiWindowClosed -ProcessId $appProcessId -Names @('Print','Save Print Output As','Save As') -Deadline (Get-PrintPhaseDeadline -TotalDeadline $deadline -MaximumMilliseconds 3000)
+        Wait-ProcessUiWindowClosed -ProcessId $appProcessId -Names @('Print','Save Print Output As','Save As') -Stage 'final-native-cleanup' -Deadline (Get-PrintPhaseDeadline -TotalDeadline $deadline -MaximumMilliseconds 3000)
         $captured += @(Get-OwnedLaunchProcesses -RootProcessId $driver.Id -StartedAfter $startedAfter)
         $captured = @(Get-UniqueOwnedLaunchProcesses -Processes $captured)
         Assert-PrintOwnedExecutables -Owned $captured -ApplicationPath $ApplicationPath -EdgeDriverPath $EdgeDriverPath

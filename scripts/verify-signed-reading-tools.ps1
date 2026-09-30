@@ -192,7 +192,7 @@ function New-ProtectedReadingFixture {
         & $writeAscii "trailer`n<< /Size 7 /Root 1 0 R /Encrypt 6 0 R /ID [<$id><$id>] >>`nstartxref`n$xref`n%%EOF`n"
         [IO.File]::WriteAllBytes($Destination,$memory.ToArray())
     } finally { $memory.Dispose() }
-    Assert-FileReceipt -Path $Destination -Bytes $script:ReadingVerificationPins.ProtectedFixtureBytes -Sha256 $script:ReadingVerificationPins.ProtectedFixtureSha256 -Kind 'Deterministic protected reading fixture'
+    Assert-ReadingFileReceipt -Path $Destination -Bytes $script:ReadingVerificationPins.ProtectedFixtureBytes -Sha256 $script:ReadingVerificationPins.ProtectedFixtureSha256 -Kind 'Deterministic protected reading fixture'
 }
 
 function Write-SanitizedReadingRecord {
@@ -260,7 +260,7 @@ $profileRoot = Resolve-ReadingRunnerPath -Path $WebViewProfileRoot -MustBeFresh
 $settingsRoot = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'local.pdfworkstation.desktop')).TrimEnd('\')
 
 $recordPath = Join-Path $signedRoot $script:ReadingVerificationPins.SignedRecordName
-Assert-FileReceipt -Path $recordPath -Bytes $script:ReadingVerificationPins.SignedRecordBytes -Sha256 $script:ReadingVerificationPins.SignedRecordSha256 -Kind 'Signed reading artifact record'
+Assert-ReadingFileReceipt -Path $recordPath -Bytes $script:ReadingVerificationPins.SignedRecordBytes -Sha256 $script:ReadingVerificationPins.SignedRecordSha256 -Kind 'Signed reading artifact record'
 $artifactRecord = Get-Content -LiteralPath $recordPath -Raw -Encoding UTF8 | ConvertFrom-Json
 if ([string]$artifactRecord.sourceRevision -cne $script:ReadingVerificationPins.SignedSourceRevision -or
     [string]$artifactRecord.packagedApplication.sha256 -cnotmatch '^[A-F0-9]{64}$' -or [uint64]$artifactRecord.packagedApplication.bytes -eq 0) {
@@ -272,8 +272,8 @@ if ($welcomeRecords.Count -ne 1 -or [string]$welcomeRecords[0].sha256 -cnotmatch
 $installRoot = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'PDF Workstation')).TrimEnd('\')
 $application = Get-UniqueInstalledReadingResource -InstallRoot $installRoot -Suffix 'pdf-workstation.exe'
 $welcome = Get-UniqueInstalledReadingResource -InstallRoot $installRoot -Suffix 'resources/welcome.pdf'
-Assert-FileReceipt -Path $application.FullName -Bytes ([uint64]$artifactRecord.packagedApplication.bytes) -Sha256 ([string]$artifactRecord.packagedApplication.sha256) -Kind 'Installed signed reading application'
-Assert-FileReceipt -Path $welcome.FullName -Bytes ([uint64]$welcomeRecords[0].bytes) -Sha256 ([string]$welcomeRecords[0].sha256) -Kind 'Installed signed reading fixture'
+Assert-ReadingFileReceipt -Path $application.FullName -Bytes ([uint64]$artifactRecord.packagedApplication.bytes) -Sha256 ([string]$artifactRecord.packagedApplication.sha256) -Kind 'Installed signed reading application'
+Assert-ReadingFileReceipt -Path $welcome.FullName -Bytes ([uint64]$welcomeRecords[0].bytes) -Sha256 ([string]$welcomeRecords[0].sha256) -Kind 'Installed signed reading fixture'
 
 [IO.Directory]::CreateDirectory($work) | Out-Null
 $plainFixture = Join-Path $work 'reading-source.pdf'
@@ -285,8 +285,8 @@ $protectedReceipt = Get-ReadingFileReceipt -Path $protectedFixture
 
 $uiResult = Invoke-InstalledReadingTools -ApplicationPath $application.FullName -ApplicationReceipt $artifactRecord.packagedApplication -WebDriverRoot $driverRoot -ProfileRoot $profileRoot -SettingsRoot $settingsRoot -PlainFixture $plainFixture -ProtectedFixture $protectedFixture -PlainReceipt $plainReceipt -ProtectedReceipt $protectedReceipt -ExpectedPublisher $script:ReadingVerificationPins.ExpectedPublisher
 if (@(Get-LaunchProcessSnapshot).Count -ne 0) { throw 'Reading-tools verification left a relevant process running.' }
-Assert-FileReceipt -Path $plainFixture -Bytes ([uint64]$plainReceipt.bytes) -Sha256 ([string]$plainReceipt.sha256) -Kind 'Final plain reading fixture'
-Assert-FileReceipt -Path $protectedFixture -Bytes ([uint64]$protectedReceipt.bytes) -Sha256 ([string]$protectedReceipt.sha256) -Kind 'Final protected reading fixture'
+Assert-ReadingFileReceipt -Path $plainFixture -Bytes ([uint64]$plainReceipt.bytes) -Sha256 ([string]$plainReceipt.sha256) -Kind 'Final plain reading fixture'
+Assert-ReadingFileReceipt -Path $protectedFixture -Bytes ([uint64]$protectedReceipt.bytes) -Sha256 ([string]$protectedReceipt.sha256) -Kind 'Final protected reading fixture'
 $record = Write-SanitizedReadingRecord -OutputRoot $output -WorkflowSourceRevision $env:GITHUB_SHA -SourceParity $sourceParity -PlainReceipt $plainReceipt -ProtectedReceipt $protectedReceipt -UiResult $uiResult
 Write-Output 'Installed signed reading-tools verification succeeded.'
 Write-Output ('Sanitized record SHA-256: ' + (Get-ExactSha256 -Path $record))

@@ -115,6 +115,23 @@ describe('installed signed reading-tools verifier', () => {
     expect(source).toContain('Assert-BoundedJsonShape');
   });
 
+  it('loads and executes the production receipt helper in a standalone reading script process', () => {
+    const source = String.raw`
+      $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
+      . '${process.cwd().replaceAll("'", "''")}\scripts\installed-reading-tools.ps1'
+      $root=Join-Path (Resolve-Path target) ('reading-receipt-'+[Guid]::NewGuid().ToString('N'))
+      [IO.Directory]::CreateDirectory($root)|Out-Null
+      $path=Join-Path $root 'receipt.bin';[IO.File]::WriteAllBytes($path,[byte[]](1,2,3,4))
+      $sha=Get-ExactSha256 -Path $path
+      Assert-ReadingFileReceipt -Path $path -Bytes 4 -Sha256 $sha -Kind 'Standalone receipt fixture'
+      [IO.File]::WriteAllBytes($path,[byte[]](1,2,3,5))
+      $rejected=$false;try{Assert-ReadingFileReceipt -Path $path -Bytes 4 -Sha256 $sha -Kind 'Standalone receipt fixture'}catch{$rejected=$true}
+      if(-not$rejected){throw 'The production receipt helper accepted changed bytes.'}
+    `;
+    const result = runPowerShell(source);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
   it('generates the exact deterministic encrypted PDF without a helper binary or network', () => {
     const script = readFileSync('scripts/verify-signed-reading-tools.ps1', 'utf8');
     expect(script).not.toMatch(/cargo|rustc|Invoke-WebRequest|Invoke-RestMethod|https?:\/\//i);
@@ -122,12 +139,7 @@ describe('installed signed reading-tools verifier', () => {
       'Join-ReadingByteArrays', 'Get-ReadingMd5', 'Invoke-ReadingRc4',
       'Get-ReadingPasswordPad', 'New-ProtectedReadingFixture',
     ], String.raw`
-      function Assert-FileReceipt {
-        param([string]$Path,[uint64]$Bytes,[string]$Sha256,[string]$Kind)
-        $item=Get-Item -LiteralPath $Path
-        $actual=(Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
-        if([uint64]$item.Length-ne$Bytes-or$actual-cne$Sha256){throw 'Fixture receipt mismatch.'}
-      }
+      . '${process.cwd().replaceAll("'", "''")}\scripts\installed-reading-tools.ps1'
       $script:ReadingVerificationPins=[ordered]@{ProtectedFixtureBytes=[uint64]912;ProtectedFixtureSha256='9BE85022232671CFD796C711E0B8B06847E7020D49AA07FA20DBD6DADE168A37'}
       $root=Join-Path (Resolve-Path target) ('reading-fixture-'+[Guid]::NewGuid().ToString('N'))
       [IO.Directory]::CreateDirectory($root)|Out-Null

@@ -138,17 +138,39 @@ const rows=[...document.querySelectorAll('button')].filter(x=>x.querySelector('s
 '@
 }
 
+function Get-PersistenceSampleRenderScript {
+    $script = @'
+const i=document.querySelector('img[alt="Page 1"]');return {tab:[...document.querySelectorAll('button')].some(x=>x.textContent.includes('welcome.pdf')),pages:[...document.querySelectorAll('span')].some(x=>x.textContent.trim()==='/ 6'),image:!!i&&i.complete&&i.naturalWidth>0&&i.src.startsWith('blob:')};
+'@
+    return $script.Trim()
+}
+
+function Get-PersistenceZoomObserveScript {
+    param([ValidateSet(125,150,175)][int]$Expected)
+    $script = @'
+const z=document.querySelector('select[aria-label="Zoom"]');return z?.value==='__EXPECTED_ZOOM__';
+'@
+    return $script.Trim().Replace('__EXPECTED_ZOOM__',[string]$Expected)
+}
+
+function Get-PersistenceImageRenderScript {
+    $script = @'
+const i=document.querySelector('img[alt="Page 1"]');return !!i&&i.complete&&i.naturalWidth>0&&i.src.startsWith('blob:');
+'@
+    return $script.Trim()
+}
+
 function Invoke-PersistenceUiFlow {
     param([string]$SessionId,[datetime]$Deadline,[ValidateSet('write','verify-and-clear','verify-cleared')][string]$Mode)
     $homeOracle = Wait-PersistenceUi -SessionId $SessionId -Deadline $Deadline -Stage 'home-ready' -Script "return {ready:document.readyState==='complete',title:document.title,sample:[...document.querySelectorAll('button')].some(x=>x.textContent.trim()==='Explore a sample PDF')};" -Predicate { param($v) [bool]$v.ready -and [string]$v.title -ceq 'PDF Workstation' -and [bool]$v.sample }
     if ($Mode -ceq 'write') {
         $clicked = Invoke-PersistenceUiScript -SessionId $SessionId -Deadline $Deadline -Stage 'sample-open' -Script "const b=[...document.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Explore a sample PDF');if(b.length===1)b[0].click();return b.length===1;"
         if ($clicked -isnot [bool] -or -not $clicked) { throw 'The exact installed sample UI control was unavailable.' }
-        $null = Wait-PersistenceUi -SessionId $SessionId -Deadline $Deadline -Stage 'sample-render' -Script "const i=document.querySelector('img[alt=\"Page 1\"]');return {tab:[...document.querySelectorAll('button')].some(x=>x.textContent.includes('welcome.pdf')),pages:[...document.querySelectorAll('span')].some(x=>x.textContent.trim()==='/ 6'),image:!!i&&i.complete&&i.naturalWidth>0&&i.src.startsWith('blob:')};" -Predicate { param($v) [bool]$v.tab -and [bool]$v.pages -and [bool]$v.image }
+        $null = Wait-PersistenceUi -SessionId $SessionId -Deadline $Deadline -Stage 'sample-render' -Script (Get-PersistenceSampleRenderScript) -Predicate { param($v) [bool]$v.tab -and [bool]$v.pages -and [bool]$v.image }
         foreach ($expected in @(125,150,175)) {
             $zoomed = Invoke-PersistenceUiScript -SessionId $SessionId -Deadline $Deadline -Stage 'zoom-change' -Script "const b=[...document.querySelectorAll('button')].filter(x=>x.getAttribute('aria-label')==='Zoom in');if(b.length===1)b[0].click();return b.length===1;"
             if ($zoomed -isnot [bool] -or -not $zoomed) { throw 'The exact Zoom in UI control was unavailable.' }
-            $null = Wait-PersistenceUi -SessionId $SessionId -Deadline $Deadline -Stage 'zoom-observe' -Script "const z=document.querySelector('select[aria-label=\"Zoom\"]');return z?.value==='${expected}';" -Predicate { param($v) $v -is [bool] -and $v }
+            $null = Wait-PersistenceUi -SessionId $SessionId -Deadline $Deadline -Stage 'zoom-observe' -Script (Get-PersistenceZoomObserveScript -Expected $expected) -Predicate { param($v) $v -is [bool] -and $v }
         }
         $changed = Invoke-PersistenceUiScript -SessionId $SessionId -Deadline $Deadline -Stage 'preference-controls' -Script "const labels=['Fit page','Select text on page','Collapse all tools','Pages','Toggle theme'],buttons=labels.map(a=>[...document.querySelectorAll('button')].filter(x=>x.getAttribute('aria-label')===a));if(buttons.some(x=>x.length!==1))return false;for(const b of buttons)b[0].click();return true;"
         if ($changed -isnot [bool] -or -not $changed) { throw 'One or more exact reading preference UI controls were unavailable.' }
@@ -169,7 +191,7 @@ function Invoke-PersistenceUiFlow {
         $null = Wait-PersistenceUi -SessionId $SessionId -Deadline $Deadline -Stage 'starred-section-observe' -Script (Get-PersistenceRecentStateScript) -Predicate { param($v) [int]$v.rows -eq 1 -and [int]$v.pages -eq $script:PersistencePins.SamplePages -and [bool]$v.starred }
         $opened = Invoke-PersistenceUiScript -SessionId $SessionId -Deadline $Deadline -Stage 'recent-reopen' -Script "const b=[...document.querySelectorAll('button')].filter(x=>x.querySelector('small')?.textContent.trim()==='PDF document'&&x.querySelector('span')?.childNodes[0]?.textContent.trim()==='welcome.pdf');if(b.length===1)b[0].click();return b.length===1;"
         if ($opened -isnot [bool] -or -not $opened) { throw 'The exact recent sample UI row was unavailable.' }
-        $null = Wait-PersistenceUi -SessionId $SessionId -Deadline $Deadline -Stage 'recent-reopen-render' -Script "const i=document.querySelector('img[alt=\"Page 1\"]');return !!i&&i.complete&&i.naturalWidth>0&&i.src.startsWith('blob:');" -Predicate { param($v) $v -is [bool] -and $v }
+        $null = Wait-PersistenceUi -SessionId $SessionId -Deadline $Deadline -Stage 'recent-reopen-render' -Script (Get-PersistenceImageRenderScript) -Predicate { param($v) $v -is [bool] -and $v }
         $documentState = Wait-PersistenceUi -SessionId $SessionId -Deadline $Deadline -Stage 'preference-restart-observe' -Script (Get-PersistenceDocumentStateScript) -Predicate { param($v) [string]$v.fit -ceq 'page' -and [int]$v.retainedZoom -eq $script:PersistencePins.Zoom -and [bool]$v.selectActive -and -not [bool]$v.panActive -and -not [bool]$v.toolsPanel -and [bool]$v.pagesPanel -and [bool]$v.dark }
         $homeClick = Invoke-PersistenceUiScript -SessionId $SessionId -Deadline $Deadline -Stage 'clear-home-return' -Script "const b=[...document.querySelectorAll('button')].filter(x=>x.getAttribute('aria-label')==='Home');if(b.length===1)b[0].click();return b.length===1;"
         if ($homeClick -isnot [bool] -or -not $homeClick) { throw 'The exact Home UI control was unavailable before clearing history.' }
@@ -184,7 +206,7 @@ function Invoke-PersistenceUiFlow {
     $clearedState = Wait-PersistenceUi -SessionId $SessionId -Deadline $Deadline -Stage 'clear-restart-observe' -Script (Get-PersistenceRecentStateScript) -Predicate { param($v) [int]$v.rows -eq 0 -and [int]$v.pages -eq 0 -and -not [bool]$v.starred -and -not [bool]$v.clearEnabled }
     $clicked = Invoke-PersistenceUiScript -SessionId $SessionId -Deadline $Deadline -Stage 'post-clear-sample-open' -Script "const b=[...document.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Explore a sample PDF');if(b.length===1)b[0].click();return b.length===1;"
     if ($clicked -isnot [bool] -or -not $clicked) { throw 'The exact installed sample UI control was unavailable after the clear-history restart.' }
-    $null = Wait-PersistenceUi -SessionId $SessionId -Deadline $Deadline -Stage 'post-clear-sample-render' -Script "const i=document.querySelector('img[alt=\"Page 1\"]');return !!i&&i.complete&&i.naturalWidth>0&&i.src.startsWith('blob:');" -Predicate { param($v) $v -is [bool] -and $v }
+    $null = Wait-PersistenceUi -SessionId $SessionId -Deadline $Deadline -Stage 'post-clear-sample-render' -Script (Get-PersistenceImageRenderScript) -Predicate { param($v) $v -is [bool] -and $v }
     $documentState = Wait-PersistenceUi -SessionId $SessionId -Deadline $Deadline -Stage 'post-clear-preference-observe' -Script (Get-PersistenceDocumentStateScript) -Predicate { param($v) [string]$v.fit -ceq 'page' -and [int]$v.retainedZoom -eq $script:PersistencePins.Zoom -and [bool]$v.selectActive -and -not [bool]$v.panActive -and -not [bool]$v.toolsPanel -and [bool]$v.pagesPanel -and [bool]$v.dark }
     return [pscustomobject]@{ preferences = $documentState; recentPresent = $false; starred = $false; clearPersisted = $true }
 }

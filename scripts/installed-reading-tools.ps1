@@ -17,6 +17,14 @@ $script:ReadingPins = [ordered]@{
     Password = 'test password'
 }
 
+function Assert-ReadingFileReceipt {
+    param([Parameter(Mandatory = $true)][string]$Path,[Parameter(Mandatory = $true)][uint64]$Bytes,[Parameter(Mandatory = $true)][string]$Sha256,[Parameter(Mandatory = $true)][string]$Kind)
+    Assert-NoReparseAncestors -Path $Path
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "$Kind is missing." }
+    $item = Get-Item -LiteralPath $Path -Force
+    if ([uint64]$item.Length -ne $Bytes -or (Get-ExactSha256 -Path $Path) -cne $Sha256) { throw "$Kind does not match its exact receipt." }
+}
+
 function Get-ReadingSha256 {
     param([Parameter(Mandatory = $true)][byte[]]$Bytes)
     $sha = [Security.Cryptography.SHA256]::Create()
@@ -460,13 +468,13 @@ function Invoke-InstalledReadingTools {
     Assert-WebDriverReceipt -Receipt $receipt
     $tauriDriver = Join-Path $WebDriverRoot 'tauri-driver-install/bin/tauri-driver.exe'
     $edgeDriver = Join-Path $WebDriverRoot 'edge-driver/msedgedriver.exe'
-    Assert-FileReceipt -Path $ApplicationPath -Bytes ([uint64]$ApplicationReceipt.bytes) -Sha256 ([string]$ApplicationReceipt.sha256) -Kind 'Installed signed reading-tools application'
+    Assert-ReadingFileReceipt -Path $ApplicationPath -Bytes ([uint64]$ApplicationReceipt.bytes) -Sha256 ([string]$ApplicationReceipt.sha256) -Kind 'Installed signed reading-tools application'
     $null = Assert-TrustedWindowsSignature -Path $ApplicationPath -ExpectedPublisher $ExpectedPublisher
-    Assert-FileReceipt -Path $tauriDriver -Bytes ([uint64]$receipt.tauriDriver.bytes) -Sha256 ([string]$receipt.tauriDriver.sha256) -Kind 'Pinned reading-tools tauri-driver'
-    Assert-FileReceipt -Path $edgeDriver -Bytes ([uint64]$receipt.edgeDriver.bytes) -Sha256 ([string]$receipt.edgeDriver.sha256) -Kind 'Pinned reading-tools EdgeDriver'
+    Assert-ReadingFileReceipt -Path $tauriDriver -Bytes ([uint64]$receipt.tauriDriver.bytes) -Sha256 ([string]$receipt.tauriDriver.sha256) -Kind 'Pinned reading-tools tauri-driver'
+    Assert-ReadingFileReceipt -Path $edgeDriver -Bytes ([uint64]$receipt.edgeDriver.bytes) -Sha256 ([string]$receipt.edgeDriver.sha256) -Kind 'Pinned reading-tools EdgeDriver'
     $null = Assert-TrustedWindowsSignature -Path $edgeDriver -ExpectedPublisher $script:LaunchPins.EdgePublisher
     foreach ($fixture in @(@($PlainFixture,$PlainReceipt,'Plain reading fixture'),@($ProtectedFixture,$ProtectedReceipt,'Protected reading fixture'))) {
-        Assert-NoReparseAncestors -Path ([string]$fixture[0]); Assert-FileReceipt -Path ([string]$fixture[0]) -Bytes ([uint64]$fixture[1].bytes) -Sha256 ([string]$fixture[1].sha256) -Kind ([string]$fixture[2])
+        Assert-ReadingFileReceipt -Path ([string]$fixture[0]) -Bytes ([uint64]$fixture[1].bytes) -Sha256 ([string]$fixture[1].sha256) -Kind ([string]$fixture[2])
     }
     if (Test-Path -LiteralPath $ProfileRoot) { throw 'Reading-tools WebView profile must be fresh.' }
     if (-not (Test-Path -LiteralPath $SettingsRoot -PathType Container)) { throw 'The controlled application settings root is missing after the signed upgrade proof.' }
@@ -482,9 +490,9 @@ function Invoke-InstalledReadingTools {
     try {
         $uiResult = Invoke-RealInstalledReadingTools -ApplicationPath $ApplicationPath -TauriDriverPath $tauriDriver -EdgeDriverPath $edgeDriver -ProfileRoot $ProfileRoot -SettingsRoot $SettingsRoot -PlainFixture $PlainFixture -ProtectedFixture $ProtectedFixture -ExpectedEdgeDriverVersion ([string]$receipt.edgeDriver.version) -ExpectedRuntimeVersion ([string]$receipt.webView2RuntimeVersion)
     } finally {
-        Assert-FileReceipt -Path $settingsSentinel -Bytes $settingsSentinelBytes -Sha256 $settingsSentinelSha256 -Kind 'Post-flow upgrade settings sentinel'
+        Assert-ReadingFileReceipt -Path $settingsSentinel -Bytes $settingsSentinelBytes -Sha256 $settingsSentinelSha256 -Kind 'Post-flow upgrade settings sentinel'
         foreach ($fixture in @(@($PlainFixture,$PlainReceipt,'Post-flow plain reading fixture'),@($ProtectedFixture,$ProtectedReceipt,'Post-flow protected reading fixture'))) {
-            Assert-NoReparseAncestors -Path ([string]$fixture[0]); Assert-FileReceipt -Path ([string]$fixture[0]) -Bytes ([uint64]$fixture[1].bytes) -Sha256 ([string]$fixture[1].sha256) -Kind ([string]$fixture[2])
+            Assert-ReadingFileReceipt -Path ([string]$fixture[0]) -Bytes ([uint64]$fixture[1].bytes) -Sha256 ([string]$fixture[1].sha256) -Kind ([string]$fixture[2])
         }
         $fixtureFiles = @(Get-ChildItem -LiteralPath ([IO.Path]::GetDirectoryName($PlainFixture)) -File -Force)
         if ($fixtureFiles.Count -ne 2 -or @($fixtureFiles | Where-Object { ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 }).Count -ne 0) { throw 'The reading fixture inventory changed or contains a reparse point.' }
