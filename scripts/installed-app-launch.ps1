@@ -9,6 +9,7 @@ $script:LaunchPins = [ordered]@{
     SessionCreationTimeoutMilliseconds = 30000
     CleanupProcessTimeoutMilliseconds = 10000
     OcrUiTextBytesMaximum = 65536
+    WebDriverErrorBytesMaximum = 4096
     RequestBytesMaximum = 1MB
     JsonDepthMaximum = 12
     JsonNodesMaximum = 512
@@ -261,6 +262,69 @@ function Wait-WebDriverOracle {
     param([string]$SessionId,[string]$Script,[datetime]$Deadline,[scriptblock]$Predicate,[string]$Kind)
     do {
         $value = Invoke-WebDriverScript -SessionId $SessionId -Script $Script -Deadline $Deadline
+        if (& $Predicate $value) { return $value }
+        Start-Sleep -Milliseconds 200
+    } while ([datetime]::UtcNow -lt $Deadline)
+    throw "$Kind did not become true before the shared launch deadline."
+}
+
+function Get-BoundedWebDriverErrorCode {
+    param([Exception]$Exception)
+    $webException = $null
+    $candidate = $Exception
+    for ($depth = 0; $depth -lt 8 -and $null -ne $candidate; $depth++) {
+        if ($candidate -is [Net.WebException]) { $webException = $candidate; break }
+        $candidate = $candidate.InnerException
+    }
+    if ($null -eq $webException -or $null -eq $webException.Response) { return 'unavailable' }
+    $response = $webException.Response
+    $stream = $null
+    $memory = $null
+    try {
+        if ($response.ContentLength -gt $script:LaunchPins.WebDriverErrorBytesMaximum) { return 'unavailable' }
+        $stream = $response.GetResponseStream()
+        if ($null -eq $stream) { return 'unavailable' }
+        $memory = [IO.MemoryStream]::new()
+        $buffer = [byte[]]::new(1024)
+        while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            if ($memory.Length + $read -gt $script:LaunchPins.WebDriverErrorBytesMaximum) { return 'unavailable' }
+            $memory.Write($buffer, 0, $read)
+        }
+        $text = [Text.UTF8Encoding]::new($false, $true).GetString($memory.ToArray())
+        $body = $text | ConvertFrom-Json
+        $errorProperty = $body.PSObject.Properties['value']?.Value?.PSObject.Properties['error']
+        if ($null -eq $errorProperty -or $errorProperty.Value -isnot [string]) { return 'other' }
+        $code = [string]$errorProperty.Value
+        if (@('javascript error','unknown error','script timeout','stale element reference','no such window','invalid session id','unexpected alert open') -ccontains $code) { return $code }
+        return 'other'
+    } catch {
+        return 'unavailable'
+    } finally {
+        if ($null -ne $memory) { $memory.Dispose() }
+        if ($null -ne $stream) { $stream.Dispose() }
+        $response.Dispose()
+    }
+}
+
+function Invoke-OcrWebDriverScript {
+    param(
+        [string]$SessionId,
+        [string]$Script,
+        [datetime]$Deadline,
+        [ValidateSet('menu-open','menu-ready','recognition-start','result-poll','dialog-close','dialog-closed','source-preservation')][string]$Stage
+    )
+    try {
+        return Invoke-WebDriverScript -SessionId $SessionId -Script $Script -Deadline $Deadline
+    } catch {
+        $errorCode = Get-BoundedWebDriverErrorCode -Exception $_.Exception
+        throw "Installed current-page OCR WebDriver stage failed: $Stage; w3cError=$errorCode."
+    }
+}
+
+function Wait-OcrWebDriverOracle {
+    param([string]$SessionId,[string]$Script,[datetime]$Deadline,[scriptblock]$Predicate,[string]$Kind,[string]$Stage)
+    do {
+        $value = Invoke-OcrWebDriverScript -SessionId $SessionId -Script $Script -Deadline $Deadline -Stage $Stage
         if (& $Predicate $value) { return $value }
         Start-Sleep -Milliseconds 200
     } while ([datetime]::UtcNow -lt $Deadline)
@@ -603,17 +667,17 @@ function Invoke-RealInstalledAppLaunch {
 const i=document.querySelector('img[alt="Page 1"]');return {tab:[...document.querySelectorAll('button')].some(x=>x.textContent.includes('welcome.pdf')),pages:[...document.querySelectorAll('span')].some(x=>x.textContent.trim()==='/ 6'),footer:[...document.querySelectorAll('footer span')].some(x=>x.textContent.trim()==='welcome.pdf · Source preserved'),image:!!i&&i.complete&&i.naturalWidth>0&&i.naturalHeight>0&&i.src.startsWith('blob:'),width:i?.naturalWidth||0,height:i?.naturalHeight||0};
 '@
         $sample = Wait-WebDriverOracle -SessionId $sessionId -Script $sampleScript -Deadline $deadline -Kind 'Installed sample PDF render' -Predicate { param($v) [bool]$v.tab -and [bool]$v.pages -and [bool]$v.footer -and [bool]$v.image -and [int]$v.width -gt 0 -and [int]$v.height -gt 0 }
-        $menuClick = Invoke-WebDriverScript -SessionId $sessionId -Script "const m=[...document.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Menu'&&x.getAttribute('aria-expanded')==='false');if(m.length===1)m[0].click();return m.length===1;" -Deadline $deadline
+        $menuClick = Invoke-OcrWebDriverScript -SessionId $sessionId -Script "const m=[...document.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Menu'&&x.getAttribute('aria-expanded')==='false');if(m.length===1)m[0].click();return m.length===1;" -Deadline $deadline -Stage 'menu-open'
         if ($menuClick -isnot [bool] -or -not $menuClick) { throw 'The exact closed Menu control was unavailable before current-page OCR.' }
-        $ocrControl = Wait-WebDriverOracle -SessionId $sessionId -Script "const m=[...document.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Menu'&&x.getAttribute('aria-expanded')==='true'),p=m.length===1?m[0].closest('header')?.nextElementSibling:null,o=p?[...p.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Recognize current page…'):[];return {menu:m.length===1&&!!p,count:o.length,enabled:o.length===1&&!o[0].disabled,title:o.length===1?o[0].title:''};" -Deadline $deadline -Kind 'Current-page OCR menu control' -Predicate { param($v) [bool]$v.menu -and [int]$v.count -eq 1 -and [bool]$v.enabled -and [string]$v.title -ceq 'Recognize text on the current page in English' }
-        $ocrClick = Invoke-WebDriverScript -SessionId $sessionId -Script "const m=[...document.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Menu'&&x.getAttribute('aria-expanded')==='true'),p=m.length===1?m[0].closest('header')?.nextElementSibling:null,o=p?[...p.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Recognize current page…'&&!x.disabled):[];if(m.length===1&&p&&o.length===1)o[0].click();return m.length===1&&!!p&&o.length===1;" -Deadline $deadline
+        $ocrControl = Wait-OcrWebDriverOracle -SessionId $sessionId -Script "const m=[...document.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Menu'&&x.getAttribute('aria-expanded')==='true'),p=m.length===1?m[0].closest('header')?.nextElementSibling:null,o=p?[...p.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Recognize current page…'):[];return {menu:m.length===1&&!!p,count:o.length,enabled:o.length===1&&!o[0].disabled,title:o.length===1?o[0].title:''};" -Deadline $deadline -Kind 'Current-page OCR menu control' -Stage 'menu-ready' -Predicate { param($v) [bool]$v.menu -and [int]$v.count -eq 1 -and [bool]$v.enabled -and [string]$v.title -ceq 'Recognize text on the current page in English' }
+        $ocrClick = Invoke-OcrWebDriverScript -SessionId $sessionId -Script "const m=[...document.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Menu'&&x.getAttribute('aria-expanded')==='true'),p=m.length===1?m[0].closest('header')?.nextElementSibling:null,o=p?[...p.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Recognize current page…'&&!x.disabled):[];if(m.length===1&&p&&o.length===1)o[0].click();return m.length===1&&!!p&&o.length===1;" -Deadline $deadline -Stage 'recognition-start'
         if ($ocrClick -isnot [bool] -or -not $ocrClick) { throw 'The exact enabled current-page OCR control was unavailable.' }
         $ocrResultScript = @'
 const dialogs=[...document.querySelectorAll('dialog[aria-labelledby="page-ocr-title"]')];if(dialogs.length!==1)return {state:'waiting',title:'',context:false,readOnly:false,aria:'',utf8Bytes:0,text:''};const d=dialogs[0],title=d.querySelector('#page-ocr-title')?.textContent.trim()||'',paragraphs=[...d.querySelectorAll('p')].map(x=>x.textContent.trim()),context=paragraphs.includes('welcome.pdf · physical page 1. OCR reads this one page in English. Recognition may contain errors.')&&paragraphs.includes('It does not change the PDF, add searchable text, index the document, or send content to a service.'),closeReady=[...d.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Close'&&!x.disabled).length===1;if(d.querySelector('[role="alert"]'))return {state:'error',title,context,readOnly:false,aria:'',utf8Bytes:0,text:''};if(paragraphs.includes('No text was recognized on this page.'))return {state:'empty',title,context,readOnly:false,aria:'',utf8Bytes:0,text:''};const t=d.querySelector('textarea[aria-label="Recognized text on page 1"]');if(!t||!closeReady)return {state:'running',title,context,readOnly:false,aria:'',utf8Bytes:0,text:''};const text=t.value,utf8Bytes=new TextEncoder().encode(text).length;if(utf8Bytes>65536)return {state:'overflow',title,context,readOnly:t.readOnly,aria:t.getAttribute('aria-label')||'',utf8Bytes,text:''};return {state:'recognized',title,context,readOnly:t.readOnly,aria:t.getAttribute('aria-label')||'',utf8Bytes,text};
 '@
         $ocrResult = $null
         do {
-            $ocrResult = Invoke-WebDriverScript -SessionId $sessionId -Script $ocrResultScript -Deadline $deadline
+            $ocrResult = Invoke-OcrWebDriverScript -SessionId $sessionId -Script $ocrResultScript -Deadline $deadline -Stage 'result-poll'
             try { $captured += @(Get-OwnedLaunchProcesses -RootProcessId $driver.Id -StartedAfter $startedAfter); $captured = @(Get-UniqueOwnedLaunchProcesses -Processes $captured) } catch { }
             if ([string]$ocrResult.state -in @('error','empty','overflow')) { throw 'Installed current-page OCR did not produce bounded recognized text.' }
             if ([string]$ocrResult.state -ceq 'recognized') { break }
@@ -626,13 +690,13 @@ const dialogs=[...document.querySelectorAll('dialog[aria-labelledby="page-ocr-ti
         }
         $ocrTextReceipt = Get-LaunchOcrTextReceipt -Text ([string]$ocrResult.text) -ReportedUtf8Bytes ([int]$ocrResult.utf8Bytes)
         $ocrResult.text = ''
-        $closeOcr = Invoke-WebDriverScript -SessionId $sessionId -Script "const d=[...document.querySelectorAll('dialog[aria-labelledby=\"page-ocr-title\"]')];const b=d.length===1?[...d[0].querySelectorAll('button')].filter(x=>x.textContent.trim()==='Close'&&!x.disabled):[];if(b.length===1)b[0].click();return d.length===1&&b.length===1;" -Deadline $deadline
+        $closeOcr = Invoke-OcrWebDriverScript -SessionId $sessionId -Script "const d=[...document.querySelectorAll('dialog[aria-labelledby=\"page-ocr-title\"]')];const b=d.length===1?[...d[0].querySelectorAll('button')].filter(x=>x.textContent.trim()==='Close'&&!x.disabled):[];if(b.length===1)b[0].click();return d.length===1&&b.length===1;" -Deadline $deadline -Stage 'dialog-close'
         if ($closeOcr -isnot [bool] -or -not $closeOcr) { throw 'The completed current-page OCR dialog could not be closed exactly.' }
-        $null = Wait-WebDriverOracle -SessionId $sessionId -Script "return document.querySelectorAll('dialog[aria-labelledby=\"page-ocr-title\"]').length===0;" -Deadline $deadline -Kind 'Current-page OCR dialog close' -Predicate { param($v) $v -is [bool] -and $v }
+        $null = Wait-OcrWebDriverOracle -SessionId $sessionId -Script "return document.querySelectorAll('dialog[aria-labelledby=\"page-ocr-title\"]').length===0;" -Deadline $deadline -Kind 'Current-page OCR dialog close' -Stage 'dialog-closed' -Predicate { param($v) $v -is [bool] -and $v }
         $postOcrScript = @'
 const tabs=[...document.querySelectorAll('button')].filter(x=>{const s=x.querySelector('span');return s&&s.textContent.trim()==='welcome.pdf'}),i=document.querySelector('img[alt="Page 1"]');return {tab:tabs.length===1,pages:[...document.querySelectorAll('span')].some(x=>x.textContent.trim()==='/ 6'),footer:[...document.querySelectorAll('footer span')].some(x=>x.textContent.trim()==='welcome.pdf · Source preserved'),image:!!i&&i.complete&&i.naturalWidth>0&&i.naturalHeight>0&&i.src.startsWith('blob:')};
 '@
-        $postOcr = Wait-WebDriverOracle -SessionId $sessionId -Script $postOcrScript -Deadline $deadline -Kind 'Post-OCR sample preservation' -Predicate { param($v) [bool]$v.tab -and [bool]$v.pages -and [bool]$v.footer -and [bool]$v.image }
+        $postOcr = Wait-OcrWebDriverOracle -SessionId $sessionId -Script $postOcrScript -Deadline $deadline -Kind 'Post-OCR sample preservation' -Stage 'source-preservation' -Predicate { param($v) [bool]$v.tab -and [bool]$v.pages -and [bool]$v.footer -and [bool]$v.image }
         $captured += @(Get-OwnedLaunchProcesses -RootProcessId $driver.Id -StartedAfter $startedAfter)
         $captured = @(Get-UniqueOwnedLaunchProcesses -Processes $captured)
         Assert-OwnedLaunchExecutables -Owned $captured -ApplicationPath $ApplicationPath -EdgeDriverPath $EdgeDriverPath -OcrEnginePath $OcrEnginePath

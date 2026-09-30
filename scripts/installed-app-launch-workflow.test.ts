@@ -180,7 +180,7 @@ describe('hosted installed signed application launch proof', () => {
     `);
     const result = runPowerShell(source);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('keeps the real WebDriver client loopback-only, bounded, exact-oracle, and truth-bound on cleanup', () => {
     const launch = readFileSync('scripts/installed-app-launch.ps1', 'utf8');
@@ -206,12 +206,14 @@ describe('hosted installed signed application launch proof', () => {
     expect(launch).toContain("x.textContent.trim()==='Close'&&!x.disabled");
     expect(launch).toContain("utf8Bytes>65536");
     expect(launch).toContain('Get-LaunchOcrTextReceipt');
+    expect(launch).toContain('Get-BoundedWebDriverErrorCode');
+    expect(launch).toContain("[ValidateSet('menu-open','menu-ready','recognition-start','result-poll','dialog-close','dialog-closed','source-preservation')]");
     expect(launch).toContain("$names = @('pdf-workstation','tauri-driver','msedgedriver','msedgewebview2','tesseract')");
-    expect(launch).toContain("$ocrResult = Invoke-WebDriverScript -SessionId $sessionId -Script $ocrResultScript -Deadline $deadline");
+    expect(launch).toContain("$ocrResult = Invoke-OcrWebDriverScript -SessionId $sessionId -Script $ocrResultScript -Deadline $deadline -Stage 'result-poll'");
     expect(launch).not.toContain('OcrDeadline');
     const rejectedOcrStates = launch.indexOf("if ([string]$ocrResult.state -in @('error','empty','overflow'))");
     const ocrHash = launch.indexOf('$ocrTextReceipt = Get-LaunchOcrTextReceipt', rejectedOcrStates);
-    const ocrClose = launch.indexOf('$closeOcr = Invoke-WebDriverScript', rejectedOcrStates);
+    const ocrClose = launch.indexOf('$closeOcr = Invoke-OcrWebDriverScript', rejectedOcrStates);
     expect(rejectedOcrStates).toBeGreaterThan(-1);
     expect(ocrHash).toBeGreaterThan(rejectedOcrStates);
     expect(ocrClose).toBeGreaterThan(ocrHash);
@@ -226,6 +228,48 @@ describe('hosted installed signed application launch proof', () => {
     expect(verifier).toContain("SignedSourceRevision = '67d238218f4796ba7b8505d072868da0f397174a'");
     expect(launch).toContain("sampleName = 'welcome.pdf'; physicalPage = 1; dialogTitle = 'Recognize text on page 1'; status = 'recognized'; language = 'eng'");
     expect(readFileSync('scripts/installed-app-launch-workflow.test.ts', 'utf8')).not.toMatch(/git\s+show|spawnSync\('git'/);
+  });
+
+  it('reports only fixed OCR stages and bounded allowlisted WebDriver error codes', () => {
+    const source = extractFunctions('scripts/installed-app-launch.ps1', ['Get-BoundedWebDriverErrorCode', 'Invoke-OcrWebDriverScript'], String.raw`
+      Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Net;
+using System.Text;
+public sealed class FixedWebResponse : WebResponse {
+  private readonly byte[] body;
+  private readonly long declaredLength;
+  public bool Closed { get; private set; }
+  public bool StreamClosed { get; private set; }
+  public FixedWebResponse(string value, long length) { body = Encoding.UTF8.GetBytes(value); declaredLength = length; }
+  public override long ContentLength { get { return declaredLength < -1 ? body.Length : declaredLength; } set { } }
+  public override Stream GetResponseStream() { return new FixedMemoryStream(body, () => StreamClosed = true); }
+  public override void Close() { Closed = true; }
+}
+public sealed class FixedMemoryStream : MemoryStream {
+  private readonly Action closed;
+  public FixedMemoryStream(byte[] value, Action onClosed) : base(value, false) { closed = onClosed; }
+  protected override void Dispose(bool disposing) { if (disposing) closed(); base.Dispose(disposing); }
+}
+'@
+      $script:LaunchPins=[ordered]@{WebDriverErrorBytesMaximum=4096}
+      function New-TestWebException([string]$body,[long]$length=-2){$response=[FixedWebResponse]::new($body,$length);[pscustomobject]@{response=$response;exception=[Net.WebException]::new('private transport message',$null,[Net.WebExceptionStatus]::ProtocolError,$response)}}
+      foreach($code in @('javascript error','unknown error','script timeout','stale element reference','no such window','invalid session id','unexpected alert open')){$case=New-TestWebException ('{"value":{"error":"'+$code+'","message":"private text","stacktrace":"private stack"}}');if((Get-BoundedWebDriverErrorCode -Exception $case.exception)-cne$code-or-not$case.response.Closed-or-not$case.response.StreamClosed){throw ('Allowlisted WebDriver error was not reduced or disposed: '+$code)}}
+      $other=New-TestWebException '{"value":{"error":"private code","message":"private text"}}';if((Get-BoundedWebDriverErrorCode -Exception $other.exception)-cne'other'-or-not$other.response.Closed){throw 'Unknown WebDriver error was not reduced or disposed.'}
+      foreach($case in @((New-TestWebException 'not-json'),(New-TestWebException ('{"value":{"error":"javascript error","message":"'+('x'*5000)+'"}}') -1))){if((Get-BoundedWebDriverErrorCode -Exception $case.exception)-cne'unavailable'-or-not$case.response.Closed-or-not$case.response.StreamClosed){throw 'Unreadable or live-oversized WebDriver error was not bounded or disposed.'}}
+      $declaredOversize=New-TestWebException ('x'*5000) 5000;if((Get-BoundedWebDriverErrorCode -Exception $declaredOversize.exception)-cne'unavailable'-or-not$declaredOversize.response.Closed-or$declaredOversize.response.StreamClosed){throw 'Declared-oversized WebDriver error was read or not disposed.'}
+      if((Get-BoundedWebDriverErrorCode -Exception ([Exception]::new('private local failure')))-cne'unavailable'){throw 'Response-free failure did not remain unavailable.'}
+      foreach($stage in @('menu-open','menu-ready','recognition-start','result-poll','dialog-close','dialog-closed','source-preservation')){
+        $script:nextException=(New-TestWebException '{"value":{"error":"javascript error","message":"private text","stacktrace":"private stack","data":"private path session-id recognized text"}}').exception
+        function Invoke-WebDriverScript { throw $script:nextException }
+        $message='';try{Invoke-OcrWebDriverScript -SessionId 'private-session' -Script 'private-script' -Deadline ([datetime]::UtcNow.AddSeconds(1)) -Stage $stage}catch{$message=$_.Exception.Message}
+        if($message-cne("Installed current-page OCR WebDriver stage failed: $stage; w3cError=javascript error.")-or$message-match'private|session|path|stack|recognized'){throw 'OCR WebDriver diagnostic changed or leaked response data.'}
+      }
+      $rejected=$false;try{Invoke-OcrWebDriverScript -SessionId 'id' -Script 'script' -Deadline ([datetime]::UtcNow.AddSeconds(1)) -Stage 'private-stage'}catch{if($_.Exception.Message-match'ValidateSet'){$rejected=$true}};if(-not$rejected){throw 'Unfixed OCR WebDriver stage was accepted.'}
+    `);
+    const result = runPowerShell(source);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
   });
 
   it('hashes only bounded nonblank OCR text and never returns the text', () => {
