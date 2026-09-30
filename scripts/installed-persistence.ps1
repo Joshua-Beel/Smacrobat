@@ -8,6 +8,8 @@ $script:PersistencePins = [ordered]@{
     SampleName = 'welcome.pdf'
     SamplePages = 6
     Launches = 3
+    LaunchTimeoutMilliseconds = 120000
+    SessionCreationTimeoutMilliseconds = 60000
 }
 
 function Assert-PersistenceExactProperties {
@@ -213,7 +215,8 @@ function Invoke-PersistenceUiFlow {
 
 function Invoke-RealPersistenceLaunch {
     param([string]$ApplicationPath,[string]$TauriDriverPath,[string]$EdgeDriverPath,[string]$ProfileRoot,[string]$SettingsRoot,[string]$ExpectedEdgeDriverVersion,[string]$ExpectedRuntimeVersion,[ValidateSet('write','verify-and-clear','verify-cleared')][string]$Mode)
-    $deadline = [datetime]::UtcNow.AddMilliseconds($script:LaunchPins.TotalTimeoutMilliseconds)
+    $script:LaunchPins.SessionCreationTimeoutMilliseconds = $script:PersistencePins.SessionCreationTimeoutMilliseconds
+    $deadline = [datetime]::UtcNow.AddMilliseconds($script:PersistencePins.LaunchTimeoutMilliseconds)
     $driverCapture = $null; $driver = $null; $sessionId = $null; $captured = @(); $result = $null; $status = $null
     $startedAfter = [datetime]::UtcNow; $sessionDeleteOutcome = 'requestfailed'; $driverExited = $false
     $driverStopOutcome = 'not-invoked'; $residualCategory = 'multiple'; $remaining = -1

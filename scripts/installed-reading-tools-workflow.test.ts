@@ -112,7 +112,24 @@ describe('installed signed reading-tools verifier', () => {
     expect(source).toContain("type = 'keyUp'");
     expect(source).toContain('RequestBytesMaximum = 1MB');
     expect(source).toContain('TotalTimeoutMilliseconds = 180000');
+    expect(source).toContain('PortReleaseTimeoutMilliseconds = 180000');
+    expect(source).toContain('Wait-ReadingWebDriverPortsFree -Deadline');
     expect(source).toContain('Assert-BoundedJsonShape');
+  });
+
+  it('waits boundedly for fixed ports released by the prior installed-app proof', () => {
+    const check = extractFunctions('scripts/installed-reading-tools.ps1', ['Wait-ReadingWebDriverPortsFree'], String.raw`
+      $script:ReadingPins=[ordered]@{PortReleasePollMilliseconds=1}
+      $attempts=0
+      Wait-ReadingWebDriverPortsFree -Deadline ([datetime]::UtcNow.AddSeconds(2)) -Probe { $script:attempts++;if($script:attempts-lt3){throw 'still occupied'} }
+      if($attempts-ne3){throw 'Port-release probe did not retry exactly to success.'}
+      $expiredProbes=0;$rejected=$false
+      try{Wait-ReadingWebDriverPortsFree -Deadline ([datetime]::UtcNow.AddMilliseconds(-1)) -Probe { $script:expiredProbes++ }}catch{$rejected=$_.Exception.Message-ceq'The prior installed-app proof did not release the fixed WebDriver ports before the bounded reading-tools handoff.'}
+      if(-not$rejected){throw 'Expired port-release wait did not fail closed.'}
+      if($expiredProbes-ne0){throw 'Expired port-release wait invoked its probe.'}
+    `);
+    const result = runPowerShell(check);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
   });
 
   it('loads and executes the production receipt helper in a standalone reading script process', () => {

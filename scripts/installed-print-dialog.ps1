@@ -151,16 +151,65 @@ function Get-SanitizedProcessUiStructureJson {
     }
 }
 
+function Get-SanitizedObservedUiStructureJson {
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Elements,
+        [Parameter(Mandatory = $true)][ValidateSet('top-level','process-descendants')][string]$Scope
+    )
+    try {
+        if ($Elements.Count -gt $script:PrintPins.UiElementMaximum) { throw 'Observed native print UI exceeded the bounded element count.' }
+        $counts = [ordered]@{
+            window = 0; pane = 0; button = 0; radioButton = 0; comboBox = 0
+            edit = 0; list = 0; listItem = 0; other = 0
+        }
+        foreach ($element in $Elements) {
+            Assert-ProcessUiElement -Element $element -ProcessId $ProcessId
+            switch (Get-UiControlTypeName -Element $element) {
+                'ControlType.Window' { $counts.window++; break }
+                'ControlType.Pane' { $counts.pane++; break }
+                'ControlType.Button' { $counts.button++; break }
+                'ControlType.RadioButton' { $counts.radioButton++; break }
+                'ControlType.ComboBox' { $counts.comboBox++; break }
+                'ControlType.Edit' { $counts.edit++; break }
+                'ControlType.List' { $counts.list++; break }
+                'ControlType.ListItem' { $counts.listItem++; break }
+                default { $counts.other++ }
+            }
+        }
+        $receipt = [ordered]@{
+            inventoryStatus = if ($Scope -ceq 'top-level') { 'top-level-observed' } else { 'process-descendants-observed' }
+            topLevelWindowCount = if ($Scope -ceq 'top-level') { [int]$Elements.Count } else { -1 }
+            processElementCount = if ($Scope -ceq 'process-descendants') { [int]$Elements.Count } else { -1 }
+            windowCount = [int]$counts.window
+            paneCount = [int]$counts.pane
+            buttonCount = [int]$counts.button
+            radioButtonCount = [int]$counts.radioButton
+            comboBoxCount = [int]$counts.comboBox
+            editCount = [int]$counts.edit
+            listCount = [int]$counts.list
+            listItemCount = [int]$counts.listItem
+            otherCount = [int]$counts.other
+        }
+        return ([pscustomobject]$receipt | ConvertTo-Json -Compress)
+    } catch {
+        return Get-SanitizedProcessUiStructureJson -ProcessId $ProcessId -DeadlineExpired
+    }
+}
+
 function Find-ProcessUiElement {
     param(
         [Parameter(Mandatory = $true)][int]$ProcessId,
         [Parameter(Mandatory = $true)][string[]]$Names,
         [string[]]$ControlTypes = @(),
         [switch]$WindowsOnly,
-        [switch]$AllowNone
+        [switch]$AllowNone,
+        [ref]$ObservedElements
     )
     $foundElements = @()
-    foreach ($element in @(Get-ProcessUiElements -ProcessId $ProcessId -WindowsOnly:$WindowsOnly)) {
+    $elements = @(Get-ProcessUiElements -ProcessId $ProcessId -WindowsOnly:$WindowsOnly)
+    if ($null -ne $ObservedElements) { $ObservedElements.Value = $elements }
+    foreach ($element in $elements) {
         try {
             Assert-ProcessUiElement -Element $element -ProcessId $ProcessId
             $name = [string]$element.Current.Name
@@ -200,16 +249,22 @@ function Wait-ProcessUiElement {
         [Parameter(Mandatory = $true)][ValidateSet('first-print-dialog','second-print-dialog','current-page-control','save-output-dialog')][string]$Stage,
         [Parameter(Mandatory = $true)][datetime]$Deadline
     )
-    do {
+    $structure = Get-SanitizedProcessUiStructureJson -ProcessId $ProcessId -DeadlineExpired
+    while ([datetime]::UtcNow -lt $Deadline) {
+        $observed = $null
+        $observedScope = if ($WindowsOnly) { 'top-level' } else { 'process-descendants' }
         try {
-            $match = Find-ProcessUiElement -ProcessId $ProcessId -Names $Names -ControlTypes $ControlTypes -WindowsOnly:$WindowsOnly -AllowNone
+            $match = Find-ProcessUiElement -ProcessId $ProcessId -Names $Names -ControlTypes $ControlTypes -WindowsOnly:$WindowsOnly -AllowNone -ObservedElements ([ref]$observed)
             if ($null -ne $match) { return $match }
         } catch {
             if ([datetime]::UtcNow -ge $Deadline) { break }
+        } finally {
+            if ($observed -is [array]) {
+                $structure = Get-SanitizedObservedUiStructureJson -ProcessId $ProcessId -Elements $observed -Scope $observedScope
+            }
         }
-        Start-Sleep -Milliseconds 150
-    } while ([datetime]::UtcNow -lt $Deadline)
-    $structure = Get-SanitizedProcessUiStructureJson -ProcessId $ProcessId -DeadlineExpired
+        if ([datetime]::UtcNow -lt $Deadline) { Start-Sleep -Milliseconds 150 }
+    }
     throw "Native print UI stage '$Stage' timed out; uiStructure=$structure."
 }
 
@@ -258,18 +313,20 @@ function Wait-ProcessUiWindowClosed {
         [Parameter(Mandatory = $true)][ValidateSet('first-print-dialog','second-print-dialog','save-output-dialog','final-native-cleanup')][string]$Stage,
         [Parameter(Mandatory = $true)][datetime]$Deadline
     )
-    do {
+    $structure = Get-SanitizedProcessUiStructureJson -ProcessId $ProcessId -DeadlineExpired
+    while ([datetime]::UtcNow -lt $Deadline) {
         $foundWindows = @()
-        foreach ($element in @(Get-ProcessUiElements -ProcessId $ProcessId -WindowsOnly)) {
+        $observed = @(Get-ProcessUiElements -ProcessId $ProcessId -WindowsOnly)
+        $structure = Get-SanitizedObservedUiStructureJson -ProcessId $ProcessId -Elements $observed -Scope 'top-level'
+        foreach ($element in $observed) {
             try {
                 $name = [string]$element.Current.Name
                 if (@($Names | Where-Object { $name.Equals($_,[StringComparison]::OrdinalIgnoreCase) }).Count -eq 1) { $foundWindows += $element }
             } catch { }
         }
         if ($foundWindows.Count -eq 0) { return }
-        Start-Sleep -Milliseconds 150
-    } while ([datetime]::UtcNow -lt $Deadline)
-    $structure = Get-SanitizedProcessUiStructureJson -ProcessId $ProcessId -DeadlineExpired
+        if ([datetime]::UtcNow -lt $Deadline) { Start-Sleep -Milliseconds 150 }
+    }
     throw "Native print UI stage '$Stage' remained open after its bounded close action; uiStructure=$structure."
 }
 

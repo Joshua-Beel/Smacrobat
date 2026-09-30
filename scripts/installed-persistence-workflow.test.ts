@@ -154,7 +154,33 @@ describe('installed persistence WebDriver proof', () => {
   });
 
   it('keeps every WebDriver request bounded and every launch cleanup fail closed', () => {
-    expect(source).toContain('[datetime]::UtcNow.AddMilliseconds($script:LaunchPins.TotalTimeoutMilliseconds)');
+    const result = runPowerShell(String.raw`
+      $tokens=$null;$errors=$null
+      $ast=[Management.Automation.Language.Parser]::ParseFile('${process.cwd().replaceAll("'", "''")}\scripts\installed-persistence.ps1',[ref]$tokens,[ref]$errors)
+      if($errors.Count){throw 'Installed persistence script did not parse.'}
+      $pins=$ast.Find({param($node)$node-is[Management.Automation.Language.AssignmentStatementAst]-and$node.Left.Extent.Text-ceq'$script:PersistencePins'},$true)
+      Invoke-Expression $pins.Extent.Text
+      if($script:PersistencePins.LaunchTimeoutMilliseconds-ne120000-or$script:PersistencePins.SessionCreationTimeoutMilliseconds-ne60000){throw 'Persistence timeout pins changed.'}
+      $function=$ast.Find({param($node)$node-is[Management.Automation.Language.FunctionDefinitionAst]-and$node.Name-ceq'Invoke-RealPersistenceLaunch'},$true)
+      $override=$function.Body.Find({param($node)$node-is[Management.Automation.Language.AssignmentStatementAst]-and$node.Left.Extent.Text-ceq'$script:LaunchPins.SessionCreationTimeoutMilliseconds'},$true)
+      $deadline=$function.Body.Find({param($node)$node-is[Management.Automation.Language.AssignmentStatementAst]-and$node.Left.Extent.Text-ceq'$deadline'},$true)
+      $session=$function.Body.Find({param($node)$node-is[Management.Automation.Language.CommandAst]-and$node.GetCommandName()-ceq'Invoke-BoundedLoopbackJson'-and$node.Extent.Text-cmatch"-Method POST -Path '/session'"},$true)
+      if($null-eq$override-or$null-eq$deadline-or$null-eq$session-or$override.Extent.StartOffset-ge$session.Extent.StartOffset-or$deadline.Extent.StartOffset-ge$session.Extent.StartOffset){throw 'Persistence timeout setup does not precede session creation.'}
+      $launchAst=[Management.Automation.Language.Parser]::ParseFile('${process.cwd().replaceAll("'", "''")}\scripts\installed-app-launch.ps1',[ref]$tokens,[ref]$errors)
+      if($errors.Count){throw 'Installed launch helper did not parse.'}
+      $launchPins=$launchAst.Find({param($node)$node-is[Management.Automation.Language.AssignmentStatementAst]-and$node.Left.Extent.Text-ceq'$script:LaunchPins'},$true)
+      Invoke-Expression $launchPins.Extent.Text
+      foreach($name in @('Get-LaunchRemainingMilliseconds','Get-LoopbackRequestTimeoutMilliseconds')){
+        $helper=$launchAst.Find({param($node)$node-is[Management.Automation.Language.FunctionDefinitionAst]-and$node.Name-ceq$name},$true)
+        Invoke-Expression $helper.Extent.Text
+      }
+      $script:LaunchPins.SessionCreationTimeoutMilliseconds=$script:PersistencePins.SessionCreationTimeoutMilliseconds
+      $launchDeadline=[datetime]::UtcNow.AddMilliseconds($script:PersistencePins.LaunchTimeoutMilliseconds)
+      $sessionTimeout=Get-LoopbackRequestTimeoutMilliseconds -Method POST -Path '/session' -Port $script:LaunchPins.WebDriverPort -Deadline $launchDeadline
+      $ordinaryTimeout=Get-LoopbackRequestTimeoutMilliseconds -Method GET -Path '/status' -Port $script:LaunchPins.WebDriverPort -Deadline $launchDeadline
+      if($sessionTimeout-ne60000-or$ordinaryTimeout-ne10000){throw 'Persistence request timeout caps changed.'}
+    `, 'pwsh');
+    expect(result.status, result.stderr || result.stdout).toBe(0);
     expect(source).toContain('Invoke-SessionDeleteOutcome');
     expect(source).toContain('Stop-OwnedLaunchProcesses');
     expect(source).toContain('Assert-LaunchCleanupState');
