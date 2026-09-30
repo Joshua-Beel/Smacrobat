@@ -162,15 +162,24 @@ describe('hosted installed signed application launch proof', () => {
       if((Assert-TrustedConsoleHostTopology -Owned $valid -RootProcessId 900 -SystemDirectory $system)-ne2){throw 'The installed System32 console-host identity was not accepted.'}
       Assert-OwnedLaunchExecutables -Owned $valid -ApplicationPath $app -EdgeDriverPath $edge -OcrEnginePath $ocr -RootProcessId 900 -SystemDirectory $system -ConsoleHostSignatureProvider $signature -ConsoleHostVersionInfoProvider $version
       Assert-OwnedLaunchExecutables -Owned $core -ApplicationPath $app -EdgeDriverPath $edge -OcrEnginePath $ocr
+      foreach($subset in @(
+        [pscustomobject]@{owned=@($core);expected=0},
+        [pscustomobject]@{owned=@($core+$console[0]);expected=1},
+        [pscustomobject]@{owned=@($core+$console[1]);expected=1},
+        [pscustomobject]@{owned=$valid;expected=2}
+      )){
+        if((Assert-TrustedConsoleHostTopology -Owned $subset.owned -RootProcessId 900 -AllowAbsent -SystemDirectory $system -SignatureProvider $signature -VersionInfoProvider $version)-ne$subset.expected){throw 'A permitted optional console-host subset was rejected.'}
+        Assert-OwnedLaunchExecutables -Owned $subset.owned -ApplicationPath $app -EdgeDriverPath $edge -OcrEnginePath $ocr -RootProcessId 900 -SystemDirectory $system -ConsoleHostSignatureProvider $signature -ConsoleHostVersionInfoProvider $version
+      }
+      foreach($oneHost in @(@($core+$console[0]),@($core+$console[1]))){$rejected=$false;try{Assert-TrustedConsoleHostTopology -Owned $oneHost -RootProcessId 900 -SystemDirectory $system -SignatureProvider $signature -VersionInfoProvider $version|Out-Null}catch{$rejected=$true};if(-not$rejected){throw 'Required mode accepted an incomplete console-host pair.'}}
       $cases=@(
-        @($core+$console[0]),
         @($core+$console+[pscustomobject]@{ProcessId=107;ParentProcessId=103;Path=$conhost}),
         @($core+[pscustomobject]@{ProcessId=105;ParentProcessId=900;Path=$conhost},[pscustomobject]@{ProcessId=106;ParentProcessId=900;Path=$conhost}),
         @($core+[pscustomobject]@{ProcessId=105;ParentProcessId=999;Path=$conhost},$console[1]),
         @($core+[pscustomobject]@{ProcessId=105;ParentProcessId=900;Path='C:\fixture\conhost.exe'},$console[1]),
         @($core+[pscustomobject]@{ProcessId=105;ParentProcessId=900;Path=$conhost},[pscustomobject]@{ProcessId=105;ParentProcessId=103;Path=$conhost})
       )
-      foreach($case in $cases){$rejected=$false;try{Assert-TrustedConsoleHostTopology -Owned $case -RootProcessId 900 -SystemDirectory $system -SignatureProvider $signature -VersionInfoProvider $version|Out-Null}catch{$rejected=$true;if($_.Exception.Message-match'fixture|999|900|105|106|107'){throw 'Console-host rejection leaked captured identity.'}};if(-not$rejected){throw 'Unsafe console-host topology was accepted.'}}
+      foreach($case in $cases){$rejected=$false;try{Assert-TrustedConsoleHostTopology -Owned $case -RootProcessId 900 -AllowAbsent -SystemDirectory $system -SignatureProvider $signature -VersionInfoProvider $version|Out-Null}catch{$rejected=$true;if($_.Exception.Message-match'fixture|999|900|105|106|107'){throw 'Console-host rejection leaked captured identity.'}};if(-not$rejected){throw 'Unsafe optional console-host topology was accepted.'}}
       foreach($providerCase in @(
         [pscustomobject]@{signature={param($path)[pscustomobject]@{Status='Valid';Publisher='Other';HasTimestamp=$true}};version=$version},
         [pscustomobject]@{signature=$signature;version={param($path)[pscustomobject]@{CompanyName='Microsoft Corporation';ProductName='Other';InternalName='ConHost';FileDescription='Console Window Host'}}}
@@ -578,8 +587,8 @@ $info=[Diagnostics.ProcessStartInfo]::new();$info.FileName=$Pwsh;$info.UseShellE
   });
 
   it('rejects occupied ports, over-deep JSON, and every native endpoint except fixed GET status', () => {
-    const source = extractFunctions('scripts/installed-app-launch.ps1', ['Assert-BoundedJsonShape', 'Get-LaunchRemainingMilliseconds', 'Get-LoopbackRequestTimeoutMilliseconds', 'Invoke-BoundedLoopbackJson', 'Assert-FixedWebDriverPortsFree'], String.raw`
-      $script:LaunchPins=[ordered]@{WebDriverPort=4444;NativeDriverPort=4445;JsonDepthMaximum=2;JsonNodesMaximum=8;RequestBytesMaximum=1MB;RequestTimeoutMilliseconds=10000;SessionCreationTimeoutMilliseconds=30000}
+    const source = extractFunctions('scripts/installed-app-launch.ps1', ['Assert-BoundedJsonShape', 'Get-LaunchRemainingMilliseconds', 'Get-LoopbackRequestTimeoutMilliseconds', 'Invoke-BoundedLoopbackJson', 'Assert-FixedWebDriverPortsFree', 'Wait-FixedWebDriverPortsFree'], String.raw`
+      $script:LaunchPins=[ordered]@{WebDriverPort=4444;NativeDriverPort=4445;JsonDepthMaximum=2;JsonNodesMaximum=8;RequestBytesMaximum=1MB;RequestTimeoutMilliseconds=10000;SessionCreationTimeoutMilliseconds=30000;CleanupProcessPollMilliseconds=100}
       $nodes=0;$rejected=$false;try{Assert-BoundedJsonShape -Value ([pscustomobject]@{a=[pscustomobject]@{b=[pscustomobject]@{c=1}}}) -Nodes ([ref]$nodes)}catch{$rejected=$true};if(-not$rejected){throw 'Deep JSON accepted.'}
       $farDeadline=[datetime]::UtcNow.AddSeconds(45)
       if((Get-LoopbackRequestTimeoutMilliseconds -Method POST -Path '/session' -Port 4444 -Deadline $farDeadline)-ne30000){throw 'Exact session creation did not receive its bounded cold-start allowance.'}
@@ -588,6 +597,12 @@ $info=[Diagnostics.ProcessStartInfo]::new();$info.FileName=$Pwsh;$info.UseShellE
       foreach($request in @([pscustomobject]@{method='POST';path='/status';port=4445},[pscustomobject]@{method='GET';path='/session';port=4445},[pscustomobject]@{method='GET';path='/status';port=4446})){$rejected=$false;try{Invoke-BoundedLoopbackJson -Method $request.method -Path $request.path -Port $request.port -Deadline ([datetime]::UtcNow.AddSeconds(1))}catch{if($_.Exception.Message -ceq'WebDriver requests are restricted to the fixed loopback endpoint and command allowlist.'){$rejected=$true}};if(-not$rejected){throw 'Unsafe native endpoint escaped its allowlist.'}}
       $allowed=$false;try{Invoke-BoundedLoopbackJson -Method GET -Path '/status' -Port 4445 -Deadline ([datetime]::UtcNow.AddSeconds(1))}catch{if($_.Exception.Message -cne'WebDriver requests are restricted to the fixed loopback endpoint and command allowlist.'){$allowed=$true}};if(-not$allowed){throw 'Exact native status endpoint was not allowed.'}
       $listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,4444);$listener.Start();try{$rejected=$false;try{Assert-FixedWebDriverPortsFree}catch{$rejected=$true};if(-not$rejected){throw 'Occupied fixed port accepted.'}}finally{$listener.Stop()}
+      $script:waitNow=[datetime]::SpecifyKind([datetime]'2026-01-01T00:00:00',[DateTimeKind]::Utc);$script:waitProbes=0;$script:waitSleeps=0
+      $clock={$script:waitNow};$sleep={param($milliseconds)$script:waitSleeps++;$script:waitNow=$script:waitNow.AddMilliseconds($milliseconds)}
+      $occupiedThenFree={if(++$script:waitProbes-eq1){throw 'A fixed loopback WebDriver port is already in use.'}}
+      if((Wait-FixedWebDriverPortsFree -Deadline $script:waitNow.AddMilliseconds(500) -ProbeProvider $occupiedThenFree -SleepProvider $sleep -UtcNowProvider $clock)-cne'free'-or$script:waitProbes-ne2-or$script:waitSleeps-ne1){throw 'Bounded fixed-port handoff did not retry once and succeed.'}
+      $script:waitProbes=0;$rejected=$false;try{Wait-FixedWebDriverPortsFree -Deadline $script:waitNow -ProbeProvider {++$script:waitProbes} -SleepProvider $sleep -UtcNowProvider $clock|Out-Null}catch{if($_.Exception.Message-ceq'Fixed loopback WebDriver ports did not become free before the handoff deadline.'){$rejected=$true}};if(-not$rejected-or$script:waitProbes-ne0){throw 'Expired fixed-port handoff probed or was accepted.'}
+      $script:waitProbes=0;$script:waitSleeps=0;$handoffDeadline=$script:waitNow.AddMilliseconds(100);$rejected=$false;try{Wait-FixedWebDriverPortsFree -Deadline $handoffDeadline -ProbeProvider {$script:waitProbes++;throw 'A fixed loopback WebDriver port is already in use.'} -SleepProvider {param($milliseconds)$script:waitSleeps++;$script:waitNow=$handoffDeadline} -UtcNowProvider $clock|Out-Null}catch{if($_.Exception.Message-ceq'Fixed loopback WebDriver ports did not become free before the handoff deadline.'){$rejected=$true}};if(-not$rejected-or$script:waitProbes-ne1-or$script:waitSleeps-ne1){throw 'Fixed-port handoff probed again after deadline expiry.'}
     `);
     const result = runPowerShell(source);
     expect(result.status, result.stderr || result.stdout).toBe(0);

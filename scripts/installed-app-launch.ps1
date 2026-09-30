@@ -238,8 +238,11 @@ function Assert-TrustedConsoleHostTopology {
     )
     $items = @($Owned)
     $consoleHosts = @($items | Where-Object { [IO.Path]::GetFileName([string]$_.Path).Equals('conhost.exe',[StringComparison]::OrdinalIgnoreCase) })
-    if ($consoleHosts.Count -eq 0 -and $AllowAbsent) { return 0 }
-    if ($script:LaunchPins.ConsoleHostMaximum -ne 2 -or $consoleHosts.Count -ne $script:LaunchPins.ConsoleHostMaximum) {
+    if ($AllowAbsent -and $consoleHosts.Count -eq 0) { return 0 }
+    if ($script:LaunchPins.ConsoleHostMaximum -ne 2) { throw 'The trusted Windows console-host bound changed.' }
+    if ($AllowAbsent) {
+        if ($consoleHosts.Count -gt $script:LaunchPins.ConsoleHostMaximum) { throw 'The captured Windows console-host count is outside the trusted topology.' }
+    } elseif ($consoleHosts.Count -ne $script:LaunchPins.ConsoleHostMaximum) {
         throw 'The captured Windows console-host count is outside the trusted topology.'
     }
     if ([string]::IsNullOrWhiteSpace($SystemDirectory)) { $SystemDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::System) }
@@ -270,7 +273,10 @@ function Assert-TrustedConsoleHostTopology {
         elseif ($webViewIds.Contains($parentProcessId)) { $webViewParents++ }
         else { throw 'A captured Windows console host was outside the owned root and WebView parent topology.' }
     }
-    if ($rootParents -ne 1 -or $webViewParents -ne 1) { throw 'The captured Windows console-host parent categories do not match the trusted topology.' }
+    if (($AllowAbsent -and ($rootParents -gt 1 -or $webViewParents -gt 1 -or $rootParents + $webViewParents -ne $consoleHosts.Count)) -or
+        (-not $AllowAbsent -and ($rootParents -ne 1 -or $webViewParents -ne 1))) {
+        throw 'The captured Windows console-host parent categories do not match the trusted topology.'
+    }
     $null = Assert-NoReparseAncestors -Path $expectedPath
     $null = Assert-TrustedWindowsSignature -Path $expectedPath -SignatureProvider $SignatureProvider -ExpectedPublisher $script:LaunchPins.ConsoleHostPublisher
     $version = if ($VersionInfoProvider) { & $VersionInfoProvider $expectedPath } else { (Get-Item -LiteralPath $expectedPath -ErrorAction Stop).VersionInfo }
@@ -489,6 +495,35 @@ function Get-OwnedLaunchProcesses {
         if ($difference -gt $tolerance -or $liveTicks + $tolerance -lt $rootLiveTicks) { throw 'A launch descendant identity changed during capture.' }
         [pscustomobject]@{ ProcessId = $process.Id; ParentProcessId = [int]$_.ParentProcessId; Path = [string]$process.Path; StartTicks = $liveTicks; CommandLine = [string]$_.CommandLine }
     })
+}
+
+function Wait-FixedWebDriverPortsFree {
+    param(
+        [Parameter(Mandatory = $true)][datetime]$Deadline,
+        [scriptblock]$ProbeProvider,
+        [scriptblock]$SleepProvider,
+        [scriptblock]$UtcNowProvider
+    )
+    $pollMilliseconds = [int]$script:LaunchPins.CleanupProcessPollMilliseconds
+    if ($pollMilliseconds -le 0 -or $pollMilliseconds -gt 1000) { throw 'The fixed-port handoff poll bound is invalid.' }
+    while ($true) {
+        $now = if ($UtcNowProvider) { [datetime](& $UtcNowProvider) } else { [datetime]::UtcNow }
+        if ($now -ge $Deadline) { throw 'Fixed loopback WebDriver ports did not become free before the handoff deadline.' }
+        $portsFree = $false
+        try {
+            if ($ProbeProvider) { $null = & $ProbeProvider } else { Assert-FixedWebDriverPortsFree }
+            $portsFree = $true
+        } catch {
+            if ($_.Exception.Message -cne 'A fixed loopback WebDriver port is already in use.') { throw }
+        }
+        $now = if ($UtcNowProvider) { [datetime](& $UtcNowProvider) } else { [datetime]::UtcNow }
+        if ($now -ge $Deadline) { throw 'Fixed loopback WebDriver ports did not become free before the handoff deadline.' }
+        if ($portsFree) { return 'free' }
+        $remainingMilliseconds = [int][Math]::Ceiling(($Deadline - $now).TotalMilliseconds)
+        if ($remainingMilliseconds -le 0) { throw 'Fixed loopback WebDriver ports did not become free before the handoff deadline.' }
+        $sleepMilliseconds = [Math]::Min($pollMilliseconds,$remainingMilliseconds)
+        if ($SleepProvider) { $null = & $SleepProvider $sleepMilliseconds } else { Start-Sleep -Milliseconds $sleepMilliseconds }
+    }
 }
 
 function Wait-LaunchProcessQuiescence {

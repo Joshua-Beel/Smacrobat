@@ -197,12 +197,20 @@ describe('installed persistence WebDriver proof', () => {
       if($errors.Count){throw 'Installed persistence script did not parse.'}
       $pins=$ast.Find({param($node)$node-is[Management.Automation.Language.AssignmentStatementAst]-and$node.Left.Extent.Text-ceq'$script:PersistencePins'},$true)
       Invoke-Expression $pins.Extent.Text
-      if($script:PersistencePins.LaunchTimeoutMilliseconds-ne120000-or$script:PersistencePins.SessionCreationTimeoutMilliseconds-ne60000){throw 'Persistence timeout pins changed.'}
+      if($script:PersistencePins.LaunchTimeoutMilliseconds-ne120000-or$script:PersistencePins.SessionCreationTimeoutMilliseconds-ne60000-or$script:PersistencePins.PortHandoffTimeoutMilliseconds-ne300000){throw 'Persistence timeout pins changed.'}
       $function=$ast.Find({param($node)$node-is[Management.Automation.Language.FunctionDefinitionAst]-and$node.Name-ceq'Invoke-RealPersistenceLaunch'},$true)
       $override=$function.Body.Find({param($node)$node-is[Management.Automation.Language.AssignmentStatementAst]-and$node.Left.Extent.Text-ceq'$script:LaunchPins.SessionCreationTimeoutMilliseconds'},$true)
+      $handoffDeadline=$function.Body.Find({param($node)$node-is[Management.Automation.Language.AssignmentStatementAst]-and$node.Left.Extent.Text-ceq'$handoffDeadline'},$true)
+      $handoff=$function.Body.Find({param($node)$node-is[Management.Automation.Language.CommandAst]-and$node.GetCommandName()-ceq'Wait-FixedWebDriverPortsFree'},$true)
       $deadline=$function.Body.Find({param($node)$node-is[Management.Automation.Language.AssignmentStatementAst]-and$node.Left.Extent.Text-ceq'$deadline'},$true)
+      $startedAfter=$function.Body.Find({param($node)$node-is[Management.Automation.Language.AssignmentStatementAst]-and$node.Left.Extent.Text-ceq'$startedAfter'},$true)
+      $startDriver=$function.Body.Find({param($node)$node-is[Management.Automation.Language.CommandAst]-and$node.GetCommandName()-ceq'Start-BoundedDiscardProcess'},$true)
       $session=$function.Body.Find({param($node)$node-is[Management.Automation.Language.CommandAst]-and$node.GetCommandName()-ceq'Invoke-BoundedLoopbackJson'-and$node.Extent.Text-cmatch"-Method POST -Path '/session'"},$true)
-      if($null-eq$override-or$null-eq$deadline-or$null-eq$session-or$override.Extent.StartOffset-ge$session.Extent.StartOffset-or$deadline.Extent.StartOffset-ge$session.Extent.StartOffset){throw 'Persistence timeout setup does not precede session creation.'}
+      if($null-eq$override-or$null-eq$handoffDeadline-or$null-eq$handoff-or$null-eq$deadline-or$null-eq$startedAfter-or$null-eq$startDriver-or$null-eq$session-or
+        $handoffDeadline.Extent.Text-cnotmatch'PortHandoffTimeoutMilliseconds'-or$deadline.Extent.Text-cnotmatch'LaunchTimeoutMilliseconds'-or
+        $handoffDeadline.Extent.StartOffset-ge$handoff.Extent.StartOffset-or$handoff.Extent.StartOffset-ge$deadline.Extent.StartOffset-or$deadline.Extent.StartOffset-ge$startedAfter.Extent.StartOffset-or$startedAfter.Extent.StartOffset-ge$startDriver.Extent.StartOffset-or
+        $override.Extent.StartOffset-ge$session.Extent.StartOffset-or$deadline.Extent.StartOffset-ge$session.Extent.StartOffset){throw 'Persistence port handoff and fresh UI deadline ordering changed.'}
+      if($function.Extent.Text-cmatch'Assert-FixedWebDriverPortsFree'){throw 'Persistence bypassed the bounded fixed-port handoff wait.'}
       $launchAst=[Management.Automation.Language.Parser]::ParseFile('${process.cwd().replaceAll("'", "''")}\scripts\installed-app-launch.ps1',[ref]$tokens,[ref]$errors)
       if($errors.Count){throw 'Installed launch helper did not parse.'}
       $launchPins=$launchAst.Find({param($node)$node-is[Management.Automation.Language.AssignmentStatementAst]-and$node.Left.Extent.Text-ceq'$script:LaunchPins'},$true)

@@ -38,6 +38,34 @@ describe('installed native print dialog verifier', () => {
     expect(source).toContain('relevantProcessesRemaining 0');
   });
 
+  it('waits through the bounded fixed-port handoff before starting fresh print deadlines and the driver', () => {
+    const result = runPowerShell7(String.raw`
+      $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
+      Set-Location -LiteralPath '${process.cwd().replaceAll("'", "''")}'
+      . ./scripts/installed-app-launch.ps1
+      . ./scripts/installed-print-dialog.ps1
+      if($script:PrintPins.PortHandoffTimeoutMilliseconds-ne300000-or$script:PrintPins.TotalTimeoutMilliseconds-ne120000){throw 'Print handoff or shared timeout pin changed.'}
+      $tokens=$null;$errors=$null
+      $ast=[Management.Automation.Language.Parser]::ParseFile('${process.cwd().replaceAll("'", "''")}\scripts\installed-print-dialog.ps1',[ref]$tokens,[ref]$errors)
+      if($errors.Count){throw 'Installed print script did not parse.'}
+      $function=$ast.Find({param($node)$node-is[Management.Automation.Language.FunctionDefinitionAst]-and$node.Name-ceq'Invoke-RealInstalledPrintDialog'},$true)
+      $handoffDeadline=$function.Body.Find({param($node)$node-is[Management.Automation.Language.AssignmentStatementAst]-and$node.Left.Extent.Text-ceq'$handoffDeadline'},$true)
+      $handoff=$function.Body.Find({param($node)$node-is[Management.Automation.Language.CommandAst]-and$node.GetCommandName()-ceq'Wait-FixedWebDriverPortsFree'},$true)
+      $deadline=$function.Body.Find({param($node)$node-is[Management.Automation.Language.AssignmentStatementAst]-and$node.Left.Extent.Text-ceq'$deadline'},$true)
+      $startedAfter=$function.Body.Find({param($node)$node-is[Management.Automation.Language.AssignmentStatementAst]-and$node.Left.Extent.Text-ceq'$startedAfter'},$true)
+      $startDriver=$function.Body.Find({param($node)$node-is[Management.Automation.Language.CommandAst]-and$node.GetCommandName()-ceq'Start-BoundedDiscardProcess'},$true)
+      if($null-eq$handoffDeadline-or$null-eq$handoff-or$null-eq$deadline-or$null-eq$startedAfter-or$null-eq$startDriver-or
+        $handoffDeadline.Extent.Text-cnotmatch'PortHandoffTimeoutMilliseconds'-or$deadline.Extent.Text-cnotmatch'TotalTimeoutMilliseconds'-or
+        $handoffDeadline.Extent.StartOffset-ge$handoff.Extent.StartOffset-or$handoff.Extent.StartOffset-ge$deadline.Extent.StartOffset-or
+        $deadline.Extent.StartOffset-ge$startedAfter.Extent.StartOffset-or$startedAfter.Extent.StartOffset-ge$startDriver.Extent.StartOffset){throw 'Print port handoff and fresh deadline ordering changed.'}
+      if($function.Extent.Text-cmatch'Assert-FixedWebDriverPortsFree'){throw 'Print verification bypassed the bounded fixed-port handoff wait.'}
+      $script:expiredProbeCalls=0
+      $rejected=$false;try{Wait-FixedWebDriverPortsFree -Deadline ([datetime]::UtcNow.AddMilliseconds(-1)) -ProbeProvider {$script:expiredProbeCalls++}}catch{$rejected=$true}
+      if(-not$rejected-or$script:expiredProbeCalls-ne0){throw 'Expired print port handoff performed a port probe.'}
+    `);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
   it('classifies printer capability exactly and never claims feature installation', () => {
     const result = runPowerShell7(String.raw`
       $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
@@ -138,6 +166,44 @@ describe('installed native print dialog verifier', () => {
       if($script:postDeadlineCalls-ne0){throw 'Expired native wait started UI Automation.'}
     `);
     expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
+  it('enumerates descendants only below validated owned top-level roots and fails closed after a delayed rooted scan', () => {
+    const result = runPowerShell7(String.raw`
+      $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
+      Set-Location -LiteralPath '${process.cwd().replaceAll("'", "''")}'
+      . ./scripts/installed-print-dialog.ps1
+      function New-EnumerationElement([int]$ownedProcessId,[int]$runtimePart,[string]$type){
+        $element=[pscustomobject]@{RuntimePart=$runtimePart;Current=[pscustomobject]@{ProcessId=$ownedProcessId;ControlType=[pscustomobject]@{ProgrammaticName=$type}}}
+        $element|Add-Member -MemberType ScriptMethod -Name GetRuntimeId -Value {[int[]]@(91,$this.RuntimePart)}
+        return $element
+      }
+      $desktop=[pscustomobject]@{Current=[pscustomobject]@{ProcessId=0}}
+      $top=New-EnumerationElement 7319 1 'ControlType.Pane'
+      $child=New-EnumerationElement 7319 2 'ControlType.Button'
+      $script:enumerationCalls=@()
+      $finder={param($root,$scope,$condition)
+        $script:enumerationCalls+=([pscustomobject]@{Root=$root;Scope=$scope})
+        if([object]::ReferenceEquals($root,$desktop)){
+          if($scope-ne[Windows.Automation.TreeScope]::Children){throw 'Desktop-wide descendants were scanned.'}
+          return @($top)
+        }
+        if(-not[object]::ReferenceEquals($root,$top)-or$scope-ne[Windows.Automation.TreeScope]::Descendants){throw 'Unexpected UIA enumeration root or scope.'}
+        return @($child,$child)
+      }
+      $items=@(Get-ProcessUiElements -ProcessId 7319 -Deadline ([datetime]::UtcNow.AddSeconds(1)) -DesktopProvider { $desktop } -FindAllProvider $finder)
+      if($items.Count-ne2-or-not[object]::ReferenceEquals($items[0],$top)-or-not[object]::ReferenceEquals($items[1],$child)){throw 'Rooted UIA enumeration did not merge bounded unique runtime identities.'}
+      if($script:enumerationCalls.Count-ne2-or$script:enumerationCalls[0].Scope-ne[Windows.Automation.TreeScope]::Children-or$script:enumerationCalls[1].Scope-ne[Windows.Automation.TreeScope]::Descendants){throw 'UIA enumeration did not use desktop-children then owned-root-descendants.'}
+      $script:lateRootedCallReturned=$false
+      $slowFinder={param($root,$scope,$condition)if([object]::ReferenceEquals($root,$desktop)){return @($top)};Start-Sleep -Milliseconds 80;$script:lateRootedCallReturned=$true;return @($child)}
+      $rejected=$false;try{Get-ProcessUiElements -ProcessId 7319 -Deadline ([datetime]::UtcNow.AddMilliseconds(20)) -DesktopProvider { $desktop } -FindAllProvider $slowFinder|Out-Null}catch{$rejected=$true}
+      if(-not$rejected-or-not$script:lateRootedCallReturned){throw 'A rooted UIA call that returned after its deadline was accepted.'}
+    `);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+    const source = readFileSync('scripts/installed-print-dialog.ps1', 'utf8');
+    expect(source).toContain('$desktop.FindAll([Windows.Automation.TreeScope]::Children');
+    expect(source).not.toContain('$desktop.FindAll([Windows.Automation.TreeScope]::Descendants');
+    expect(source).toContain('$root.FindAll([Windows.Automation.TreeScope]::Descendants');
   });
 
   it('retains sanitized observed counts when an exact native match is ambiguous', () => {

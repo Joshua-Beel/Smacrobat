@@ -121,7 +121,9 @@ describe('installed signed reading-tools verifier', () => {
     expect(source).toContain('RequestBytesMaximum = 1MB');
     expect(source).toContain('TotalTimeoutMilliseconds = 180000');
     expect(source).toContain('PortReleaseTimeoutMilliseconds = 180000');
-    expect(source).toContain('Wait-ReadingWebDriverPortsFree -Deadline');
+    expect(source).toContain('$null = Wait-FixedWebDriverPortsFree -Deadline');
+    expect(source).not.toContain('function Wait-ReadingWebDriverPortsFree');
+    expect(source.indexOf('Wait-FixedWebDriverPortsFree -Deadline')).toBeLessThan(source.indexOf('$deadline = [datetime]::UtcNow.AddMilliseconds($script:ReadingPins.TotalTimeoutMilliseconds)'));
     expect(source).toContain('Assert-BoundedJsonShape');
   });
 
@@ -152,16 +154,42 @@ describe('installed signed reading-tools verifier', () => {
   });
 
   it('waits boundedly for fixed ports released by the prior installed-app proof', () => {
-    const check = extractFunctions('scripts/installed-reading-tools.ps1', ['Wait-ReadingWebDriverPortsFree'], String.raw`
-      $script:ReadingPins=[ordered]@{PortReleasePollMilliseconds=1}
-      $attempts=0
-      Wait-ReadingWebDriverPortsFree -Deadline ([datetime]::UtcNow.AddSeconds(2)) -Probe { $script:attempts++;if($script:attempts-lt3){throw 'still occupied'} }
-      if($attempts-ne3){throw 'Port-release probe did not retry exactly to success.'}
+    const check = extractFunctions('scripts/installed-app-launch.ps1', ['Wait-FixedWebDriverPortsFree'], String.raw`
+      $script:LaunchPins=[ordered]@{CleanupProcessPollMilliseconds=100}
+      $script:now=[datetime]::SpecifyKind([datetime]'2026-01-01T00:00:00',[DateTimeKind]::Utc);$attempts=0
+      $clock={$script:now};$sleep={param($milliseconds)$script:now=$script:now.AddMilliseconds($milliseconds)}
+      Wait-FixedWebDriverPortsFree -Deadline $script:now.AddMilliseconds(500) -ProbeProvider { $script:attempts++;if($script:attempts-lt3){throw 'A fixed loopback WebDriver port is already in use.'} } -SleepProvider $sleep -UtcNowProvider $clock|Out-Null
+      if($attempts-ne3){throw 'Shared port-release probe did not retry exactly to success.'}
       $expiredProbes=0;$rejected=$false
-      try{Wait-ReadingWebDriverPortsFree -Deadline ([datetime]::UtcNow.AddMilliseconds(-1)) -Probe { $script:expiredProbes++ }}catch{$rejected=$_.Exception.Message-ceq'The prior installed-app proof did not release the fixed WebDriver ports before the bounded reading-tools handoff.'}
-      if(-not$rejected){throw 'Expired port-release wait did not fail closed.'}
-      if($expiredProbes-ne0){throw 'Expired port-release wait invoked its probe.'}
+      try{Wait-FixedWebDriverPortsFree -Deadline $script:now -ProbeProvider { $script:expiredProbes++ } -SleepProvider $sleep -UtcNowProvider $clock|Out-Null}catch{$rejected=$_.Exception.Message-ceq'Fixed loopback WebDriver ports did not become free before the handoff deadline.'}
+      if(-not$rejected){throw 'Expired shared port-release wait did not fail closed.'}
+      if($expiredProbes-ne0){throw 'Expired shared port-release wait invoked its probe.'}
     `);
+    const result = runPowerShell(check);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
+  it('suppresses the shared port status and leaves one reading result object on the return pipeline', () => {
+    const check = String.raw`
+      $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
+      $tokens=$null;$errors=$null
+      $ast=[Management.Automation.Language.Parser]::ParseFile('${process.cwd().replaceAll("'", "''")}\\scripts\\installed-reading-tools.ps1',[ref]$tokens,[ref]$errors)
+      if($errors.Count){throw 'Reading script did not parse.'}
+      $function=$ast.Find({param($node)$node-is[Management.Automation.Language.FunctionDefinitionAst]-and$node.Name-ceq'Invoke-RealInstalledReadingTools'},$true)
+      $waits=@($function.FindAll({param($node)$node-is[Management.Automation.Language.CommandAst]-and$node.GetCommandName()-ceq'Wait-FixedWebDriverPortsFree'},$true))
+      if($waits.Count-ne1){throw 'Reading function did not contain one shared fixed-port handoff.'}
+      $assignment=$waits[0]
+      while($null-ne$assignment-and$assignment-isnot[Management.Automation.Language.AssignmentStatementAst]){$assignment=$assignment.Parent}
+      if($null-eq$assignment-or$assignment.Left-isnot[Management.Automation.Language.VariableExpressionAst]-or$assignment.Left.VariablePath.UserPath-cne'null'){throw 'Shared fixed-port handoff output was not assigned to null.'}
+      $returns=@($function.FindAll({param($node)$node-is[Management.Automation.Language.ReturnStatementAst]-and$node.Extent.Text.Trim()-ceq'return $result'},$true))
+      if($returns.Count-ne1){throw 'Reading function did not expose one exact result return.'}
+      function Wait-FixedWebDriverPortsFree{param([datetime]$Deadline);'free'}
+      $script:ReadingPins=[ordered]@{PortReleaseTimeoutMilliseconds=180000}
+      $result=[pscustomobject][ordered]@{schemaVersion=1;kind='reading-tools'}
+      $statements=$assignment.Extent.Text+[Environment]::NewLine+$returns[0].Extent.Text
+      $output=@(&([scriptblock]::Create($statements)))
+      if($output.Count-ne1-or$output[0]-isnot[Management.Automation.PSCustomObject]-or($output[0].PSObject.Properties.Name-join',')-cne'schemaVersion,kind'){throw 'Shared fixed-port status contaminated the reading result pipeline.'}
+    `;
     const result = runPowerShell(check);
     expect(result.status, result.stderr || result.stdout).toBe(0);
   });

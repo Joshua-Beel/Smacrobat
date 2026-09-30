@@ -10,7 +10,6 @@ Set-StrictMode -Version Latest
 $script:ReadingPins = [ordered]@{
     TotalTimeoutMilliseconds = 180000
     PortReleaseTimeoutMilliseconds = 180000
-    PortReleasePollMilliseconds = 250
     UiAutomationPollMilliseconds = 100
     ClipboardPollMilliseconds = 100
     RequestBytesMaximum = 1MB
@@ -19,19 +18,6 @@ $script:ReadingPins = [ordered]@{
     SelectionText = 'A place for your PDFs.'
     SearchText = 'Sample document'
     Password = 'test password'
-}
-
-function Wait-ReadingWebDriverPortsFree {
-    param([Parameter(Mandatory = $true)][datetime]$Deadline,[scriptblock]$Probe)
-    while ([datetime]::UtcNow -lt $Deadline) {
-        try {
-            if ($Probe) { & $Probe } else { Assert-FixedWebDriverPortsFree }
-            if ([datetime]::UtcNow -lt $Deadline) { return }
-            break
-        } catch { }
-        Start-Sleep -Milliseconds $script:ReadingPins.PortReleasePollMilliseconds
-    }
-    throw 'The prior installed-app proof did not release the fixed WebDriver ports before the bounded reading-tools handoff.'
 }
 
 function Assert-ReadingFileReceipt {
@@ -372,7 +358,7 @@ function Cancel-ReadingPassword {
 
 function Invoke-RealInstalledReadingTools {
     param([string]$ApplicationPath,[string]$TauriDriverPath,[string]$EdgeDriverPath,[string]$ProfileRoot,[string]$SettingsRoot,[string]$PlainFixture,[string]$ProtectedFixture,[string]$ExpectedEdgeDriverVersion,[string]$ExpectedRuntimeVersion)
-    Wait-ReadingWebDriverPortsFree -Deadline ([datetime]::UtcNow.AddMilliseconds($script:ReadingPins.PortReleaseTimeoutMilliseconds))
+    $null = Wait-FixedWebDriverPortsFree -Deadline ([datetime]::UtcNow.AddMilliseconds($script:ReadingPins.PortReleaseTimeoutMilliseconds))
     $deadline = [datetime]::UtcNow.AddMilliseconds($script:ReadingPins.TotalTimeoutMilliseconds)
     $driverCapture = $null; $driver = $null; $sessionId = $null; $captured = @(); $result = $null
     $startedAfter = [datetime]::UtcNow; $sessionDeleteOutcome = 'requestfailed'; $driverExited = $false

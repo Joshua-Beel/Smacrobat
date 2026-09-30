@@ -1,6 +1,7 @@
 $script:PrintPins = [ordered]@{
     PrinterName = 'Microsoft Print to PDF'
     TotalTimeoutMilliseconds = 120000
+    PortHandoffTimeoutMilliseconds = 300000
     NativeDialogTimeoutMilliseconds = 20000
     OutputTimeoutMilliseconds = 45000
     UiElementMaximum = 2048
@@ -70,14 +71,57 @@ function Initialize-PrintUiAutomation {
 }
 
 function Get-ProcessUiElements {
-    param([Parameter(Mandatory = $true)][int]$ProcessId,[switch]$WindowsOnly,$RootElement)
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [switch]$WindowsOnly,
+        $RootElement,
+        [datetime]$Deadline = [datetime]::MaxValue,
+        [scriptblock]$DesktopProvider,
+        [scriptblock]$FindAllProvider
+    )
+    if ([datetime]::UtcNow -ge $Deadline) { throw 'Native print UI enumeration deadline expired.' }
     Initialize-PrintUiAutomation
     $condition = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ProcessIdProperty,$ProcessId)
-    $scope = if ($WindowsOnly) { [Windows.Automation.TreeScope]::Children } else { [Windows.Automation.TreeScope]::Descendants }
-    $root = if ($null -ne $RootElement) { Assert-ProcessUiElement -Element $RootElement -ProcessId $ProcessId; $RootElement } else { [Windows.Automation.AutomationElement]::RootElement }
-    $collection = $root.FindAll($scope,$condition)
-    if ($collection.Count -gt $script:PrintPins.UiElementMaximum) { throw 'Native print UI exceeded its bounded element count.' }
-    return @($collection | ForEach-Object { $_ })
+    if ($null -ne $RootElement) {
+        Assert-ProcessUiElement -Element $RootElement -ProcessId $ProcessId
+        if ([datetime]::UtcNow -ge $Deadline) { throw 'Native print UI enumeration deadline expired.' }
+        $collection = if ($FindAllProvider) { @(& $FindAllProvider $RootElement ([Windows.Automation.TreeScope]::Descendants) $condition) } else { @($RootElement.FindAll([Windows.Automation.TreeScope]::Descendants,$condition) | ForEach-Object { $_ }) }
+        if ([datetime]::UtcNow -ge $Deadline) { throw 'Native print UI enumeration exceeded its deadline.' }
+        if ($collection.Count -gt $script:PrintPins.UiElementMaximum) { throw 'Native print UI exceeded its bounded element count.' }
+        foreach ($element in $collection) {
+            Assert-ProcessUiElement -Element $element -ProcessId $ProcessId
+            if ([datetime]::UtcNow -ge $Deadline) { throw 'Native print UI enumeration exceeded its deadline.' }
+        }
+        return $collection
+    }
+    $desktop = if ($DesktopProvider) { & $DesktopProvider } else { [Windows.Automation.AutomationElement]::RootElement }
+    $topLevel = if ($FindAllProvider) { @(& $FindAllProvider $desktop ([Windows.Automation.TreeScope]::Children) $condition) } else { @($desktop.FindAll([Windows.Automation.TreeScope]::Children,$condition) | ForEach-Object { $_ }) }
+    if ([datetime]::UtcNow -ge $Deadline) { throw 'Native print UI top-level enumeration exceeded its deadline.' }
+    if ($topLevel.Count -lt 1 -or $topLevel.Count -gt $script:PrintPins.UiElementMaximum) { throw 'Native print UI top-level enumeration was missing or oversized.' }
+    foreach ($element in $topLevel) {
+        Assert-ProcessUiElement -Element $element -ProcessId $ProcessId
+        if ([datetime]::UtcNow -ge $Deadline) { throw 'Native print UI top-level enumeration exceeded its deadline.' }
+        if ((Get-UiControlTypeName -Element $element) -notin @('ControlType.Window','ControlType.Pane')) { throw 'Native print UI top-level root had an unsupported control type.' }
+        if ([datetime]::UtcNow -ge $Deadline) { throw 'Native print UI top-level enumeration exceeded its deadline.' }
+    }
+    if ($WindowsOnly) { return $topLevel }
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $elements = [Collections.Generic.List[object]]::new()
+    foreach ($root in $topLevel) {
+        $rootIdentity = Get-ProcessUiRuntimeIdentity -Element $root -ProcessId $ProcessId -Deadline $Deadline
+        if ($seen.Add($rootIdentity)) { $elements.Add($root) }
+        $descendants = if ($FindAllProvider) { @(& $FindAllProvider $root ([Windows.Automation.TreeScope]::Descendants) $condition) } else { @($root.FindAll([Windows.Automation.TreeScope]::Descendants,$condition) | ForEach-Object { $_ }) }
+        if ([datetime]::UtcNow -ge $Deadline) { throw 'Native print UI rooted descendant enumeration exceeded its deadline.' }
+        if ($elements.Count + $descendants.Count -gt $script:PrintPins.UiElementMaximum) { throw 'Native print UI exceeded its bounded element count.' }
+        foreach ($element in $descendants) {
+            Assert-ProcessUiElement -Element $element -ProcessId $ProcessId
+            if ([datetime]::UtcNow -ge $Deadline) { throw 'Native print UI rooted descendant enumeration exceeded its deadline.' }
+            $identity = Get-ProcessUiRuntimeIdentity -Element $element -ProcessId $ProcessId -Deadline $Deadline
+            if ($seen.Add($identity)) { $elements.Add($element) }
+        }
+    }
+    if ([datetime]::UtcNow -ge $Deadline) { throw 'Native print UI enumeration exceeded its deadline.' }
+    return @($elements)
 }
 
 function Assert-ProcessUiElement {
@@ -277,7 +321,7 @@ function Get-ProcessTopLevelUiSnapshot {
         [scriptblock]$ElementProvider
     )
     if ([datetime]::UtcNow -ge $Deadline) { throw 'Native top-level UI snapshot deadline expired.' }
-    $elements = if ($ElementProvider) { @(& $ElementProvider $ProcessId $true) } else { @(Get-ProcessUiElements -ProcessId $ProcessId -WindowsOnly) }
+    $elements = if ($ElementProvider) { @(& $ElementProvider $ProcessId $true) } else { @(Get-ProcessUiElements -ProcessId $ProcessId -WindowsOnly -Deadline $Deadline) }
     if ([datetime]::UtcNow -ge $Deadline) { throw 'Native top-level UI snapshot exceeded its deadline.' }
     if ($elements.Count -gt $script:PrintPins.UiElementMaximum) { throw 'Native top-level UI snapshot exceeded the bounded element count.' }
     $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
@@ -326,9 +370,9 @@ function Get-ProcessUiTreeSnapshot {
         [scriptblock]$ParentProvider
     )
     if ([datetime]::UtcNow -ge $Deadline) { throw 'Native process UI snapshot deadline expired.' }
-    $topLevel = if ($ElementProvider) { @(& $ElementProvider $ProcessId $true) } else { @(Get-ProcessUiElements -ProcessId $ProcessId -WindowsOnly) }
+    $topLevel = if ($ElementProvider) { @(& $ElementProvider $ProcessId $true) } else { @(Get-ProcessUiElements -ProcessId $ProcessId -WindowsOnly -Deadline $Deadline) }
     if ([datetime]::UtcNow -ge $Deadline) { throw 'Native process UI snapshot exceeded its deadline.' }
-    $elements = if ($ElementProvider) { @(& $ElementProvider $ProcessId $false) } else { @(Get-ProcessUiElements -ProcessId $ProcessId) }
+    $elements = if ($ElementProvider) { @(& $ElementProvider $ProcessId $false) } else { @(Get-ProcessUiElements -ProcessId $ProcessId -Deadline $Deadline) }
     if ([datetime]::UtcNow -ge $Deadline) { throw 'Native process UI snapshot exceeded its deadline.' }
     if ($topLevel.Count -lt 1 -or $topLevel.Count -gt $script:PrintPins.UiElementMaximum -or $elements.Count -lt 1 -or $elements.Count -gt $script:PrintPins.UiElementMaximum) {
         throw 'Native process UI snapshot was missing or exceeded its bounded element count.'
@@ -1075,14 +1119,16 @@ function Invoke-RealInstalledPrintDialog {
         [Parameter(Mandatory = $true)][string]$ExpectedEdgeDriverVersion,
         [Parameter(Mandatory = $true)]$PrinterFacts
     )
-    $deadline = [datetime]::UtcNow.AddMilliseconds($script:PrintPins.TotalTimeoutMilliseconds)
     $driverCapture = $null; $driver = $null; $sessionId = $null; $captured = @(); $result = $null
-    $startedAfter = [datetime]::UtcNow; $sessionDeleteOutcome = 'requestfailed'; $driverExited = $false
+    $sessionDeleteOutcome = 'requestfailed'; $driverExited = $false
     $driverStopOutcome = 'not-invoked'; $residualCategory = 'multiple'
     $capturedOutcomes = [pscustomobject]@{ application='absent';tauriDriver='absent';edgeDriver='absent';webview='absent';ocrEngine='absent';other='absent' }
     $residualFacts = [pscustomobject]@{ ownership='none';application=$false;tauriDriver=$false;edgeDriver=$false;webview=$false;ocrEngine=$false;other=$false }
     try {
-        Assert-FixedWebDriverPortsFree
+        $handoffDeadline = [datetime]::UtcNow.AddMilliseconds($script:PrintPins.PortHandoffTimeoutMilliseconds)
+        $null = Wait-FixedWebDriverPortsFree -Deadline $handoffDeadline
+        $deadline = [datetime]::UtcNow.AddMilliseconds($script:PrintPins.TotalTimeoutMilliseconds)
+        $startedAfter = [datetime]::UtcNow
         $driverCapture = Start-BoundedDiscardProcess -Path $TauriDriverPath -Arguments @("--port=$($script:LaunchPins.WebDriverPort)","--native-port=$($script:LaunchPins.NativeDriverPort)","--native-driver=$EdgeDriverPath")
         $driverCapture.Start(); $driver = $driverCapture.Process
         $status = $null

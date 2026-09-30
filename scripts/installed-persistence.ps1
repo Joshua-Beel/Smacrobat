@@ -10,6 +10,7 @@ $script:PersistencePins = [ordered]@{
     Launches = 3
     LaunchTimeoutMilliseconds = 120000
     SessionCreationTimeoutMilliseconds = 60000
+    PortHandoffTimeoutMilliseconds = 300000
     OwnedProcessMaximum = 128
     UnknownIdentityMaximum = 16
 }
@@ -283,14 +284,16 @@ function Invoke-PersistenceUiFlow {
 function Invoke-RealPersistenceLaunch {
     param([string]$ApplicationPath,[string]$TauriDriverPath,[string]$EdgeDriverPath,[string]$ProfileRoot,[string]$SettingsRoot,[string]$ExpectedEdgeDriverVersion,[string]$ExpectedRuntimeVersion,[ValidateSet('write','verify-and-clear','verify-cleared')][string]$Mode)
     $script:LaunchPins.SessionCreationTimeoutMilliseconds = $script:PersistencePins.SessionCreationTimeoutMilliseconds
-    $deadline = [datetime]::UtcNow.AddMilliseconds($script:PersistencePins.LaunchTimeoutMilliseconds)
     $driverCapture = $null; $driver = $null; $sessionId = $null; $captured = @(); $result = $null; $status = $null
-    $startedAfter = [datetime]::UtcNow; $sessionDeleteOutcome = 'requestfailed'; $driverExited = $false
+    $sessionDeleteOutcome = 'requestfailed'; $driverExited = $false
     $driverStopOutcome = 'not-invoked'; $residualCategory = 'multiple'; $remaining = -1
     $capturedOutcomes = [pscustomobject]@{ application = 'absent'; tauriDriver = 'absent'; edgeDriver = 'absent'; webview = 'absent'; ocrEngine = 'absent'; other = 'absent' }
     $residualFacts = [pscustomobject]@{ ownership = 'none'; application = $false; tauriDriver = $false; edgeDriver = $false; webview = $false; ocrEngine = $false; other = $false }
     try {
-        Assert-FixedWebDriverPortsFree
+        $handoffDeadline = [datetime]::UtcNow.AddMilliseconds($script:PersistencePins.PortHandoffTimeoutMilliseconds)
+        $null = Wait-FixedWebDriverPortsFree -Deadline $handoffDeadline
+        $deadline = [datetime]::UtcNow.AddMilliseconds($script:PersistencePins.LaunchTimeoutMilliseconds)
+        $startedAfter = [datetime]::UtcNow
         $driverCapture = Start-BoundedDiscardProcess -Path $TauriDriverPath -Arguments @("--port=$($script:LaunchPins.WebDriverPort)","--native-port=$($script:LaunchPins.NativeDriverPort)","--native-driver=$EdgeDriverPath")
         $driverCapture.Start(); $driver = $driverCapture.Process
         do {
