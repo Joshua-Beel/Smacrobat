@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 function runPowerShell(source: string) {
   const root = `target/reading-tools-test-${randomUUID()}`;
@@ -92,7 +92,8 @@ describe('installed signed reading-tools verifier', () => {
     expect(source).toContain('$capabilities.browserVersion');
     expect(source).toContain("$capabilities.'msedge.userDataDir'");
     expect(source).toContain('Get-OwnedProfileBinding');
-    const check = extractFunctions('scripts/installed-reading-tools.ps1', ['Assert-ReadingOwnedExecutables'], String.raw`
+    const check = extractFunctions('scripts/installed-reading-tools.ps1', ['Get-ReadingSha256', 'Get-ReadingOwnedExecutableDiagnostic', 'Assert-ReadingOwnedExecutables'], String.raw`
+      $script:ReadingPins=[ordered]@{OwnedProcessMaximum=128;UnknownExecutableHashMaximum=32}
       $app='C:\\Program Files\\PDF Workstation\\pdf-workstation.exe';$edge='C:\\drivers\\msedgedriver.exe'
       $valid=@([pscustomobject]@{Path=$app},[pscustomobject]@{Path=$edge},[pscustomobject]@{Path='C:\\WebView\\msedgewebview2.exe'})
       Assert-ReadingOwnedExecutables $valid $app $edge
@@ -156,6 +157,43 @@ describe('installed signed reading-tools verifier', () => {
     `);
     const result = runPowerShell(check);
     expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
+  it('reports deterministic bounded privacy-safe unknown descendant diagnostics', () => {
+    const check = extractFunctions('scripts/installed-reading-tools.ps1', ['Get-ReadingSha256', 'Get-ReadingOwnedExecutableDiagnostic', 'Assert-ReadingOwnedExecutables'], String.raw`
+      $script:ReadingPins=[ordered]@{OwnedProcessMaximum=128;UnknownExecutableHashMaximum=32}
+      $app='C:\\Program Files\\PDF Workstation\\pdf-workstation.exe';$edge='C:\\drivers\\msedgedriver.exe'
+      $valid=@([pscustomobject]@{Path=$app},[pscustomobject]@{Path=$edge},[pscustomobject]@{Path='C:\\WebView\\msedgewebview2.exe'})
+      $unknownA=[pscustomobject]@{Path='C:\\private\\NoTePad.EXE';ProcessId=98765;CommandLine='secret argument'}
+      $unknownB=[pscustomobject]@{Path='D:\\sensitive\\ALPHA.exe';ProcessId=87654;CommandLine='private switch'}
+      $missing=[pscustomobject]@{Path=$null;ProcessId=76543;CommandLine='hidden'}
+      $first=Get-ReadingOwnedExecutableDiagnostic -Owned @($valid+$unknownA+$unknownB+$missing) -ApplicationPath $app -EdgeDriverPath $edge
+      $second=Get-ReadingOwnedExecutableDiagnostic -Owned @(@($missing)+@($unknownB)+$valid+@($unknownA)) -ApplicationPath $app -EdgeDriverPath $edge
+      $firstJson=$first|ConvertTo-Json -Depth 4 -Compress;$secondJson=$second|ConvertTo-Json -Depth 4 -Compress
+      if($firstJson-cne$secondJson){throw 'Unknown descendant diagnostic was not deterministic.'}
+      $expectedProperties='schemaVersion,capturedCount,applicationCount,edgeDriverCount,webViewCount,unknownCount,missingPathCount,unknownLeafHashCount,unknownLeafHashes,unknownLeafHashesTruncated,parentCategoryCountsAvailable,parentCategoryCounts'
+      if(($first.PSObject.Properties.Name-join',')-cne$expectedProperties){throw 'Unknown descendant diagnostic schema drifted.'}
+      if($first.capturedCount-ne6-or$first.applicationCount-ne1-or$first.edgeDriverCount-ne1-or$first.webViewCount-ne1-or$first.unknownCount-ne3-or$first.missingPathCount-ne1){throw 'Unknown descendant counts were incorrect.'}
+      if($first.unknownLeafHashCount-ne2-or$first.unknownLeafHashes.Count-ne2-or$first.unknownLeafHashesTruncated-or$first.parentCategoryCountsAvailable-or$first.parentCategoryCounts.Count-ne0){throw 'Unknown descendant privacy fields were incorrect.'}
+      if(@($first.unknownLeafHashes|Where-Object{$_-cnotmatch'^[A-F0-9]{64}$'}).Count){throw 'Unknown descendant leaf hash was malformed.'}
+      $message='';try{Assert-ReadingOwnedExecutables -Owned @($valid+$unknownA+$missing) -ApplicationPath $app -EdgeDriverPath $edge}catch{$message=$_.Exception.Message}
+      if($message-cnotmatch'^Reading-tools captured an unexpected descendant executable; diagnostic='){throw 'Strict unknown descendant rejection was lost.'}
+      foreach($forbidden in @('notepad.exe','private','sensitive','98765','secret argument','C:\\','D:\\')){if($message.ToLowerInvariant().Contains($forbidden.ToLowerInvariant())){throw 'Unknown descendant diagnostic leaked a raw value.'}}
+      $many=@($valid);for($index=0;$index-lt35;$index++){$many+=[pscustomobject]@{Path=('C:\\private\\rogue-{0:d2}.exe'-f$index)}}
+      $bounded=Get-ReadingOwnedExecutableDiagnostic -Owned $many -ApplicationPath $app -EdgeDriverPath $edge
+      if($bounded.unknownCount-ne35-or$bounded.unknownLeafHashCount-ne32-or$bounded.unknownLeafHashes.Count-ne32-or-not$bounded.unknownLeafHashesTruncated){throw 'Unknown descendant hash cap was not enforced.'}
+      $over=@();for($index=0;$index-lt129;$index++){$over+=[pscustomobject]@{Path=$app}}
+      $capRejected=$false;try{Get-ReadingOwnedExecutableDiagnostic -Owned $over -ApplicationPath $app -EdgeDriverPath $edge|Out-Null}catch{$capRejected=$_.Exception.Message-ceq'Reading-tools owned executable inventory exceeded its process-count cap.'}
+      if(-not$capRejected){throw 'Owned executable process cap did not fail closed.'}
+      $firstJson
+    `);
+    const result = runPowerShell(check);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+    const diagnostic = JSON.parse(result.stdout.trim()) as { unknownLeafHashes: string[] };
+    const expectedNotepadHash = createHash('sha256').update('notepad.exe', 'utf8').digest('hex').toUpperCase();
+    expect(diagnostic.unknownLeafHashes).toEqual([...diagnostic.unknownLeafHashes].sort());
+    expect(diagnostic.unknownLeafHashes).toContain(expectedNotepadHash);
+    expect(result.stdout).not.toMatch(/notepad\.exe|private|sensitive|98765|secret argument|[A-Z]:\\/i);
   });
 
   it('loads and executes the production receipt helper in a standalone reading script process', () => {

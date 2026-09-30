@@ -11,6 +11,7 @@ $script:PersistencePins = [ordered]@{
     LaunchTimeoutMilliseconds = 120000
     SessionCreationTimeoutMilliseconds = 60000
     OwnedProcessMaximum = 128
+    UnknownIdentityMaximum = 16
 }
 
 function Assert-PersistenceExactProperties {
@@ -112,26 +113,66 @@ function Wait-PersistenceUi {
 }
 
 function Get-PersistenceOwnedExecutableCounts {
-    param([object[]]$Owned,[string]$ApplicationPath,[string]$EdgeDriverPath)
+    param([object[]]$Owned,[string]$ApplicationPath,[string]$EdgeDriverPath,[int]$RootProcessId = 0)
     $application = [IO.Path]::GetFullPath($ApplicationPath)
     $driver = [IO.Path]::GetFullPath($EdgeDriverPath)
     $items = @($Owned)
     if ($items.Count -gt $script:PersistencePins.OwnedProcessMaximum) { throw 'Persistence WebDriver captured an oversized descendant inventory.' }
-    $counts = [ordered]@{ applicationCount = 0; edgeDriverCount = 0; webViewCount = 0; unknownCount = 0; totalCount = [int]$items.Count }
+    $counts = [ordered]@{
+        applicationCount = 0; edgeDriverCount = 0; webViewCount = 0; unknownCount = 0; totalCount = [int]$items.Count
+        missingPathCount = 0; unknownLeafNameSha256 = @()
+        parentCategoryCounts = [pscustomobject][ordered]@{ applicationCount = 0; edgeDriverCount = 0; webViewCount = 0; rootCount = 0; unknownCount = 0; unavailableCount = 0 }
+    }
+    $metadata = [Collections.Generic.List[object]]::new()
+    $categoriesByProcessId = @{}
+    $unknownHashes = [Collections.Generic.List[string]]::new()
     foreach ($process in $items) {
-        try { $path = [IO.Path]::GetFullPath([string]$process.Path) } catch { $counts.unknownCount++; continue }
-        $name = [IO.Path]::GetFileName($path)
-        if ($path.Equals($application,[StringComparison]::OrdinalIgnoreCase)) { $counts.applicationCount++; continue }
-        if ($path.Equals($driver,[StringComparison]::OrdinalIgnoreCase)) { $counts.edgeDriverCount++; continue }
-        if ($name.Equals('msedgewebview2.exe',[StringComparison]::OrdinalIgnoreCase)) { $counts.webViewCount++; continue }
-        $counts.unknownCount++
+        $path = ''; $leafName = ''; $category = 'unknown'
+        $rawPath = [string]$process.Path
+        if (-not [string]::IsNullOrWhiteSpace($rawPath)) { try { $path = [IO.Path]::GetFullPath($rawPath); $leafName = [IO.Path]::GetFileName($path) } catch { } }
+        if ([string]::IsNullOrWhiteSpace($path) -or [string]::IsNullOrWhiteSpace($leafName)) { $counts.missingPathCount++ }
+        elseif ($path.Equals($application,[StringComparison]::OrdinalIgnoreCase)) { $category = 'application'; $counts.applicationCount++ }
+        elseif ($path.Equals($driver,[StringComparison]::OrdinalIgnoreCase)) { $category = 'edgeDriver'; $counts.edgeDriverCount++ }
+        elseif ($leafName.Equals('msedgewebview2.exe',[StringComparison]::OrdinalIgnoreCase)) { $category = 'webView'; $counts.webViewCount++ }
+        else {
+            $hash = [Security.Cryptography.SHA256]::Create()
+            try { $unknownHashes.Add(([BitConverter]::ToString($hash.ComputeHash([Text.Encoding]::UTF8.GetBytes($leafName.ToLowerInvariant())))).Replace('-','')) } finally { $hash.Dispose() }
+        }
+        if ($category -ceq 'unknown') { $counts.unknownCount++ }
+        $metadata.Add([pscustomobject]@{ Record = $process; Category = $category })
+        $processIdProperty = $process.PSObject.Properties['ProcessId']
+        $capturedProcessId = 0
+        if ($null -ne $processIdProperty -and [int]::TryParse([string]$processIdProperty.Value,[ref]$capturedProcessId) -and $capturedProcessId -gt 0) {
+            if ($categoriesByProcessId.ContainsKey($capturedProcessId)) { $categoriesByProcessId[$capturedProcessId] = 'unknown' } else { $categoriesByProcessId[$capturedProcessId] = $category }
+        }
+    }
+    $uniqueHashes = @($unknownHashes | Sort-Object -CaseSensitive -Unique)
+    if ($uniqueHashes.Count -gt $script:PersistencePins.UnknownIdentityMaximum) { throw 'Persistence WebDriver captured an oversized unknown executable identity inventory.' }
+    $counts.unknownLeafNameSha256 = $uniqueHashes
+    foreach ($item in $metadata) {
+        if ([string]$item.Category -cne 'unknown') { continue }
+        $parentProperty = $item.Record.PSObject.Properties['ParentProcessId']
+        $parentProcessId = 0
+        if ($null -eq $parentProperty -or -not [int]::TryParse([string]$parentProperty.Value,[ref]$parentProcessId) -or $parentProcessId -le 0) {
+            $counts.parentCategoryCounts.unavailableCount++; continue
+        }
+        $parentCategory = if ($RootProcessId -gt 0 -and $parentProcessId -eq $RootProcessId) { 'root' }
+            elseif ($categoriesByProcessId.ContainsKey($parentProcessId)) { [string]$categoriesByProcessId[$parentProcessId] }
+            else { 'unknown' }
+        switch ($parentCategory) {
+            'application' { $counts.parentCategoryCounts.applicationCount++; break }
+            'edgeDriver' { $counts.parentCategoryCounts.edgeDriverCount++; break }
+            'webView' { $counts.parentCategoryCounts.webViewCount++; break }
+            'root' { $counts.parentCategoryCounts.rootCount++; break }
+            default { $counts.parentCategoryCounts.unknownCount++ }
+        }
     }
     return [pscustomobject]$counts
 }
 
 function Assert-PersistenceOwnedExecutables {
-    param([object[]]$Owned,[string]$ApplicationPath,[string]$EdgeDriverPath)
-    $counts = Get-PersistenceOwnedExecutableCounts -Owned $Owned -ApplicationPath $ApplicationPath -EdgeDriverPath $EdgeDriverPath
+    param([object[]]$Owned,[string]$ApplicationPath,[string]$EdgeDriverPath,[int]$RootProcessId = 0)
+    $counts = Get-PersistenceOwnedExecutableCounts -Owned $Owned -ApplicationPath $ApplicationPath -EdgeDriverPath $EdgeDriverPath -RootProcessId $RootProcessId
     $summary = $counts | ConvertTo-Json -Compress
     if ([int]$counts.unknownCount -ne 0) {
         throw "Persistence WebDriver captured an unexpected descendant executable; ownedCounts=$summary."
@@ -270,7 +311,7 @@ function Invoke-RealPersistenceLaunch {
         $flow = Invoke-PersistenceUiFlow -SessionId $sessionId -Deadline $deadline -Mode $Mode
         $captured += @(Get-OwnedLaunchProcesses -RootProcessId $driver.Id -StartedAfter $startedAfter)
         $captured = @(Get-UniqueOwnedLaunchProcesses -Processes $captured)
-        Assert-PersistenceOwnedExecutables -Owned $captured -ApplicationPath $ApplicationPath -EdgeDriverPath $EdgeDriverPath
+        Assert-PersistenceOwnedExecutables -Owned $captured -ApplicationPath $ApplicationPath -EdgeDriverPath $EdgeDriverPath -RootProcessId $driver.Id
         $binding = if ($returnedUserData) { 'session-capability-' + (Get-ExactProfileBinding -Candidate $returnedUserData -RequestedProfile $ProfileRoot -SettingsRoot $SettingsRoot) } else { Get-OwnedProfileBinding -Owned $captured -RequestedProfile $ProfileRoot -SettingsRoot $SettingsRoot }
         if ($driverCapture.Exceeded) { throw 'Persistence WebDriver diagnostic output exceeded its discarded character cap.' }
         $result = [pscustomobject]@{ mode = $Mode; nativeDriverVersion = $nativeDriverVersion; returnedRuntimeVersion = $returnedRuntimeVersion; profileBinding = $binding; preferences = $flow.preferences; recentPresent = [bool]$flow.recentPresent; starred = [bool]$flow.starred; clearPersisted = [bool]$flow.clearPersisted }

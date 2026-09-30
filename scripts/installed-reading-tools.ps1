@@ -14,6 +14,8 @@ $script:ReadingPins = [ordered]@{
     UiAutomationPollMilliseconds = 100
     ClipboardPollMilliseconds = 100
     RequestBytesMaximum = 1MB
+    OwnedProcessMaximum = 128
+    UnknownExecutableHashMaximum = 32
     SelectionText = 'A place for your PDFs.'
     SearchText = 'Sample document'
     Password = 'test password'
@@ -250,18 +252,50 @@ function Open-ReadingUserFile {
     Submit-ProcessBoundOpenDialog -Dialog $dialog -ApplicationProcessId $ApplicationProcessId -Path $Path
 }
 
-function Assert-ReadingOwnedExecutables {
+function Get-ReadingOwnedExecutableDiagnostic {
     param([object[]]$Owned,[string]$ApplicationPath,[string]$EdgeDriverPath)
+    if ($Owned.Count -gt $script:ReadingPins.OwnedProcessMaximum) { throw 'Reading-tools owned executable inventory exceeded its process-count cap.' }
     $application = [IO.Path]::GetFullPath($ApplicationPath); $edgeDriver = [IO.Path]::GetFullPath($EdgeDriverPath)
-    $applications = 0; $edgeDrivers = 0; $webViews = 0
+    $applications = 0; $edgeDrivers = 0; $webViews = 0; $unknown = 0; $missingPaths = 0
+    $unknownHashes = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($process in $Owned) {
-        $path = [IO.Path]::GetFullPath([string]$process.Path); $name = [IO.Path]::GetFileName($path)
+        $pathProperty = $process.PSObject.Properties['Path']
+        if ($null -eq $pathProperty -or [string]::IsNullOrWhiteSpace([string]$pathProperty.Value)) { $missingPaths++; $unknown++; continue }
+        try { $path = [IO.Path]::GetFullPath([string]$pathProperty.Value); $name = [IO.Path]::GetFileName($path) } catch { $missingPaths++; $unknown++; continue }
+        if ([string]::IsNullOrWhiteSpace($name)) { $missingPaths++; $unknown++; continue }
         if ($path.Equals($application,[StringComparison]::OrdinalIgnoreCase)) { $applications++; continue }
         if ($path.Equals($edgeDriver,[StringComparison]::OrdinalIgnoreCase)) { $edgeDrivers++; continue }
         if ($name.Equals('msedgewebview2.exe',[StringComparison]::OrdinalIgnoreCase)) { $webViews++; continue }
-        throw 'Reading-tools captured an unexpected descendant executable.'
+        $unknown++
+        $leafBytes = [Text.UTF8Encoding]::new($false).GetBytes($name.ToLowerInvariant())
+        $null = $unknownHashes.Add((Get-ReadingSha256 -Bytes $leafBytes))
     }
-    if ($applications -ne 1 -or $edgeDrivers -ne 1 -or $webViews -lt 1) { throw 'Reading-tools did not capture the exact app, EdgeDriver, and WebView descendant topology.' }
+    $sortedHashes = @($unknownHashes | Sort-Object)
+    $reportedHashes = @($sortedHashes | Select-Object -First $script:ReadingPins.UnknownExecutableHashMaximum)
+    return [pscustomobject][ordered]@{
+        schemaVersion = 1
+        capturedCount = [int]$Owned.Count
+        applicationCount = $applications
+        edgeDriverCount = $edgeDrivers
+        webViewCount = $webViews
+        unknownCount = $unknown
+        missingPathCount = $missingPaths
+        unknownLeafHashCount = [int]$reportedHashes.Count
+        unknownLeafHashes = $reportedHashes
+        unknownLeafHashesTruncated = $sortedHashes.Count -gt $script:ReadingPins.UnknownExecutableHashMaximum
+        parentCategoryCountsAvailable = $false
+        parentCategoryCounts = @()
+    }
+}
+
+function Assert-ReadingOwnedExecutables {
+    param([object[]]$Owned,[string]$ApplicationPath,[string]$EdgeDriverPath)
+    $diagnostic = Get-ReadingOwnedExecutableDiagnostic -Owned $Owned -ApplicationPath $ApplicationPath -EdgeDriverPath $EdgeDriverPath
+    if ($diagnostic.unknownCount -ne 0 -or $diagnostic.missingPathCount -ne 0) {
+        $summary = $diagnostic | ConvertTo-Json -Depth 4 -Compress
+        throw "Reading-tools captured an unexpected descendant executable; diagnostic=$summary"
+    }
+    if ($diagnostic.applicationCount -ne 1 -or $diagnostic.edgeDriverCount -ne 1 -or $diagnostic.webViewCount -lt 1) { throw 'Reading-tools did not capture the exact app, EdgeDriver, and WebView descendant topology.' }
 }
 
 function Assert-ReadingProfileScope {
