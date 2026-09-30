@@ -213,15 +213,19 @@ describe('hosted installed signed application launch proof', () => {
     expect(launch).not.toContain('OcrDeadline');
     const rejectedOcrStates = launch.indexOf("if ([string]$ocrResult.state -in @('error','empty','overflow'))");
     const ocrHash = launch.indexOf('$ocrTextReceipt = Get-LaunchOcrTextReceipt', rejectedOcrStates);
-    const ocrClose = launch.indexOf('$closeOcr = Invoke-OcrWebDriverScript', rejectedOcrStates);
+    const closeScriptStart = launch.indexOf("$closeOcrScript = @'", rejectedOcrStates);
+    const ocrClose = launch.indexOf('$closeOcr = Invoke-OcrWebDriverScript', closeScriptStart);
     expect(rejectedOcrStates).toBeGreaterThan(-1);
     expect(ocrHash).toBeGreaterThan(rejectedOcrStates);
     expect(ocrClose).toBeGreaterThan(ocrHash);
     const postOcr = launch.indexOf('$postOcrScript', ocrClose);
-    const closeFlow = launch.slice(ocrClose, postOcr);
+    const closeFlow = launch.slice(closeScriptStart, postOcr);
     expect(closeFlow).toContain("if(d.length===1&&b.length===1)setTimeout(()=>b[0].click(),0);return d.length===1&&b.length===1;");
+    expect(closeFlow).toContain('-Script $closeOcrScript');
+    expect(closeFlow).toContain('-Script $dialogClosedScript');
     expect(closeFlow).toContain("-Stage 'dialog-closed'");
-    expect(closeFlow).toContain("document.querySelectorAll('dialog[aria-labelledby=\\\"page-ocr-title\\\"]').length===0");
+    expect(closeFlow).toContain("document.querySelectorAll('dialog[aria-labelledby=\"page-ocr-title\"]').length===0");
+    expect(closeFlow).not.toContain('\\"');
     expect(closeFlow).not.toMatch(/\.close\(|\.remove\(|removeChild\(/);
     expect(launch).toContain('BeginOutputReadLine');
     expect(launch).toContain('BeginErrorReadLine');
@@ -234,6 +238,44 @@ describe('hosted installed signed application launch proof', () => {
     expect(verifier).toContain("SignedSourceRevision = '67d238218f4796ba7b8505d072868da0f397174a'");
     expect(launch).toContain("sampleName = 'welcome.pdf'; physicalPage = 1; dialogTitle = 'Recognize text on page 1'; status = 'recognized'; language = 'eng'");
     expect(readFileSync('scripts/installed-app-launch-workflow.test.ts', 'utf8')).not.toMatch(/git\s+show|spawnSync\('git'/);
+  });
+
+  it('passes each OCR close script as one exact literal PowerShell string', () => {
+    const launch = readFileSync('scripts/installed-app-launch.ps1', 'utf8');
+    const closeScript = launch.match(/\$closeOcrScript = @'\r?\n([^\r\n]+)\r?\n'@/)?.[1];
+    const closedScript = launch.match(/\$dialogClosedScript = @'\r?\n([^\r\n]+)\r?\n'@/)?.[1];
+    expect(closeScript).toBe("const d=[...document.querySelectorAll('dialog[aria-labelledby=\"page-ocr-title\"]')];const b=d.length===1?[...d[0].querySelectorAll('button')].filter(x=>x.textContent.trim()==='Close'&&!x.disabled):[];if(d.length===1&&b.length===1)setTimeout(()=>b[0].click(),0);return d.length===1&&b.length===1;");
+    expect(closedScript).toBe("return document.querySelectorAll('dialog[aria-labelledby=\"page-ocr-title\"]').length===0;");
+    expect(() => new Function(closeScript!)).not.toThrow();
+    expect(() => new Function(closedScript!)).not.toThrow();
+    expect(`${closeScript}\n${closedScript}`).not.toContain('\\"');
+    expect(`${closeScript}\n${closedScript}`).not.toMatch(/\.close\(|\.remove\(|removeChild\(/);
+
+    const source = String.raw`
+      $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
+      $tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile('${process.cwd().replaceAll("'", "''")}\\scripts\\installed-app-launch.ps1',[ref]$tokens,[ref]$errors)
+      if($errors.Count){throw 'Installed launch script did not parse.'}
+      $function=$ast.Find({param($node)$node-is[Management.Automation.Language.FunctionDefinitionAst]-and$node.Name-ceq'Invoke-RealInstalledAppLaunch'},$true)
+      $expected=[ordered]@{
+        closeOcrScript=@'
+const d=[...document.querySelectorAll('dialog[aria-labelledby="page-ocr-title"]')];const b=d.length===1?[...d[0].querySelectorAll('button')].filter(x=>x.textContent.trim()==='Close'&&!x.disabled):[];if(d.length===1&&b.length===1)setTimeout(()=>b[0].click(),0);return d.length===1&&b.length===1;
+'@
+        dialogClosedScript=@'
+return document.querySelectorAll('dialog[aria-labelledby="page-ocr-title"]').length===0;
+'@
+      }
+      foreach($name in $expected.Keys){
+        $assignments=@($function.FindAll({param($node)$node-is[Management.Automation.Language.AssignmentStatementAst]-and$node.Left.Extent.Text-ceq('$'+$name)},$true))
+        if($assignments.Count-ne1-or$assignments[0].Right-isnot[Management.Automation.Language.CommandExpressionAst]){throw ('OCR close script assignment changed: '+$name)}
+        $literalTokens=@($tokens|Where-Object{$_.Extent.StartOffset-ge$assignments[0].Right.Extent.StartOffset-and$_.Extent.EndOffset-le$assignments[0].Right.Extent.EndOffset})
+        if($literalTokens.Count-ne1-or$literalTokens[0].Kind-cne[Management.Automation.Language.TokenKind]::HereStringLiteral){throw ('OCR close script was not one literal token: '+$name)}
+        Invoke-Expression $assignments[0].Extent.Text
+        $captured=(Get-Variable -Name $name -ValueOnly)
+        if($captured-isnot[string]-or$captured-cne$expected[$name]-or$captured.Contains('\"')){throw ('OCR close script runtime value changed: '+$name)}
+      }
+    `;
+    const result = runPowerShell(source);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
   });
 
   it('reports only fixed OCR stages and bounded allowlisted WebDriver error codes', () => {

@@ -690,9 +690,15 @@ const dialogs=[...document.querySelectorAll('dialog[aria-labelledby="page-ocr-ti
         }
         $ocrTextReceipt = Get-LaunchOcrTextReceipt -Text ([string]$ocrResult.text) -ReportedUtf8Bytes ([int]$ocrResult.utf8Bytes)
         $ocrResult.text = ''
-        $closeOcr = Invoke-OcrWebDriverScript -SessionId $sessionId -Script "const d=[...document.querySelectorAll('dialog[aria-labelledby=\"page-ocr-title\"]')];const b=d.length===1?[...d[0].querySelectorAll('button')].filter(x=>x.textContent.trim()==='Close'&&!x.disabled):[];if(d.length===1&&b.length===1)setTimeout(()=>b[0].click(),0);return d.length===1&&b.length===1;" -Deadline $deadline -Stage 'dialog-close'
+        $closeOcrScript = @'
+const d=[...document.querySelectorAll('dialog[aria-labelledby="page-ocr-title"]')];const b=d.length===1?[...d[0].querySelectorAll('button')].filter(x=>x.textContent.trim()==='Close'&&!x.disabled):[];if(d.length===1&&b.length===1)setTimeout(()=>b[0].click(),0);return d.length===1&&b.length===1;
+'@
+        $closeOcr = Invoke-OcrWebDriverScript -SessionId $sessionId -Script $closeOcrScript -Deadline $deadline -Stage 'dialog-close'
         if ($closeOcr -isnot [bool] -or -not $closeOcr) { throw 'The completed current-page OCR dialog could not be closed exactly.' }
-        $null = Wait-OcrWebDriverOracle -SessionId $sessionId -Script "return document.querySelectorAll('dialog[aria-labelledby=\"page-ocr-title\"]').length===0;" -Deadline $deadline -Kind 'Current-page OCR dialog close' -Stage 'dialog-closed' -Predicate { param($v) $v -is [bool] -and $v }
+        $dialogClosedScript = @'
+return document.querySelectorAll('dialog[aria-labelledby="page-ocr-title"]').length===0;
+'@
+        $null = Wait-OcrWebDriverOracle -SessionId $sessionId -Script $dialogClosedScript -Deadline $deadline -Kind 'Current-page OCR dialog close' -Stage 'dialog-closed' -Predicate { param($v) $v -is [bool] -and $v }
         $postOcrScript = @'
 const tabs=[...document.querySelectorAll('button')].filter(x=>{const s=x.querySelector('span');return s&&s.textContent.trim()==='welcome.pdf'}),i=document.querySelector('img[alt="Page 1"]');return {tab:tabs.length===1,pages:[...document.querySelectorAll('span')].some(x=>x.textContent.trim()==='/ 6'),footer:[...document.querySelectorAll('footer span')].some(x=>x.textContent.trim()==='welcome.pdf · Source preserved'),image:!!i&&i.complete&&i.naturalWidth>0&&i.naturalHeight>0&&i.src.startsWith('blob:')};
 '@
