@@ -1,0 +1,654 @@
+$script:PrintPins = [ordered]@{
+    PrinterName = 'Microsoft Print to PDF'
+    TotalTimeoutMilliseconds = 120000
+    NativeDialogTimeoutMilliseconds = 20000
+    OutputTimeoutMilliseconds = 45000
+    UiElementMaximum = 2048
+    OutputBytesMaximum = 64MB
+    PdfRenderSize = 384
+    PdfFingerprintSize = 64
+    CorrelationMinimum = 0.82
+    MeanAbsoluteDifferenceMaximum = 38.0
+}
+
+function Assert-PrintExactProperties {
+    param($Value,[string[]]$Expected,[string]$Kind)
+    $actual = @($Value.PSObject.Properties.Name | Sort-Object -CaseSensitive)
+    $wanted = @($Expected | Sort-Object -CaseSensitive)
+    if ($actual.Count -ne $wanted.Count -or (Compare-Object $wanted $actual -CaseSensitive)) {
+        throw "$Kind has an unexpected or missing property."
+    }
+}
+
+function Get-PrintCapabilityFacts {
+    param([scriptblock]$PrinterProvider)
+    if ($PrinterProvider) { $printers = @(& $PrinterProvider) } else { $printers = @(Get-CimInstance -ClassName Win32_Printer -ErrorAction Stop) }
+    if ($printers.Count -gt 256) { throw 'Printer preflight returned an unsupported number of printers.' }
+    $names = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $pdf = 0
+    foreach ($printer in $printers) {
+        $name = [string]$printer.Name
+        if ([string]::IsNullOrWhiteSpace($name) -or $name.Length -gt 260 -or -not $names.Add($name)) {
+            throw 'Printer preflight returned an invalid or duplicated printer identity.'
+        }
+        if ($name.Equals($script:PrintPins.PrinterName,[StringComparison]::OrdinalIgnoreCase)) { $pdf++ }
+    }
+    if ($pdf -gt 1) { throw 'Microsoft Print to PDF is duplicated.' }
+    return [pscustomobject]@{
+        printerCount = $printers.Count
+        anyPrinterAvailable = $printers.Count -gt 0
+        microsoftPrintToPdfAvailable = $pdf -eq 1
+        featureInstallationAttempted = $false
+    }
+}
+
+function Assert-PrintCapabilityFacts {
+    param($Facts)
+    Assert-PrintExactProperties -Value $Facts -Expected @('printerCount','anyPrinterAvailable','microsoftPrintToPdfAvailable','featureInstallationAttempted') -Kind 'Printer capability facts'
+    if ([int]$Facts.printerCount -lt 0 -or [int]$Facts.printerCount -gt 256 -or
+        $Facts.anyPrinterAvailable -isnot [bool] -or $Facts.microsoftPrintToPdfAvailable -isnot [bool] -or
+        $Facts.featureInstallationAttempted -isnot [bool] -or $Facts.featureInstallationAttempted -or
+        ([bool]$Facts.anyPrinterAvailable -ne ([int]$Facts.printerCount -gt 0)) -or
+        ([bool]$Facts.microsoftPrintToPdfAvailable -and -not [bool]$Facts.anyPrinterAvailable)) {
+        throw 'Printer capability facts are inconsistent.'
+    }
+}
+
+function Get-PrintPhaseDeadline {
+    param([Parameter(Mandatory = $true)][datetime]$TotalDeadline,[Parameter(Mandatory = $true)][int]$MaximumMilliseconds)
+    if ($MaximumMilliseconds -le 0 -or [datetime]::UtcNow -ge $TotalDeadline) { throw 'Installed print verification exceeded its shared total deadline.' }
+    $phase = [datetime]::UtcNow.AddMilliseconds($MaximumMilliseconds)
+    if ($phase -gt $TotalDeadline) { return $TotalDeadline }
+    return $phase
+}
+
+function Initialize-PrintUiAutomation {
+    if (-not ('Windows.Automation.AutomationElement' -as [type])) {
+        Add-Type -AssemblyName UIAutomationClient
+        Add-Type -AssemblyName UIAutomationTypes
+    }
+}
+
+function Get-ProcessUiElements {
+    param([Parameter(Mandatory = $true)][int]$ProcessId,[switch]$WindowsOnly)
+    Initialize-PrintUiAutomation
+    $condition = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ProcessIdProperty,$ProcessId)
+    $scope = if ($WindowsOnly) { [Windows.Automation.TreeScope]::Children } else { [Windows.Automation.TreeScope]::Descendants }
+    $root = [Windows.Automation.AutomationElement]::RootElement
+    $collection = $root.FindAll($scope,$condition)
+    if ($collection.Count -gt $script:PrintPins.UiElementMaximum) { throw 'Native print UI exceeded its bounded element count.' }
+    return @($collection | ForEach-Object { $_ })
+}
+
+function Assert-ProcessUiElement {
+    param([Parameter(Mandatory = $true)]$Element,[Parameter(Mandatory = $true)][int]$ProcessId)
+    if ([int]$Element.Current.ProcessId -ne $ProcessId) { throw 'Native print UI element escaped the owned application process.' }
+}
+
+function Get-UiControlTypeName {
+    param([Parameter(Mandatory = $true)]$Element)
+    try { return [string]$Element.Current.ControlType.ProgrammaticName } catch { return '' }
+}
+
+function Find-ProcessUiElement {
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)][string[]]$Names,
+        [string[]]$ControlTypes = @(),
+        [switch]$WindowsOnly,
+        [switch]$AllowNone
+    )
+    $foundElements = @()
+    foreach ($element in @(Get-ProcessUiElements -ProcessId $ProcessId -WindowsOnly:$WindowsOnly)) {
+        try {
+            Assert-ProcessUiElement -Element $element -ProcessId $ProcessId
+            $name = [string]$element.Current.Name
+            $type = Get-UiControlTypeName -Element $element
+            if (@($Names | Where-Object { $name.Equals($_,[StringComparison]::OrdinalIgnoreCase) }).Count -eq 1 -and
+                ($ControlTypes.Count -eq 0 -or $ControlTypes.Contains($type))) {
+                $foundElements += $element
+            }
+        } catch { }
+    }
+    if ($foundElements.Count -eq 0 -and $AllowNone) { return $null }
+    if ($foundElements.Count -ne 1) { throw 'Native print UI target was missing or ambiguous.' }
+    return $foundElements[0]
+}
+
+function Find-ProcessUiElementByAutomationId {
+    param([Parameter(Mandatory = $true)][int]$ProcessId,[Parameter(Mandatory = $true)][string[]]$AutomationIds,[Parameter(Mandatory = $true)][string[]]$ControlTypes)
+    $foundElements = @()
+    foreach ($element in @(Get-ProcessUiElements -ProcessId $ProcessId)) {
+        try {
+            Assert-ProcessUiElement -Element $element -ProcessId $ProcessId
+            $automationId = [string]$element.Current.AutomationId
+            $type = Get-UiControlTypeName -Element $element
+            if ($AutomationIds.Contains($automationId) -and $ControlTypes.Contains($type)) { $foundElements += $element }
+        } catch { }
+    }
+    if ($foundElements.Count -ne 1) { throw 'Native print UI automation identifier was missing or ambiguous.' }
+    return $foundElements[0]
+}
+
+function Wait-ProcessUiElement {
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)][string[]]$Names,
+        [string[]]$ControlTypes = @(),
+        [switch]$WindowsOnly,
+        [Parameter(Mandatory = $true)][datetime]$Deadline
+    )
+    do {
+        try {
+            $match = Find-ProcessUiElement -ProcessId $ProcessId -Names $Names -ControlTypes $ControlTypes -WindowsOnly:$WindowsOnly -AllowNone
+            if ($null -ne $match) { return $match }
+        } catch {
+            if ([datetime]::UtcNow -ge $Deadline) { throw }
+        }
+        Start-Sleep -Milliseconds 150
+    } while ([datetime]::UtcNow -lt $Deadline)
+    throw 'Native print UI target did not appear before its bounded deadline.'
+}
+
+function Invoke-ProcessUiElement {
+    param([Parameter(Mandatory = $true)]$Element,[Parameter(Mandatory = $true)][int]$ProcessId)
+    Assert-ProcessUiElement -Element $Element -ProcessId $ProcessId
+    $pattern = $null
+    if (-not $Element.TryGetCurrentPattern([Windows.Automation.InvokePattern]::Pattern,[ref]$pattern)) {
+        throw 'Native print UI control does not expose InvokePattern.'
+    }
+    ([Windows.Automation.InvokePattern]$pattern).Invoke()
+}
+
+function Select-ProcessUiElement {
+    param([Parameter(Mandatory = $true)]$Element,[Parameter(Mandatory = $true)][int]$ProcessId)
+    Assert-ProcessUiElement -Element $Element -ProcessId $ProcessId
+    $selection = $null
+    if ($Element.TryGetCurrentPattern([Windows.Automation.SelectionItemPattern]::Pattern,[ref]$selection)) {
+        ([Windows.Automation.SelectionItemPattern]$selection).Select()
+        return
+    }
+    $invoke = $null
+    if ($Element.TryGetCurrentPattern([Windows.Automation.InvokePattern]::Pattern,[ref]$invoke)) {
+        ([Windows.Automation.InvokePattern]$invoke).Invoke()
+        return
+    }
+    throw 'Native print UI selection does not expose a supported UI Automation pattern.'
+}
+
+function Set-ProcessUiElementValue {
+    param([Parameter(Mandatory = $true)]$Element,[Parameter(Mandatory = $true)][int]$ProcessId,[Parameter(Mandatory = $true)][string]$Value)
+    Assert-ProcessUiElement -Element $Element -ProcessId $ProcessId
+    $pattern = $null
+    if (-not $Element.TryGetCurrentPattern([Windows.Automation.ValuePattern]::Pattern,[ref]$pattern)) {
+        throw 'Native print UI edit does not expose ValuePattern.'
+    }
+    $valuePattern = [Windows.Automation.ValuePattern]$pattern
+    if ($valuePattern.Current.IsReadOnly) { throw 'Native print UI edit is read-only.' }
+    $valuePattern.SetValue($Value)
+}
+
+function Wait-ProcessUiWindowClosed {
+    param([Parameter(Mandatory = $true)][int]$ProcessId,[Parameter(Mandatory = $true)][string[]]$Names,[Parameter(Mandatory = $true)][datetime]$Deadline)
+    do {
+        $foundWindows = @()
+        foreach ($element in @(Get-ProcessUiElements -ProcessId $ProcessId -WindowsOnly)) {
+            try {
+                $name = [string]$element.Current.Name
+                if (@($Names | Where-Object { $name.Equals($_,[StringComparison]::OrdinalIgnoreCase) }).Count -eq 1) { $foundWindows += $element }
+            } catch { }
+        }
+        if ($foundWindows.Count -eq 0) { return }
+        Start-Sleep -Milliseconds 150
+    } while ([datetime]::UtcNow -lt $Deadline)
+    throw 'Native print UI window remained open after its bounded close action.'
+}
+
+function Open-NativePrintDialogFromWebView {
+    param([Parameter(Mandatory = $true)][string]$SessionId,[Parameter(Mandatory = $true)][datetime]$Deadline)
+    $script = @'
+const dialogs=[...document.querySelectorAll('dialog[aria-labelledby="print-title"]')];
+if(dialogs.length!==1)return false;
+const buttons=[...dialogs[0].querySelectorAll('button')].filter(x=>x.textContent.trim()==='Choose printer…'&&!x.disabled);
+if(buttons.length===1)buttons[0].click();
+return buttons.length===1;
+'@
+    $clicked = Invoke-WebDriverScript -SessionId $SessionId -Script $script -Deadline $Deadline
+    if ($clicked -isnot [bool] -or -not $clicked) { throw 'The exact enabled print control was unavailable.' }
+}
+
+function Wait-WebPrintStatus {
+    param([Parameter(Mandatory = $true)][string]$SessionId,[Parameter(Mandatory = $true)][string]$Prefix,[Parameter(Mandatory = $true)][datetime]$Deadline)
+    $encoded = $Prefix | ConvertTo-Json -Compress
+    $script = @'
+const prefix=__PREFIX__;
+const d=[...document.querySelectorAll('dialog[aria-labelledby="print-title"]')];
+const s=d.length===1?d[0].querySelector('[role="status"]'):null;
+return {count:d.length,text:s?.textContent.trim()||'',ready:d.length===1&&!!s&&s.textContent.trim().startsWith(prefix)};
+'@.Replace('__PREFIX__',$encoded)
+    return Wait-WebDriverOracle -SessionId $SessionId -Script $script -Deadline $Deadline -Kind 'Installed print result transport' -Predicate { param($v) [int]$v.count -eq 1 -and [bool]$v.ready -and ([string]$v.text).Length -le 240 }
+}
+
+function Close-WebPrintDialog {
+    param([Parameter(Mandatory = $true)][string]$SessionId,[Parameter(Mandatory = $true)][datetime]$Deadline)
+    $script = @'
+const dialogs=[...document.querySelectorAll('dialog[aria-labelledby="print-title"]')];
+if(dialogs.length!==1)return false;
+const buttons=[...dialogs[0].querySelectorAll('button')].filter(x=>x.textContent.trim()==='Close'&&!x.disabled);
+if(buttons.length===1)buttons[0].click();
+return buttons.length===1;
+'@
+    $closed = Invoke-WebDriverScript -SessionId $SessionId -Script $script -Deadline $Deadline
+    if ($closed -isnot [bool] -or -not $closed) { throw 'The completed print dialog could not be closed exactly.' }
+    $closedOracle = @'
+return document.querySelectorAll('dialog[aria-labelledby="print-title"]').length===0;
+'@
+    $null = Wait-WebDriverOracle -SessionId $SessionId -Script $closedOracle -Deadline $Deadline -Kind 'Installed print dialog close' -Predicate { param($v) $v -is [bool] -and $v }
+}
+
+function Cancel-NativePrintDialog {
+    param([Parameter(Mandatory = $true)][int]$ProcessId,[Parameter(Mandatory = $true)][datetime]$Deadline)
+    $window = Wait-ProcessUiElement -ProcessId $ProcessId -Names @('Print') -ControlTypes @('ControlType.Window') -WindowsOnly -Deadline $Deadline
+    $cancel = Find-ProcessUiElement -ProcessId $ProcessId -Names @('Cancel') -ControlTypes @('ControlType.Button')
+    Invoke-ProcessUiElement -Element $cancel -ProcessId $ProcessId
+    Wait-ProcessUiWindowClosed -ProcessId $ProcessId -Names @('Print') -Deadline $Deadline
+    return $window
+}
+
+function Select-PdfPrinterAndCurrentPage {
+    param([Parameter(Mandatory = $true)][int]$ProcessId,[Parameter(Mandatory = $true)][datetime]$Deadline)
+    $null = Wait-ProcessUiElement -ProcessId $ProcessId -Names @('Print') -ControlTypes @('ControlType.Window') -WindowsOnly -Deadline $Deadline
+    $printer = $null
+    try { $printer = Find-ProcessUiElement -ProcessId $ProcessId -Names @($script:PrintPins.PrinterName) } catch {
+        $combos = @(Get-ProcessUiElements -ProcessId $ProcessId | Where-Object { (Get-UiControlTypeName -Element $_) -ceq 'ControlType.ComboBox' })
+        if ($combos.Count -gt 8) { throw 'Native print dialog exposed too many combo boxes.' }
+        foreach ($combo in $combos) {
+            Assert-ProcessUiElement -Element $combo -ProcessId $ProcessId
+            $expand = $null
+            if ($combo.TryGetCurrentPattern([Windows.Automation.ExpandCollapsePattern]::Pattern,[ref]$expand)) {
+                ([Windows.Automation.ExpandCollapsePattern]$expand).Expand()
+                Start-Sleep -Milliseconds 100
+                try { $printer = Find-ProcessUiElement -ProcessId $ProcessId -Names @($script:PrintPins.PrinterName) -AllowNone } catch { }
+                if ($null -ne $printer) { break }
+            }
+        }
+    }
+    if ($null -eq $printer) { throw 'Microsoft Print to PDF was not exposed by the process-bound native dialog.' }
+    Select-ProcessUiElement -Element $printer -ProcessId $ProcessId
+    $current = Wait-ProcessUiElement -ProcessId $ProcessId -Names @('Current Page','Current page') -ControlTypes @('ControlType.RadioButton') -Deadline $Deadline
+    Select-ProcessUiElement -Element $current -ProcessId $ProcessId
+}
+
+function Submit-NativePrintToPdf {
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)][string]$OutputPath,
+        [Parameter(Mandatory = $true)][datetime]$Deadline
+    )
+    Select-PdfPrinterAndCurrentPage -ProcessId $ProcessId -Deadline $Deadline
+    $print = Find-ProcessUiElement -ProcessId $ProcessId -Names @('Print') -ControlTypes @('ControlType.Button')
+    Invoke-ProcessUiElement -Element $print -ProcessId $ProcessId
+    Wait-ProcessUiWindowClosed -ProcessId $ProcessId -Names @('Print') -Deadline $Deadline
+    $null = Wait-ProcessUiElement -ProcessId $ProcessId -Names @('Save Print Output As','Save As') -ControlTypes @('ControlType.Window') -WindowsOnly -Deadline $Deadline
+    try {
+        $filename = Find-ProcessUiElementByAutomationId -ProcessId $ProcessId -AutomationIds @('1001','FileNameControlHost') -ControlTypes @('ControlType.Edit')
+    } catch {
+        $filename = Find-ProcessUiElement -ProcessId $ProcessId -Names @('File name:','File name') -ControlTypes @('ControlType.Edit')
+    }
+    Set-ProcessUiElementValue -Element $filename -ProcessId $ProcessId -Value $OutputPath
+    $save = Find-ProcessUiElement -ProcessId $ProcessId -Names @('Save') -ControlTypes @('ControlType.Button')
+    Invoke-ProcessUiElement -Element $save -ProcessId $ProcessId
+    Wait-ProcessUiWindowClosed -ProcessId $ProcessId -Names @('Save Print Output As','Save As') -Deadline $Deadline
+}
+
+function Wait-StablePrintFile {
+    param([Parameter(Mandatory = $true)][string]$Path,[Parameter(Mandatory = $true)][datetime]$Deadline)
+    $last = -1L
+    $stable = 0
+    do {
+        if (Test-Path -LiteralPath $Path -PathType Leaf) {
+            $item = Get-Item -LiteralPath $Path
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Printed PDF output is reparse-backed.' }
+            if ($item.Length -le 0 -or $item.Length -gt $script:PrintPins.OutputBytesMaximum) { throw 'Printed PDF output is empty or oversized.' }
+            if ($item.Length -eq $last) { $stable++ } else { $stable = 0; $last = $item.Length }
+            if ($stable -ge 2) { return $item }
+        }
+        Start-Sleep -Milliseconds 250
+    } while ([datetime]::UtcNow -lt $Deadline)
+    throw 'Printed PDF output did not become stable before its bounded deadline.'
+}
+
+function Initialize-PdfiumPrintProof {
+    if ('SignedPdfiumPrintProof' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Linq;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+
+public sealed class SignedPdfiumPrintProof {
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr LoadLibraryExW(string path, IntPtr file, uint flags);
+  [DllImport("kernel32.dll", CharSet=CharSet.Ansi, SetLastError=true)] static extern IntPtr GetProcAddress(IntPtr module, string name);
+  [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate void Init();
+  [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate void Destroy();
+  [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate IntPtr LoadMem(IntPtr data, ulong length, IntPtr password);
+  [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate void CloseDocument(IntPtr document);
+  [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate int PageCount(IntPtr document);
+  [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate IntPtr LoadPage(IntPtr document, int index);
+  [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate void ClosePage(IntPtr page);
+  [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate double PageMetric(IntPtr page);
+  [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate IntPtr BitmapCreate(int width, int height, int alpha);
+  [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate void BitmapDestroy(IntPtr bitmap);
+  [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate void BitmapFill(IntPtr bitmap, int left, int top, int width, int height, uint color);
+  [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate void Render(IntPtr bitmap, IntPtr page, int left, int top, int width, int height, int rotate, int flags);
+  [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate IntPtr BitmapBuffer(IntPtr bitmap);
+  [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate int BitmapInt(IntPtr bitmap);
+
+  readonly IntPtr module;
+  readonly Init init;
+  readonly Destroy destroy;
+  readonly LoadMem load;
+  readonly CloseDocument closeDocument;
+  readonly PageCount pageCount;
+  readonly LoadPage loadPage;
+  readonly ClosePage closePage;
+  readonly PageMetric pageWidth;
+  readonly PageMetric pageHeight;
+  readonly BitmapCreate bitmapCreate;
+  readonly BitmapDestroy bitmapDestroy;
+  readonly BitmapFill bitmapFill;
+  readonly Render render;
+  readonly BitmapBuffer bitmapBuffer;
+  readonly BitmapInt bitmapStride;
+
+  T Get<T>(string name) where T : Delegate {
+    var address = GetProcAddress(module, name);
+    if (address == IntPtr.Zero) throw new InvalidOperationException("Signed PDFium is missing a required export.");
+    return Marshal.GetDelegateForFunctionPointer<T>(address);
+  }
+
+  public SignedPdfiumPrintProof(string path) {
+    module = LoadLibraryExW(Path.GetFullPath(path), IntPtr.Zero, 0x00000100 | 0x00001000);
+    if (module == IntPtr.Zero) throw new InvalidOperationException("Signed PDFium could not be loaded from its exact installed path.");
+    init=Get<Init>("FPDF_InitLibrary"); destroy=Get<Destroy>("FPDF_DestroyLibrary"); load=Get<LoadMem>("FPDF_LoadMemDocument64"); closeDocument=Get<CloseDocument>("FPDF_CloseDocument");
+    pageCount=Get<PageCount>("FPDF_GetPageCount"); loadPage=Get<LoadPage>("FPDF_LoadPage"); closePage=Get<ClosePage>("FPDF_ClosePage"); pageWidth=Get<PageMetric>("FPDF_GetPageWidth"); pageHeight=Get<PageMetric>("FPDF_GetPageHeight");
+    bitmapCreate=Get<BitmapCreate>("FPDFBitmap_Create"); bitmapDestroy=Get<BitmapDestroy>("FPDFBitmap_Destroy"); bitmapFill=Get<BitmapFill>("FPDFBitmap_FillRect"); render=Get<Render>("FPDF_RenderPageBitmap"); bitmapBuffer=Get<BitmapBuffer>("FPDFBitmap_GetBuffer"); bitmapStride=Get<BitmapInt>("FPDFBitmap_GetStride");
+    init();
+  }
+
+  public sealed class Proof {
+    public int Pages { get; set; }
+    public double WidthPoints { get; set; }
+    public double HeightPoints { get; set; }
+    public int InkPixels { get; set; }
+    public byte[] Fingerprint { get; set; }
+    public string FingerprintSha256 { get; set; }
+  }
+
+  public Proof Inspect(string path, int renderSize, int fingerprintSize, long maximumBytes) {
+    var bytes=File.ReadAllBytes(path);
+    if(bytes.Length<=0 || bytes.LongLength>maximumBytes) throw new InvalidOperationException("PDF proof input is empty or oversized.");
+    var handle=GCHandle.Alloc(bytes,GCHandleType.Pinned); IntPtr document=IntPtr.Zero, page=IntPtr.Zero, bitmap=IntPtr.Zero;
+    try {
+      document=load(handle.AddrOfPinnedObject(),(ulong)bytes.LongLength,IntPtr.Zero); if(document==IntPtr.Zero) throw new InvalidOperationException("Signed PDFium could not parse the PDF proof input.");
+      int pages=pageCount(document); if(pages<=0 || pages>65536) throw new InvalidOperationException("PDF proof page count is invalid.");
+      page=loadPage(document,0); if(page==IntPtr.Zero) throw new InvalidOperationException("Signed PDFium could not load the first proof page.");
+      double width=pageWidth(page), height=pageHeight(page); if(!(width>0&&height>0&&width<20000&&height<20000)) throw new InvalidOperationException("PDF proof page dimensions are invalid.");
+      bitmap=bitmapCreate(renderSize,renderSize,1); if(bitmap==IntPtr.Zero) throw new InvalidOperationException("Signed PDFium could not allocate the bounded proof bitmap.");
+      bitmapFill(bitmap,0,0,renderSize,renderSize,0xFFFFFFFF); render(bitmap,page,0,0,renderSize,renderSize,0,0x801);
+      int stride=bitmapStride(bitmap); if(stride<renderSize*4 || stride>renderSize*8) throw new InvalidOperationException("PDF proof bitmap stride is invalid.");
+      var raw=new byte[stride*renderSize]; Marshal.Copy(bitmapBuffer(bitmap),raw,0,raw.Length);
+      var gray=new byte[renderSize*renderSize]; int minX=renderSize,minY=renderSize,maxX=-1,maxY=-1,ink=0;
+      for(int y=0;y<renderSize;y++) for(int x=0;x<renderSize;x++) { int i=y*stride+x*4; byte g=(byte)((raw[i]*29+raw[i+1]*150+raw[i+2]*77)>>8); gray[y*renderSize+x]=g; if(g<245){ink++;minX=Math.Min(minX,x);minY=Math.Min(minY,y);maxX=Math.Max(maxX,x);maxY=Math.Max(maxY,y);} }
+      if(ink<64 || maxX<=minX || maxY<=minY) throw new InvalidOperationException("PDF proof first page has insufficient rendered content.");
+      var fingerprint=new byte[fingerprintSize*fingerprintSize]; double boxW=maxX-minX+1, boxH=maxY-minY+1;
+      for(int y=0;y<fingerprintSize;y++) for(int x=0;x<fingerprintSize;x++) { int sx=Math.Min(maxX,minX+(int)Math.Floor((x+0.5)*boxW/fingerprintSize)); int sy=Math.Min(maxY,minY+(int)Math.Floor((y+0.5)*boxH/fingerprintSize)); fingerprint[y*fingerprintSize+x]=gray[sy*renderSize+sx]; }
+      string hash=Convert.ToHexString(SHA256.HashData(fingerprint));
+      return new Proof{Pages=pages,WidthPoints=width,HeightPoints=height,InkPixels=ink,Fingerprint=fingerprint,FingerprintSha256=hash};
+    } finally { if(bitmap!=IntPtr.Zero)bitmapDestroy(bitmap); if(page!=IntPtr.Zero)closePage(page); if(document!=IntPtr.Zero)closeDocument(document); if(handle.IsAllocated)handle.Free(); }
+  }
+
+  public static double Correlation(byte[] a, byte[] b) {
+    if(a==null||b==null||a.Length!=b.Length||a.Length==0) throw new ArgumentException("PDF fingerprints are incompatible.");
+    double ma=a.Average(x=>(double)x),mb=b.Average(x=>(double)x),num=0,da=0,db=0;
+    for(int i=0;i<a.Length;i++){double x=a[i]-ma,y=b[i]-mb;num+=x*y;da+=x*x;db+=y*y;}
+    if(da<=0||db<=0)return 0; return num/Math.Sqrt(da*db);
+  }
+  public static double MeanAbsoluteDifference(byte[] a, byte[] b) {
+    if(a==null||b==null||a.Length!=b.Length||a.Length==0) throw new ArgumentException("PDF fingerprints are incompatible.");
+    double sum=0;for(int i=0;i<a.Length;i++)sum+=Math.Abs(a[i]-b[i]);return sum/a.Length;
+  }
+}
+'@
+}
+
+function Get-PdfiumPrintProof {
+    param([Parameter(Mandatory = $true)][string]$PdfiumPath,[Parameter(Mandatory = $true)][string]$PdfPath)
+    Initialize-PdfiumPrintProof
+    $engine = [SignedPdfiumPrintProof]::new($PdfiumPath)
+    return $engine.Inspect($PdfPath,$script:PrintPins.PdfRenderSize,$script:PrintPins.PdfFingerprintSize,$script:PrintPins.OutputBytesMaximum)
+}
+
+function Compare-PdfiumPrintProof {
+    param([Parameter(Mandatory = $true)]$Source,[Parameter(Mandatory = $true)]$Output)
+    $correlation = [SignedPdfiumPrintProof]::Correlation($Source.Fingerprint,$Output.Fingerprint)
+    $difference = [SignedPdfiumPrintProof]::MeanAbsoluteDifference($Source.Fingerprint,$Output.Fingerprint)
+    if ($Output.Pages -ne 1 -or $correlation -lt $script:PrintPins.CorrelationMinimum -or $difference -gt $script:PrintPins.MeanAbsoluteDifferenceMaximum) {
+        throw 'Printed PDF did not parse as one page or correlate with the installed sample first page.'
+    }
+    return [pscustomobject]@{ correlation = [Math]::Round($correlation,6); meanAbsoluteDifference = [Math]::Round($difference,3) }
+}
+
+function Assert-PrintCleanupResult {
+    param([Parameter(Mandatory = $true)]$Result)
+    if ($Result.sessionDeleted -isnot [bool] -or -not $Result.sessionDeleted -or
+        $Result.ownedProcessTreeStopped -isnot [bool] -or -not $Result.ownedProcessTreeStopped -or
+        [int]$Result.relevantProcessesRemaining -ne 0) {
+        throw 'Installed print cleanup did not delete the session, stop the owned process tree, and clear relevant processes.'
+    }
+}
+
+function Wait-OwnedPrintApplication {
+    param([Parameter(Mandatory = $true)]$Driver,[Parameter(Mandatory = $true)][datetime]$StartedAfter,[Parameter(Mandatory = $true)][string]$ApplicationPath,[Parameter(Mandatory = $true)][datetime]$Deadline)
+    do {
+        $owned = @(Get-OwnedLaunchProcesses -RootProcessId $Driver.Id -StartedAfter $StartedAfter)
+        $apps = @($owned | Where-Object { ([string]$_.Path).Equals($ApplicationPath,[StringComparison]::OrdinalIgnoreCase) })
+        if ($apps.Count -eq 1) { return [pscustomobject]@{ ProcessId = [int]$apps[0].ProcessId; Owned = $owned } }
+        if ($apps.Count -gt 1) { throw 'The WebDriver process tree contains multiple installed application processes.' }
+        Start-Sleep -Milliseconds 150
+    } while ([datetime]::UtcNow -lt $Deadline)
+    throw 'The exact installed application process did not appear before the shared deadline.'
+}
+
+function Assert-PrintOwnedExecutables {
+    param([object[]]$Owned,[string]$ApplicationPath,[string]$EdgeDriverPath)
+    $app = 0; $edge = 0; $webviews = 0
+    foreach ($item in $Owned) {
+        $path = [string]$item.Path
+        if ($path.Equals($ApplicationPath,[StringComparison]::OrdinalIgnoreCase)) { $app++; continue }
+        if ($path.Equals($EdgeDriverPath,[StringComparison]::OrdinalIgnoreCase)) { $edge++; continue }
+        if ([IO.Path]::GetFileName($path).Equals('msedgewebview2.exe',[StringComparison]::OrdinalIgnoreCase)) { $webviews++; continue }
+        throw 'The print verification process tree contains an unexpected executable.'
+    }
+    if ($app -ne 1 -or $edge -ne 1 -or $webviews -lt 1) { throw 'The print verification process tree is incomplete or ambiguous.' }
+}
+
+function Invoke-RealInstalledPrintDialog {
+    param(
+        [Parameter(Mandatory = $true)][string]$ApplicationPath,
+        [Parameter(Mandatory = $true)][string]$SamplePath,
+        [Parameter(Mandatory = $true)][string]$PdfiumPath,
+        [Parameter(Mandatory = $true)][string]$TauriDriverPath,
+        [Parameter(Mandatory = $true)][string]$EdgeDriverPath,
+        [Parameter(Mandatory = $true)][string]$ProfileRoot,
+        [Parameter(Mandatory = $true)][string]$SettingsRoot,
+        [Parameter(Mandatory = $true)][string]$OutputPdfPath,
+        [Parameter(Mandatory = $true)][string]$ExpectedEdgeDriverVersion,
+        [Parameter(Mandatory = $true)]$PrinterFacts
+    )
+    $deadline = [datetime]::UtcNow.AddMilliseconds($script:PrintPins.TotalTimeoutMilliseconds)
+    $driverCapture = $null; $driver = $null; $sessionId = $null; $captured = @(); $result = $null
+    $startedAfter = [datetime]::UtcNow; $sessionDeleteOutcome = 'requestfailed'; $driverExited = $false
+    $driverStopOutcome = 'not-invoked'; $residualCategory = 'multiple'
+    $capturedOutcomes = [pscustomobject]@{ application='absent';tauriDriver='absent';edgeDriver='absent';webview='absent';ocrEngine='absent';other='absent' }
+    $residualFacts = [pscustomobject]@{ ownership='none';application=$false;tauriDriver=$false;edgeDriver=$false;webview=$false;ocrEngine=$false;other=$false }
+    try {
+        Assert-FixedWebDriverPortsFree
+        $driverCapture = Start-BoundedDiscardProcess -Path $TauriDriverPath -Arguments @("--port=$($script:LaunchPins.WebDriverPort)","--native-port=$($script:LaunchPins.NativeDriverPort)","--native-driver=$EdgeDriverPath")
+        $driverCapture.Start(); $driver = $driverCapture.Process
+        $status = $null
+        do {
+            try { $status = Invoke-BoundedLoopbackJson -Method GET -Path '/status' -Deadline $deadline } catch { }
+            if ($null -ne $status -and [bool]$status.value.ready) { break }
+            if ($driver.HasExited) { throw 'Pinned tauri-driver exited before print verification readiness.' }
+            Start-Sleep -Milliseconds 200
+        } while ([datetime]::UtcNow -lt $deadline)
+        if ($null -eq $status -or -not [bool]$status.value.ready) { throw 'Pinned tauri-driver did not become ready for print verification.' }
+        $nativeVersion = Wait-NativeDriverStatus -ExpectedVersion $ExpectedEdgeDriverVersion -Deadline $deadline -TauriDriver $driver
+        $sessionBody = [ordered]@{ capabilities=[ordered]@{ alwaysMatch=[ordered]@{ browserName='wry';'tauri:options'=[ordered]@{application=$ApplicationPath;args=@();webviewOptions=[ordered]@{userDataFolder=$ProfileRoot}} } } }
+        $session = Invoke-BoundedLoopbackJson -Method POST -Path '/session' -Body $sessionBody -Deadline $deadline
+        if ([string]$session.value.sessionId -cnotmatch '^[A-Za-z0-9-]+$') { throw 'WebDriver did not return a bounded print session identifier.' }
+        $sessionId = [string]$session.value.sessionId
+        $capabilities = $session.value.capabilities
+        $runtimeVersion = [string]$capabilities.browserVersion
+        $vendor = $capabilities.PSObject.Properties['msedge.msedgedriverVersion']
+        if ($null -ne $vendor -and ([string]$vendor.Value -split '\s+')[0] -cne $nativeVersion) { throw 'Print session EdgeDriver version disagrees with native status.' }
+        $userData = $capabilities.PSObject.Properties['msedge.userDataDir']
+        $ownedApp = Wait-OwnedPrintApplication -Driver $driver -StartedAfter $startedAfter -ApplicationPath $ApplicationPath -Deadline $deadline
+        $appProcessId = [int]$ownedApp.ProcessId; $captured += @($ownedApp.Owned)
+        $homeOracle = Wait-WebDriverOracle -SessionId $sessionId -Script "return {ready:document.readyState==='complete',title:document.title,sample:[...document.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Explore a sample PDF').length};" -Deadline $deadline -Kind 'Installed print home UI' -Predicate { param($v) [bool]$v.ready -and [string]$v.title -ceq 'PDF Workstation' -and [int]$v.sample -eq 1 }
+        $clicked = Invoke-WebDriverScript -SessionId $sessionId -Script "const b=[...document.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Explore a sample PDF');if(b.length===1)b[0].click();return b.length===1;" -Deadline $deadline
+        if ($clicked -isnot [bool] -or -not $clicked) { throw 'The installed sample-open control was unavailable.' }
+        $sampleOracle = @'
+const i=document.querySelector('img[alt="Page 1"]');
+return {tab:[...document.querySelectorAll('button')].some(x=>x.textContent.includes('welcome.pdf')),pages:[...document.querySelectorAll('span')].some(x=>x.textContent.trim()==='/ 6'),image:!!i&&i.complete&&i.naturalWidth>0&&i.naturalHeight>0&&i.src.startsWith('blob:')};
+'@
+        $sample = Wait-WebDriverOracle -SessionId $sessionId -Script $sampleOracle -Deadline $deadline -Kind 'Installed sample before printing' -Predicate { param($v) [bool]$v.tab -and [bool]$v.pages -and [bool]$v.image }
+        $printDialog = Invoke-WebDriverScript -SessionId $sessionId -Script "const b=[...document.querySelectorAll('button')].filter(x=>x.getAttribute('aria-label')==='Print');if(b.length===1)b[0].click();return b.length===1;" -Deadline $deadline
+        if ($printDialog -isnot [bool] -or -not $printDialog) { throw 'The exact installed Print control was unavailable.' }
+        $printDialogOracle = @'
+return document.querySelectorAll('dialog[aria-labelledby="print-title"]').length===1;
+'@
+        $null = Wait-WebDriverOracle -SessionId $sessionId -Script $printDialogOracle -Deadline $deadline -Kind 'Installed print dialog' -Predicate { param($v) $v -is [bool] -and $v }
+
+        Open-NativePrintDialogFromWebView -SessionId $sessionId -Deadline $deadline
+        $nativeDeadline = Get-PrintPhaseDeadline -TotalDeadline $deadline -MaximumMilliseconds $script:PrintPins.NativeDialogTimeoutMilliseconds
+        $null = Cancel-NativePrintDialog -ProcessId $appProcessId -Deadline $nativeDeadline
+        $cancelStatus = Wait-WebPrintStatus -SessionId $sessionId -Prefix 'Printing canceled.' -Deadline $deadline
+
+        Open-NativePrintDialogFromWebView -SessionId $sessionId -Deadline $deadline
+        $nativeDeadline = Get-PrintPhaseDeadline -TotalDeadline $deadline -MaximumMilliseconds $script:PrintPins.NativeDialogTimeoutMilliseconds
+        $output = [ordered]@{ status='explicit-unavailable';bytes=$null;sha256=$null;pages=$null;widthPoints=$null;heightPoints=$null;sourceFingerprintSha256=$null;outputFingerprintSha256=$null;correlation=$null;meanAbsoluteDifference=$null }
+        if ([bool]$PrinterFacts.microsoftPrintToPdfAvailable) {
+            Submit-NativePrintToPdf -ProcessId $appProcessId -OutputPath $OutputPdfPath -Deadline $nativeDeadline
+            $item = Wait-StablePrintFile -Path $OutputPdfPath -Deadline (Get-PrintPhaseDeadline -TotalDeadline $deadline -MaximumMilliseconds $script:PrintPins.OutputTimeoutMilliseconds)
+            $submitted = Wait-WebPrintStatus -SessionId $sessionId -Prefix '1 page submitted to the printer.' -Deadline $deadline
+            $sourceProof = Get-PdfiumPrintProof -PdfiumPath $PdfiumPath -PdfPath $SamplePath
+            $outputProof = Get-PdfiumPrintProof -PdfiumPath $PdfiumPath -PdfPath $OutputPdfPath
+            $comparison = Compare-PdfiumPrintProof -Source $sourceProof -Output $outputProof
+            $output = [ordered]@{
+                status='verified';bytes=[uint64]$item.Length;sha256=Get-ExactSha256 -Path $OutputPdfPath
+                pages=[int]$outputProof.Pages;widthPoints=[Math]::Round([double]$outputProof.WidthPoints,3);heightPoints=[Math]::Round([double]$outputProof.HeightPoints,3)
+                sourceFingerprintSha256=[string]$sourceProof.FingerprintSha256;outputFingerprintSha256=[string]$outputProof.FingerprintSha256
+                correlation=[double]$comparison.correlation;meanAbsoluteDifference=[double]$comparison.meanAbsoluteDifference
+            }
+        } else {
+            $null = Cancel-NativePrintDialog -ProcessId $appProcessId -Deadline $nativeDeadline
+            $null = Wait-WebPrintStatus -SessionId $sessionId -Prefix 'Printing canceled.' -Deadline $deadline
+        }
+        Close-WebPrintDialog -SessionId $sessionId -Deadline $deadline
+        Wait-ProcessUiWindowClosed -ProcessId $appProcessId -Names @('Print','Save Print Output As','Save As') -Deadline (Get-PrintPhaseDeadline -TotalDeadline $deadline -MaximumMilliseconds 3000)
+        $captured += @(Get-OwnedLaunchProcesses -RootProcessId $driver.Id -StartedAfter $startedAfter)
+        $captured = @(Get-UniqueOwnedLaunchProcesses -Processes $captured)
+        Assert-PrintOwnedExecutables -Owned $captured -ApplicationPath $ApplicationPath -EdgeDriverPath $EdgeDriverPath
+        $profileBinding = if ($null -ne $userData -and -not [string]::IsNullOrWhiteSpace([string]$userData.Value)) { 'session-capability-' + (Get-ExactProfileBinding -Candidate ([string]$userData.Value) -RequestedProfile $ProfileRoot -SettingsRoot $SettingsRoot) } else { Get-OwnedProfileBinding -Owned $captured -RequestedProfile $ProfileRoot -SettingsRoot $SettingsRoot }
+        if ($driverCapture.Exceeded) { throw 'WebDriver diagnostic output exceeded its discarded character cap.' }
+        $result = [pscustomobject]@{
+            nativeDriverVersion=$nativeVersion;returnedRuntimeVersion=$runtimeVersion;profileBinding=$profileBinding
+            nativeDialogOpenVerified=$true;nativeDialogCancelVerified=$true;cancelResultTransportVerified=([string]$cancelStatus.text).StartsWith('Printing canceled.');nativeDialogReopenVerified=$true
+            webPrintDialogClosed=$true;output=[pscustomobject]$output
+        }
+    } finally {
+        $cleanupDeadline = [datetime]::UtcNow.AddSeconds(10)
+        if ($sessionId) { $sessionDeleteOutcome = Invoke-SessionDeleteOutcome -SessionId $sessionId -Deadline $cleanupDeadline }
+        if ($driver) {
+            try { $captured += @(Get-OwnedLaunchProcesses -RootProcessId $driver.Id -StartedAfter $startedAfter); $captured = @(Get-UniqueOwnedLaunchProcesses -Processes $captured) } catch { }
+            $capturedOutcomes = Stop-OwnedLaunchProcesses -TauriDriver $driver -Captured $captured -Deadline $cleanupDeadline
+            $driverStopOutcome = [string]$capturedOutcomes.rootOutcome; $driverExited = [bool]$driver.HasExited
+            $remaining = @(Get-LaunchProcessSnapshot); $residualCategory = Get-LaunchResidualCategory -Processes $remaining
+            $residualFacts = Get-LaunchResidualFacts -Processes $remaining -Captured $captured
+        }
+        if ($driverCapture) { $driverCapture.Dispose() }
+    }
+    $clear = $residualCategory -ceq 'none'
+    Assert-LaunchCleanupState -Result $result -SessionDeleteOutcome $sessionDeleteOutcome -DriverExited $driverExited -RelevantProcessesClear $clear -DriverStopOutcome $driverStopOutcome -ResidualCategory $residualCategory -CapturedApplication $capturedOutcomes.application -CapturedTauriDriver $capturedOutcomes.tauriDriver -CapturedEdgeDriver $capturedOutcomes.edgeDriver -CapturedWebView $capturedOutcomes.webview -CapturedOcrEngine $capturedOutcomes.ocrEngine -CapturedOther $capturedOutcomes.other -ResidualOwnership $residualFacts.ownership -ResidualApplication $residualFacts.application -ResidualTauriDriver $residualFacts.tauriDriver -ResidualEdgeDriver $residualFacts.edgeDriver -ResidualWebView $residualFacts.webview -ResidualOcrEngine $residualFacts.ocrEngine -ResidualOther $residualFacts.other
+    $result | Add-Member sessionDeleted ($sessionDeleteOutcome -ceq 'verified')
+    $result | Add-Member ownedProcessTreeStopped $driverExited
+    $result | Add-Member relevantProcessesRemaining 0
+    return $result
+}
+
+function Invoke-InstalledPrintDialogVerification {
+    param(
+        [Parameter(Mandatory = $true)][string]$ApplicationPath,[Parameter(Mandatory = $true)]$ApplicationReceipt,
+        [Parameter(Mandatory = $true)][string]$SamplePath,[Parameter(Mandatory = $true)]$SampleReceipt,
+        [Parameter(Mandatory = $true)][string]$PdfiumPath,[Parameter(Mandatory = $true)]$PdfiumReceipt,
+        [Parameter(Mandatory = $true)][string]$WebDriverRoot,[Parameter(Mandatory = $true)][string]$ProfileRoot,
+        [Parameter(Mandatory = $true)][string]$SettingsRoot,[Parameter(Mandatory = $true)][string]$OutputPdfPath,
+        [Parameter(Mandatory = $true)][string]$ExpectedPublisher,[Parameter(Mandatory = $true)]$PrinterFacts,
+        [scriptblock]$ProcessProvider
+    )
+    Assert-PrintCapabilityFacts -Facts $PrinterFacts
+    Assert-FileReceipt -Path $ApplicationPath -Bytes ([uint64]$ApplicationReceipt.bytes) -Sha256 ([string]$ApplicationReceipt.sha256) -Kind 'Installed signed print application'
+    $null = Assert-TrustedWindowsSignature -Path $ApplicationPath -ExpectedPublisher $ExpectedPublisher
+    Assert-FileReceipt -Path $SamplePath -Bytes ([uint64]$SampleReceipt.bytes) -Sha256 ([string]$SampleReceipt.sha256) -Kind 'Installed print sample'
+    Assert-FileReceipt -Path $PdfiumPath -Bytes ([uint64]$PdfiumReceipt.bytes) -Sha256 ([string]$PdfiumReceipt.sha256) -Kind 'Installed signed PDFium'
+    $null = Assert-TrustedWindowsSignature -Path $PdfiumPath -ExpectedPublisher $ExpectedPublisher
+    $receipt = Get-Content -LiteralPath (Join-Path $WebDriverRoot 'webdriver-receipt.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    Assert-WebDriverReceipt -Receipt $receipt
+    $tauri = Join-Path $WebDriverRoot 'tauri-driver-install/bin/tauri-driver.exe'; $edge = Join-Path $WebDriverRoot 'edge-driver/msedgedriver.exe'
+    Assert-FileReceipt -Path $tauri -Bytes ([uint64]$receipt.tauriDriver.bytes) -Sha256 ([string]$receipt.tauriDriver.sha256) -Kind 'Pinned tauri-driver executable'
+    Assert-FileReceipt -Path $edge -Bytes ([uint64]$receipt.edgeDriver.bytes) -Sha256 ([string]$receipt.edgeDriver.sha256) -Kind 'Exact EdgeDriver executable'
+    $null = Assert-TrustedWindowsSignature -Path $edge -ExpectedPublisher $script:LaunchPins.EdgePublisher
+    $expectedSettings = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'local.pdfworkstation.desktop')).TrimEnd('\')
+    $actualSettings = [IO.Path]::GetFullPath($SettingsRoot).TrimEnd('\')
+    if (-not $actualSettings.Equals($expectedSettings,[StringComparison]::OrdinalIgnoreCase)) { throw 'Print settings root does not match the exact application identity.' }
+    Assert-NoReparseAncestors -Path $actualSettings
+    if (-not (Test-Path -LiteralPath $actualSettings -PathType Container) -or @(Get-ChildItem -LiteralPath $actualSettings -Force).Count -ne 0) { throw 'Print settings root must be an empty controlled directory before launch.' }
+    if (Test-Path -LiteralPath $ProfileRoot) { throw 'Print WebView profile must be fresh.' }
+    [IO.Directory]::CreateDirectory($ProfileRoot) | Out-Null
+    Assert-NoReparseAncestors -Path $ProfileRoot
+    if (@(Get-ChildItem -LiteralPath $ProfileRoot -Force).Count -ne 0) { throw 'Print WebView profile was not empty.' }
+    if (Test-Path -LiteralPath $OutputPdfPath) { throw 'Printed PDF output path must be fresh.' }
+    if (@(Get-LaunchProcessSnapshot).Count -ne 0) { throw 'A relevant application or WebDriver process existed before print verification.' }
+    $result = if ($ProcessProvider) { & $ProcessProvider $ApplicationPath $SamplePath $PdfiumPath $tauri $edge $ProfileRoot $SettingsRoot $OutputPdfPath ([string]$receipt.edgeDriver.version) $PrinterFacts } else { Invoke-RealInstalledPrintDialog -ApplicationPath $ApplicationPath -SamplePath $SamplePath -PdfiumPath $PdfiumPath -TauriDriverPath $tauri -EdgeDriverPath $edge -ProfileRoot $ProfileRoot -SettingsRoot $SettingsRoot -OutputPdfPath $OutputPdfPath -ExpectedEdgeDriverVersion ([string]$receipt.edgeDriver.version) -PrinterFacts $PrinterFacts }
+    Assert-PrintExactProperties -Value $result -Expected @('nativeDriverVersion','returnedRuntimeVersion','profileBinding','nativeDialogOpenVerified','nativeDialogCancelVerified','cancelResultTransportVerified','nativeDialogReopenVerified','webPrintDialogClosed','output','sessionDeleted','ownedProcessTreeStopped','relevantProcessesRemaining') -Kind 'Installed print result'
+    Assert-PrintExactProperties -Value $result.output -Expected @('status','bytes','sha256','pages','widthPoints','heightPoints','sourceFingerprintSha256','outputFingerprintSha256','correlation','meanAbsoluteDifference') -Kind 'Installed print output result'
+    $runtime = ([string]$result.returnedRuntimeVersion).Split('.'); $expectedRuntime = ([string]$receipt.webView2RuntimeVersion).Split('.')
+    if ([string]$result.nativeDriverVersion -cne [string]$receipt.edgeDriver.version -or $runtime.Count -ne 4 -or ($runtime[0..2] -join '.') -cne ($expectedRuntime[0..2] -join '.') -or
+        [string]$result.profileBinding -cnotmatch '^(session-capability-|owned-webview-)(requested-profile|requested-ebwebview|tauri-app-settings-ebwebview)$' -or
+        -not [bool]$result.nativeDialogOpenVerified -or -not [bool]$result.nativeDialogCancelVerified -or -not [bool]$result.cancelResultTransportVerified -or -not [bool]$result.nativeDialogReopenVerified -or -not [bool]$result.webPrintDialogClosed -or
+        -not [bool]$result.sessionDeleted -or -not [bool]$result.ownedProcessTreeStopped -or [int]$result.relevantProcessesRemaining -ne 0) { throw 'Installed print result did not satisfy native dialog, transport, reopen, and cleanup oracles.' }
+    Assert-PrintCleanupResult -Result $result
+    if ([bool]$PrinterFacts.microsoftPrintToPdfAvailable) {
+        if ([string]$result.output.status -cne 'verified' -or [uint64]$result.output.bytes -eq 0 -or [string]$result.output.sha256 -cnotmatch '^[A-F0-9]{64}$' -or [int]$result.output.pages -ne 1 -or
+            [string]$result.output.sourceFingerprintSha256 -cnotmatch '^[A-F0-9]{64}$' -or [string]$result.output.outputFingerprintSha256 -cnotmatch '^[A-F0-9]{64}$' -or
+            [double]$result.output.correlation -lt $script:PrintPins.CorrelationMinimum -or [double]$result.output.meanAbsoluteDifference -gt $script:PrintPins.MeanAbsoluteDifferenceMaximum) { throw 'Available Microsoft Print to PDF output was not fully parsed, rendered, and correlated.' }
+        Assert-FileReceipt -Path $OutputPdfPath -Bytes ([uint64]$result.output.bytes) -Sha256 ([string]$result.output.sha256) -Kind 'Printed PDF output'
+    } elseif ([string]$result.output.status -cne 'explicit-unavailable' -or (Test-Path -LiteralPath $OutputPdfPath)) { throw 'Unavailable Microsoft Print to PDF was not reported explicitly without an output file.' }
+    $applicationProfile = Join-Path $actualSettings 'EBWebView'
+    $requestedChild = Join-Path $ProfileRoot 'EBWebView'
+    $usesApplicationProfile = ([string]$result.profileBinding).EndsWith('tauri-app-settings-ebwebview',[StringComparison]::Ordinal)
+    $usesRequestedChild = ([string]$result.profileBinding).EndsWith('requested-ebwebview',[StringComparison]::Ordinal)
+    if ($usesApplicationProfile) {
+        if (-not (Test-Path -LiteralPath $applicationProfile -PathType Container) -or @(Get-ChildItem -LiteralPath $applicationProfile -Force).Count -eq 0 -or @(Get-ChildItem -LiteralPath $actualSettings -Force).Count -ne 1 -or @(Get-ChildItem -LiteralPath $ProfileRoot -Force).Count -ne 0) { throw 'The print run did not exclusively populate its controlled application profile.' }
+        Assert-NoReparseAncestors -Path $applicationProfile
+    } elseif ($usesRequestedChild) {
+        if (-not (Test-Path -LiteralPath $requestedChild -PathType Container) -or @(Get-ChildItem -LiteralPath $requestedChild -Force).Count -eq 0 -or @(Get-ChildItem -LiteralPath $ProfileRoot -Force).Count -ne 1 -or @(Get-ChildItem -LiteralPath $actualSettings -Force).Count -ne 0) { throw 'The print run did not exclusively populate its controlled requested child profile.' }
+        Assert-NoReparseAncestors -Path $requestedChild
+    } else {
+        if (@(Get-ChildItem -LiteralPath $ProfileRoot -Force).Count -eq 0 -or @(Get-ChildItem -LiteralPath $actualSettings -Force).Count -ne 0) { throw 'The print run did not exclusively populate its exact requested profile.' }
+    }
+    return $result
+}

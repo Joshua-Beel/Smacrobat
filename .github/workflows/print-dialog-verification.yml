@@ -1,0 +1,156 @@
+name: Manual signed print dialog verification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: signed-print-dialog-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  print-dialog:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - name: Require a manual master dispatch
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REPOSITORY -cne 'Joshua-Beel/Smacrobat' -or
+              $env:GITHUB_EVENT_NAME -cne 'workflow_dispatch' -or
+              $env:GITHUB_REF -cne 'refs/heads/master') {
+            throw 'Dispatch this print verification only from the master branch.'
+          }
+
+      - name: Initialize fresh runner paths
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP) -or [string]::IsNullOrWhiteSpace($env:GITHUB_ENV)) {
+            throw 'GitHub-hosted runner path variables are unavailable.'
+          }
+          $root = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\')
+          $values = @(
+            "SIGNED_ARTIFACT_ROOT=$root\pdf-workstation-print-signed-artifact"
+            "PRINT_WORK_ROOT=$root\pdf-workstation-print-work"
+            "PRINT_OUTPUT_ROOT=$root\pdf-workstation-print-output"
+            "WEBDRIVER_ROOT=$root\pdf-workstation-print-webdriver"
+            "WEBVIEW_PROFILE_ROOT=$root\pdf-workstation-print-webview-profile"
+          )
+          $writer = [IO.StreamWriter]::new($env:GITHUB_ENV,$true,[Text.UTF8Encoding]::new($false))
+          try { foreach ($value in $values) { $writer.WriteLine([string]$value) } } finally { $writer.Dispose() }
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify clean source and exact signed printing blobs
+        shell: pwsh
+        run: |
+          $head = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $head -cne $env:GITHUB_SHA) { throw 'Checked-out HEAD does not match github.sha.' }
+          git diff --quiet --
+          if ($LASTEXITCODE -ne 0) { throw 'Tracked working-tree files changed after checkout.' }
+          git diff --cached --quiet --
+          if ($LASTEXITCODE -ne 0) { throw 'The tracked index changed after checkout.' }
+          $signed = '67d238218f4796ba7b8505d072868da0f397174a'
+          git cat-file -e "$signed^{commit}"
+          if ($LASTEXITCODE -ne 0) { throw 'The exact signed source commit is unavailable.' }
+          $paths = @(
+            'src-tauri/src/printing.rs'
+            'src-tauri/src/print_commands.rs'
+            'src-tauri/src/service.rs'
+            'src/PrintDialog.tsx'
+            'src/bridge.ts'
+            'src-tauri/src/main.rs'
+            'src-tauri/resources/welcome.pdf'
+            'src-tauri/tauri.conf.json'
+          )
+          foreach ($path in $paths) {
+            $currentBlob = (git rev-parse "${head}:$path").Trim()
+            $signedBlob = (git rev-parse "${signed}:$path").Trim()
+            if ($LASTEXITCODE -ne 0 -or $currentBlob -cne $signedBlob -or $currentBlob -cnotmatch '^[a-f0-9]{40,64}$') {
+              throw "Printing source blob does not match the signed application: $path"
+            }
+            Write-Output ("SIGNED_PRINT_BLOB path={0} object={1}" -f $path,$currentBlob)
+          }
+          $workflowShellBlob = (git rev-parse "${head}:src/App.tsx").Trim()
+          $signedShellBlob = (git rev-parse "${signed}:src/App.tsx").Trim()
+          if ($LASTEXITCODE -ne 0 -or $workflowShellBlob -cnotmatch '^[a-f0-9]{40,64}$' -or $signedShellBlob -cnotmatch '^[a-f0-9]{40,64}$') {
+            throw 'Application shell blob parity could not be determined.'
+          }
+          Write-Output ("SIGNED_PRINT_SHELL path=src/App.tsx matched={0}" -f ($workflowShellBlob -ceq $signedShellBlob).ToString().ToLowerInvariant())
+
+      - name: Preflight hosted Windows printers without installing features
+        shell: pwsh
+        run: |
+          ./scripts/verify-signed-print-dialog.ps1 -PreflightOnly -OutputRoot $env:PRINT_OUTPUT_ROOT
+
+      - name: Prepare exact hosted WebDriver inputs
+        shell: pwsh
+        run: |
+          ./scripts/setup-installed-app-webdriver.ps1 -OutputRoot $env:WEBDRIVER_ROOT
+
+      - name: Recheck clean source after driver preparation
+        shell: pwsh
+        run: |
+          $head = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $head -cne $env:GITHUB_SHA) { throw 'Checked-out HEAD changed during WebDriver preparation.' }
+          git diff --quiet --
+          if ($LASTEXITCODE -ne 0) { throw 'Tracked working-tree files changed during WebDriver preparation.' }
+          git diff --cached --quiet --
+          if ($LASTEXITCODE -ne 0) { throw 'The tracked index changed during WebDriver preparation.' }
+
+      - name: Verify exact signed artifact metadata
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          if (Test-Path -LiteralPath $env:SIGNED_ARTIFACT_ROOT) { throw 'Signed artifact download root must be fresh.' }
+          $headers = @{
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            Accept = 'application/vnd.github+json'
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          $artifact = Invoke-RestMethod -Uri 'https://api.github.com/repos/Joshua-Beel/Smacrobat/actions/artifacts/11005152678' -Headers $headers
+          if ([uint64]$artifact.id -ne 11005152678 -or
+              [string]$artifact.name -cne 'signed-ocr-installer-67d238218f4796ba7b8505d072868da0f397174a' -or
+              [uint64]$artifact.size_in_bytes -ne 10437483 -or
+              [string]$artifact.digest -cne 'sha256:c0e89b5ae821d5875c31855c6596a7d47b7ca052468a026745a5d638e50ca569' -or
+              [uint64]$artifact.workflow_run.id -ne 36499724415 -or
+              [string]$artifact.workflow_run.head_sha -cne '67d238218f4796ba7b8505d072868da0f397174a' -or
+              [bool]$artifact.expired) {
+            throw 'Signed OCR artifact metadata does not match the pinned successful run.'
+          }
+
+      - name: Download exact signed application artifact
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: '11005152678'
+          github-token: ${{ github.token }}
+          repository: Joshua-Beel/Smacrobat
+          run-id: '36499724415'
+          merge-multiple: true
+          path: ${{ env.SIGNED_ARTIFACT_ROOT }}
+
+      - name: Verify signed installed native print dialog and output
+        shell: pwsh
+        run: |
+          ./scripts/verify-signed-print-dialog.ps1 `
+            -SignedArtifactRoot $env:SIGNED_ARTIFACT_ROOT `
+            -WorkRoot $env:PRINT_WORK_ROOT `
+            -OutputRoot $env:PRINT_OUTPUT_ROOT `
+            -WebDriverRoot $env:WEBDRIVER_ROOT `
+            -WebViewProfileRoot $env:WEBVIEW_PROFILE_ROOT
+
+      - name: Upload only the sanitized print verification record
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-print-dialog-verification-${{ github.sha }}
+          path: ${{ env.PRINT_OUTPUT_ROOT }}/print-dialog-verification.json
+          if-no-files-found: ignore
