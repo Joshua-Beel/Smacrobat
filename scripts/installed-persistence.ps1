@@ -184,11 +184,11 @@ function Assert-PersistenceOwnedExecutables {
     $counts = Get-PersistenceOwnedExecutableCounts -Owned $Owned -ApplicationPath $ApplicationPath -EdgeDriverPath $EdgeDriverPath -RootProcessId $RootProcessId
     $summary = $counts | ConvertTo-Json -Compress
     try {
-        $null = Assert-TrustedConsoleHostTopology -Owned $Owned -RootProcessId $RootProcessId -SystemDirectory $SystemDirectory -SignatureProvider $ConsoleHostSignatureProvider -VersionInfoProvider $ConsoleHostVersionInfoProvider
+        $trustedConsoleHostCount = Assert-TrustedConsoleHostTopology -Owned $Owned -RootProcessId $RootProcessId -SystemDirectory $SystemDirectory -SignatureProvider $ConsoleHostSignatureProvider -VersionInfoProvider $ConsoleHostVersionInfoProvider
     } catch {
         throw "Persistence WebDriver captured an untrusted console-host topology; ownedCounts=$summary."
     }
-    if ([int]$counts.unknownCount -ne $script:LaunchPins.ConsoleHostMaximum) {
+    if ([int]$counts.unknownCount -ne [int]$trustedConsoleHostCount) {
         throw "Persistence WebDriver captured an unexpected descendant executable; ownedCounts=$summary."
     }
     if ([int]$counts.applicationCount -ne 1 -or [int]$counts.edgeDriverCount -ne 1 -or [int]$counts.webViewCount -lt 1) {
@@ -215,6 +215,12 @@ const i=document.querySelector('img[alt="Page 1"]');return {tab:[...document.que
     return $script.Trim()
 }
 
+function Get-PersistenceHomeScript {
+    return @'
+return {ready:document.readyState==='complete',title:document.title,sample:[...document.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Explore a sample PDF'&&!x.disabled).length};
+'@
+}
+
 function Get-PersistenceZoomObserveScript {
     param([ValidateSet(125,150,175)][int]$Expected)
     $script = @'
@@ -232,7 +238,11 @@ const i=document.querySelector('img[alt="Page 1"]');return !!i&&i.complete&&i.na
 
 function Invoke-PersistenceUiFlow {
     param([string]$SessionId,[datetime]$Deadline,[ValidateSet('write','verify-and-clear','verify-cleared')][string]$Mode)
-    $homeOracle = Wait-PersistenceUi -SessionId $SessionId -Deadline $Deadline -Stage 'home-ready' -Script "return {ready:document.readyState==='complete',title:document.title,sample:[...document.querySelectorAll('button')].some(x=>x.textContent.trim()==='Explore a sample PDF')};" -Predicate { param($v) [bool]$v.ready -and [string]$v.title -ceq 'PDF Workstation' -and [bool]$v.sample }
+    if ($Mode -ceq 'verify-and-clear') {
+        $recent = Wait-PersistenceUi -SessionId $SessionId -Deadline $Deadline -Stage 'recent-restart-observe' -Script (Get-PersistenceRecentStateScript) -Predicate { param($v) [int]$v.rows -eq 1 -and [int]$v.pages -eq $script:PersistencePins.SamplePages -and [bool]$v.starred -and [bool]$v.clearEnabled }
+    } else {
+        $homeOracle = Wait-PersistenceUi -SessionId $SessionId -Deadline $Deadline -Stage 'home-ready' -Script (Get-PersistenceHomeScript) -Predicate { param($v) [bool]$v.ready -and [string]$v.title -ceq 'PDF Workstation' -and [int]$v.sample -eq 1 }
+    }
     if ($Mode -ceq 'write') {
         $clicked = Invoke-PersistenceUiScript -SessionId $SessionId -Deadline $Deadline -Stage 'sample-open' -Script "const b=[...document.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Explore a sample PDF');if(b.length===1)b[0].click();return b.length===1;"
         if ($clicked -isnot [bool] -or -not $clicked) { throw 'The exact installed sample UI control was unavailable.' }
@@ -255,7 +265,6 @@ function Invoke-PersistenceUiFlow {
     }
 
     if ($Mode -ceq 'verify-and-clear') {
-        $recent = Wait-PersistenceUi -SessionId $SessionId -Deadline $Deadline -Stage 'recent-restart-observe' -Script (Get-PersistenceRecentStateScript) -Predicate { param($v) [int]$v.rows -eq 1 -and [int]$v.pages -eq $script:PersistencePins.SamplePages -and [bool]$v.starred -and [bool]$v.clearEnabled }
         $starredSection = Invoke-PersistenceUiScript -SessionId $SessionId -Deadline $Deadline -Stage 'starred-section' -Script "const b=[...document.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Starred');if(b.length===1)b[0].click();return b.length===1;"
         if ($starredSection -isnot [bool] -or -not $starredSection) { throw 'The exact Starred UI control was unavailable.' }
         $null = Wait-PersistenceUi -SessionId $SessionId -Deadline $Deadline -Stage 'starred-section-observe' -Script (Get-PersistenceRecentStateScript) -Predicate { param($v) [int]$v.rows -eq 1 -and [int]$v.pages -eq $script:PersistencePins.SamplePages -and [bool]$v.starred }

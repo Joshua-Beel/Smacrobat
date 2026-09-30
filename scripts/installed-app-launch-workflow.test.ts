@@ -121,6 +121,7 @@ describe('hosted installed signed application launch proof', () => {
 
   it('binds the live native-driver status and fresh profile when vendor capabilities are absent', () => {
     const source = extractFunctions('scripts/installed-app-launch.ps1', ['Assert-NativeDriverStatus', 'Wait-NativeDriverStatus', 'Get-ExactProfileBinding', 'Get-OwnedProfileBinding', 'Assert-TrustedConsoleHostTopology', 'Assert-OwnedLaunchExecutables', 'Get-UniqueOwnedLaunchProcesses'], String.raw`
+      $script:LaunchPins=[ordered]@{OwnedProcessMaximum=128;ConsoleHostPublisher='Microsoft Windows'}
       $version='151.0.4129.78';$status=[pscustomobject]@{value=[pscustomobject]@{ready=$true;build=[pscustomobject]@{version=($version+' (trusted-build)')}}}
       if((Assert-NativeDriverStatus -Status $status -ExpectedVersion $version)-cne$version){throw 'Native status version was not bound.'}
       foreach($bad in @(
@@ -150,7 +151,7 @@ describe('hosted installed signed application launch proof', () => {
 
   it('allows only the exact signed System32 console-host root and WebView topology', () => {
     const source = extractFunctions('scripts/installed-app-launch.ps1', ['Assert-TrustedConsoleHostTopology', 'Assert-OwnedLaunchExecutables'], String.raw`
-      $script:LaunchPins=[ordered]@{ConsoleHostMaximum=2;ConsoleHostPublisher='Microsoft Windows'}
+      $script:LaunchPins=[ordered]@{OwnedProcessMaximum=128;ConsoleHostPublisher='Microsoft Windows'}
       $system=[Environment]::GetFolderPath([Environment+SpecialFolder]::System);$conhost=Join-Path $system 'conhost.exe'
       $signature={param($path)[pscustomobject]@{Status='Valid';Publisher='Microsoft Windows';HasTimestamp=$true}}
       $version={param($path)[pscustomobject]@{CompanyName='Microsoft Corporation';ProductName=('Microsoft'+[char]0x00AE+' Windows'+[char]0x00AE+' Operating System');InternalName='ConHost';FileDescription='Console Window Host'}}
@@ -158,6 +159,9 @@ describe('hosted installed signed application launch proof', () => {
       $core=@([pscustomobject]@{ProcessId=101;ParentProcessId=900;Path=$app},[pscustomobject]@{ProcessId=102;ParentProcessId=900;Path=$edge},[pscustomobject]@{ProcessId=103;ParentProcessId=101;Path=$web},[pscustomobject]@{ProcessId=104;ParentProcessId=101;Path=$ocr})
       $console=@([pscustomobject]@{ProcessId=105;ParentProcessId=900;Path=$conhost},[pscustomobject]@{ProcessId=106;ParentProcessId=103;Path=$conhost})
       $valid=@($core+$console)
+      $sequentialRoot=@($core+$console[0]+[pscustomobject]@{ProcessId=107;ParentProcessId=900;Path=$conhost})
+      $sequentialWebView=@($core+$console[1]+[pscustomobject]@{ProcessId=108;ParentProcessId=103;Path=$conhost})
+      $sequentialBoth=@($valid+[pscustomobject]@{ProcessId=107;ParentProcessId=900;Path=$conhost},[pscustomobject]@{ProcessId=108;ParentProcessId=103;Path=$conhost})
       if((Assert-TrustedConsoleHostTopology -Owned $valid -RootProcessId 900 -SystemDirectory $system -SignatureProvider $signature -VersionInfoProvider $version)-ne2){throw 'Trusted console-host topology was not accepted.'}
       if((Assert-TrustedConsoleHostTopology -Owned $valid -RootProcessId 900 -SystemDirectory $system)-ne2){throw 'The installed System32 console-host identity was not accepted.'}
       Assert-OwnedLaunchExecutables -Owned $valid -ApplicationPath $app -EdgeDriverPath $edge -OcrEnginePath $ocr -RootProcessId 900 -SystemDirectory $system -ConsoleHostSignatureProvider $signature -ConsoleHostVersionInfoProvider $version
@@ -166,24 +170,30 @@ describe('hosted installed signed application launch proof', () => {
         [pscustomobject]@{owned=@($core);expected=0},
         [pscustomobject]@{owned=@($core+$console[0]);expected=1},
         [pscustomobject]@{owned=@($core+$console[1]);expected=1},
-        [pscustomobject]@{owned=$valid;expected=2}
+        [pscustomobject]@{owned=$valid;expected=2},
+        [pscustomobject]@{owned=$sequentialRoot;expected=2},
+        [pscustomobject]@{owned=$sequentialWebView;expected=2},
+        [pscustomobject]@{owned=$sequentialBoth;expected=4}
       )){
         if((Assert-TrustedConsoleHostTopology -Owned $subset.owned -RootProcessId 900 -AllowAbsent -SystemDirectory $system -SignatureProvider $signature -VersionInfoProvider $version)-ne$subset.expected){throw 'A permitted optional console-host subset was rejected.'}
         Assert-OwnedLaunchExecutables -Owned $subset.owned -ApplicationPath $app -EdgeDriverPath $edge -OcrEnginePath $ocr -RootProcessId 900 -SystemDirectory $system -ConsoleHostSignatureProvider $signature -ConsoleHostVersionInfoProvider $version
       }
       foreach($oneHost in @(@($core+$console[0]),@($core+$console[1]))){$rejected=$false;try{Assert-TrustedConsoleHostTopology -Owned $oneHost -RootProcessId 900 -SystemDirectory $system -SignatureProvider $signature -VersionInfoProvider $version|Out-Null}catch{$rejected=$true};if(-not$rejected){throw 'Required mode accepted an incomplete console-host pair.'}}
+      if((Assert-TrustedConsoleHostTopology -Owned $sequentialBoth -RootProcessId 900 -SystemDirectory $system -SignatureProvider $signature -VersionInfoProvider $version)-ne4){throw 'Required mode rejected sequential trusted console-host identities.'}
       $cases=@(
-        @($core+$console+[pscustomobject]@{ProcessId=107;ParentProcessId=103;Path=$conhost}),
-        @($core+[pscustomobject]@{ProcessId=105;ParentProcessId=900;Path=$conhost},[pscustomobject]@{ProcessId=106;ParentProcessId=900;Path=$conhost}),
         @($core+[pscustomobject]@{ProcessId=105;ParentProcessId=999;Path=$conhost},$console[1]),
         @($core+[pscustomobject]@{ProcessId=105;ParentProcessId=900;Path='C:\fixture\conhost.exe'},$console[1]),
-        @($core+[pscustomobject]@{ProcessId=105;ParentProcessId=900;Path=$conhost},[pscustomobject]@{ProcessId=105;ParentProcessId=103;Path=$conhost})
+        @($core+[pscustomobject]@{ProcessId=105;ParentProcessId=900;Path=$conhost},[pscustomobject]@{ProcessId=105;ParentProcessId=103;Path=$conhost}),
+        @($core+[pscustomobject]@{ProcessId=0;ParentProcessId=900;Path=$conhost},$console[1])
       )
       foreach($case in $cases){$rejected=$false;try{Assert-TrustedConsoleHostTopology -Owned $case -RootProcessId 900 -AllowAbsent -SystemDirectory $system -SignatureProvider $signature -VersionInfoProvider $version|Out-Null}catch{$rejected=$true;if($_.Exception.Message-match'fixture|999|900|105|106|107'){throw 'Console-host rejection leaked captured identity.'}};if(-not$rejected){throw 'Unsafe optional console-host topology was accepted.'}}
       foreach($providerCase in @(
         [pscustomobject]@{signature={param($path)[pscustomobject]@{Status='Valid';Publisher='Other';HasTimestamp=$true}};version=$version},
         [pscustomobject]@{signature=$signature;version={param($path)[pscustomobject]@{CompanyName='Microsoft Corporation';ProductName='Other';InternalName='ConHost';FileDescription='Console Window Host'}}}
       )){$rejected=$false;try{Assert-TrustedConsoleHostTopology -Owned $valid -RootProcessId 900 -SystemDirectory $system -SignatureProvider $providerCase.signature -VersionInfoProvider $providerCase.version|Out-Null}catch{$rejected=$true};if(-not$rejected){throw 'Untrusted console-host signature or product identity was accepted.'}}
+      $boundedNoHost=@(1..128|ForEach-Object{[pscustomobject]@{ProcessId=1000+$_;ParentProcessId=900;Path=('C:\fixture\worker-'+$_+'.exe')}})
+      if((Assert-TrustedConsoleHostTopology -Owned $boundedNoHost -RootProcessId 900 -AllowAbsent -SystemDirectory $system -SignatureProvider $signature -VersionInfoProvider $version)-ne0){throw 'The pinned no-host inventory boundary was rejected.'}
+      foreach($count in @(129,130)){$oversizedNoHost=@(1..$count|ForEach-Object{[pscustomobject]@{ProcessId=1000+$_;ParentProcessId=900;Path=('C:\fixture\worker-'+$_+'.exe')}});$rejected=$false;try{Assert-TrustedConsoleHostTopology -Owned $oversizedNoHost -RootProcessId 900 -AllowAbsent -SystemDirectory $system -SignatureProvider $signature -VersionInfoProvider $version|Out-Null}catch{$rejected=$true};if(-not$rejected){throw ('The pinned process cap accepted a no-host inventory of '+$count+'.')}}
       $rejected=$false;try{Assert-OwnedLaunchExecutables -Owned @($valid+[pscustomobject]@{ProcessId=108;ParentProcessId=900;Path='C:\private\helper.exe'}) -ApplicationPath $app -EdgeDriverPath $edge -OcrEnginePath $ocr -RootProcessId 900 -SystemDirectory $system -ConsoleHostSignatureProvider $signature -ConsoleHostVersionInfoProvider $version}catch{$rejected=$true};if(-not$rejected){throw 'An unrelated owned executable was accepted.'}
     `);
     const result = runPowerShell(source);

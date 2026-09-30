@@ -31,22 +31,24 @@ describe('installed persistence WebDriver proof', () => {
       $tokens=$null;$errors=$null
       $ast=[Management.Automation.Language.Parser]::ParseFile('${process.cwd().replaceAll("'", "''")}\scripts\installed-persistence.ps1',[ref]$tokens,[ref]$errors)
       if($errors.Count){throw 'Installed persistence script did not parse.'}
-      foreach($name in @('Get-PersistenceSampleRenderScript','Get-PersistenceZoomObserveScript','Get-PersistenceImageRenderScript')){
+      foreach($name in @('Get-PersistenceHomeScript','Get-PersistenceSampleRenderScript','Get-PersistenceZoomObserveScript','Get-PersistenceImageRenderScript','Get-PersistenceRecentStateScript')){
         $function=$ast.Find({param($node)$node-is[Management.Automation.Language.FunctionDefinitionAst]-and$node.Name-ceq$name},$true)
         if($null-eq$function){throw ('Missing script helper: '+$name)}
         Invoke-Expression $function.Extent.Text
       }
-      $stages=@('sample-render','zoom-observe','recent-reopen-render','post-clear-sample-render')
+      $stages=@('home-ready','sample-render','zoom-observe','recent-restart-observe','recent-reopen-render','post-clear-sample-render')
       $commands=@($ast.FindAll({param($node)$node-is[Management.Automation.Language.CommandAst]-and$node.GetCommandName()-ceq'Wait-PersistenceUi'},$true)|Where-Object{
         $elements=$_.CommandElements
         $stageIndex=-1
         for($index=0;$index-lt$elements.Count;$index++){if($elements[$index]-is[Management.Automation.Language.CommandParameterAst]-and$elements[$index].ParameterName-ceq'Stage'){$stageIndex=$index;break}}
         $stageIndex-ge 0-and$stageIndex+1-lt$elements.Count-and$stages-contains[string]$elements[$stageIndex+1].Value
       })
-      if($commands.Count-ne 4){throw 'The exact four affected persistence stages were not found.'}
+      if($commands.Count-ne 6){throw 'The exact six persistence stages were not found.'}
       $expectedInvocations=@{
+        'home-ready'='(Get-PersistenceHomeScript)'
         'sample-render'='(Get-PersistenceSampleRenderScript)'
         'zoom-observe'='(Get-PersistenceZoomObserveScript -Expected $expected)'
+        'recent-restart-observe'='(Get-PersistenceRecentStateScript)'
         'recent-reopen-render'='(Get-PersistenceImageRenderScript)'
         'post-clear-sample-render'='(Get-PersistenceImageRenderScript)'
       }
@@ -65,6 +67,7 @@ describe('installed persistence WebDriver proof', () => {
         if($elements[$scriptIndex+1].Extent.Text-cne$expectedInvocations[$stage]){throw ('Persistence stage uses the wrong script helper: '+$stage)}
       }
       [ordered]@{
+        home=Get-PersistenceHomeScript
         sample=Get-PersistenceSampleRenderScript
         zoom125=Get-PersistenceZoomObserveScript -Expected 125
         zoom150=Get-PersistenceZoomObserveScript -Expected 150
@@ -76,6 +79,7 @@ describe('installed persistence WebDriver proof', () => {
       const result = runPowerShell(check, executable);
       expect(result.status, `${executable}: ${result.stderr || result.stdout}`).toBe(0);
       const scripts = JSON.parse(result.stdout.trim()) as Record<string, string>;
+      expect(scripts.home).toBe(`return {ready:document.readyState==='complete',title:document.title,sample:[...document.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Explore a sample PDF'&&!x.disabled).length};`);
       expect(scripts.sample).toBe(`const i=document.querySelector('img[alt="Page 1"]');return {tab:[...document.querySelectorAll('button')].some(x=>x.textContent.includes('welcome.pdf')),pages:[...document.querySelectorAll('span')].some(x=>x.textContent.trim()==='/ 6'),image:!!i&&i.complete&&i.naturalWidth>0&&i.src.startsWith('blob:')};`);
       expect(scripts.zoom125).toBe(`const z=document.querySelector('select[aria-label="Zoom"]');return z?.value==='125';`);
       expect(scripts.zoom150).toBe(`const z=document.querySelector('select[aria-label="Zoom"]');return z?.value==='150';`);
@@ -84,6 +88,40 @@ describe('installed persistence WebDriver proof', () => {
       for (const value of Object.values(scripts)) expect(() => new Function(value)).not.toThrow();
     }
     expect(source.match(/-Script \(Get-PersistenceImageRenderScript\)/g)).toHaveLength(2);
+  });
+
+  it('uses the unique Home sample marker only for empty-history phases', () => {
+    const check = String.raw`
+      $tokens=$null;$errors=$null
+      $ast=[Management.Automation.Language.Parser]::ParseFile('${process.cwd().replaceAll("'", "''")}\scripts\installed-persistence.ps1',[ref]$tokens,[ref]$errors)
+      $function=$ast.Find({param($node)$node-is[Management.Automation.Language.FunctionDefinitionAst]-and$node.Name-ceq'Get-PersistenceHomeScript'},$true)
+      Invoke-Expression $function.Extent.Text
+      Get-PersistenceHomeScript
+    `;
+    const result = runPowerShell(check, 'pwsh');
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+    const homeScript = result.stdout.trim();
+    const buttons = [
+      { textContent: 'Open a file', disabled: false },
+      { textContent: 'Open a file', disabled: false },
+      { textContent: 'Explore a sample PDF', disabled: false },
+    ];
+    const document = {
+      readyState: 'complete',
+      title: 'PDF Workstation',
+      querySelectorAll: (selector: string) => selector === 'button' ? buttons : [],
+    };
+    expect(new Function('document', homeScript)(document)).toEqual({ ready: true, title: 'PDF Workstation', sample: 1 });
+    const appSource = readFileSync('src/App.tsx', 'utf8');
+    expect((appSource.match(/Open a file/g) || []).length).toBeGreaterThan(1);
+    expect(appSource).toContain('Explore a sample PDF');
+    expect(appSource).toContain('!listed.length');
+    const flow = source.slice(source.indexOf('function Invoke-PersistenceUiFlow'), source.indexOf('function Invoke-RealPersistenceLaunch'));
+    expect(flow.match(/-Stage 'home-ready'/g)).toHaveLength(1);
+    expect(flow.match(/-Stage 'recent-restart-observe'/g)).toHaveLength(1);
+    expect(flow).toContain("if ($Mode -ceq 'verify-and-clear') {");
+    expect(flow.indexOf("-Stage 'recent-restart-observe'")).toBeLessThan(flow.indexOf("if ($Mode -ceq 'write')"));
+    expect(flow).not.toContain("sample:[...document.querySelectorAll('button')].some");
   });
 
   it('uses the same profile roots across three clean process launches and verifies clear on the third', () => {
@@ -146,6 +184,10 @@ describe('installed persistence WebDriver proof', () => {
       $validCore=@([pscustomobject]@{ProcessId=101;ParentProcessId=900;Path=$app},[pscustomobject]@{ProcessId=102;ParentProcessId=900;Path=$edge},[pscustomobject]@{ProcessId=103;ParentProcessId=101;Path='C:\WebView\msedgewebview2.exe'})
       $valid=@($validCore+[pscustomobject]@{ProcessId=104;ParentProcessId=900;Path=$conhost},[pscustomobject]@{ProcessId=105;ParentProcessId=103;Path=$conhost})
       Assert-PersistenceOwnedExecutables $valid $app $edge -RootProcessId 900 -SystemDirectory $system -ConsoleHostSignatureProvider $signature -ConsoleHostVersionInfoProvider $version
+      $sequential=@($valid+[pscustomobject]@{ProcessId=106;ParentProcessId=900;Path=$conhost})
+      Assert-PersistenceOwnedExecutables $sequential $app $edge -RootProcessId 900 -SystemDirectory $system -ConsoleHostSignatureProvider $signature -ConsoleHostVersionInfoProvider $version
+      $sequentialReceipt=Get-PersistenceOwnedExecutableCounts $sequential $app $edge -RootProcessId 900
+      if($sequentialReceipt.unknownCount-ne3-or$sequentialReceipt.parentCategoryCounts.rootCount-ne2-or$sequentialReceipt.parentCategoryCounts.webViewCount-ne1){throw 'Sequential trusted console-host diagnostics changed.'}
       $receipt=Get-PersistenceOwnedExecutableCounts $valid $app $edge -RootProcessId 900
       Assert-PersistenceExactProperties -Value $receipt -Expected @('applicationCount','edgeDriverCount','webViewCount','unknownCount','totalCount','missingPathCount','unknownLeafNameSha256','parentCategoryCounts') -Kind 'Sanitized persistence process counts'
       Assert-PersistenceExactProperties -Value $receipt.parentCategoryCounts -Expected @('applicationCount','edgeDriverCount','webViewCount','rootCount','unknownCount','unavailableCount') -Kind 'Sanitized persistence parent-category counts'

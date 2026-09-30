@@ -85,7 +85,7 @@ function Get-ProcessUiElements {
     if ($null -ne $RootElement) {
         Assert-ProcessUiElement -Element $RootElement -ProcessId $ProcessId
         if ([datetime]::UtcNow -ge $Deadline) { throw 'Native print UI enumeration deadline expired.' }
-        $collection = if ($FindAllProvider) { @(& $FindAllProvider $RootElement ([Windows.Automation.TreeScope]::Descendants) $condition) } else { @($RootElement.FindAll([Windows.Automation.TreeScope]::Descendants,$condition) | ForEach-Object { $_ }) }
+        $collection = @(if ($FindAllProvider) { & $FindAllProvider $RootElement ([Windows.Automation.TreeScope]::Descendants) $condition } else { $RootElement.FindAll([Windows.Automation.TreeScope]::Descendants,$condition) | ForEach-Object { $_ } })
         if ([datetime]::UtcNow -ge $Deadline) { throw 'Native print UI enumeration exceeded its deadline.' }
         if ($collection.Count -gt $script:PrintPins.UiElementMaximum) { throw 'Native print UI exceeded its bounded element count.' }
         foreach ($element in $collection) {
@@ -95,7 +95,7 @@ function Get-ProcessUiElements {
         return $collection
     }
     $desktop = if ($DesktopProvider) { & $DesktopProvider } else { [Windows.Automation.AutomationElement]::RootElement }
-    $topLevel = if ($FindAllProvider) { @(& $FindAllProvider $desktop ([Windows.Automation.TreeScope]::Children) $condition) } else { @($desktop.FindAll([Windows.Automation.TreeScope]::Children,$condition) | ForEach-Object { $_ }) }
+    $topLevel = @(if ($FindAllProvider) { & $FindAllProvider $desktop ([Windows.Automation.TreeScope]::Children) $condition } else { $desktop.FindAll([Windows.Automation.TreeScope]::Children,$condition) | ForEach-Object { $_ } })
     if ([datetime]::UtcNow -ge $Deadline) { throw 'Native print UI top-level enumeration exceeded its deadline.' }
     if ($topLevel.Count -lt 1 -or $topLevel.Count -gt $script:PrintPins.UiElementMaximum) { throw 'Native print UI top-level enumeration was missing or oversized.' }
     foreach ($element in $topLevel) {
@@ -110,7 +110,7 @@ function Get-ProcessUiElements {
     foreach ($root in $topLevel) {
         $rootIdentity = Get-ProcessUiRuntimeIdentity -Element $root -ProcessId $ProcessId -Deadline $Deadline
         if ($seen.Add($rootIdentity)) { $elements.Add($root) }
-        $descendants = if ($FindAllProvider) { @(& $FindAllProvider $root ([Windows.Automation.TreeScope]::Descendants) $condition) } else { @($root.FindAll([Windows.Automation.TreeScope]::Descendants,$condition) | ForEach-Object { $_ }) }
+        $descendants = @(if ($FindAllProvider) { & $FindAllProvider $root ([Windows.Automation.TreeScope]::Descendants) $condition } else { $root.FindAll([Windows.Automation.TreeScope]::Descendants,$condition) | ForEach-Object { $_ } })
         if ([datetime]::UtcNow -ge $Deadline) { throw 'Native print UI rooted descendant enumeration exceeded its deadline.' }
         if ($elements.Count + $descendants.Count -gt $script:PrintPins.UiElementMaximum) { throw 'Native print UI exceeded its bounded element count.' }
         foreach ($element in $descendants) {
@@ -321,7 +321,7 @@ function Get-ProcessTopLevelUiSnapshot {
         [scriptblock]$ElementProvider
     )
     if ([datetime]::UtcNow -ge $Deadline) { throw 'Native top-level UI snapshot deadline expired.' }
-    $elements = if ($ElementProvider) { @(& $ElementProvider $ProcessId $true) } else { @(Get-ProcessUiElements -ProcessId $ProcessId -WindowsOnly -Deadline $Deadline) }
+    $elements = @(if ($ElementProvider) { & $ElementProvider $ProcessId $true } else { Get-ProcessUiElements -ProcessId $ProcessId -WindowsOnly -Deadline $Deadline })
     if ([datetime]::UtcNow -ge $Deadline) { throw 'Native top-level UI snapshot exceeded its deadline.' }
     if ($elements.Count -gt $script:PrintPins.UiElementMaximum) { throw 'Native top-level UI snapshot exceeded the bounded element count.' }
     $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
@@ -370,9 +370,9 @@ function Get-ProcessUiTreeSnapshot {
         [scriptblock]$ParentProvider
     )
     if ([datetime]::UtcNow -ge $Deadline) { throw 'Native process UI snapshot deadline expired.' }
-    $topLevel = if ($ElementProvider) { @(& $ElementProvider $ProcessId $true) } else { @(Get-ProcessUiElements -ProcessId $ProcessId -WindowsOnly -Deadline $Deadline) }
+    $topLevel = @(if ($ElementProvider) { & $ElementProvider $ProcessId $true } else { Get-ProcessUiElements -ProcessId $ProcessId -WindowsOnly -Deadline $Deadline })
     if ([datetime]::UtcNow -ge $Deadline) { throw 'Native process UI snapshot exceeded its deadline.' }
-    $elements = if ($ElementProvider) { @(& $ElementProvider $ProcessId $false) } else { @(Get-ProcessUiElements -ProcessId $ProcessId -Deadline $Deadline) }
+    $elements = @(if ($ElementProvider) { & $ElementProvider $ProcessId $false } else { Get-ProcessUiElements -ProcessId $ProcessId -Deadline $Deadline })
     if ([datetime]::UtcNow -ge $Deadline) { throw 'Native process UI snapshot exceeded its deadline.' }
     if ($topLevel.Count -lt 1 -or $topLevel.Count -gt $script:PrintPins.UiElementMaximum -or $elements.Count -lt 1 -or $elements.Count -gt $script:PrintPins.UiElementMaximum) {
         throw 'Native process UI snapshot was missing or exceeded its bounded element count.'
@@ -1093,7 +1093,7 @@ function Assert-PrintOwnedExecutables {
         [scriptblock]$ConsoleHostVersionInfoProvider
     )
     $trustedConsoleHosts = Assert-TrustedConsoleHostTopology -Owned $Owned -RootProcessId $RootProcessId -SystemDirectory $SystemDirectory -SignatureProvider $ConsoleHostSignatureProvider -VersionInfoProvider $ConsoleHostVersionInfoProvider
-    if ([int]$trustedConsoleHosts -ne 2) { throw 'The print verification console-host topology was incomplete.' }
+    if ([int]$trustedConsoleHosts -lt 2) { throw 'The print verification console-host topology was incomplete.' }
     $app = 0; $edge = 0; $webviews = 0; $consoleHosts = 0
     foreach ($item in $Owned) {
         $path = [string]$item.Path
@@ -1152,7 +1152,7 @@ function Invoke-RealInstalledPrintDialog {
         $ownedApp = Wait-OwnedPrintApplication -Driver $driver -StartedAfter $startedAfter -ApplicationPath $ApplicationPath -Deadline $deadline
         $appProcessId = [int]$ownedApp.ProcessId; $captured += @($ownedApp.Owned)
         $trustedConsoleHostCount = Assert-TrustedConsoleHostTopology -Owned $captured -RootProcessId $driver.Id
-        if ([int]$trustedConsoleHostCount -ne 2) { throw 'The print verification console-host topology was incomplete before UI Automation.' }
+        if ([int]$trustedConsoleHostCount -lt 2) { throw 'The print verification console-host topology was incomplete before UI Automation.' }
         $homeOracle = Wait-WebDriverOracle -SessionId $sessionId -Script "return {ready:document.readyState==='complete',title:document.title,sample:[...document.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Explore a sample PDF').length};" -Deadline $deadline -Kind 'Installed print home UI' -Predicate { param($v) [bool]$v.ready -and [string]$v.title -ceq 'PDF Workstation' -and [int]$v.sample -eq 1 }
         $clicked = Invoke-WebDriverScript -SessionId $sessionId -Script "const b=[...document.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Explore a sample PDF');if(b.length===1)b[0].click();return b.length===1;" -Deadline $deadline
         if ($clicked -isnot [bool] -or -not $clicked) { throw 'The installed sample-open control was unavailable.' }

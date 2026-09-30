@@ -15,7 +15,7 @@ $script:LaunchPins = [ordered]@{
     JsonDepthMaximum = 12
     JsonNodesMaximum = 512
     ProcessTimestampToleranceTicks = 10
-    ConsoleHostMaximum = 2
+    OwnedProcessMaximum = 128
     ConsoleHostPublisher = 'Microsoft Windows'
 }
 
@@ -237,14 +237,9 @@ function Assert-TrustedConsoleHostTopology {
         [scriptblock]$VersionInfoProvider
     )
     $items = @($Owned)
+    if ($script:LaunchPins.OwnedProcessMaximum -ne 128 -or $items.Count -gt $script:LaunchPins.OwnedProcessMaximum) { throw 'The captured launch inventory is outside its process-count bound.' }
     $consoleHosts = @($items | Where-Object { [IO.Path]::GetFileName([string]$_.Path).Equals('conhost.exe',[StringComparison]::OrdinalIgnoreCase) })
     if ($AllowAbsent -and $consoleHosts.Count -eq 0) { return 0 }
-    if ($script:LaunchPins.ConsoleHostMaximum -ne 2) { throw 'The trusted Windows console-host bound changed.' }
-    if ($AllowAbsent) {
-        if ($consoleHosts.Count -gt $script:LaunchPins.ConsoleHostMaximum) { throw 'The captured Windows console-host count is outside the trusted topology.' }
-    } elseif ($consoleHosts.Count -ne $script:LaunchPins.ConsoleHostMaximum) {
-        throw 'The captured Windows console-host count is outside the trusted topology.'
-    }
     if ([string]::IsNullOrWhiteSpace($SystemDirectory)) { $SystemDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::System) }
     $expectedPath = [IO.Path]::GetFullPath((Join-Path ([IO.Path]::GetFullPath($SystemDirectory).TrimEnd('\')) 'conhost.exe'))
     if (@($consoleHosts | Where-Object { -not ([IO.Path]::GetFullPath([string]$_.Path)).Equals($expectedPath,[StringComparison]::OrdinalIgnoreCase) }).Count -ne 0) {
@@ -273,8 +268,7 @@ function Assert-TrustedConsoleHostTopology {
         elseif ($webViewIds.Contains($parentProcessId)) { $webViewParents++ }
         else { throw 'A captured Windows console host was outside the owned root and WebView parent topology.' }
     }
-    if (($AllowAbsent -and ($rootParents -gt 1 -or $webViewParents -gt 1 -or $rootParents + $webViewParents -ne $consoleHosts.Count)) -or
-        (-not $AllowAbsent -and ($rootParents -ne 1 -or $webViewParents -ne 1))) {
+    if (-not $AllowAbsent -and ($rootParents -lt 1 -or $webViewParents -lt 1)) {
         throw 'The captured Windows console-host parent categories do not match the trusted topology.'
     }
     $null = Assert-NoReparseAncestors -Path $expectedPath

@@ -181,7 +181,7 @@ describe('installed native print dialog verifier', () => {
       $desktop=[pscustomobject]@{Current=[pscustomobject]@{ProcessId=0}}
       $top=New-EnumerationElement 7319 1 'ControlType.Pane'
       $child=New-EnumerationElement 7319 2 'ControlType.Button'
-      $script:enumerationCalls=@()
+      $child2=New-EnumerationElement 7319 3 'ControlType.Edit'
       $finder={param($root,$scope,$condition)
         $script:enumerationCalls+=([pscustomobject]@{Root=$root;Scope=$scope})
         if([object]::ReferenceEquals($root,$desktop)){
@@ -189,11 +189,17 @@ describe('installed native print dialog verifier', () => {
           return @($top)
         }
         if(-not[object]::ReferenceEquals($root,$top)-or$scope-ne[Windows.Automation.TreeScope]::Descendants){throw 'Unexpected UIA enumeration root or scope.'}
-        return @($child,$child)
+        if($script:descendantCase-ceq'zero'){return @()}
+        if($script:descendantCase-ceq'one'){return $child}
+        return @($child,$child2,$child)
       }
-      $items=@(Get-ProcessUiElements -ProcessId 7319 -Deadline ([datetime]::UtcNow.AddSeconds(1)) -DesktopProvider { $desktop } -FindAllProvider $finder)
-      if($items.Count-ne2-or-not[object]::ReferenceEquals($items[0],$top)-or-not[object]::ReferenceEquals($items[1],$child)){throw 'Rooted UIA enumeration did not merge bounded unique runtime identities.'}
-      if($script:enumerationCalls.Count-ne2-or$script:enumerationCalls[0].Scope-ne[Windows.Automation.TreeScope]::Children-or$script:enumerationCalls[1].Scope-ne[Windows.Automation.TreeScope]::Descendants){throw 'UIA enumeration did not use desktop-children then owned-root-descendants.'}
+      foreach($fixture in @([pscustomobject]@{Name='zero';Count=1},[pscustomobject]@{Name='one';Count=2},[pscustomobject]@{Name='many';Count=3})){
+        $script:descendantCase=[string]$fixture.Name;$script:enumerationCalls=@()
+        $items=@(Get-ProcessUiElements -ProcessId 7319 -Deadline ([datetime]::UtcNow.AddSeconds(1)) -DesktopProvider { $desktop } -FindAllProvider $finder)
+        if($items.Count-ne[int]$fixture.Count-or-not[object]::ReferenceEquals($items[0],$top)){throw ('Rooted UIA '+$fixture.Name+' result did not retain array Count under strict mode.')}
+        if($script:enumerationCalls.Count-ne2-or$script:enumerationCalls[0].Scope-ne[Windows.Automation.TreeScope]::Children-or$script:enumerationCalls[1].Scope-ne[Windows.Automation.TreeScope]::Descendants){throw 'UIA enumeration did not use desktop-children then owned-root-descendants.'}
+      }
+      if(-not[object]::ReferenceEquals($items[1],$child)-or-not[object]::ReferenceEquals($items[2],$child2)){throw 'Rooted UIA enumeration did not merge bounded unique runtime identities.'}
       $script:lateRootedCallReturned=$false
       $slowFinder={param($root,$scope,$condition)if([object]::ReferenceEquals($root,$desktop)){return @($top)};Start-Sleep -Milliseconds 80;$script:lateRootedCallReturned=$true;return @($child)}
       $rejected=$false;try{Get-ProcessUiElements -ProcessId 7319 -Deadline ([datetime]::UtcNow.AddMilliseconds(20)) -DesktopProvider { $desktop } -FindAllProvider $slowFinder|Out-Null}catch{$rejected=$true}
@@ -204,6 +210,9 @@ describe('installed native print dialog verifier', () => {
     expect(source).toContain('$desktop.FindAll([Windows.Automation.TreeScope]::Children');
     expect(source).not.toContain('$desktop.FindAll([Windows.Automation.TreeScope]::Descendants');
     expect(source).toContain('$root.FindAll([Windows.Automation.TreeScope]::Descendants');
+    expect(source).toContain('$topLevel = @(if ($FindAllProvider)');
+    expect(source).toContain('$descendants = @(if ($FindAllProvider)');
+    expect(source).toContain('$elements = @(if ($ElementProvider)');
   });
 
   it('retains sanitized observed counts when an exact native match is ambiguous', () => {
@@ -350,14 +359,21 @@ describe('installed native print dialog verifier', () => {
       foreach($bad in @(0,-1)){$rejected=$false;try{Get-PrintPhaseDeadline -TotalDeadline $total -MaximumMilliseconds $bad}catch{$rejected=$true};if(-not$rejected){throw 'Invalid phase duration accepted.'}}
       $rejected=$false;try{Get-PrintPhaseDeadline -TotalDeadline ([datetime]::UtcNow.AddMilliseconds(-1)) -MaximumMilliseconds 1}catch{$rejected=$true};if(-not$rejected){throw 'Expired total deadline accepted.'}
       $script:topologyCalls=0
-      function Assert-TrustedConsoleHostTopology {param([object[]]$Owned,[int]$RootProcessId,[string]$SystemDirectory,[scriptblock]$SignatureProvider,[scriptblock]$VersionInfoProvider)$script:topologyCalls++;if($RootProcessId-ne41-or@($Owned|Where-Object{[IO.Path]::GetFileName([string]$_.Path)-ieq'conhost.exe'}).Count-ne2){throw 'invalid topology'};return 2}
+      function Assert-TrustedConsoleHostTopology {param([object[]]$Owned,[int]$RootProcessId,[string]$SystemDirectory,[scriptblock]$SignatureProvider,[scriptblock]$VersionInfoProvider)
+        $script:topologyCalls++;$trusted=@($Owned|Where-Object{[IO.Path]::GetFileName([string]$_.Path)-ieq'conhost.exe'});$webviewIds=@($Owned|Where-Object{[IO.Path]::GetFileName([string]$_.Path)-ieq'msedgewebview2.exe'}|ForEach-Object{[int]$_.ProcessId})
+        if($RootProcessId-ne41-or$trusted.Count-lt2-or@($trusted|Where-Object{[int]$_.ParentProcessId-eq$RootProcessId}).Count-lt1-or@($trusted|Where-Object{$webviewIds-contains[int]$_.ParentProcessId}).Count-lt1){throw 'invalid topology'};return $trusted.Count
+      }
       $app='C:\fixture\pdf-workstation.exe';$edge='C:\fixture\msedgedriver.exe';$owned=@(
-        [pscustomobject]@{Path=$app},[pscustomobject]@{Path=$edge},[pscustomobject]@{Path='C:\fixture\msedgewebview2.exe'},
-        [pscustomobject]@{Path='C:\Windows\System32\conhost.exe'},[pscustomobject]@{Path='C:\Windows\System32\conhost.exe'}
+        [pscustomobject]@{Path=$app;ProcessId=42},[pscustomobject]@{Path=$edge;ProcessId=43},[pscustomobject]@{Path='C:\fixture\msedgewebview2.exe';ProcessId=44},
+        [pscustomobject]@{Path='C:\Windows\System32\conhost.exe';ProcessId=45;ParentProcessId=41},
+        [pscustomobject]@{Path='C:\Windows\System32\conhost.exe';ProcessId=46;ParentProcessId=44},
+        [pscustomobject]@{Path='C:\Windows\System32\conhost.exe';ProcessId=47;ParentProcessId=44}
       )
       Assert-PrintOwnedExecutables -Owned $owned -ApplicationPath $app -EdgeDriverPath $edge -RootProcessId 41
       if($script:topologyCalls-ne1){throw 'Print executable validation bypassed the full trusted console-host topology helper.'}
       $rejected=$false;try{Assert-PrintOwnedExecutables -Owned @($owned+[pscustomobject]@{Path='C:\fixture\rogue.exe'}) -ApplicationPath $app -EdgeDriverPath $edge -RootProcessId 41}catch{$rejected=$true};if(-not$rejected){throw 'Unexpected descendant accepted.'}
+      function Assert-TrustedConsoleHostTopology {return 2}
+      $rejected=$false;try{Assert-PrintOwnedExecutables -Owned $owned -ApplicationPath $app -EdgeDriverPath $edge -RootProcessId 41}catch{$rejected=$true};if(-not$rejected){throw 'Console-host inventory was not compared with the trusted lifetime-union count.'}
       function Assert-TrustedConsoleHostTopology {throw 'full topology rejected'}
       $rejected=$false;try{Assert-PrintOwnedExecutables -Owned $owned -ApplicationPath $app -EdgeDriverPath $edge -RootProcessId 41}catch{$rejected=$true};if(-not$rejected){throw 'Console hosts were accepted by leaf name after full topology rejection.'}
       Assert-ProcessUiElement -Element ([pscustomobject]@{Current=[pscustomobject]@{ProcessId=42}}) -ProcessId 42
@@ -375,5 +391,7 @@ describe('installed native print dialog verifier', () => {
     expect(firstUiSnapshot).toBeGreaterThan(topologyCall);
     expect(source.match(/Assert-TrustedConsoleHostTopology -Owned/g)).toHaveLength(2);
     expect(source).not.toMatch(/Assert-TrustedConsoleHostTopology[^\r\n]*-AllowAbsent/);
+    expect(source.match(/\[int\]\$trustedConsoleHost(?:s|Count) -lt 2/g)).toHaveLength(2);
+    expect(source).not.toMatch(/\[int\]\$trustedConsoleHost(?:s|Count) -ne 2/);
   });
 });
