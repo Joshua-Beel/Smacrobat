@@ -157,6 +157,23 @@ describe('installed native print dialog verifier', () => {
     expect(result.status, result.stderr || result.stdout).toBe(0);
   });
 
+  it('accepts the exact process-owned Print target when hosted UIA exposes it as a top-level pane', () => {
+    const result = runPowerShell7(String.raw`
+      $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
+      Set-Location -LiteralPath '${process.cwd().replaceAll("'", "''")}'
+      . ./scripts/installed-print-dialog.ps1
+      function New-HostedTopLevel([string]$name,[string]$type){
+        [pscustomobject]@{Current=[pscustomobject]@{ProcessId=7319;ControlType=[pscustomobject]@{ProgrammaticName=$type};Name=$name}}
+      }
+      function Get-ProcessUiElements {param([int]$ProcessId,[switch]$WindowsOnly)@((New-HostedTopLevel 'PDF Workstation' 'ControlType.Window'),(New-HostedTopLevel 'Print' 'ControlType.Pane'))}
+      $target=Wait-ProcessUiElement -ProcessId 7319 -Names @('Print') -ControlTypes @('ControlType.Window','ControlType.Pane') -WindowsOnly -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddSeconds(1))
+      if([int]$target.Current.ProcessId-ne7319-or[string]$target.Current.Name-cne'Print'-or[string]$target.Current.ControlType.ProgrammaticName-cne'ControlType.Pane'){throw 'Hosted top-level Print pane was not matched exactly.'}
+    `);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+    const source = readFileSync('scripts/installed-print-dialog.ps1', 'utf8');
+    expect(source.match(/-Names @\('Print'\) -ControlTypes @\('ControlType\.Window','ControlType\.Pane'\) -WindowsOnly/g)).toHaveLength(2);
+  });
+
   it('maps every native wait callsite to its exact diagnostic stage', () => {
     const result = runPowerShell7(String.raw`
       $ErrorActionPreference='Stop';Set-StrictMode -Version Latest

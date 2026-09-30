@@ -230,9 +230,21 @@ function Submit-ProcessBoundOpenDialog {
     $invokePattern.Invoke()
 }
 
+function Get-ReadingHomeScript {
+    return @'
+return {ready:document.readyState==='complete',title:document.title,sample:[...document.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Explore a sample PDF'&&!x.disabled).length};
+'@
+}
+
+function Get-ReadingOpenFileScript {
+    return @'
+const b=[...document.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Open a file'&&!x.disabled&&x.parentElement?.querySelector('button[aria-label="Toggle theme"]'));if(b.length===1)b[0].click();return b.length===1;
+'@
+}
+
 function Open-ReadingUserFile {
     param([Parameter(Mandatory = $true)][string]$SessionId,[Parameter(Mandatory = $true)][int]$ApplicationProcessId,[Parameter(Mandatory = $true)][string]$Path,[Parameter(Mandatory = $true)][datetime]$Deadline)
-    $clicked = Invoke-WebDriverScript -SessionId $SessionId -Deadline $Deadline -Script "const b=[...document.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Open a file'&&!x.disabled);if(b.length===1)b[0].click();return b.length===1;"
+    $clicked = Invoke-WebDriverScript -SessionId $SessionId -Deadline $Deadline -Script (Get-ReadingOpenFileScript)
     if ($clicked -isnot [bool] -or -not $clicked) { throw 'The exact installed Open a file control was unavailable.' }
     $dialog = Wait-ProcessBoundOpenDialog -ApplicationProcessId $ApplicationProcessId -Deadline $Deadline
     Submit-ProcessBoundOpenDialog -Dialog $dialog -ApplicationProcessId $ApplicationProcessId -Path $Path
@@ -345,7 +357,7 @@ function Invoke-RealInstalledReadingTools {
         $runtimeParts = $returnedRuntimeVersion.Split('.'); $expectedRuntimeParts = $ExpectedRuntimeVersion.Split('.')
         if ($returnedRuntimeVersion -cnotmatch '^\d+\.\d+\.\d+\.\d+$' -or $runtimeParts.Count -ne 4 -or ($runtimeParts[0..2] -join '.') -cne ($expectedRuntimeParts[0..2] -join '.')) { throw 'Reading-tools WebView2 runtime capability disagrees with its trusted receipt.' }
         $returnedUserData = if ($null -ne $capabilities.PSObject.Properties['msedge.userDataDir']) { [string]$capabilities.'msedge.userDataDir' } else { '' }
-        $homeOracle = Wait-WebDriverOracle -SessionId $sessionId -Deadline $deadline -Kind 'reading-tools home' -Script "return {ready:document.readyState==='complete',title:document.title,open:[...document.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Open a file'&&!x.disabled).length};" -Predicate { param($v) [bool]$v.ready -and [string]$v.title -ceq 'PDF Workstation' -and [int]$v.open -eq 1 }
+        $homeOracle = Wait-WebDriverOracle -SessionId $sessionId -Deadline $deadline -Kind 'reading-tools home' -Script (Get-ReadingHomeScript) -Predicate { param($v) [bool]$v.ready -and [string]$v.title -ceq 'PDF Workstation' -and [int]$v.sample -eq 1 }
         do {
             $captured += @(Get-OwnedLaunchProcesses -RootProcessId $driver.Id -StartedAfter $startedAfter); $captured = @(Get-UniqueOwnedLaunchProcesses -Processes $captured)
             $apps = @($captured | Where-Object { [string]$_.Path -and [IO.Path]::GetFullPath([string]$_.Path).Equals([IO.Path]::GetFullPath($ApplicationPath),[StringComparison]::OrdinalIgnoreCase) })

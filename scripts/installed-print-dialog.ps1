@@ -378,7 +378,7 @@ function Cancel-NativePrintDialog {
         [Parameter(Mandatory = $true)][ValidateSet('first-print-dialog','second-print-dialog')][string]$Stage,
         [Parameter(Mandatory = $true)][datetime]$Deadline
     )
-    $window = Wait-ProcessUiElement -ProcessId $ProcessId -Names @('Print') -ControlTypes @('ControlType.Window') -WindowsOnly -Stage $Stage -Deadline $Deadline
+    $window = Wait-ProcessUiElement -ProcessId $ProcessId -Names @('Print') -ControlTypes @('ControlType.Window','ControlType.Pane') -WindowsOnly -Stage $Stage -Deadline $Deadline
     $cancel = Find-ProcessUiElement -ProcessId $ProcessId -Names @('Cancel') -ControlTypes @('ControlType.Button')
     Invoke-ProcessUiElement -Element $cancel -ProcessId $ProcessId
     Wait-ProcessUiWindowClosed -ProcessId $ProcessId -Names @('Print') -Stage $Stage -Deadline $Deadline
@@ -387,7 +387,7 @@ function Cancel-NativePrintDialog {
 
 function Select-PdfPrinterAndCurrentPage {
     param([Parameter(Mandatory = $true)][int]$ProcessId,[Parameter(Mandatory = $true)][datetime]$Deadline)
-    $null = Wait-ProcessUiElement -ProcessId $ProcessId -Names @('Print') -ControlTypes @('ControlType.Window') -WindowsOnly -Stage 'second-print-dialog' -Deadline $Deadline
+    $null = Wait-ProcessUiElement -ProcessId $ProcessId -Names @('Print') -ControlTypes @('ControlType.Window','ControlType.Pane') -WindowsOnly -Stage 'second-print-dialog' -Deadline $Deadline
     $printer = $null
     try { $printer = Find-ProcessUiElement -ProcessId $ProcessId -Names @($script:PrintPins.PrinterName) } catch {
         $combos = @(Get-ProcessUiElements -ProcessId $ProcessId | Where-Object { (Get-UiControlTypeName -Element $_) -ceq 'ControlType.ComboBox' })

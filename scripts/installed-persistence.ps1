@@ -10,6 +10,7 @@ $script:PersistencePins = [ordered]@{
     Launches = 3
     LaunchTimeoutMilliseconds = 120000
     SessionCreationTimeoutMilliseconds = 60000
+    OwnedProcessMaximum = 128
 }
 
 function Assert-PersistenceExactProperties {
@@ -110,21 +111,33 @@ function Wait-PersistenceUi {
     throw "Installed persistence UI stage did not complete: $Stage."
 }
 
-function Assert-PersistenceOwnedExecutables {
+function Get-PersistenceOwnedExecutableCounts {
     param([object[]]$Owned,[string]$ApplicationPath,[string]$EdgeDriverPath)
     $application = [IO.Path]::GetFullPath($ApplicationPath)
     $driver = [IO.Path]::GetFullPath($EdgeDriverPath)
-    $applications = 0; $drivers = 0; $webViews = 0
-    foreach ($process in $Owned) {
-        $path = [IO.Path]::GetFullPath([string]$process.Path)
+    $items = @($Owned)
+    if ($items.Count -gt $script:PersistencePins.OwnedProcessMaximum) { throw 'Persistence WebDriver captured an oversized descendant inventory.' }
+    $counts = [ordered]@{ applicationCount = 0; edgeDriverCount = 0; webViewCount = 0; unknownCount = 0; totalCount = [int]$items.Count }
+    foreach ($process in $items) {
+        try { $path = [IO.Path]::GetFullPath([string]$process.Path) } catch { $counts.unknownCount++; continue }
         $name = [IO.Path]::GetFileName($path)
-        if ($path.Equals($application,[StringComparison]::OrdinalIgnoreCase)) { $applications++; continue }
-        if ($path.Equals($driver,[StringComparison]::OrdinalIgnoreCase)) { $drivers++; continue }
-        if ($name.Equals('msedgewebview2.exe',[StringComparison]::OrdinalIgnoreCase)) { $webViews++; continue }
-        throw 'Persistence WebDriver captured an unexpected descendant executable.'
+        if ($path.Equals($application,[StringComparison]::OrdinalIgnoreCase)) { $counts.applicationCount++; continue }
+        if ($path.Equals($driver,[StringComparison]::OrdinalIgnoreCase)) { $counts.edgeDriverCount++; continue }
+        if ($name.Equals('msedgewebview2.exe',[StringComparison]::OrdinalIgnoreCase)) { $counts.webViewCount++; continue }
+        $counts.unknownCount++
     }
-    if ($applications -ne 1 -or $drivers -ne 1 -or $webViews -lt 1) {
-        throw 'Persistence WebDriver did not capture exactly one installed app, one trusted EdgeDriver, and at least one WebView2 process.'
+    return [pscustomobject]$counts
+}
+
+function Assert-PersistenceOwnedExecutables {
+    param([object[]]$Owned,[string]$ApplicationPath,[string]$EdgeDriverPath)
+    $counts = Get-PersistenceOwnedExecutableCounts -Owned $Owned -ApplicationPath $ApplicationPath -EdgeDriverPath $EdgeDriverPath
+    $summary = $counts | ConvertTo-Json -Compress
+    if ([int]$counts.unknownCount -ne 0) {
+        throw "Persistence WebDriver captured an unexpected descendant executable; ownedCounts=$summary."
+    }
+    if ([int]$counts.applicationCount -ne 1 -or [int]$counts.edgeDriverCount -ne 1 -or [int]$counts.webViewCount -lt 1) {
+        throw "Persistence WebDriver did not capture exactly one installed app, one trusted EdgeDriver, and at least one WebView2 process; ownedCounts=$summary."
     }
 }
 

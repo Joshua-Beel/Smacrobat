@@ -117,6 +117,32 @@ describe('installed signed reading-tools verifier', () => {
     expect(source).toContain('Assert-BoundedJsonShape');
   });
 
+  it('uses the signed Home marker and the unique global Open action when Home has two Open buttons', () => {
+    const check = extractFunctions('scripts/installed-reading-tools.ps1', ['Get-ReadingHomeScript', 'Get-ReadingOpenFileScript'], String.raw`
+      [ordered]@{home=Get-ReadingHomeScript;open=Get-ReadingOpenFileScript}|ConvertTo-Json -Compress
+    `);
+    const result = runPowerShell(check);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+    const scripts = JSON.parse(result.stdout.trim()) as { home: string; open: string };
+    expect(() => new Function('document', scripts.home)).not.toThrow();
+    expect(() => new Function('document', scripts.open)).not.toThrow();
+    const globalParent = { querySelector: (selector: string) => selector === 'button[aria-label="Toggle theme"]' ? {} : null };
+    const emptyParent = { querySelector: () => null };
+    const clicked: string[] = [];
+    const buttons = [
+      { textContent: 'Open a file', disabled: false, parentElement: globalParent, click: () => clicked.push('global') },
+      { textContent: 'Open a file', disabled: false, parentElement: emptyParent, click: () => clicked.push('empty') },
+      { textContent: 'Explore a sample PDF', disabled: false, parentElement: emptyParent, click: () => clicked.push('sample') },
+    ];
+    const document = { readyState: 'complete', title: 'PDF Workstation', querySelectorAll: (selector: string) => selector === 'button' ? buttons : [] };
+    expect(new Function('document', scripts.home)(document)).toEqual({ ready: true, title: 'PDF Workstation', sample: 1 });
+    expect(new Function('document', scripts.open)(document)).toBe(true);
+    expect(clicked).toEqual(['global']);
+    const checkedOutApp = readFileSync('src/App.tsx', 'utf8');
+    expect((checkedOutApp.match(/Open a file/g) || []).length).toBeGreaterThan(1);
+    expect(checkedOutApp).toContain('Explore a sample PDF');
+  });
+
   it('waits boundedly for fixed ports released by the prior installed-app proof', () => {
     const check = extractFunctions('scripts/installed-reading-tools.ps1', ['Wait-ReadingWebDriverPortsFree'], String.raw`
       $script:ReadingPins=[ordered]@{PortReleasePollMilliseconds=1}
