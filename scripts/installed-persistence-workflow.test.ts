@@ -130,24 +130,33 @@ describe('installed persistence WebDriver proof', () => {
     const launchSource = readFileSync('scripts/installed-app-launch.ps1', 'utf8');
     expect(launchSource).toContain('ParentProcessId = [int]$_.ParentProcessId');
     const check = String.raw`
+      . ./scripts/ocr/installer-package.ps1
+      . ./scripts/ocr/windows-signing.ps1
       $tokens=$null;$errors=$null
       $ast=[Management.Automation.Language.Parser]::ParseFile('${process.cwd().replaceAll("'", "''")}\scripts\installed-persistence.ps1',[ref]$tokens,[ref]$errors)
       $pins=$ast.Find({param($node)$node-is[Management.Automation.Language.AssignmentStatementAst]-and$node.Left.Extent.Text-ceq'$script:PersistencePins'},$true);Invoke-Expression $pins.Extent.Text
+      $launchAst=[Management.Automation.Language.Parser]::ParseFile('${process.cwd().replaceAll("'", "''")}\scripts\installed-app-launch.ps1',[ref]$tokens,[ref]$errors)
+      $launchPins=$launchAst.Find({param($node)$node-is[Management.Automation.Language.AssignmentStatementAst]-and$node.Left.Extent.Text-ceq'$script:LaunchPins'},$true);Invoke-Expression $launchPins.Extent.Text
+      $consoleFunction=$launchAst.Find({param($node)$node-is[Management.Automation.Language.FunctionDefinitionAst]-and$node.Name-ceq'Assert-TrustedConsoleHostTopology'},$true);Invoke-Expression $consoleFunction.Extent.Text
       foreach($name in @('Assert-PersistenceExactProperties','Get-PersistenceOwnedExecutableCounts','Assert-PersistenceOwnedExecutables')){$function=$ast.Find({param($node)$node-is[Management.Automation.Language.FunctionDefinitionAst]-and$node.Name-ceq$name},$true);Invoke-Expression $function.Extent.Text}
+      $system=[Environment]::GetFolderPath([Environment+SpecialFolder]::System);$conhost=Join-Path $system 'conhost.exe'
+      $signature={param($path)[pscustomobject]@{Status='Valid';Publisher='Microsoft Windows';HasTimestamp=$true}}
+      $version={param($path)[pscustomobject]@{CompanyName='Microsoft Corporation';ProductName=('Microsoft'+[char]0x00AE+' Windows'+[char]0x00AE+' Operating System');InternalName='ConHost';FileDescription='Console Window Host'}}
       $app='C:\Program Files\PDF Workstation\pdf-workstation.exe';$edge='C:\drivers\msedgedriver.exe'
-      $valid=@([pscustomobject]@{ProcessId=101;ParentProcessId=900;Path=$app},[pscustomobject]@{ProcessId=102;ParentProcessId=900;Path=$edge},[pscustomobject]@{ProcessId=103;ParentProcessId=101;Path='C:\WebView\msedgewebview2.exe'})
-      Assert-PersistenceOwnedExecutables $valid $app $edge -RootProcessId 900
+      $validCore=@([pscustomobject]@{ProcessId=101;ParentProcessId=900;Path=$app},[pscustomobject]@{ProcessId=102;ParentProcessId=900;Path=$edge},[pscustomobject]@{ProcessId=103;ParentProcessId=101;Path='C:\WebView\msedgewebview2.exe'})
+      $valid=@($validCore+[pscustomobject]@{ProcessId=104;ParentProcessId=900;Path=$conhost},[pscustomobject]@{ProcessId=105;ParentProcessId=103;Path=$conhost})
+      Assert-PersistenceOwnedExecutables $valid $app $edge -RootProcessId 900 -SystemDirectory $system -ConsoleHostSignatureProvider $signature -ConsoleHostVersionInfoProvider $version
       $receipt=Get-PersistenceOwnedExecutableCounts $valid $app $edge -RootProcessId 900
       Assert-PersistenceExactProperties -Value $receipt -Expected @('applicationCount','edgeDriverCount','webViewCount','unknownCount','totalCount','missingPathCount','unknownLeafNameSha256','parentCategoryCounts') -Kind 'Sanitized persistence process counts'
       Assert-PersistenceExactProperties -Value $receipt.parentCategoryCounts -Expected @('applicationCount','edgeDriverCount','webViewCount','rootCount','unknownCount','unavailableCount') -Kind 'Sanitized persistence parent-category counts'
-      if($receipt.applicationCount-ne1-or$receipt.edgeDriverCount-ne1-or$receipt.webViewCount-ne1-or$receipt.unknownCount-ne0-or$receipt.totalCount-ne3-or$receipt.missingPathCount-ne0-or$receipt.unknownLeafNameSha256.Count-ne0){throw 'Approved persistence process counts changed.'}
+      if($receipt.applicationCount-ne1-or$receipt.edgeDriverCount-ne1-or$receipt.webViewCount-ne1-or$receipt.unknownCount-ne2-or$receipt.totalCount-ne5-or$receipt.missingPathCount-ne0-or$receipt.unknownLeafNameSha256.Count-ne1-or$receipt.unknownLeafNameSha256[0]-cne'C7FA65795C3627674274F83CCAB5776C80922708787A2121AC4D5CFD02551FC4'-or$receipt.parentCategoryCounts.rootCount-ne1-or$receipt.parentCategoryCounts.webViewCount-ne1){throw 'Approved persistence process counts changed.'}
       foreach($bad in @(@($valid[0],$valid[1]),@($valid+[pscustomobject]@{ProcessId=104;ParentProcessId=101;Path='C:\Secret\private-helper.exe';CommandLine='private command'}),@($valid+$valid[0]))){
-        $rejected=$false;$message='';try{Assert-PersistenceOwnedExecutables $bad $app $edge}catch{$rejected=$true;$message=$_.Exception.Message};if(-not$rejected){throw 'Unsafe captured descendant set was accepted.'}
+        $rejected=$false;$message='';try{Assert-PersistenceOwnedExecutables $bad $app $edge -RootProcessId 900 -SystemDirectory $system -ConsoleHostSignatureProvider $signature -ConsoleHostVersionInfoProvider $version}catch{$rejected=$true;$message=$_.Exception.Message};if(-not$rejected){throw 'Unsafe captured descendant set was accepted.'}
         if($message-match'(?i)(secret|private-helper|private command|program files|pdf-workstation|msedgedriver|msedgewebview2|\\)'-or$message-cnotmatch'ownedCounts=\{'){throw 'Persistence descendant rejection leaked identity or omitted sanitized counts.'}
       }
       $script:PersistencePins.OwnedProcessMaximum=2;$rejected=$false;try{Get-PersistenceOwnedExecutableCounts $valid $app $edge|Out-Null}catch{$rejected=$true};if(-not$rejected){throw 'Oversized persistence descendant inventory was accepted.'}
       $script:PersistencePins.OwnedProcessMaximum=128
-      $diagnostic=@($valid,
+      $diagnostic=@($validCore,
         [pscustomobject]@{ProcessId=104;ParentProcessId=101;Path='C:\Secret\zeta-helper.exe';CommandLine='private command'},
         [pscustomobject]@{ProcessId=105;ParentProcessId=102;Path='C:\Secret\alpha-helper.exe'},
         [pscustomobject]@{ProcessId=106;ParentProcessId=103;Path='C:\Secret\web-helper.exe'},

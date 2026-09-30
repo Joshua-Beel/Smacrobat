@@ -171,10 +171,23 @@ function Get-PersistenceOwnedExecutableCounts {
 }
 
 function Assert-PersistenceOwnedExecutables {
-    param([object[]]$Owned,[string]$ApplicationPath,[string]$EdgeDriverPath,[int]$RootProcessId = 0)
+    param(
+        [object[]]$Owned,
+        [string]$ApplicationPath,
+        [string]$EdgeDriverPath,
+        [int]$RootProcessId = 0,
+        [string]$SystemDirectory,
+        [scriptblock]$ConsoleHostSignatureProvider,
+        [scriptblock]$ConsoleHostVersionInfoProvider
+    )
     $counts = Get-PersistenceOwnedExecutableCounts -Owned $Owned -ApplicationPath $ApplicationPath -EdgeDriverPath $EdgeDriverPath -RootProcessId $RootProcessId
     $summary = $counts | ConvertTo-Json -Compress
-    if ([int]$counts.unknownCount -ne 0) {
+    try {
+        $null = Assert-TrustedConsoleHostTopology -Owned $Owned -RootProcessId $RootProcessId -SystemDirectory $SystemDirectory -SignatureProvider $ConsoleHostSignatureProvider -VersionInfoProvider $ConsoleHostVersionInfoProvider
+    } catch {
+        throw "Persistence WebDriver captured an untrusted console-host topology; ownedCounts=$summary."
+    }
+    if ([int]$counts.unknownCount -ne $script:LaunchPins.ConsoleHostMaximum) {
         throw "Persistence WebDriver captured an unexpected descendant executable; ownedCounts=$summary."
     }
     if ([int]$counts.applicationCount -ne 1 -or [int]$counts.edgeDriverCount -ne 1 -or [int]$counts.webViewCount -lt 1) {

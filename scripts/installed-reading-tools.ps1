@@ -253,10 +253,10 @@ function Open-ReadingUserFile {
 }
 
 function Get-ReadingOwnedExecutableDiagnostic {
-    param([object[]]$Owned,[string]$ApplicationPath,[string]$EdgeDriverPath)
+    param([object[]]$Owned,[string]$ApplicationPath,[string]$EdgeDriverPath,[int]$TrustedConsoleHostCount = 0)
     if ($Owned.Count -gt $script:ReadingPins.OwnedProcessMaximum) { throw 'Reading-tools owned executable inventory exceeded its process-count cap.' }
     $application = [IO.Path]::GetFullPath($ApplicationPath); $edgeDriver = [IO.Path]::GetFullPath($EdgeDriverPath)
-    $applications = 0; $edgeDrivers = 0; $webViews = 0; $unknown = 0; $missingPaths = 0
+    $applications = 0; $edgeDrivers = 0; $webViews = 0; $consoleHosts = 0; $unknown = 0; $missingPaths = 0
     $unknownHashes = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($process in $Owned) {
         $pathProperty = $process.PSObject.Properties['Path']
@@ -266,6 +266,7 @@ function Get-ReadingOwnedExecutableDiagnostic {
         if ($path.Equals($application,[StringComparison]::OrdinalIgnoreCase)) { $applications++; continue }
         if ($path.Equals($edgeDriver,[StringComparison]::OrdinalIgnoreCase)) { $edgeDrivers++; continue }
         if ($name.Equals('msedgewebview2.exe',[StringComparison]::OrdinalIgnoreCase)) { $webViews++; continue }
+        if ($TrustedConsoleHostCount -gt 0 -and $name.Equals('conhost.exe',[StringComparison]::OrdinalIgnoreCase)) { $consoleHosts++; continue }
         $unknown++
         $leafBytes = [Text.UTF8Encoding]::new($false).GetBytes($name.ToLowerInvariant())
         $null = $unknownHashes.Add((Get-ReadingSha256 -Bytes $leafBytes))
@@ -278,6 +279,7 @@ function Get-ReadingOwnedExecutableDiagnostic {
         applicationCount = $applications
         edgeDriverCount = $edgeDrivers
         webViewCount = $webViews
+        consoleHostCount = $consoleHosts
         unknownCount = $unknown
         missingPathCount = $missingPaths
         unknownLeafHashCount = [int]$reportedHashes.Count
@@ -289,13 +291,22 @@ function Get-ReadingOwnedExecutableDiagnostic {
 }
 
 function Assert-ReadingOwnedExecutables {
-    param([object[]]$Owned,[string]$ApplicationPath,[string]$EdgeDriverPath)
-    $diagnostic = Get-ReadingOwnedExecutableDiagnostic -Owned $Owned -ApplicationPath $ApplicationPath -EdgeDriverPath $EdgeDriverPath
+    param(
+        [object[]]$Owned,
+        [string]$ApplicationPath,
+        [string]$EdgeDriverPath,
+        [Parameter(Mandatory = $true)][int]$RootProcessId,
+        [string]$SystemDirectory,
+        [scriptblock]$ConsoleHostSignatureProvider,
+        [scriptblock]$ConsoleHostVersionInfoProvider
+    )
+    $trustedConsoleHostCount = Assert-TrustedConsoleHostTopology -Owned $Owned -RootProcessId $RootProcessId -SystemDirectory $SystemDirectory -SignatureProvider $ConsoleHostSignatureProvider -VersionInfoProvider $ConsoleHostVersionInfoProvider
+    $diagnostic = Get-ReadingOwnedExecutableDiagnostic -Owned $Owned -ApplicationPath $ApplicationPath -EdgeDriverPath $EdgeDriverPath -TrustedConsoleHostCount $trustedConsoleHostCount
     if ($diagnostic.unknownCount -ne 0 -or $diagnostic.missingPathCount -ne 0) {
         $summary = $diagnostic | ConvertTo-Json -Depth 4 -Compress
         throw "Reading-tools captured an unexpected descendant executable; diagnostic=$summary"
     }
-    if ($diagnostic.applicationCount -ne 1 -or $diagnostic.edgeDriverCount -ne 1 -or $diagnostic.webViewCount -lt 1) { throw 'Reading-tools did not capture the exact app, EdgeDriver, and WebView descendant topology.' }
+    if ($diagnostic.applicationCount -ne 1 -or $diagnostic.edgeDriverCount -ne 1 -or $diagnostic.webViewCount -lt 1 -or $diagnostic.consoleHostCount -ne $trustedConsoleHostCount) { throw 'Reading-tools did not capture the exact app, EdgeDriver, WebView, and trusted console-host descendant topology.' }
 }
 
 function Assert-ReadingProfileScope {
@@ -365,7 +376,7 @@ function Invoke-RealInstalledReadingTools {
     $deadline = [datetime]::UtcNow.AddMilliseconds($script:ReadingPins.TotalTimeoutMilliseconds)
     $driverCapture = $null; $driver = $null; $sessionId = $null; $captured = @(); $result = $null
     $startedAfter = [datetime]::UtcNow; $sessionDeleteOutcome = 'requestfailed'; $driverExited = $false
-    $driverStopOutcome = 'not-invoked'; $remaining = -1; $residualCategory = 'multiple'; $clipboardCleared = $false
+    $driverStopOutcome = 'not-invoked'; $processesQuiescent = $false; $remaining = -1; $residualCategory = 'multiple'; $clipboardCleared = $false
     $capturedOutcomes = [pscustomobject]@{ application='absent';tauriDriver='absent';edgeDriver='absent';webview='absent';ocrEngine='absent';other='absent' }
     $residualFacts = [pscustomobject]@{ ownership='none';application=$false;tauriDriver=$false;edgeDriver=$false;webview=$false;ocrEngine=$false;other=$false }
     try {
@@ -401,7 +412,7 @@ function Invoke-RealInstalledReadingTools {
         } while ([datetime]::UtcNow -lt $deadline)
         if ($apps.Count -ne 1) { throw 'The owned installed application process was unavailable for process-bound UI Automation.' }
         $applicationProcessId = [int]$apps[0].ProcessId
-        Assert-ReadingOwnedExecutables -Owned $captured -ApplicationPath $ApplicationPath -EdgeDriverPath $EdgeDriverPath
+        Assert-ReadingOwnedExecutables -Owned $captured -ApplicationPath $ApplicationPath -EdgeDriverPath $EdgeDriverPath -RootProcessId $driver.Id
         $profileBinding = if ($returnedUserData) { 'session-capability-' + (Get-ExactProfileBinding -Candidate $returnedUserData -RequestedProfile $ProfileRoot -SettingsRoot $SettingsRoot) } else { Get-OwnedProfileBinding -Owned $captured -RequestedProfile $ProfileRoot -SettingsRoot $SettingsRoot }
         Assert-ReadingProfileScope -ProfileRoot $ProfileRoot -SettingsRoot $SettingsRoot -Binding $profileBinding
 
@@ -454,7 +465,7 @@ const a=document.querySelector('aside[aria-label="Find in document"]'),live=[...
         Cancel-ReadingPassword -SessionId $sessionId -Deadline $deadline
 
         $captured += @(Get-OwnedLaunchProcesses -RootProcessId $driver.Id -StartedAfter $startedAfter); $captured = @(Get-UniqueOwnedLaunchProcesses -Processes $captured)
-        Assert-ReadingOwnedExecutables -Owned $captured -ApplicationPath $ApplicationPath -EdgeDriverPath $EdgeDriverPath
+        Assert-ReadingOwnedExecutables -Owned $captured -ApplicationPath $ApplicationPath -EdgeDriverPath $EdgeDriverPath -RootProcessId $driver.Id
         Assert-ReadingProfileScope -ProfileRoot $ProfileRoot -SettingsRoot $SettingsRoot -Binding $profileBinding
         if ($driverCapture.Exceeded) { throw 'Reading-tools WebDriver diagnostic output exceeded its discarded cap.' }
         $result = [pscustomobject]@{
@@ -494,9 +505,12 @@ const a=document.querySelector('aside[aria-label="Find in document"]'),live=[...
         if ($sessionId) { $sessionDeleteOutcome = Invoke-SessionDeleteOutcome -SessionId $sessionId -Deadline $cleanupDeadline }
         if ($driver) {
             try { $captured += @(Get-OwnedLaunchProcesses -RootProcessId $driver.Id -StartedAfter $startedAfter); $captured = @(Get-UniqueOwnedLaunchProcesses -Processes $captured) } catch { }
-            $capturedOutcomes = Stop-OwnedLaunchProcesses -TauriDriver $driver -Captured $captured -Deadline ([datetime]::UtcNow.AddMilliseconds($script:LaunchPins.CleanupProcessTimeoutMilliseconds))
+            $processCleanupDeadline = [datetime]::UtcNow.AddMilliseconds($script:LaunchPins.CleanupProcessTimeoutMilliseconds)
+            $capturedOutcomes = Stop-OwnedLaunchProcesses -TauriDriver $driver -Captured $captured -Deadline $processCleanupDeadline
             $driverStopOutcome = [string]$capturedOutcomes.rootOutcome
-            $remainingProcesses = @(Get-LaunchProcessSnapshot); $remaining = $remainingProcesses.Count
+            $quiescence = Wait-LaunchProcessQuiescence -Deadline $processCleanupDeadline
+            $processesQuiescent = [bool]$quiescence.stable
+            $remainingProcesses = @($quiescence.processes); $remaining = $remainingProcesses.Count
             $residualCategory = Get-LaunchResidualCategory -Processes $remainingProcesses
             $residualFacts = Get-LaunchResidualFacts -Processes $remainingProcesses -Captured $captured
             $driverExited = [bool]$driver.HasExited
@@ -504,8 +518,8 @@ const a=document.querySelector('aside[aria-label="Find in document"]'),live=[...
         if ($driverCapture) { $driverCapture.Dispose() }
     }
     if (-not $clipboardCleared) { throw 'Installed reading-tools verification did not clear and verify the Windows clipboard.' }
-    Assert-LaunchCleanupState -Result $result -SessionDeleteOutcome $sessionDeleteOutcome -DriverExited $driverExited -RelevantProcessesClear ($residualCategory -ceq 'none') -DriverStopOutcome $driverStopOutcome -ResidualCategory $residualCategory -CapturedApplication $capturedOutcomes.application -CapturedTauriDriver $capturedOutcomes.tauriDriver -CapturedEdgeDriver $capturedOutcomes.edgeDriver -CapturedWebView $capturedOutcomes.webview -CapturedOcrEngine $capturedOutcomes.ocrEngine -CapturedOther $capturedOutcomes.other -ResidualOwnership $residualFacts.ownership -ResidualApplication $residualFacts.application -ResidualTauriDriver $residualFacts.tauriDriver -ResidualEdgeDriver $residualFacts.edgeDriver -ResidualWebView $residualFacts.webview -ResidualOcrEngine $residualFacts.ocrEngine -ResidualOther $residualFacts.other
-    if ($null -eq $result -or $sessionDeleteOutcome -cne 'verified' -or -not $driverExited -or $remaining -ne 0) { throw 'Installed reading-tools cleanup did not reach its exact zero-process state.' }
+    Assert-LaunchCleanupState -Result $result -SessionDeleteOutcome $sessionDeleteOutcome -DriverExited $driverExited -RelevantProcessesClear ($processesQuiescent -and $residualCategory -ceq 'none') -DriverStopOutcome $driverStopOutcome -ResidualCategory $residualCategory -CapturedApplication $capturedOutcomes.application -CapturedTauriDriver $capturedOutcomes.tauriDriver -CapturedEdgeDriver $capturedOutcomes.edgeDriver -CapturedWebView $capturedOutcomes.webview -CapturedOcrEngine $capturedOutcomes.ocrEngine -CapturedOther $capturedOutcomes.other -ResidualOwnership $residualFacts.ownership -ResidualApplication $residualFacts.application -ResidualTauriDriver $residualFacts.tauriDriver -ResidualEdgeDriver $residualFacts.edgeDriver -ResidualWebView $residualFacts.webview -ResidualOcrEngine $residualFacts.ocrEngine -ResidualOther $residualFacts.other
+    if ($null -eq $result -or $sessionDeleteOutcome -cne 'verified' -or -not $driverExited -or -not $processesQuiescent -or $remaining -ne 0) { throw 'Installed reading-tools cleanup did not reach its exact zero-process state.' }
     $result | Add-Member -NotePropertyName sessionDeleted -NotePropertyValue $true
     $result | Add-Member -NotePropertyName ownedProcessTreeStopped -NotePropertyValue $true
     $result | Add-Member -NotePropertyName relevantProcessesRemaining -NotePropertyValue 0

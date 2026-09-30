@@ -120,7 +120,7 @@ describe('hosted installed signed application launch proof', () => {
   });
 
   it('binds the live native-driver status and fresh profile when vendor capabilities are absent', () => {
-    const source = extractFunctions('scripts/installed-app-launch.ps1', ['Assert-NativeDriverStatus', 'Wait-NativeDriverStatus', 'Get-ExactProfileBinding', 'Get-OwnedProfileBinding', 'Assert-OwnedLaunchExecutables', 'Get-UniqueOwnedLaunchProcesses'], String.raw`
+    const source = extractFunctions('scripts/installed-app-launch.ps1', ['Assert-NativeDriverStatus', 'Wait-NativeDriverStatus', 'Get-ExactProfileBinding', 'Get-OwnedProfileBinding', 'Assert-TrustedConsoleHostTopology', 'Assert-OwnedLaunchExecutables', 'Get-UniqueOwnedLaunchProcesses'], String.raw`
       $version='151.0.4129.78';$status=[pscustomobject]@{value=[pscustomobject]@{ready=$true;build=[pscustomobject]@{version=($version+' (trusted-build)')}}}
       if((Assert-NativeDriverStatus -Status $status -ExpectedVersion $version)-cne$version){throw 'Native status version was not bound.'}
       foreach($bad in @(
@@ -143,6 +143,39 @@ describe('hosted installed signed application launch proof', () => {
       Assert-OwnedLaunchExecutables -Owned $executables -ApplicationPath $app -EdgeDriverPath $edge -OcrEnginePath $engine
       foreach($badExecutables in @(@([pscustomobject]@{Path=$app},[pscustomobject]@{Path='C:\wrong\msedgedriver.exe'}),@([pscustomobject]@{Path=$app},[pscustomobject]@{Path=$edge},[pscustomobject]@{Path=$edge}),@([pscustomobject]@{Path=$app},[pscustomobject]@{Path=$edge},[pscustomobject]@{Path='C:\wrong\tesseract.exe'}))){$rejected=$false;try{Assert-OwnedLaunchExecutables -Owned $badExecutables -ApplicationPath $app -EdgeDriverPath $edge -OcrEnginePath $engine}catch{$rejected=$true};if(-not$rejected){throw 'Wrong or duplicate owned executable accepted.'}}
       $started=[datetime]::UtcNow.ToUniversalTime().Ticks;$edgeOne=[pscustomobject]@{ProcessId=41;Path=$edge;StartTicks=$started};$edgeTwo=[pscustomobject]@{ProcessId=42;Path=$edge;StartTicks=$started};$deduped=@(Get-UniqueOwnedLaunchProcesses -Processes @($edgeOne,$edgeOne,$edgeTwo));if($deduped.Count-ne2){throw 'Repeated exact process snapshots were not identity-deduplicated.'};$rejected=$false;try{Assert-OwnedLaunchExecutables -Owned @([pscustomobject]@{Path=$app},$deduped,[pscustomobject]@{Path=$engine}) -ApplicationPath $app -EdgeDriverPath $edge -OcrEnginePath $engine}catch{$rejected=$true};if(-not$rejected){throw 'Two distinct same-path process identities were collapsed or accepted.'}
+    `);
+    const result = runPowerShell(source);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
+  it('allows only the exact signed System32 console-host root and WebView topology', () => {
+    const source = extractFunctions('scripts/installed-app-launch.ps1', ['Assert-TrustedConsoleHostTopology', 'Assert-OwnedLaunchExecutables'], String.raw`
+      $script:LaunchPins=[ordered]@{ConsoleHostMaximum=2;ConsoleHostPublisher='Microsoft Windows'}
+      $system=[Environment]::GetFolderPath([Environment+SpecialFolder]::System);$conhost=Join-Path $system 'conhost.exe'
+      $signature={param($path)[pscustomobject]@{Status='Valid';Publisher='Microsoft Windows';HasTimestamp=$true}}
+      $version={param($path)[pscustomobject]@{CompanyName='Microsoft Corporation';ProductName=('Microsoft'+[char]0x00AE+' Windows'+[char]0x00AE+' Operating System');InternalName='ConHost';FileDescription='Console Window Host'}}
+      $app='C:\fixture\pdf-workstation.exe';$edge='C:\fixture\msedgedriver.exe';$ocr='C:\fixture\tesseract.exe';$web='C:\fixture\msedgewebview2.exe'
+      $core=@([pscustomobject]@{ProcessId=101;ParentProcessId=900;Path=$app},[pscustomobject]@{ProcessId=102;ParentProcessId=900;Path=$edge},[pscustomobject]@{ProcessId=103;ParentProcessId=101;Path=$web},[pscustomobject]@{ProcessId=104;ParentProcessId=101;Path=$ocr})
+      $console=@([pscustomobject]@{ProcessId=105;ParentProcessId=900;Path=$conhost},[pscustomobject]@{ProcessId=106;ParentProcessId=103;Path=$conhost})
+      $valid=@($core+$console)
+      if((Assert-TrustedConsoleHostTopology -Owned $valid -RootProcessId 900 -SystemDirectory $system -SignatureProvider $signature -VersionInfoProvider $version)-ne2){throw 'Trusted console-host topology was not accepted.'}
+      if((Assert-TrustedConsoleHostTopology -Owned $valid -RootProcessId 900 -SystemDirectory $system)-ne2){throw 'The installed System32 console-host identity was not accepted.'}
+      Assert-OwnedLaunchExecutables -Owned $valid -ApplicationPath $app -EdgeDriverPath $edge -OcrEnginePath $ocr -RootProcessId 900 -SystemDirectory $system -ConsoleHostSignatureProvider $signature -ConsoleHostVersionInfoProvider $version
+      Assert-OwnedLaunchExecutables -Owned $core -ApplicationPath $app -EdgeDriverPath $edge -OcrEnginePath $ocr
+      $cases=@(
+        @($core+$console[0]),
+        @($core+$console+[pscustomobject]@{ProcessId=107;ParentProcessId=103;Path=$conhost}),
+        @($core+[pscustomobject]@{ProcessId=105;ParentProcessId=900;Path=$conhost},[pscustomobject]@{ProcessId=106;ParentProcessId=900;Path=$conhost}),
+        @($core+[pscustomobject]@{ProcessId=105;ParentProcessId=999;Path=$conhost},$console[1]),
+        @($core+[pscustomobject]@{ProcessId=105;ParentProcessId=900;Path='C:\fixture\conhost.exe'},$console[1]),
+        @($core+[pscustomobject]@{ProcessId=105;ParentProcessId=900;Path=$conhost},[pscustomobject]@{ProcessId=105;ParentProcessId=103;Path=$conhost})
+      )
+      foreach($case in $cases){$rejected=$false;try{Assert-TrustedConsoleHostTopology -Owned $case -RootProcessId 900 -SystemDirectory $system -SignatureProvider $signature -VersionInfoProvider $version|Out-Null}catch{$rejected=$true;if($_.Exception.Message-match'fixture|999|900|105|106|107'){throw 'Console-host rejection leaked captured identity.'}};if(-not$rejected){throw 'Unsafe console-host topology was accepted.'}}
+      foreach($providerCase in @(
+        [pscustomobject]@{signature={param($path)[pscustomobject]@{Status='Valid';Publisher='Other';HasTimestamp=$true}};version=$version},
+        [pscustomobject]@{signature=$signature;version={param($path)[pscustomobject]@{CompanyName='Microsoft Corporation';ProductName='Other';InternalName='ConHost';FileDescription='Console Window Host'}}}
+      )){$rejected=$false;try{Assert-TrustedConsoleHostTopology -Owned $valid -RootProcessId 900 -SystemDirectory $system -SignatureProvider $providerCase.signature -VersionInfoProvider $providerCase.version|Out-Null}catch{$rejected=$true};if(-not$rejected){throw 'Untrusted console-host signature or product identity was accepted.'}}
+      $rejected=$false;try{Assert-OwnedLaunchExecutables -Owned @($valid+[pscustomobject]@{ProcessId=108;ParentProcessId=900;Path='C:\private\helper.exe'}) -ApplicationPath $app -EdgeDriverPath $edge -OcrEnginePath $ocr -RootProcessId 900 -SystemDirectory $system -ConsoleHostSignatureProvider $signature -ConsoleHostVersionInfoProvider $version}catch{$rejected=$true};if(-not$rejected){throw 'An unrelated owned executable was accepted.'}
     `);
     const result = runPowerShell(source);
     expect(result.status, result.stderr || result.stdout).toBe(0);
@@ -411,6 +444,41 @@ $child=[Diagnostics.Process]::Start($info);[IO.File]::WriteAllText($ChildPidPath
     expect(result.status, result.stderr || result.stdout).toBe(0);
   });
 
+  it('requires two fresh empty cleanup snapshots and fails closed on late or persistent residuals', () => {
+    const launchSource = readFileSync('scripts/installed-app-launch.ps1', 'utf8');
+    const source = extractFunctions('scripts/installed-app-launch.ps1', ['Wait-LaunchProcessQuiescence', 'Get-LaunchProcessCategory', 'Get-LaunchResidualCategory', 'Get-LaunchResidualFacts', 'Assert-LaunchCleanupState'], String.raw`
+      $script:LaunchPins=[ordered]@{CleanupProcessPollMilliseconds=1}
+      $started=[datetime]::UtcNow;$path='C:\\fixture\\msedgedriver.exe';$captured=[pscustomobject]@{ProcessId=71;Path=$path;StartTicks=$started.ToUniversalTime().Ticks}
+      $residual=[pscustomobject]@{Id=71;ProcessName='msedgedriver';Path=$path;StartTime=$started}
+      $transient=[Collections.Generic.Queue[object]]::new();$transient.Enqueue($residual);$transient.Enqueue($null);$transient.Enqueue($null);$transientCalls=0
+      $transientResult=Wait-LaunchProcessQuiescence -Deadline ([datetime]::UtcNow.AddSeconds(2)) -SnapshotProvider {$script:transientCalls++;$next=$transient.Dequeue();if($null-ne$next){$next}}
+      if(-not$transientResult.stable-or$transientResult.processes.Count-ne0-or$transientCalls-ne3){throw 'Transient captured residual did not require two later fresh empty probes.'}
+      $capturedOtherRejected=$false;try{Assert-LaunchCleanupState -Result ([pscustomobject]@{complete=$true}) -SessionDeleteOutcome verified -DriverExited $true -RelevantProcessesClear $transientResult.stable -DriverStopOutcome tree-kill-exited -ResidualCategory none -CapturedApplication absent -CapturedTauriDriver absent -CapturedEdgeDriver absent -CapturedWebView absent -CapturedOcrEngine absent -CapturedOther incomplete -ResidualOwnership none -ResidualApplication $false -ResidualTauriDriver $false -ResidualEdgeDriver $false -ResidualWebView $false -ResidualOcrEngine $false -ResidualOther $false}catch{$capturedOtherRejected=$_.Exception.Message-cmatch'captured=application:absent,tauri-driver:absent,edge-driver:absent,webview:absent,ocr-engine:absent,other:incomplete;'}
+      if(-not$capturedOtherRejected){throw 'Two empty global snapshots accepted an incomplete captured console-host or other identity.'}
+      $late=[Collections.Generic.Queue[object]]::new();$late.Enqueue($null);$late.Enqueue($residual);$late.Enqueue($null);$late.Enqueue($null);$lateCalls=0
+      $lateResult=Wait-LaunchProcessQuiescence -Deadline ([datetime]::UtcNow.AddSeconds(2)) -SnapshotProvider {$script:lateCalls++;$next=$late.Dequeue();if($null-ne$next){$next}}
+      if(-not$lateResult.stable-or$lateResult.processes.Count-ne0-or$lateCalls-ne4){throw 'A late residual did not reset cleanup quiescence.'}
+      $persistentCalls=0;$persistentResult=Wait-LaunchProcessQuiescence -Deadline ([datetime]::UtcNow.AddMilliseconds(20)) -SnapshotProvider {$script:persistentCalls++;$residual}
+      if($persistentResult.stable-or$persistentResult.processes.Count-ne1-or$persistentCalls-lt1){throw 'Persistent cleanup residual was accepted or its final facts were lost.'}
+      $capturedFacts=Get-LaunchResidualFacts -Processes $persistentResult.processes -Captured @($captured)
+      $reused=[pscustomobject]@{Id=71;ProcessName='msedgedriver';Path=$path;StartTime=$started.AddTicks(1)}
+      $reusedResult=Wait-LaunchProcessQuiescence -Deadline ([datetime]::UtcNow.AddMilliseconds(20)) -SnapshotProvider {$reused}
+      $reusedFacts=Get-LaunchResidualFacts -Processes $reusedResult.processes -Captured @($captured)
+      if($capturedFacts.ownership-cne'captured'-or$reusedFacts.ownership-cne'uncaptured'-or-not$capturedFacts.edgeDriver-or-not$reusedFacts.edgeDriver){throw 'Final captured or PID-reuse residual facts were not identity-bound.'}
+      foreach($case in @([pscustomobject]@{result=$persistentResult;facts=$capturedFacts},[pscustomobject]@{result=$reusedResult;facts=$reusedFacts})){
+        $message='';try{Assert-LaunchCleanupState -Result ([pscustomobject]@{complete=$true}) -SessionDeleteOutcome verified -DriverExited $true -RelevantProcessesClear $case.result.stable -DriverStopOutcome tree-kill-exited -ResidualCategory (Get-LaunchResidualCategory -Processes $case.result.processes) -CapturedApplication absent -CapturedTauriDriver absent -CapturedEdgeDriver all-exited -CapturedWebView absent -CapturedOcrEngine absent -CapturedOther absent -ResidualOwnership $case.facts.ownership -ResidualApplication $case.facts.application -ResidualTauriDriver $case.facts.tauriDriver -ResidualEdgeDriver $case.facts.edgeDriver -ResidualWebView $case.facts.webview -ResidualOcrEngine $case.facts.ocrEngine -ResidualOther $case.facts.other}catch{$message=$_.Exception.Message}
+        if($message-cnotmatch('residualOwnership='+$case.facts.ownership)-or$message-match'fixture|msedgedriver\.exe|71'){throw 'Persistent cleanup rejection lost sanitized final identity facts.'}
+      }
+      $expiredCalls=0;$expiredRejected=$false;try{Wait-LaunchProcessQuiescence -Deadline ([datetime]::UtcNow.AddMilliseconds(-1)) -SnapshotProvider {$script:expiredCalls++}|Out-Null}catch{$expiredRejected=$_.Exception.Message-ceq'Installed application cleanup quiescence deadline expired before its first process probe.'}
+      if(-not$expiredRejected-or$expiredCalls-ne0){throw 'Expired cleanup quiescence probed or did not fail closed.'}
+      $providerRejected=$false;try{Wait-LaunchProcessQuiescence -Deadline ([datetime]::UtcNow.AddSeconds(1)) -SnapshotProvider {throw 'snapshot failure'}|Out-Null}catch{$providerRejected=$_.Exception.Message-ceq'snapshot failure'}
+      if(-not$providerRejected){throw 'Cleanup snapshot provider failure was accepted.'}
+    `);
+    expect(launchSource.match(/function Wait-LaunchProcessQuiescence[\s\S]*?\n}/)?.[0]).not.toMatch(/\.Kill\(|Stop-Process/);
+    const result = runPowerShell(source);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
   it('uses one-microsecond process timestamp precision without capturing stale parent-PID collisions', () => {
     const source = extractFunctions('scripts/installed-app-launch.ps1', ['Get-OwnedLaunchProcesses'], String.raw`
       $script:LaunchPins=[ordered]@{ProcessTimestampToleranceTicks=10}
@@ -488,7 +556,7 @@ $info=[Diagnostics.ProcessStartInfo]::new();$info.FileName=$Pwsh;$info.UseShellE
 
   it('does not retry a timed-out session POST and still stops the owned process tree', () => {
     const source = extractFunctions('scripts/installed-app-launch.ps1', ['Invoke-RealInstalledAppLaunch'], String.raw`
-      $script:LaunchPins=[ordered]@{TotalTimeoutMilliseconds=60000;CleanupProcessTimeoutMilliseconds=10000;WebDriverPort=4444;NativeDriverPort=4445}
+      $script:LaunchPins=[ordered]@{TotalTimeoutMilliseconds=60000;CleanupProcessTimeoutMilliseconds=10000;CleanupProcessPollMilliseconds=1;WebDriverPort=4444;NativeDriverPort=4445}
       $script:sessionPosts=0;$script:deleteRequests=0;$script:driverStopped=$false
       $driver=[pscustomobject]@{HasExited=$false;Id=1234}
       $capture=[pscustomobject]@{Process=$driver;Exceeded=$false};$capture|Add-Member ScriptMethod Start {};$capture|Add-Member ScriptMethod Dispose {}
@@ -499,6 +567,7 @@ $info=[Diagnostics.ProcessStartInfo]::new();$info.FileName=$Pwsh;$info.UseShellE
       function Get-OwnedLaunchProcesses{param([int]$RootProcessId,[datetime]$StartedAfter);@()}
       function Stop-OwnedLaunchProcesses{param($TauriDriver,[object[]]$Captured,[datetime]$Deadline);$script:driverStopped=$true;$TauriDriver.HasExited=$true;[pscustomobject]@{rootOutcome='tree-kill-exited';application='absent';tauriDriver='absent';edgeDriver='absent';webview='absent';ocrEngine='absent';other='absent'}}
       function Get-LaunchProcessSnapshot{@()}
+      function Wait-LaunchProcessQuiescence{param([datetime]$Deadline);[pscustomobject]@{stable=$true;processes=@()}}
       function Get-LaunchResidualCategory{param([object[]]$Processes);'none'}
       function Get-LaunchResidualFacts{param([object[]]$Processes,[object[]]$Captured);[pscustomobject]@{ownership='none';application=$false;tauriDriver=$false;edgeDriver=$false;webview=$false;ocrEngine=$false;other=$false}}
       $rejected=$false;try{Invoke-RealInstalledAppLaunch -ApplicationPath 'app.exe' -TauriDriverPath 'tauri-driver.exe' -EdgeDriverPath 'msedgedriver.exe' -OcrEnginePath 'tesseract.exe' -ProfileRoot 'profile' -SettingsRoot 'settings' -ExpectedEdgeDriverVersion '151.0.1.2'}catch{if($_.Exception.Message-ceq'session-timeout'){$rejected=$true}else{throw}}

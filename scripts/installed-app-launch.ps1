@@ -8,12 +8,15 @@ $script:LaunchPins = [ordered]@{
     RequestTimeoutMilliseconds = 10000
     SessionCreationTimeoutMilliseconds = 30000
     CleanupProcessTimeoutMilliseconds = 10000
+    CleanupProcessPollMilliseconds = 100
     OcrUiTextBytesMaximum = 65536
     WebDriverErrorBytesMaximum = 4096
     RequestBytesMaximum = 1MB
     JsonDepthMaximum = 12
     JsonNodesMaximum = 512
     ProcessTimestampToleranceTicks = 10
+    ConsoleHostMaximum = 2
+    ConsoleHostPublisher = 'Microsoft Windows'
 }
 
 function Assert-LaunchExactProperties {
@@ -224,8 +227,72 @@ function Get-OwnedProfileBinding {
     return "owned-webview-$binding"
 }
 
+function Assert-TrustedConsoleHostTopology {
+    param(
+        [object[]]$Owned,
+        [Parameter(Mandatory = $true)][int]$RootProcessId,
+        [switch]$AllowAbsent,
+        [string]$SystemDirectory,
+        [scriptblock]$SignatureProvider,
+        [scriptblock]$VersionInfoProvider
+    )
+    $items = @($Owned)
+    $consoleHosts = @($items | Where-Object { [IO.Path]::GetFileName([string]$_.Path).Equals('conhost.exe',[StringComparison]::OrdinalIgnoreCase) })
+    if ($consoleHosts.Count -eq 0 -and $AllowAbsent) { return 0 }
+    if ($script:LaunchPins.ConsoleHostMaximum -ne 2 -or $consoleHosts.Count -ne $script:LaunchPins.ConsoleHostMaximum) {
+        throw 'The captured Windows console-host count is outside the trusted topology.'
+    }
+    if ([string]::IsNullOrWhiteSpace($SystemDirectory)) { $SystemDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::System) }
+    $expectedPath = [IO.Path]::GetFullPath((Join-Path ([IO.Path]::GetFullPath($SystemDirectory).TrimEnd('\')) 'conhost.exe'))
+    if (@($consoleHosts | Where-Object { -not ([IO.Path]::GetFullPath([string]$_.Path)).Equals($expectedPath,[StringComparison]::OrdinalIgnoreCase) }).Count -ne 0) {
+        throw 'A captured Windows console host did not use the canonical System32 executable.'
+    }
+    $ownedIds = [Collections.Generic.HashSet[int]]::new()
+    $webViewIds = [Collections.Generic.HashSet[int]]::new()
+    foreach ($process in $items) {
+        $processIdProperty = $process.PSObject.Properties['ProcessId']
+        $processId = 0
+        if ($null -eq $processIdProperty -or -not [int]::TryParse([string]$processIdProperty.Value,[ref]$processId) -or $processId -le 0 -or -not $ownedIds.Add($processId)) {
+            throw 'The captured console-host topology has an invalid process identity.'
+        }
+        if ([IO.Path]::GetFileName([string]$process.Path).Equals('msedgewebview2.exe',[StringComparison]::OrdinalIgnoreCase)) { $null = $webViewIds.Add($processId) }
+    }
+    $rootParents = 0
+    $webViewParents = 0
+    foreach ($consoleHost in $consoleHosts) {
+        if ([int]$consoleHost.ProcessId -eq $RootProcessId) { throw 'The captured console-host topology has an invalid process identity.' }
+        $parentProperty = $consoleHost.PSObject.Properties['ParentProcessId']
+        $parentProcessId = 0
+        if ($null -eq $parentProperty -or -not [int]::TryParse([string]$parentProperty.Value,[ref]$parentProcessId) -or $parentProcessId -le 0) {
+            throw 'The captured console-host topology has an invalid parent identity.'
+        }
+        if ($parentProcessId -eq $RootProcessId) { $rootParents++ }
+        elseif ($webViewIds.Contains($parentProcessId)) { $webViewParents++ }
+        else { throw 'A captured Windows console host was outside the owned root and WebView parent topology.' }
+    }
+    if ($rootParents -ne 1 -or $webViewParents -ne 1) { throw 'The captured Windows console-host parent categories do not match the trusted topology.' }
+    $null = Assert-NoReparseAncestors -Path $expectedPath
+    $null = Assert-TrustedWindowsSignature -Path $expectedPath -SignatureProvider $SignatureProvider -ExpectedPublisher $script:LaunchPins.ConsoleHostPublisher
+    $version = if ($VersionInfoProvider) { & $VersionInfoProvider $expectedPath } else { (Get-Item -LiteralPath $expectedPath -ErrorAction Stop).VersionInfo }
+    $expectedProduct = 'Microsoft' + [char]0x00AE + ' Windows' + [char]0x00AE + ' Operating System'
+    if ([string]$version.CompanyName -cne 'Microsoft Corporation' -or [string]$version.ProductName -cne $expectedProduct -or
+        [string]$version.InternalName -cne 'ConHost' -or [string]$version.FileDescription -cne 'Console Window Host') {
+        throw 'The canonical Windows console host has an unexpected product identity.'
+    }
+    return [int]$consoleHosts.Count
+}
+
 function Assert-OwnedLaunchExecutables {
-    param([object[]]$Owned,[Parameter(Mandatory = $true)][string]$ApplicationPath,[Parameter(Mandatory = $true)][string]$EdgeDriverPath,[Parameter(Mandatory = $true)][string]$OcrEnginePath)
+    param(
+        [object[]]$Owned,
+        [Parameter(Mandatory = $true)][string]$ApplicationPath,
+        [Parameter(Mandatory = $true)][string]$EdgeDriverPath,
+        [Parameter(Mandatory = $true)][string]$OcrEnginePath,
+        [int]$RootProcessId = 0,
+        [string]$SystemDirectory,
+        [scriptblock]$ConsoleHostSignatureProvider,
+        [scriptblock]$ConsoleHostVersionInfoProvider
+    )
     $applications = @($Owned | Where-Object { [IO.Path]::GetFileName([string]$_.Path).Equals('pdf-workstation.exe',[StringComparison]::OrdinalIgnoreCase) })
     if ($applications.Count -ne 1 -or -not ([IO.Path]::GetFullPath([string]$applications[0].Path)).Equals([IO.Path]::GetFullPath($ApplicationPath),[StringComparison]::OrdinalIgnoreCase)) {
         throw 'WebDriver did not launch exactly the installed signed application.'
@@ -238,6 +305,16 @@ function Assert-OwnedLaunchExecutables {
     if (@($ocrEngines | Where-Object { -not ([IO.Path]::GetFullPath([string]$_.Path)).Equals([IO.Path]::GetFullPath($OcrEnginePath),[StringComparison]::OrdinalIgnoreCase) }).Count -ne 0) {
         throw 'An owned OCR process did not use the exact trusted installed engine.'
     }
+    $unknown = @($Owned | Where-Object {
+        $leaf = [IO.Path]::GetFileName([string]$_.Path)
+        -not $leaf.Equals('pdf-workstation.exe',[StringComparison]::OrdinalIgnoreCase) -and
+        -not $leaf.Equals('msedgedriver.exe',[StringComparison]::OrdinalIgnoreCase) -and
+        -not $leaf.Equals('msedgewebview2.exe',[StringComparison]::OrdinalIgnoreCase) -and
+        -not $leaf.Equals('tesseract.exe',[StringComparison]::OrdinalIgnoreCase) -and
+        -not $leaf.Equals('conhost.exe',[StringComparison]::OrdinalIgnoreCase)
+    })
+    if ($unknown.Count -ne 0) { throw 'The owned launch tree contains an unexpected executable.' }
+    $null = Assert-TrustedConsoleHostTopology -Owned $Owned -RootProcessId $RootProcessId -AllowAbsent -SystemDirectory $SystemDirectory -SignatureProvider $ConsoleHostSignatureProvider -VersionInfoProvider $ConsoleHostVersionInfoProvider
 }
 
 function Get-UniqueOwnedLaunchProcesses {
@@ -412,6 +489,29 @@ function Get-OwnedLaunchProcesses {
         if ($difference -gt $tolerance -or $liveTicks + $tolerance -lt $rootLiveTicks) { throw 'A launch descendant identity changed during capture.' }
         [pscustomobject]@{ ProcessId = $process.Id; ParentProcessId = [int]$_.ParentProcessId; Path = [string]$process.Path; StartTicks = $liveTicks; CommandLine = [string]$_.CommandLine }
     })
+}
+
+function Wait-LaunchProcessQuiescence {
+    param([Parameter(Mandatory = $true)][datetime]$Deadline,[scriptblock]$SnapshotProvider)
+    if ([datetime]::UtcNow -ge $Deadline) { throw 'Installed application cleanup quiescence deadline expired before its first process probe.' }
+    $emptySnapshots = 0
+    $latest = @()
+    while ([datetime]::UtcNow -lt $Deadline) {
+        $latest = @(if ($SnapshotProvider) { & $SnapshotProvider } else { Get-LaunchProcessSnapshot })
+        if ($latest.Count -eq 0) {
+            $emptySnapshots++
+            if ($emptySnapshots -ge 2) {
+                if ([datetime]::UtcNow -lt $Deadline) { return [pscustomobject]@{ stable = $true; processes = @() } }
+                break
+            }
+        } else {
+            $emptySnapshots = 0
+        }
+        $remainingMilliseconds = [int][Math]::Floor(($Deadline - [datetime]::UtcNow).TotalMilliseconds)
+        if ($remainingMilliseconds -le 0) { break }
+        Start-Sleep -Milliseconds ([Math]::Min($script:LaunchPins.CleanupProcessPollMilliseconds,$remainingMilliseconds))
+    }
+    return [pscustomobject]@{ stable = $false; processes = @($latest) }
 }
 
 function Start-BoundedDiscardProcess {
@@ -618,7 +718,8 @@ function Assert-LaunchCleanupState {
         [bool]$ResidualOther
     )
     $resultComplete = $null -ne $Result
-    if ($resultComplete -and $SessionDeleteOutcome -ceq 'verified' -and $DriverExited -and $RelevantProcessesClear) { return }
+    $capturedProcessesComplete = @($CapturedApplication,$CapturedTauriDriver,$CapturedEdgeDriver,$CapturedWebView,$CapturedOcrEngine,$CapturedOther) -cnotcontains 'incomplete'
+    if ($resultComplete -and $SessionDeleteOutcome -ceq 'verified' -and $DriverExited -and $RelevantProcessesClear -and $capturedProcessesComplete) { return }
     $driverExitedLabel = if ($DriverExited) { 'true' } else { 'false' }
     $relevantProcessesClearLabel = if ($RelevantProcessesClear) { 'true' } else { 'false' }
     $resultCompleteLabel = if ($resultComplete) { 'true' } else { 'false' }
@@ -646,6 +747,7 @@ function Invoke-RealInstalledAppLaunch {
     $remaining = -1
     $driverExited = $false
     $driverStopOutcome = 'not-invoked'
+    $processesQuiescent = $false
     $residualCategory = 'multiple'
     $capturedOutcomes = [pscustomobject]@{ application = 'absent'; tauriDriver = 'absent'; edgeDriver = 'absent'; webview = 'absent'; ocrEngine = 'absent'; other = 'absent' }
     $residualFacts = [pscustomobject]@{ ownership = 'none'; application = $false; tauriDriver = $false; edgeDriver = $false; webview = $false; ocrEngine = $false; other = $false }
@@ -744,7 +846,7 @@ const tabs=[...document.querySelectorAll('button')].filter(x=>{const s=x.querySe
         $postOcr = Wait-OcrWebDriverOracle -SessionId $sessionId -Script $postOcrScript -Deadline $deadline -Kind 'Post-OCR sample preservation' -Stage 'source-preservation' -Predicate { param($v) [bool]$v.tab -and [bool]$v.pages -and [bool]$v.footer -and [bool]$v.image }
         $captured += @(Get-OwnedLaunchProcesses -RootProcessId $driver.Id -StartedAfter $startedAfter)
         $captured = @(Get-UniqueOwnedLaunchProcesses -Processes $captured)
-        Assert-OwnedLaunchExecutables -Owned $captured -ApplicationPath $ApplicationPath -EdgeDriverPath $EdgeDriverPath -OcrEnginePath $OcrEnginePath
+        Assert-OwnedLaunchExecutables -Owned $captured -ApplicationPath $ApplicationPath -EdgeDriverPath $EdgeDriverPath -OcrEnginePath $OcrEnginePath -RootProcessId $driver.Id
         $profileBinding = if (-not [string]::IsNullOrWhiteSpace($returnedUserData)) {
             'session-capability-' + (Get-ExactProfileBinding -Candidate $returnedUserData -RequestedProfile $ProfileRoot -SettingsRoot $SettingsRoot)
         } else {
@@ -782,16 +884,18 @@ const tabs=[...document.querySelectorAll('button')].filter(x=>{const s=x.querySe
             $processCleanupDeadline = [datetime]::UtcNow.AddMilliseconds($script:LaunchPins.CleanupProcessTimeoutMilliseconds)
             $capturedOutcomes = Stop-OwnedLaunchProcesses -TauriDriver $driver -Captured $captured -Deadline $processCleanupDeadline
             $driverStopOutcome = [string]$capturedOutcomes.rootOutcome
-            $remainingProcesses = @(Get-LaunchProcessSnapshot)
+            $quiescence = Wait-LaunchProcessQuiescence -Deadline $processCleanupDeadline
+            $processesQuiescent = [bool]$quiescence.stable
+            $remainingProcesses = @($quiescence.processes)
             $remaining = $remainingProcesses.Count
             $residualCategory = Get-LaunchResidualCategory -Processes $remainingProcesses
             $residualFacts = Get-LaunchResidualFacts -Processes $remainingProcesses -Captured $captured
             $driverExited = [bool]$driver.HasExited
-            $ownedStopped = $driverExited -and $residualCategory -ceq 'none'
+            $ownedStopped = $driverExited -and $processesQuiescent -and $residualCategory -ceq 'none'
         }
         if ($driverCapture) { $driverCapture.Dispose() }
     }
-    $relevantProcessesClear = $residualCategory -ceq 'none'
+    $relevantProcessesClear = $processesQuiescent -and $residualCategory -ceq 'none'
     Assert-LaunchCleanupState -Result $result -SessionDeleteOutcome $sessionDeleteOutcome -DriverExited $driverExited -RelevantProcessesClear $relevantProcessesClear -DriverStopOutcome $driverStopOutcome -ResidualCategory $residualCategory -CapturedApplication $capturedOutcomes.application -CapturedTauriDriver $capturedOutcomes.tauriDriver -CapturedEdgeDriver $capturedOutcomes.edgeDriver -CapturedWebView $capturedOutcomes.webview -CapturedOcrEngine $capturedOutcomes.ocrEngine -CapturedOther $capturedOutcomes.other -ResidualOwnership $residualFacts.ownership -ResidualApplication $residualFacts.application -ResidualTauriDriver $residualFacts.tauriDriver -ResidualEdgeDriver $residualFacts.edgeDriver -ResidualWebView $residualFacts.webview -ResidualOcrEngine $residualFacts.ocrEngine -ResidualOther $residualFacts.other
     if ($null -eq $result -or -not $sessionDeleted -or -not $ownedStopped -or $remaining -ne 0) {
         throw 'Installed application launch cleanup did not delete the session and stop the owned process tree.'

@@ -92,13 +92,20 @@ describe('installed signed reading-tools verifier', () => {
     expect(source).toContain('$capabilities.browserVersion');
     expect(source).toContain("$capabilities.'msedge.userDataDir'");
     expect(source).toContain('Get-OwnedProfileBinding');
+    expect(source).toContain('Assert-TrustedConsoleHostTopology -Owned $Owned -RootProcessId $RootProcessId');
+    expect(source).not.toContain('Assert-TrustedConsoleHostTopology -Owned $Owned -RootProcessId $RootProcessId -AllowAbsent');
     const check = extractFunctions('scripts/installed-reading-tools.ps1', ['Get-ReadingSha256', 'Get-ReadingOwnedExecutableDiagnostic', 'Assert-ReadingOwnedExecutables'], String.raw`
       $script:ReadingPins=[ordered]@{OwnedProcessMaximum=128;UnknownExecutableHashMaximum=32}
+      $script:trustedConsoleCalls=0;$script:rejectConsole=$false
+      function Assert-TrustedConsoleHostTopology{param([object[]]$Owned,[int]$RootProcessId,[string]$SystemDirectory,[scriptblock]$SignatureProvider,[scriptblock]$VersionInfoProvider);$script:trustedConsoleCalls++;if($script:rejectConsole){throw 'Untrusted console topology.'};if($RootProcessId-ne900){throw 'Wrong root process.'};2}
       $app='C:\\Program Files\\PDF Workstation\\pdf-workstation.exe';$edge='C:\\drivers\\msedgedriver.exe'
-      $valid=@([pscustomobject]@{Path=$app},[pscustomobject]@{Path=$edge},[pscustomobject]@{Path='C:\\WebView\\msedgewebview2.exe'})
-      Assert-ReadingOwnedExecutables $valid $app $edge
-      $rejected=$false;try{Assert-ReadingOwnedExecutables @($valid+[pscustomobject]@{Path='C:\\Windows\\notepad.exe'}) $app $edge}catch{$rejected=$true}
+      $valid=@([pscustomobject]@{ProcessId=101;ParentProcessId=900;Path=$app},[pscustomobject]@{ProcessId=102;ParentProcessId=900;Path=$edge},[pscustomobject]@{ProcessId=103;ParentProcessId=101;Path='C:\\WebView\\msedgewebview2.exe'},[pscustomobject]@{ProcessId=104;ParentProcessId=900;Path='C:\\Windows\\System32\\conhost.exe'},[pscustomobject]@{ProcessId=105;ParentProcessId=103;Path='C:\\Windows\\System32\\conhost.exe'})
+      Assert-ReadingOwnedExecutables -Owned $valid -ApplicationPath $app -EdgeDriverPath $edge -RootProcessId 900
+      if($trustedConsoleCalls-ne1){throw 'Reading topology did not invoke the trusted console-host validator.'}
+      $rejected=$false;try{Assert-ReadingOwnedExecutables -Owned @($valid+[pscustomobject]@{ProcessId=106;ParentProcessId=900;Path='C:\\Windows\\notepad.exe'}) -ApplicationPath $app -EdgeDriverPath $edge -RootProcessId 900}catch{$rejected=$true}
       if(-not$rejected){throw 'Rogue descendant was accepted.'}
+      $script:rejectConsole=$true;$consoleRejected=$false;try{Assert-ReadingOwnedExecutables -Owned $valid -ApplicationPath $app -EdgeDriverPath $edge -RootProcessId 900}catch{$consoleRejected=$_.Exception.Message-ceq'Untrusted console topology.'}
+      if(-not$consoleRejected){throw 'Reading topology accepted a console host rejected by the shared validator.'}
     `);
     const result = runPowerShell(check);
     expect(result.status, result.stderr || result.stdout).toBe(0);
@@ -171,12 +178,14 @@ describe('installed signed reading-tools verifier', () => {
       $second=Get-ReadingOwnedExecutableDiagnostic -Owned @(@($missing)+@($unknownB)+$valid+@($unknownA)) -ApplicationPath $app -EdgeDriverPath $edge
       $firstJson=$first|ConvertTo-Json -Depth 4 -Compress;$secondJson=$second|ConvertTo-Json -Depth 4 -Compress
       if($firstJson-cne$secondJson){throw 'Unknown descendant diagnostic was not deterministic.'}
-      $expectedProperties='schemaVersion,capturedCount,applicationCount,edgeDriverCount,webViewCount,unknownCount,missingPathCount,unknownLeafHashCount,unknownLeafHashes,unknownLeafHashesTruncated,parentCategoryCountsAvailable,parentCategoryCounts'
+      $expectedProperties='schemaVersion,capturedCount,applicationCount,edgeDriverCount,webViewCount,consoleHostCount,unknownCount,missingPathCount,unknownLeafHashCount,unknownLeafHashes,unknownLeafHashesTruncated,parentCategoryCountsAvailable,parentCategoryCounts'
       if(($first.PSObject.Properties.Name-join',')-cne$expectedProperties){throw 'Unknown descendant diagnostic schema drifted.'}
       if($first.capturedCount-ne6-or$first.applicationCount-ne1-or$first.edgeDriverCount-ne1-or$first.webViewCount-ne1-or$first.unknownCount-ne3-or$first.missingPathCount-ne1){throw 'Unknown descendant counts were incorrect.'}
       if($first.unknownLeafHashCount-ne2-or$first.unknownLeafHashes.Count-ne2-or$first.unknownLeafHashesTruncated-or$first.parentCategoryCountsAvailable-or$first.parentCategoryCounts.Count-ne0){throw 'Unknown descendant privacy fields were incorrect.'}
       if(@($first.unknownLeafHashes|Where-Object{$_-cnotmatch'^[A-F0-9]{64}$'}).Count){throw 'Unknown descendant leaf hash was malformed.'}
-      $message='';try{Assert-ReadingOwnedExecutables -Owned @($valid+$unknownA+$missing) -ApplicationPath $app -EdgeDriverPath $edge}catch{$message=$_.Exception.Message}
+      function Assert-TrustedConsoleHostTopology{param([object[]]$Owned,[int]$RootProcessId,[string]$SystemDirectory,[scriptblock]$SignatureProvider,[scriptblock]$VersionInfoProvider);2}
+      $console=@([pscustomobject]@{Path='C:\\Windows\\System32\\conhost.exe'},[pscustomobject]@{Path='C:\\Windows\\System32\\conhost.exe'})
+      $message='';try{Assert-ReadingOwnedExecutables -Owned @($valid+$console+$unknownA+$missing) -ApplicationPath $app -EdgeDriverPath $edge -RootProcessId 900}catch{$message=$_.Exception.Message}
       if($message-cnotmatch'^Reading-tools captured an unexpected descendant executable; diagnostic='){throw 'Strict unknown descendant rejection was lost.'}
       foreach($forbidden in @('notepad.exe','private','sensitive','98765','secret argument','C:\\','D:\\')){if($message.ToLowerInvariant().Contains($forbidden.ToLowerInvariant())){throw 'Unknown descendant diagnostic leaked a raw value.'}}
       $many=@($valid);for($index=0;$index-lt35;$index++){$many+=[pscustomobject]@{Path=('C:\\private\\rogue-{0:d2}.exe'-f$index)}}
@@ -253,6 +262,8 @@ describe('installed signed reading-tools verifier', () => {
     expect(installed).toContain('Post-flow plain reading fixture');
     expect(installed).toContain('The reading fixture inventory changed or contains a reparse point.');
     expect(installed).toContain('Assert-LaunchCleanupState');
+    expect(installed).toContain('Wait-LaunchProcessQuiescence -Deadline $processCleanupDeadline');
+    expect(installed).toContain('-not $processesQuiescent');
     expect(installed).toContain("$sessionDeleteOutcome -cne 'verified'");
     expect(installed).toContain('$remaining -ne 0');
     expect(installed).toContain('-NotePropertyName relevantProcessesRemaining -NotePropertyValue 0');

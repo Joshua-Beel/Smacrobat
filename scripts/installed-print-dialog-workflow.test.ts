@@ -157,7 +157,7 @@ describe('installed native print dialog verifier', () => {
     expect(result.status, result.stderr || result.stdout).toBe(0);
   });
 
-  it('binds an unnamed hosted native surface by new runtime identity and proves exact close', () => {
+  it('preserves exact top-level cleanup baselines and rejects late runtime identity reads', () => {
     const result = runPowerShell7(String.raw`
       $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
       Set-Location -LiteralPath '${process.cwd().replaceAll("'", "''")}'
@@ -168,15 +168,8 @@ describe('installed native print dialog verifier', () => {
         return $element
       }
       $main=New-HostedTopLevel 7319 1 'ControlType.Window' 'PDF Workstation'
-      $native=New-HostedTopLevel 7319 2 'ControlType.Pane' ''
       $replacement=New-HostedTopLevel 7319 3 'ControlType.Pane' ''
       $baseline=@(Get-ProcessTopLevelUiSnapshot -ProcessId 7319 -Deadline ([datetime]::UtcNow.AddSeconds(1)) -ElementProvider {param($requestedProcessId,$windowsOnly)@($main)})
-      $target=Wait-NewProcessTopLevelUiSurface -ProcessId 7319 -Baseline $baseline -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddSeconds(1)) -ElementProvider {param($requestedProcessId,$windowsOnly)@($main,$native)}
-      if([string]$target.runtimeIdentity-cne'42:2'-or[string]$target.controlType-cne'ControlType.Pane'-or[string]$target.element.Current.Name-cne''){throw 'Unnamed hosted native surface was not bound by exact runtime identity.'}
-      $script:closePolls=0
-      $closeProvider={param($requestedProcessId,$windowsOnly)$script:closePolls++;if($script:closePolls-eq1){@($main,$native)}else{@($main,$replacement)}}
-      Wait-ProcessTopLevelUiSurfaceClosed -ProcessId 7319 -RuntimeIdentity ([string]$target.runtimeIdentity) -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddSeconds(1)) -ElementProvider $closeProvider
-      if($script:closePolls-lt2){throw 'Exact hosted native surface disappearance was not observed.'}
       $message='';try{Wait-ProcessTopLevelUiBaselineRestored -ProcessId 7319 -Baseline $baseline -Stage 'first-native-cleanup' -Deadline ([datetime]::UtcNow.AddMilliseconds(50)) -ElementProvider {param($requestedProcessId,$windowsOnly)@($main,$replacement)}}catch{$message=$_.Exception.Message}
       if($message-cnotmatch'exact top-level baseline'-or$message-cnotmatch'"topLevelWindowCount":2'-or$message-cnotmatch'"paneCount":1'){throw 'An extra replacement surface was accepted after first cancellation.'}
       $absorbedBaseline=@(Get-ProcessTopLevelUiSnapshot -ProcessId 7319 -Deadline ([datetime]::UtcNow.AddSeconds(1)) -ElementProvider {param($requestedProcessId,$windowsOnly)@($main,$replacement)})
@@ -185,42 +178,72 @@ describe('installed native print dialog verifier', () => {
       $rejected=$false;try{Get-ProcessTopLevelUiSnapshot -ProcessId 7319 -Deadline ([datetime]::UtcNow.AddSeconds(1)) -ElementProvider {param($requestedProcessId,$windowsOnly)@($foreign)}|Out-Null}catch{$rejected=$true};if(-not$rejected){throw 'Foreign top-level surface was accepted.'}
       $delayed=New-HostedTopLevel 7319 6 'ControlType.Pane' '' 80
       $rejected=$false;try{Get-ProcessTopLevelUiSnapshot -ProcessId 7319 -Deadline ([datetime]::UtcNow.AddMilliseconds(20)) -ElementProvider {param($requestedProcessId,$windowsOnly)@($delayed)}|Out-Null}catch{$rejected=$true};if(-not$rejected){throw 'A runtime identity read completed successfully after its deadline.'}
-      $second=New-HostedTopLevel 7319 5 'ControlType.Window' ''
-      $message='';try{Wait-NewProcessTopLevelUiSurface -ProcessId 7319 -Baseline $baseline -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(50)) -ElementProvider {param($requestedProcessId,$windowsOnly)@($native)}|Out-Null}catch{$message=$_.Exception.Message}
-      if($message-cnotmatch'exactly one new owned top-level surface'){throw 'A replacement surface was accepted after the baseline main window disappeared.'}
-      $message='';try{Wait-NewProcessTopLevelUiSurface -ProcessId 7319 -Baseline $baseline -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(50)) -ElementProvider {param($requestedProcessId,$windowsOnly)@($main,$native,$second)}|Out-Null}catch{$message=$_.Exception.Message}
-      if($message-cnotmatch'exactly one new owned top-level surface'-or$message-cnotmatch'"topLevelWindowCount":3'-or$message-cnotmatch'"windowCount":2'-or$message-cnotmatch'"paneCount":1'){throw 'Ambiguous new native surfaces did not fail with sanitized counts.'}
-      if($message-match'(?i)(runtimeIdentity|42:|bounding|rectangle|caption|"name"|"text"|"path"|"processid"|7319)'){throw 'Runtime-identity diagnostics leaked private UI data.'}
     `);
     expect(result.status, result.stderr || result.stdout).toBe(0);
     const source = readFileSync('scripts/installed-print-dialog.ps1', 'utf8');
     expect(source).toContain('$element.GetRuntimeId()');
-    expect(source).toContain("@('ControlType.Window','ControlType.Pane')");
-    expect(source).not.toMatch(/Wait-ProcessUiElement -ProcessId \$ProcessId -Names @\('Print'\).*WindowsOnly/);
     expect(source).toContain("-Baseline $originalNativeBaseline -Stage 'first-native-cleanup'");
     expect(source).toContain('-Expected $originalNativeBaseline -Actual $secondNativeBaseline');
     expect(source).toContain("-Baseline $originalNativeBaseline -Stage 'final-native-cleanup'");
     expect(source).not.toContain("-Baseline $secondNativeBaseline -Stage 'final-native-cleanup'");
   });
 
-  it('rejects matching controls outside the captured native surface without invoking them', () => {
+  it('binds a descendant delta inside an unchanged owned top-level surface and rejects other ancestry', () => {
     const result = runPowerShell7(String.raw`
       $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
       Set-Location -LiteralPath '${process.cwd().replaceAll("'", "''")}'
       . ./scripts/installed-print-dialog.ps1
-      function New-Control([string]$name){[pscustomobject]@{Clicked=$false;Current=[pscustomobject]@{ProcessId=7319;ControlType=[pscustomobject]@{ProgrammaticName='ControlType.Button'};Name=$name}}}
-      $outside=New-Control 'Cancel';$surface=[pscustomobject]@{Descendants=@();Current=[pscustomobject]@{ProcessId=7319}}
-      function Get-ProcessUiElements {param([int]$ProcessId,[switch]$WindowsOnly,$RootElement)if($null-ne$RootElement){@($RootElement.Descendants)}else{@($outside)}}
-      $rejected=$false;try{Find-ProcessUiElement -ProcessId 7319 -Names @('Cancel') -ControlTypes @('ControlType.Button') -RootElement $surface|Out-Null}catch{$rejected=$true}
-      if(-not$rejected-or$outside.Clicked){throw 'A matching control outside the captured surface was accepted or invoked.'}
-      $inside=New-Control 'Cancel';$surface.Descendants=@($inside)
-      $found=Find-ProcessUiElement -ProcessId 7319 -Names @('Cancel') -ControlTypes @('ControlType.Button') -RootElement $surface
-      if(-not[object]::ReferenceEquals($found,$inside)-or$outside.Clicked){throw 'Captured-surface lookup did not isolate its exact descendant.'}
+      function New-TreeElement([int]$ownedProcessId,[int]$runtimePart,[string]$type,[string]$name,$parent){
+        $element=[pscustomobject]@{RuntimePart=$runtimePart;Parent=$parent;Clicked=$false;Current=[pscustomobject]@{ProcessId=$ownedProcessId;ControlType=[pscustomobject]@{ProgrammaticName=$type};Name=$name;AutomationId=''}}
+        $element|Add-Member -MemberType ScriptMethod -Name GetRuntimeId -Value {[int[]]@(77,$this.RuntimePart)}
+        return $element
+      }
+      $desktop=[pscustomobject]@{Current=[pscustomobject]@{ProcessId=0}}
+      $main=New-TreeElement 7319 1 'ControlType.Window' 'PDF Workstation' $desktop
+      $pane=New-TreeElement 7319 2 'ControlType.Pane' '' $desktop
+      $outside=New-TreeElement 7319 3 'ControlType.Button' 'Cancel' $main
+      $dialog=New-TreeElement 7319 4 'ControlType.Pane' '' $pane
+      $inside=New-TreeElement 7319 5 'ControlType.Button' 'Cancel' $dialog
+      $print=New-TreeElement 7319 6 'ControlType.Button' 'Print' $dialog
+      $script:treeElements=@($main,$pane,$outside)
+      $provider={param($requestedProcessId,$windowsOnly)if($windowsOnly){@($main,$pane)}else{@($script:treeElements)}}
+      $parents={param($element)$element.Parent}
+      $baseline=@(Get-ProcessUiTreeSnapshot -ProcessId 7319 -Deadline ([datetime]::UtcNow.AddSeconds(1)) -ElementProvider $provider -ParentProvider $parents)
+      $script:treeElements=@($main,$pane,$outside,$dialog,$inside,$print)
+      $binding=Wait-NewProcessUiSurface -ProcessId 7319 -Baseline $baseline -AnchorNames @('Cancel') -AnchorControlTypes @('ControlType.Button') -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddSeconds(1)) -ElementProvider $provider -ParentProvider $parents
+      if([string]$binding.surfaceRootIdentity-cne'77:4'-or@($binding.trackedIdentities).Count-ne3){throw 'Descendant delta did not bind its exact common ancestor inside the unchanged top-level pane.'}
+      $found=Find-BoundProcessUiElement -ProcessId 7319 -Binding $binding -Names @('Cancel') -ControlTypes @('ControlType.Button') -Deadline ([datetime]::UtcNow.AddSeconds(1)) -ElementProvider $provider -ParentProvider $parents
+      if(-not[object]::ReferenceEquals($found,$inside)){throw 'A baseline matching control outside the descendant delta was accepted.'}
+      $other=New-TreeElement 7319 7 'ControlType.Button' 'Other' $main
+      $script:treeElements=@($main,$pane,$outside,$dialog,$inside,$print,$other)
+      $message='';try{Wait-NewProcessUiSurface -ProcessId 7319 -Baseline $baseline -AnchorNames @('Cancel') -AnchorControlTypes @('ControlType.Button') -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(50)) -ElementProvider $provider -ParentProvider $parents|Out-Null}catch{$message=$_.Exception.Message}
+      if($message-cnotmatch'one process-owned descendant surface'-or$message-cnotmatch'baselineUiStructure='-or$message-cnotmatch'postUiStructure='-or$message-cnotmatch'newUiStructure='){throw 'Mixed-root descendant delta did not fail with bounded evidence.'}
+      if($message-match'(?i)(runtimeIdentity|77:|PDF Workstation|bounding|rectangle|caption|"name"|"text"|"path"|"processid"|7319)'){throw 'Descendant-delta diagnostics leaked private UI data.'}
+      $sibling=New-TreeElement 7319 8 'ControlType.Pane' '' $pane
+      $outsidePrint=New-TreeElement 7319 9 'ControlType.Button' 'Print' $sibling
+      $script:treeElements=@($main,$pane,$outside,$dialog,$inside,$print,$sibling,$outsidePrint)
+      $message='';try{Wait-NewProcessUiSurface -ProcessId 7319 -Baseline $baseline -AnchorNames @('Cancel') -AnchorControlTypes @('ControlType.Button') -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(50)) -ElementProvider $provider -ParentProvider $parents|Out-Null}catch{$message=$_.Exception.Message}
+      if($message-cnotmatch'one process-owned descendant surface'-or$outsidePrint.Clicked){throw 'A same-top-level sibling Print widened the bound surface or was clicked.'}
+      $outsideCancel=New-TreeElement 7319 10 'ControlType.Button' 'Cancel' $sibling
+      $script:treeElements=@($main,$pane,$outside,$dialog,$inside,$print,$sibling,$outsidePrint,$outsideCancel)
+      $message='';try{Wait-NewProcessUiSurface -ProcessId 7319 -Baseline $baseline -AnchorNames @('Cancel') -AnchorControlTypes @('ControlType.Button') -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(50)) -ElementProvider $provider -ParentProvider $parents|Out-Null}catch{$message=$_.Exception.Message}
+      if($message-cnotmatch'one process-owned descendant surface'-or$outsidePrint.Clicked-or$outsideCancel.Clicked){throw 'Matching controls in a sibling subtree were accepted or clicked.'}
+      $script:treeElements=@($main,$pane,$outside)
+      Wait-BoundProcessUiSurfaceClosed -ProcessId 7319 -Binding $binding -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddSeconds(1)) -ElementProvider $provider -ParentProvider $parents
+      $foreign=New-TreeElement 7320 11 'ControlType.Button' 'Cancel' $pane
+      $script:treeElements=@($main,$pane,$outside,$foreign)
+      $rejected=$false;try{Get-ProcessUiTreeSnapshot -ProcessId 7319 -Deadline ([datetime]::UtcNow.AddSeconds(1)) -ElementProvider $provider -ParentProvider $parents|Out-Null}catch{$rejected=$true};if(-not$rejected){throw 'A foreign descendant was accepted.'}
+      $script:treeElements=@($main,$pane,$outside,$dialog,$inside)
+      $slowParents={param($element)Start-Sleep -Milliseconds 80;$element.Parent}
+      $rejected=$false;try{Get-ProcessUiTreeSnapshot -ProcessId 7319 -Deadline ([datetime]::UtcNow.AddMilliseconds(20)) -ElementProvider $provider -ParentProvider $slowParents|Out-Null}catch{$rejected=$true};if(-not$rejected){throw 'A parent read completed successfully after its deadline.'}
     `);
     expect(result.status, result.stderr || result.stdout).toBe(0);
     const source = readFileSync('scripts/installed-print-dialog.ps1', 'utf8');
-    expect(source.match(/-RootElement \$surface\.element/g)?.length).toBeGreaterThanOrEqual(6);
-    expect(source.match(/-RootElement \$saveSurface\.element/g)?.length).toBeGreaterThanOrEqual(3);
+    expect(source.match(/Find-BoundProcessUiElement/g)?.length).toBeGreaterThanOrEqual(8);
+    expect(source).toContain('TreeWalker]::RawViewWalker.GetParent');
+    expect(source).toContain('-not $baselineIdentities.Contains($surfaceRootIdentity)');
+    expect(source).toContain('$firstNativeControlBaseline = @(Get-ProcessUiTreeSnapshot');
+    expect(source).toContain('$secondNativeControlBaseline = @(Get-ProcessUiTreeSnapshot');
   });
 
   it('maps every native wait callsite to its exact diagnostic stage', () => {
@@ -229,7 +252,7 @@ describe('installed native print dialog verifier', () => {
       $tokens=$null;$errors=$null
       $ast=[Management.Automation.Language.Parser]::ParseFile('${process.cwd().replaceAll("'", "''")}\\scripts\\installed-print-dialog.ps1',[ref]$tokens,[ref]$errors)
       if($errors.Count){throw 'Installed print script did not parse.'}
-      $calls=@($ast.FindAll({param($node)$node-is[Management.Automation.Language.CommandAst]-and$node.GetCommandName()-in@('Wait-ProcessUiElement','Wait-ProcessUiWindowClosed','Wait-NewProcessTopLevelUiSurface','Wait-ProcessTopLevelUiSurfaceClosed','Wait-ProcessTopLevelUiBaselineRestored')},$true))
+      $calls=@($ast.FindAll({param($node)$node-is[Management.Automation.Language.CommandAst]-and$node.GetCommandName()-in@('Wait-ProcessUiElement','Wait-ProcessUiWindowClosed','Wait-NewProcessUiSurface','Wait-BoundProcessUiElement','Wait-BoundProcessUiSurfaceClosed','Wait-ProcessTopLevelUiBaselineRestored')},$true))
       $actual=@($calls|ForEach-Object{
         $elements=@($_.CommandElements);$stageIndex=-1
         for($index=0;$index-lt$elements.Count;$index++){if($elements[$index]-is[Management.Automation.Language.CommandParameterAst]-and$elements[$index].ParameterName-ceq'Stage'){$stageIndex=$index;break}}
@@ -241,9 +264,10 @@ describe('installed native print dialog verifier', () => {
         ($_.GetCommandName()+':'+$stage)
       }|Sort-Object)
       $expected=@(
-        'Wait-NewProcessTopLevelUiSurface:$Stage','Wait-NewProcessTopLevelUiSurface:save-output-dialog','Wait-NewProcessTopLevelUiSurface:second-print-dialog',
-        'Wait-ProcessTopLevelUiSurfaceClosed:$Stage','Wait-ProcessTopLevelUiSurfaceClosed:save-output-dialog','Wait-ProcessTopLevelUiSurfaceClosed:second-print-dialog',
-        'Wait-ProcessTopLevelUiBaselineRestored:final-native-cleanup','Wait-ProcessTopLevelUiBaselineRestored:first-native-cleanup','Wait-ProcessUiElement:current-page-control'
+        'Wait-NewProcessUiSurface:$Stage','Wait-NewProcessUiSurface:save-output-dialog','Wait-NewProcessUiSurface:second-print-dialog',
+        'Wait-BoundProcessUiSurfaceClosed:$Stage','Wait-BoundProcessUiSurfaceClosed:save-output-dialog','Wait-BoundProcessUiSurfaceClosed:second-print-dialog',
+        'Wait-BoundProcessUiElement:current-page-control',
+        'Wait-ProcessTopLevelUiBaselineRestored:final-native-cleanup','Wait-ProcessTopLevelUiBaselineRestored:first-native-cleanup'
       )|Sort-Object
       if(($actual-join'|')-cne($expected-join'|')){throw ('Native wait stage mapping changed: '+($actual-join','))}
     `);
@@ -259,9 +283,17 @@ describe('installed native print dialog verifier', () => {
       if($phase-gt$total){throw 'Phase deadline escaped total deadline.'}
       foreach($bad in @(0,-1)){$rejected=$false;try{Get-PrintPhaseDeadline -TotalDeadline $total -MaximumMilliseconds $bad}catch{$rejected=$true};if(-not$rejected){throw 'Invalid phase duration accepted.'}}
       $rejected=$false;try{Get-PrintPhaseDeadline -TotalDeadline ([datetime]::UtcNow.AddMilliseconds(-1)) -MaximumMilliseconds 1}catch{$rejected=$true};if(-not$rejected){throw 'Expired total deadline accepted.'}
-      $app='C:\fixture\pdf-workstation.exe';$edge='C:\fixture\msedgedriver.exe';$owned=@([pscustomobject]@{Path=$app},[pscustomobject]@{Path=$edge},[pscustomobject]@{Path='C:\fixture\msedgewebview2.exe'})
-      Assert-PrintOwnedExecutables -Owned $owned -ApplicationPath $app -EdgeDriverPath $edge
-      $rejected=$false;try{Assert-PrintOwnedExecutables -Owned @($owned+[pscustomobject]@{Path='C:\fixture\rogue.exe'}) -ApplicationPath $app -EdgeDriverPath $edge}catch{$rejected=$true};if(-not$rejected){throw 'Unexpected descendant accepted.'}
+      $script:topologyCalls=0
+      function Assert-TrustedConsoleHostTopology {param([object[]]$Owned,[int]$RootProcessId,[string]$SystemDirectory,[scriptblock]$SignatureProvider,[scriptblock]$VersionInfoProvider)$script:topologyCalls++;if($RootProcessId-ne41-or@($Owned|Where-Object{[IO.Path]::GetFileName([string]$_.Path)-ieq'conhost.exe'}).Count-ne2){throw 'invalid topology'};return 2}
+      $app='C:\fixture\pdf-workstation.exe';$edge='C:\fixture\msedgedriver.exe';$owned=@(
+        [pscustomobject]@{Path=$app},[pscustomobject]@{Path=$edge},[pscustomobject]@{Path='C:\fixture\msedgewebview2.exe'},
+        [pscustomobject]@{Path='C:\Windows\System32\conhost.exe'},[pscustomobject]@{Path='C:\Windows\System32\conhost.exe'}
+      )
+      Assert-PrintOwnedExecutables -Owned $owned -ApplicationPath $app -EdgeDriverPath $edge -RootProcessId 41
+      if($script:topologyCalls-ne1){throw 'Print executable validation bypassed the full trusted console-host topology helper.'}
+      $rejected=$false;try{Assert-PrintOwnedExecutables -Owned @($owned+[pscustomobject]@{Path='C:\fixture\rogue.exe'}) -ApplicationPath $app -EdgeDriverPath $edge -RootProcessId 41}catch{$rejected=$true};if(-not$rejected){throw 'Unexpected descendant accepted.'}
+      function Assert-TrustedConsoleHostTopology {throw 'full topology rejected'}
+      $rejected=$false;try{Assert-PrintOwnedExecutables -Owned $owned -ApplicationPath $app -EdgeDriverPath $edge -RootProcessId 41}catch{$rejected=$true};if(-not$rejected){throw 'Console hosts were accepted by leaf name after full topology rejection.'}
       Assert-ProcessUiElement -Element ([pscustomobject]@{Current=[pscustomobject]@{ProcessId=42}}) -ProcessId 42
       $rejected=$false;try{Assert-ProcessUiElement -Element ([pscustomobject]@{Current=[pscustomobject]@{ProcessId=43}}) -ProcessId 42}catch{$rejected=$true};if(-not$rejected){throw 'Foreign UI Automation element accepted.'}
       $clean=[pscustomobject]@{sessionDeleted=$true;ownedProcessTreeStopped=$true;relevantProcessesRemaining=0};Assert-PrintCleanupResult $clean
@@ -270,5 +302,12 @@ describe('installed native print dialog verifier', () => {
       foreach($bad in @([pscustomobject]@{Pages=2;Fingerprint=[byte[]](1,40,100,220)},[pscustomobject]@{Pages=1;Fingerprint=[byte[]](220,100,40,1)})){$rejected=$false;try{Compare-PdfiumPrintProof $source $bad}catch{$rejected=$true};if(-not$rejected){throw 'Unsafe PDF proof accepted.'}}
     `);
     expect(result.status, result.stderr || result.stdout).toBe(0);
+    const source = readFileSync('scripts/installed-print-dialog.ps1', 'utf8');
+    const topologyCall = source.indexOf('$trustedConsoleHostCount = Assert-TrustedConsoleHostTopology');
+    const firstUiSnapshot = source.indexOf('$originalNativeBaseline = @(Get-ProcessTopLevelUiSnapshot');
+    expect(topologyCall).toBeGreaterThan(0);
+    expect(firstUiSnapshot).toBeGreaterThan(topologyCall);
+    expect(source.match(/Assert-TrustedConsoleHostTopology -Owned/g)).toHaveLength(2);
+    expect(source).not.toMatch(/Assert-TrustedConsoleHostTopology[^\r\n]*-AllowAbsent/);
   });
 });
