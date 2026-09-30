@@ -217,6 +217,12 @@ describe('hosted installed signed application launch proof', () => {
     expect(rejectedOcrStates).toBeGreaterThan(-1);
     expect(ocrHash).toBeGreaterThan(rejectedOcrStates);
     expect(ocrClose).toBeGreaterThan(ocrHash);
+    const postOcr = launch.indexOf('$postOcrScript', ocrClose);
+    const closeFlow = launch.slice(ocrClose, postOcr);
+    expect(closeFlow).toContain("if(d.length===1&&b.length===1)setTimeout(()=>b[0].click(),0);return d.length===1&&b.length===1;");
+    expect(closeFlow).toContain("-Stage 'dialog-closed'");
+    expect(closeFlow).toContain("document.querySelectorAll('dialog[aria-labelledby=\\\"page-ocr-title\\\"]').length===0");
+    expect(closeFlow).not.toMatch(/\.close\(|\.remove\(|removeChild\(/);
     expect(launch).toContain('BeginOutputReadLine');
     expect(launch).toContain('BeginErrorReadLine');
     expect(launch).toContain("$null -eq $delete.value");

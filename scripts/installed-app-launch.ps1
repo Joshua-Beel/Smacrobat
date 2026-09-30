@@ -690,7 +690,7 @@ const dialogs=[...document.querySelectorAll('dialog[aria-labelledby="page-ocr-ti
         }
         $ocrTextReceipt = Get-LaunchOcrTextReceipt -Text ([string]$ocrResult.text) -ReportedUtf8Bytes ([int]$ocrResult.utf8Bytes)
         $ocrResult.text = ''
-        $closeOcr = Invoke-OcrWebDriverScript -SessionId $sessionId -Script "const d=[...document.querySelectorAll('dialog[aria-labelledby=\"page-ocr-title\"]')];const b=d.length===1?[...d[0].querySelectorAll('button')].filter(x=>x.textContent.trim()==='Close'&&!x.disabled):[];if(b.length===1)b[0].click();return d.length===1&&b.length===1;" -Deadline $deadline -Stage 'dialog-close'
+        $closeOcr = Invoke-OcrWebDriverScript -SessionId $sessionId -Script "const d=[...document.querySelectorAll('dialog[aria-labelledby=\"page-ocr-title\"]')];const b=d.length===1?[...d[0].querySelectorAll('button')].filter(x=>x.textContent.trim()==='Close'&&!x.disabled):[];if(d.length===1&&b.length===1)setTimeout(()=>b[0].click(),0);return d.length===1&&b.length===1;" -Deadline $deadline -Stage 'dialog-close'
         if ($closeOcr -isnot [bool] -or -not $closeOcr) { throw 'The completed current-page OCR dialog could not be closed exactly.' }
         $null = Wait-OcrWebDriverOracle -SessionId $sessionId -Script "return document.querySelectorAll('dialog[aria-labelledby=\"page-ocr-title\"]').length===0;" -Deadline $deadline -Kind 'Current-page OCR dialog close' -Stage 'dialog-closed' -Predicate { param($v) $v -is [bool] -and $v }
         $postOcrScript = @'
