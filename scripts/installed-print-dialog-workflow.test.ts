@@ -654,6 +654,73 @@ describe('installed native print dialog verifier', () => {
     expect(result.status, result.stderr || result.stdout).toBe(0);
   });
 
+  it('routes a null UIA printer result through the exact native list and propagates lookup errors', () => {
+    const result = runPowerShell7(String.raw`
+      $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
+      Set-Location -LiteralPath '${process.cwd().replaceAll("'", "''")}'
+      . ./scripts/installed-print-dialog.ps1
+      $surface=[pscustomobject]@{surfaceRootIdentity='hwnd:202|runtime:1'}
+      $script:expectedPrinter=[pscustomobject]@{Marker=[object]::new();Current=[pscustomobject]@{ProcessId=7319}}
+      $script:mode='missing';$script:nativeLookups=0
+      $uiFinder={param($requestedProcessId,$bindingValue,$name,$deadline)
+        if($name-cne'Microsoft Print to PDF'){throw 'UIA printer lookup changed its exact name.'}
+        if($script:mode-ceq'ambiguous'){throw 'Native process UI bound target was ambiguous.'}
+        if($script:mode-ceq'provider-error'){throw 'Native process UI provider failed.'}
+        return $null
+      }
+      $nativeFinder={param($requestedProcessId,$bindingValue,$deadline)$script:nativeLookups=$script:nativeLookups+1;return $script:expectedPrinter}
+      $found=Find-BoundPdfPrinterElement -ProcessId 7319 -Binding $surface -Deadline ([datetime]::UtcNow.AddSeconds(2)) -UiFinder $uiFinder -NativeFinder $nativeFinder
+      if(@($found).Count-ne1-or-not[object]::ReferenceEquals($found.Marker,$script:expectedPrinter.Marker)-or$script:nativeLookups-ne1){throw 'A null UIA result did not return the exact rooted native printer item.'}
+      foreach($failureMode in @('ambiguous','provider-error')){
+        $script:mode=$failureMode;$beforeNative=$script:nativeLookups;$rejected=$false
+        try{Find-BoundPdfPrinterElement -ProcessId 7319 -Binding $surface -Deadline ([datetime]::UtcNow.AddSeconds(2)) -UiFinder $uiFinder -NativeFinder $nativeFinder|Out-Null}catch{$rejected=$true}
+        if(-not$rejected-or$script:nativeLookups-ne$beforeNative){throw 'A UIA ambiguity or provider error was swallowed by native printer fallback.'}
+      }
+      $script:mode='missing'
+      $ambiguousNativeFinder={param($requestedProcessId,$bindingValue,$deadline)throw 'Exact native printer list was ambiguous.'}
+      $rejected=$false;try{Find-BoundPdfPrinterElement -ProcessId 7319 -Binding $surface -Deadline ([datetime]::UtcNow.AddSeconds(2)) -UiFinder $uiFinder -NativeFinder $ambiguousNativeFinder|Out-Null}catch{$rejected=$true}
+      if(-not$rejected){throw 'An exact native-list ambiguity reached printer selection.'}
+    `);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
+  it('emits only bounded privacy-safe facts below the exact native printer list', () => {
+    const result = runPowerShell7(String.raw`
+      $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
+      Set-Location -LiteralPath '${process.cwd().replaceAll("'", "''")}'
+      . ./scripts/installed-print-dialog.ps1
+      Initialize-PrintUiAutomation
+      function New-DiagnosticElement([int]$owner,[string]$type,[string]$name,[bool]$selection,[bool]$invoke){
+        $element=[pscustomobject]@{Selection=$selection;Invoke=$invoke;PatternCall=0;Current=[pscustomobject]@{ProcessId=$owner;ControlType=[pscustomobject]@{ProgrammaticName=$type};Name=$name}}
+        $element|Add-Member -MemberType ScriptMethod -Name TryGetCurrentPattern -Value {
+          param($pattern,[ref]$value)$this.PatternCall++
+          $available=if(($this.PatternCall%2)-eq1){[bool]$this.Selection}else{[bool]$this.Invoke}
+          if($available){$value.Value=[pscustomobject]@{}};return $available
+        }
+        return $element
+      }
+      $printerList=New-DiagnosticElement 7319 'ControlType.List' 'Private list' $false $false
+      $descendants=@()
+      foreach($index in 0..64){
+        $owner=if($index-eq0){9999}else{7319};$type=if($index-eq0){'ControlType.Pane'}else{'ControlType.ListItem'};$name=if($index-eq0){'Microsoft Print to PDF'}else{"Private printer $index"}
+        $descendants+=New-DiagnosticElement $owner $type $name ($index%2-eq0) ($index%3-eq0)
+      }
+      function Get-BoundNativeRoleElement { param($ProcessId,$Binding,$Role,$Deadline,$NativeWindowProvider)if($Role-cne'printerList'){throw 'Diagnostic escaped the bound printer list role.'};return $printerList }
+      $provider={param($root,$maximum,$deadline)if(-not[object]::ReferenceEquals($root,$printerList)-or$maximum-ne64){throw 'Diagnostic traversal escaped its exact bounded root.'};$descendants}
+      $json=Get-BoundNativePrinterListDiagnosticJson -ProcessId 7319 -Binding ([pscustomobject]@{}) -Deadline ([datetime]::UtcNow.AddSeconds(2)) -TraversalProvider $provider
+      $receipt=$json|ConvertFrom-Json
+      Assert-PrintExactProperties -Value $receipt -Expected @('inventoryStatus','descendantCount','countCapped','facts') -Kind 'Native printer-list diagnostic receipt'
+      if($receipt.inventoryStatus-cne'available'-or$receipt.descendantCount-ne64-or-not$receipt.countCapped-or@($receipt.facts).Count-ne64){throw 'Native printer-list diagnostic bounds changed.'}
+      foreach($fact in @($receipt.facts)){Assert-PrintExactProperties -Value $fact -Expected @('controlTypeBucket','processIdMatches','exactPrinterName','selectionPatternAvailable','invokePatternAvailable') -Kind 'Native printer-list diagnostic fact'}
+      if($receipt.facts[0].controlTypeBucket-cne'pane'-or$receipt.facts[0].processIdMatches-or-not$receipt.facts[0].exactPrinterName-or-not$receipt.facts[0].selectionPatternAvailable-or-not$receipt.facts[0].invokePatternAvailable){throw 'Native printer-list diagnostic facts changed.'}
+      if($json-cmatch'7319|9999|Microsoft Print to PDF|Private printer|Private list|handle|automationId|coordinates|bounds'){throw 'Native printer-list diagnostic leaked a sensitive value or field.'}
+      $slowProvider={param($root,$maximum,$deadline)Start-Sleep -Milliseconds 40;@($descendants[0])}
+      $unavailable=Get-BoundNativePrinterListDiagnosticJson -ProcessId 7319 -Binding ([pscustomobject]@{}) -Deadline ([datetime]::UtcNow.AddMilliseconds(20)) -TraversalProvider $slowProvider
+      if($unavailable-cne'{"inventoryStatus":"unavailable","descendantCount":-1,"countCapped":false,"facts":[]}'){throw 'Expired printer-list diagnostics did not fail closed.'}
+    `);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
   it('selects one visible dialog-class HWND from the hosted 11-owned 5-candidate topology', () => {
     const result = runPowerShell7(String.raw`
       $ErrorActionPreference='Stop';Set-StrictMode -Version Latest

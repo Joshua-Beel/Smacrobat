@@ -1909,6 +1909,112 @@ function Find-BoundNativePrinterElement {
     return $printerMatches[0]
 }
 
+function Get-BoundedNativePrinterListDescendants {
+    param(
+        [Parameter(Mandatory = $true)]$RootElement,
+        [Parameter(Mandatory = $true)][datetime]$Deadline,
+        [scriptblock]$TraversalProvider
+    )
+    $maximum = 64
+    if ([datetime]::UtcNow -ge $Deadline) { throw 'Native printer-list diagnostic deadline expired.' }
+    if ($TraversalProvider) {
+        $provided = @(& $TraversalProvider $RootElement $maximum $Deadline)
+        if ([datetime]::UtcNow -ge $Deadline) { throw 'Native printer-list diagnostic traversal exceeded its deadline.' }
+        return @($provided | Select-Object -First ($maximum + 1))
+    }
+    Initialize-PrintUiAutomation
+    $walker = [Windows.Automation.TreeWalker]::RawViewWalker
+    $pending = [Collections.Generic.Queue[object]]::new()
+    $result = [Collections.Generic.List[object]]::new()
+    $pending.Enqueue($RootElement)
+    while ($pending.Count -gt 0 -and $result.Count -le $maximum) {
+        if ([datetime]::UtcNow -ge $Deadline) { throw 'Native printer-list diagnostic deadline expired.' }
+        $parentElement = $pending.Dequeue()
+        $childElement = $walker.GetFirstChild($parentElement)
+        if ([datetime]::UtcNow -ge $Deadline) { throw 'Native printer-list diagnostic traversal exceeded its deadline.' }
+        while ($null -ne $childElement) {
+            $result.Add($childElement)
+            if ($result.Count -gt $maximum) { break }
+            $pending.Enqueue($childElement)
+            if ([datetime]::UtcNow -ge $Deadline) { throw 'Native printer-list diagnostic deadline expired.' }
+            $childElement = $walker.GetNextSibling($childElement)
+            if ([datetime]::UtcNow -ge $Deadline) { throw 'Native printer-list diagnostic traversal exceeded its deadline.' }
+        }
+    }
+    return @($result)
+}
+
+function Get-BoundNativePrinterListDiagnosticJson {
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)]$Binding,
+        [Parameter(Mandatory = $true)][datetime]$Deadline,
+        [scriptblock]$NativeWindowProvider,
+        [scriptblock]$TraversalProvider
+    )
+    $unavailable = '{"inventoryStatus":"unavailable","descendantCount":-1,"countCapped":false,"facts":[]}'
+    if ([datetime]::UtcNow -ge $Deadline) { return $unavailable }
+    try {
+        $listElement = Get-BoundNativeRoleElement -ProcessId $ProcessId -Binding $Binding -Role 'printerList' -Deadline $Deadline -NativeWindowProvider $NativeWindowProvider
+        if ($null -eq $listElement) { return $unavailable }
+        $observed = @(Get-BoundedNativePrinterListDescendants -RootElement $listElement -Deadline $Deadline -TraversalProvider $TraversalProvider)
+        $maximum = 64
+        $facts = @()
+        foreach ($element in @($observed | Select-Object -First $maximum)) {
+            if ([datetime]::UtcNow -ge $Deadline) { throw 'Native printer-list diagnostic deadline expired.' }
+            $ownerMatches = [int]$element.Current.ProcessId -eq $ProcessId
+            if ([datetime]::UtcNow -ge $Deadline) { throw 'Native printer-list diagnostic fact read exceeded its deadline.' }
+            $controlTypeBucket = Get-SanitizedNativeUiControlTypeBucket -ControlType (Get-UiControlTypeName -Element $element)
+            if ([datetime]::UtcNow -ge $Deadline) { throw 'Native printer-list diagnostic fact read exceeded its deadline.' }
+            $name = [string]$element.Current.Name
+            if ([datetime]::UtcNow -ge $Deadline) { throw 'Native printer-list diagnostic fact read exceeded its deadline.' }
+            $selectionPattern = $null
+            $selectionAvailable = [bool]$element.TryGetCurrentPattern([Windows.Automation.SelectionItemPattern]::Pattern,[ref]$selectionPattern)
+            if ([datetime]::UtcNow -ge $Deadline) { throw 'Native printer-list diagnostic pattern read exceeded its deadline.' }
+            $invokePattern = $null
+            $invokeAvailable = [bool]$element.TryGetCurrentPattern([Windows.Automation.InvokePattern]::Pattern,[ref]$invokePattern)
+            if ([datetime]::UtcNow -ge $Deadline) { throw 'Native printer-list diagnostic pattern read exceeded its deadline.' }
+            $facts += [pscustomobject][ordered]@{
+                controlTypeBucket=$controlTypeBucket
+                processIdMatches=[bool]$ownerMatches
+                exactPrinterName=[bool]$name.Equals($script:PrintPins.PrinterName,[StringComparison]::OrdinalIgnoreCase)
+                selectionPatternAvailable=[bool]$selectionAvailable
+                invokePatternAvailable=[bool]$invokeAvailable
+            }
+        }
+        if ([datetime]::UtcNow -ge $Deadline) { throw 'Native printer-list diagnostic deadline expired.' }
+        return ([pscustomobject][ordered]@{
+            inventoryStatus='available'
+            descendantCount=[int][Math]::Min($observed.Count,$maximum)
+            countCapped=[bool]($observed.Count -gt $maximum)
+            facts=$facts
+        } | ConvertTo-Json -Compress -Depth 4)
+    } catch {
+        return $unavailable
+    }
+}
+
+function Find-BoundPdfPrinterElement {
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)]$Binding,
+        [Parameter(Mandatory = $true)][datetime]$Deadline,
+        [scriptblock]$UiFinder,
+        [scriptblock]$NativeFinder
+    )
+    Assert-NativePrintDeadline -Deadline $Deadline
+    $printer = if ($UiFinder) {
+        & $UiFinder $ProcessId $Binding $script:PrintPins.PrinterName $Deadline
+    } else {
+        Find-BoundProcessUiElement -ProcessId $ProcessId -Binding $Binding -Names @($script:PrintPins.PrinterName) -AllowNone -Deadline $Deadline
+    }
+    if ($null -eq $printer -and [string]$Binding.surfaceRootIdentity -cmatch '^hwnd:') {
+        Assert-NativePrintDeadline -Deadline $Deadline
+        $printer = if ($NativeFinder) { & $NativeFinder $ProcessId $Binding $Deadline } else { Find-BoundNativePrinterElement -ProcessId $ProcessId -Binding $Binding -Deadline $Deadline }
+    }
+    return $printer
+}
+
 function Select-BoundNativeComboItemExact {
     param([Parameter(Mandatory = $true)][int]$ProcessId,[Parameter(Mandatory = $true)]$Binding,[Parameter(Mandatory = $true)][string]$Value,[Parameter(Mandatory = $true)][datetime]$Deadline,[scriptblock]$ComboContainsProvider,[scriptblock]$ComboSelectProvider,[scriptblock]$NativeWindowProvider)
     if (($null -eq $ComboContainsProvider) -xor ($null -eq $ComboSelectProvider)) { throw 'Native printer combo test providers were incomplete.' }
@@ -1942,12 +2048,11 @@ function Select-PdfPrinterAndCurrentPage {
     }
     $printer = $null
     $printerSelectedByNativeCombo = $false
-    Assert-NativePrintDeadline -Deadline $Deadline
-    try { $printer = Find-BoundProcessUiElement -ProcessId $ProcessId -Binding $surface -Names @($script:PrintPins.PrinterName) -Deadline $Deadline } catch {
+    $printer = Find-BoundPdfPrinterElement -ProcessId $ProcessId -Binding $surface -Deadline $Deadline
+    if ($null -eq $printer) {
         Assert-NativePrintDeadline -Deadline $Deadline
         if ([string]$surface.surfaceRootIdentity -cmatch '^hwnd:') {
-            $printer = Find-BoundNativePrinterElement -ProcessId $ProcessId -Binding $surface -Deadline $Deadline
-            if ($null -eq $printer) { $printerSelectedByNativeCombo = Select-BoundNativeComboItemExact -ProcessId $ProcessId -Binding $surface -Value $script:PrintPins.PrinterName -Deadline $Deadline }
+            $printerSelectedByNativeCombo = Select-BoundNativeComboItemExact -ProcessId $ProcessId -Binding $surface -Value $script:PrintPins.PrinterName -Deadline $Deadline
         }
         if ($null -eq $printer -and -not $printerSelectedByNativeCombo) {
             $combos = @(Get-BoundProcessUiElementsByControlType -ProcessId $ProcessId -Binding $surface -ControlType 'ControlType.ComboBox' -Deadline $Deadline)
@@ -1961,13 +2066,18 @@ function Select-PdfPrinterAndCurrentPage {
                     ([Windows.Automation.ExpandCollapsePattern]$expand).Expand()
                     Start-Sleep -Milliseconds 100
                     Assert-NativePrintDeadline -Deadline $Deadline
-                    try { $printer = Find-BoundProcessUiElement -ProcessId $ProcessId -Binding $surface -Names @($script:PrintPins.PrinterName) -AllowNone -Deadline $Deadline } catch { }
+                    $printer = Find-BoundProcessUiElement -ProcessId $ProcessId -Binding $surface -Names @($script:PrintPins.PrinterName) -AllowNone -Deadline $Deadline
                     if ($null -ne $printer) { break }
                 }
             }
         }
     }
-    if ($null -eq $printer -and -not $printerSelectedByNativeCombo) { throw 'Microsoft Print to PDF was not exposed by the process-bound native dialog.' }
+    if ($null -eq $printer -and -not $printerSelectedByNativeCombo) {
+        $printerListUiStructure = if ([string]$surface.surfaceRootIdentity -cmatch '^hwnd:') {
+            Get-BoundNativePrinterListDiagnosticJson -ProcessId $ProcessId -Binding $surface -Deadline $Deadline
+        } else { '{"inventoryStatus":"unavailable","descendantCount":-1,"countCapped":false,"facts":[]}' }
+        throw "Microsoft Print to PDF was not exposed by the process-bound native dialog; printerListUiStructure=$printerListUiStructure."
+    }
     if ($null -ne $printer) { Select-ProcessUiElement -Element $printer -ProcessId $ProcessId -Deadline $Deadline }
     if ($null -ne $surface.nativeRoles) {
         $null = Invoke-BoundNativeButtonRole -ProcessId $ProcessId -Binding $surface -Role 'currentPage' -Deadline $Deadline
