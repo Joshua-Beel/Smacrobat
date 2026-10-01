@@ -491,6 +491,15 @@ public sealed class NativeSaveDialogFixture : IDisposable {
     expect(source).toContain('-Expected $originalNativeBaseline -Actual $secondNativeBaseline');
     expect(source).toContain("-Baseline $originalNativeBaseline -Stage 'final-native-cleanup'");
     expect(source).not.toContain("-Baseline $secondNativeBaseline -Stage 'final-native-cleanup'");
+    const flow = source.slice(source.indexOf('function Invoke-RealInstalledPrintDialog'), source.indexOf('function Invoke-InstalledPrintDialogVerification'));
+    const submitIndex = flow.indexOf('Submit-NativePrintToPdf');
+    const outputIndex = flow.indexOf('Wait-StablePrintFile', submitIndex);
+    const closeIndex = flow.indexOf('Close-WebPrintDialog', outputIndex);
+    const finalCleanupIndex = flow.indexOf("Wait-ProcessTopLevelUiBaselineRestored -ProcessId $appProcessId -Baseline $originalNativeBaseline -Stage 'final-native-cleanup'", closeIndex);
+    expect(submitIndex).toBeGreaterThanOrEqual(0);
+    expect(outputIndex).toBeGreaterThan(submitIndex);
+    expect(closeIndex).toBeGreaterThan(outputIndex);
+    expect(finalCleanupIndex).toBeGreaterThan(closeIndex);
   });
 
   it('binds a descendant delta inside an unchanged owned top-level surface and rejects other ancestry', () => {
@@ -675,6 +684,9 @@ public sealed class NativeSaveDialogFixture : IDisposable {
       $confirmation=New-NativeHostedElement 60 600 'ControlType.Window' ''
       $unexpectedPane=New-NativeHostedElement 61 610 'ControlType.Pane' ''
       $unexpectedWindow=New-NativeHostedElement 62 620 'ControlType.Window' ''
+      $replacementPane=New-NativeHostedElement 63 611 'ControlType.Pane' ''
+      $replacementWindow=New-NativeHostedElement 64 621 'ControlType.Window' ''
+      $extraResidual=New-NativeHostedElement 65 630 'ControlType.Pane' ''
       $hostedBaseline=@($main)
       foreach($index in 1..3){$hostedBaseline+=New-NativeHostedElement (10+$index) (110+$index) 'ControlType.Pane' ''}
       $hostedPost=@($hostedBaseline)+@($dialog)
@@ -685,6 +697,7 @@ public sealed class NativeSaveDialogFixture : IDisposable {
       if($baselineReceipt-cnotmatch'"processElementCount":4'-or$baselineReceipt-cnotmatch'"windowCount":1'-or$baselineReceipt-cnotmatch'"paneCount":3'){throw 'Hosted HWND baseline topology fixture changed.'}
       if($postReceipt-cnotmatch'"processElementCount":35'-or$postReceipt-cnotmatch'"windowCount":2'-or$postReceipt-cnotmatch'"paneCount":33'){throw 'Hosted HWND post topology fixture changed.'}
       $script:nativeState='baseline';$script:uiaTreeCalls=0
+      $script:residualVariant='exact';$script:residualCalls=0
       function Get-ProcessUiTreeSnapshot {$script:uiaTreeCalls++;throw 'The hosted rooted UIA provider stalled.'}
       $provider={param($requestedProcessId,[long]$rootHandle,[bool]$topLevelOnly)
         if($rootHandle-ne0){
@@ -719,6 +732,23 @@ public sealed class NativeSaveDialogFixture : IDisposable {
           )
         }
         if($script:nativeState-ceq'baseline'-or$script:nativeState-ceq'closed'){return @((New-NativeProviderRecord 100 0 $main 'Chrome_WidgetWin_1'))}
+        if($script:nativeState-ceq'residual-profile'){
+          $script:residualCalls++
+          if($script:residualVariant-ceq'provider-error'-and$script:residualCalls-eq2){throw 'Transient residual provider failure.'}
+          $useReplacement=$script:residualVariant-ceq'replacement'-and$script:residualCalls-eq2
+          $swapDescriptors=$script:residualVariant-ceq'descriptor-swap'-and$script:residualCalls-eq2
+          $paneElement=if($swapDescriptors){New-NativeHostedElement 61 610 'ControlType.Window' ''}else{$unexpectedPane}
+          $windowElement=if($swapDescriptors){New-NativeHostedElement 62 620 'ControlType.Pane' ''}else{$unexpectedWindow}
+          $paneRecord=if($useReplacement){New-NativeProviderRecord 611 0 $replacementPane 'PrivateInertPane' 0 $false $false}else{New-NativeProviderRecord 610 0 $paneElement $(if($script:residualVariant-ceq'known-class'){'Chrome_WidgetWin_1'}else{'PrivateInertPane'}) 0 ($script:residualVariant-ceq'visible'-or($script:residualVariant-ceq'late-exact'-and$script:residualCalls-eq1)) $swapDescriptors}
+          $windowRecord=if($useReplacement){New-NativeProviderRecord 621 0 $replacementWindow 'PrivateInertWindow' 0 $false $true}else{New-NativeProviderRecord 620 0 $windowElement 'PrivateInertWindow' $(if($script:residualVariant-ceq'control-id'){1}else{0}) $false (-not($swapDescriptors-or($script:residualVariant-ceq'unstable'-and$script:residualCalls-eq2)))}
+          if($script:residualVariant-ceq'label'){$windowRecord|Add-Member -MemberType NoteProperty -Name IsLabelSave -Value $true -Force}
+          $records=@($paneRecord,$windowRecord)
+          if(-not($script:residualVariant-ceq'baseline-loss'-and$script:residualCalls-eq2)){$records=@((New-NativeProviderRecord 100 0 $main 'Chrome_WidgetWin_1'))+$records}
+          if($script:residualVariant-ceq'extra'){$records+=New-NativeProviderRecord 630 0 $extraResidual 'PrivateExtraSurface' 0 $false $false}
+          if($script:residualVariant-ceq'bound-reappears'-and$script:residualCalls-eq2){$records+=New-NativeProviderRecord 200 0 $dialog '#32770'}
+          if($script:residualVariant-ceq'successor'-and$script:residualCalls-eq2){$records+=New-NativeProviderRecord 600 0 $confirmation '#32770'}
+          return $records
+        }
         if($script:nativeState-ceq'changed-baseline'){return @((New-NativeProviderRecord 100 0 $changedMain 'Chrome_WidgetWin_1'))}
         if($script:nativeState-ceq'allowed-nonsurface'){return @((New-NativeProviderRecord 100 0 $main 'Chrome_WidgetWin_1'),(New-NativeProviderRecord 400 0 $allowedButtonReplacement 'Button'))}
         if($script:nativeState-ceq'native-save-with-print'){return @((New-NativeProviderRecord 100 0 $main 'Chrome_WidgetWin_1'),(New-NativeProviderRecord 200 0 (New-NativeHostedElement 2 200 'ControlType.Window' '') '#32770'),[pscustomobject]@{HandleValue=500L;ParentHandleValue=0L;ProcessId=7319;ClassName='#32770';ControlId=0;ButtonStyle=-1;IsVisible=$true;IsEnabled=$true;IsLabelSave=$false;IsLabelCancel=$false;Element=$nativeSaveRoot})}
@@ -782,6 +812,22 @@ public sealed class NativeSaveDialogFixture : IDisposable {
       try{Wait-BoundProcessUiSurfaceClosed -ProcessId 7319 -Binding $binding -Stage 'second-print-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(450)) -NativeWindowProvider $provider}catch{$descriptorMessage=$_.Exception.Message}
       if($descriptorMessage-cnotmatch'"unexpectedSurfaceCount":2'-or$descriptorMessage-cnotmatch'"unexpectedSurfaceDescriptorsStatus":"available"'-or$descriptorMessage-cnotmatch'"count":1,"classBucket":"chromeSystemMessageWindow","controlIdBucket":"none","controlTypeBucket":"window","visible":false,"enabled":true,"isSurface":true'-or$descriptorMessage-cnotmatch'"count":1,"classBucket":"chromeWidgetWin1","controlIdBucket":"none","controlTypeBucket":"pane","visible":false,"enabled":false,"isSurface":true'-or$descriptorMessage-cnotmatch'"successorDialogCount":0'-or$descriptorMessage-cnotmatch'"fixedLabelMatches":\{"print":false,"save":false,"cancel":false,"currentPage":false,"printer":false,"fileName":false,"yes":false,"no":false,"ok":false,"continue":false\}'){throw 'Unexpected hidden top-level surfaces did not produce deterministic bounded technical descriptors.'}
       if($descriptorMessage-cmatch'(?i)(hwnd:|HandleValue|ParentHandleValue|99:|7319|Chrome_WidgetWin|Chrome_SystemMessageWindow|C:\\|fixture|proof\.pdf|caption|runtimeIdentity|processId)'){throw 'Unexpected surface descriptors leaked an identity, raw class, path, or process value.'}
+      $script:nativeState='residual-profile';$script:residualVariant='exact';$script:residualCalls=0
+      Wait-BoundProcessUiSurfaceClosed -ProcessId 7319 -Binding $binding -Stage 'second-print-dialog' -Deadline ([datetime]::UtcNow.AddSeconds(2)) -NativeWindowProvider $provider
+      if($script:residualCalls-lt3){throw 'The exact inert residual profile was accepted without multiple stable observations.'}
+      foreach($variant in @('visible','label','control-id','known-class','extra')){
+        $script:residualVariant=$variant;$script:residualCalls=0;$rejected=$false
+        try{Wait-BoundProcessUiSurfaceClosed -ProcessId 7319 -Binding $binding -Stage 'second-print-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(300)) -NativeWindowProvider $provider}catch{$rejected=$true}
+        if(-not$rejected){throw "A non-exact or unstable transitional residual profile was accepted: $variant"}
+      }
+      foreach($variant in @('replacement','descriptor-swap','unstable','late-exact','bound-reappears','baseline-loss','successor','provider-error')){
+        $script:residualVariant=$variant;$script:residualCalls=0;$rejected=$false
+        try{Wait-BoundProcessUiSurfaceClosed -ProcessId 7319 -Binding $binding -Stage 'second-print-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(1200)) -NativeWindowProvider $provider}catch{$rejected=$true}
+        if(-not$rejected-or$script:residualCalls-lt5){throw "A one-observation deviation reset or lacked enough later exact polls: $variant / $script:residualCalls"}
+      }
+      $script:residualVariant='exact';$script:residualCalls=0;$rejected=$false
+      try{Wait-BoundProcessUiSurfaceClosed -ProcessId 7319 -Binding $binding -Stage 'second-print-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(250)) -AllowedSurfaceIdentities @('hwnd:500|native') -NativeWindowProvider $provider}catch{$rejected=$true}
+      if(-not$rejected){throw 'A transitional residual profile with an allowed successor state was accepted.'}
       $script:nativeState='replacement';$rejected=$false
       try{Wait-BoundProcessUiSurfaceClosed -ProcessId 7319 -Binding $binding -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(250)) -NativeWindowProvider $provider}catch{$rejected=$true}
       if(-not$rejected){throw 'A replacement HWND surface was accepted as close.'}
@@ -792,7 +838,7 @@ public sealed class NativeSaveDialogFixture : IDisposable {
       if(-not$rejected-or$slowStage-cne'native-enumeration-started'){throw 'A native HWND snapshot completed after its deadline or entered UIA conversion before native enumeration completed.'}
     `);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 30_000);
 
   it('emits deterministic bounded privacy-safe HWND topology diagnostics', () => {
     const result = runPowerShell7(String.raw`

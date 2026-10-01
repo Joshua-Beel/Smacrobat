@@ -2233,6 +2233,47 @@ function Get-SanitizedNativeCloseStateJson {
     } | ConvertTo-Json -Compress -Depth 6)
 }
 
+function Test-ExactSecondPrintResidualProfile {
+    param(
+        [Parameter(Mandatory = $true)][int]$UnexpectedSurfaceCount,
+        [Parameter(Mandatory = $true)][ValidateSet('unavailable','available')][string]$DescriptorStatus,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Descriptors
+    )
+    if ($DescriptorStatus -cne 'available' -or $UnexpectedSurfaceCount -ne 2 -or $Descriptors.Count -ne 2) { return $false }
+    $paneCount = 0; $windowCount = 0
+    foreach ($descriptor in $Descriptors) {
+        Assert-PrintExactProperties -Value $descriptor -Expected @('count','classBucket','controlIdBucket','controlTypeBucket','visible','enabled','isSurface','fixedLabelMatches') -Kind 'Transitional second-print residual descriptor'
+        Assert-PrintExactProperties -Value $descriptor.fixedLabelMatches -Expected @('print','save','cancel','currentPage','printer','fileName','yes','no','ok','continue') -Kind 'Transitional second-print residual labels'
+        if ([int]$descriptor.count -ne 1 -or [string]$descriptor.classBucket -cne 'other' -or [string]$descriptor.controlIdBucket -cne 'none' -or [bool]$descriptor.visible -or -not [bool]$descriptor.isSurface) { return $false }
+        foreach ($labelValue in @($descriptor.fixedLabelMatches.PSObject.Properties.Value)) { if ([bool]$labelValue) { return $false } }
+        if ([string]$descriptor.controlTypeBucket -ceq 'pane' -and -not [bool]$descriptor.enabled) { $paneCount++ }
+        elseif ([string]$descriptor.controlTypeBucket -ceq 'window' -and [bool]$descriptor.enabled) { $windowCount++ }
+        else { return $false }
+    }
+    return $paneCount -eq 1 -and $windowCount -eq 1
+}
+
+function Get-SecondPrintResidualIdentityDescriptorKey {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$UnexpectedEntries,
+        [Parameter(Mandatory = $true)][object[]]$TopLevelRecords,
+        [Parameter(Mandatory = $true)][datetime]$Deadline
+    )
+    if ($UnexpectedEntries.Count -ne 2) { throw 'Transitional second-print residual identity count was invalid.' }
+    $pairs = @()
+    foreach ($entry in $UnexpectedEntries) {
+        if ([datetime]::UtcNow -ge $Deadline) { throw 'Transitional second-print residual identity binding deadline expired.' }
+        $descriptor = @(Get-SanitizedUnexpectedNativeSurfaceDescriptors -UnexpectedEntries @($entry) -TopLevelRecords $TopLevelRecords -Deadline $Deadline)
+        if ($descriptor.Count -ne 1 -or [int]$descriptor[0].count -ne 1) { throw 'Transitional second-print residual identity descriptor was invalid.' }
+        $runtimeIdentity = [string]$entry.runtimeIdentity
+        if ([string]::IsNullOrWhiteSpace($runtimeIdentity)) { throw 'Transitional second-print residual runtime identity was invalid.' }
+        $descriptorJson = $descriptor[0] | ConvertTo-Json -Compress -Depth 5
+        if ([datetime]::UtcNow -ge $Deadline) { throw 'Transitional second-print residual identity binding deadline expired.' }
+        $pairs += $runtimeIdentity + '=' + $descriptorJson
+    }
+    return @($pairs | Sort-Object) -join '|'
+}
+
 function Wait-BoundProcessUiSurfaceClosed {
     param(
         [Parameter(Mandatory = $true)][int]$ProcessId,
@@ -2271,6 +2312,7 @@ function Wait-BoundProcessUiSurfaceClosed {
         $baselineHandleValues = [Collections.Generic.HashSet[long]]::new()
         foreach ($identity in $baselineIdentities) { $null = $baselineHandleValues.Add((Get-NativeSurfaceHandleValue -Identity ([string]$identity))) }
         $nextDetailedDiagnostic = [datetime]::MinValue
+        $residualProfileIdentityDescriptorKey = ''; $residualProfileObservations = 0; $residualProfileInvalid = $false; $residualObservationBegan = $false
         while ([datetime]::UtcNow -lt $Deadline) {
             try {
                 $topLevelRecords = @()
@@ -2311,10 +2353,25 @@ function Wait-BoundProcessUiSurfaceClosed {
                     if ($baselineIdentities.Contains($identity) -or $uiaAllowedIdentities -ccontains $identity -or $validatedNativeAllowedHandles.Contains($handleValue)) { continue }
                     $unexpectedSurface = $true; $unexpectedSurfaceCount++; $unexpectedEntries += $entry
                 }
+                $unexpectedSurfaceDescriptorsStatus = 'available'; $unexpectedSurfaceDescriptors = @()
+                try { $unexpectedSurfaceDescriptors = @(Get-SanitizedUnexpectedNativeSurfaceDescriptors -UnexpectedEntries $unexpectedEntries -TopLevelRecords $topLevelRecords -Deadline $Deadline) }
+                catch { if ([datetime]::UtcNow -ge $Deadline) { throw }; $unexpectedSurfaceDescriptorsStatus = 'unavailable'; $unexpectedSurfaceDescriptors = @() }
+                $successorDialogs = @($topLevelRecords | Where-Object {
+                    [long]$_.HandleValue -ne $boundHandleValue -and -not $baselineHandleValues.Contains([long]$_.HandleValue) -and
+                        $null -ne $_.PSObject.Properties['ClassName'] -and ([string]$_.ClassName).Equals('#32770',[StringComparison]::OrdinalIgnoreCase) -and
+                        $null -ne $_.PSObject.Properties['IsVisible'] -and [bool]$_.IsVisible
+                })
+                $residualEvaluationReady = $Stage -ceq 'second-print-dialog' -and -not $boundSurfaceRemains -and $baselinePresent -and $baselineExactSurfaceCount -eq $baselineIdentities.Count
+                $exactResidualProfile = $residualEvaluationReady -and $allowedSurfaces.Count -eq 0 -and $allowedPresent -and $successorDialogs.Count -eq 0 -and
+                    (Test-ExactSecondPrintResidualProfile -UnexpectedSurfaceCount $unexpectedSurfaceCount -DescriptorStatus $unexpectedSurfaceDescriptorsStatus -Descriptors $unexpectedSurfaceDescriptors)
+                if ($exactResidualProfile) {
+                    $identityDescriptorKey = Get-SecondPrintResidualIdentityDescriptorKey -UnexpectedEntries $unexpectedEntries -TopLevelRecords $topLevelRecords -Deadline $Deadline
+                    if ([datetime]::UtcNow -ge $Deadline) { throw 'Transitional second-print residual validation deadline expired.' }
+                    if (-not $residualObservationBegan) { $residualObservationBegan = $true; $residualProfileIdentityDescriptorKey = $identityDescriptorKey }
+                    elseif ($identityDescriptorKey -cne $residualProfileIdentityDescriptorKey) { $residualProfileInvalid = $true }
+                    if (-not $residualProfileInvalid) { $residualProfileObservations++ }
+                } elseif ($residualObservationBegan -or $residualEvaluationReady) { $residualProfileInvalid = $true }
                 if ([datetime]::UtcNow -ge $nextDetailedDiagnostic) {
-                    $unexpectedSurfaceDescriptorsStatus = 'available'; $unexpectedSurfaceDescriptors = @()
-                    try { $unexpectedSurfaceDescriptors = @(Get-SanitizedUnexpectedNativeSurfaceDescriptors -UnexpectedEntries $unexpectedEntries -TopLevelRecords $topLevelRecords -Deadline $Deadline) }
-                    catch { if ([datetime]::UtcNow -ge $Deadline) { throw }; $unexpectedSurfaceDescriptorsStatus = 'unavailable'; $unexpectedSurfaceDescriptors = @() }
                     $boundSaveRoleStatus = if ($Stage -ceq 'save-output-dialog' -and $boundIsExplicitNative) { if ($boundSurfaceRemains) { 'unavailable' } else { 'absent' } } else { 'not-applicable' }
                     $filenameStatus = if ($Stage -ceq 'save-output-dialog' -and $boundIsExplicitNative) { if ($boundSurfaceRemains) { 'unavailable' } else { 'not-applicable' } } else { 'not-applicable' }
                     if ($Stage -ceq 'save-output-dialog' -and $boundIsExplicitNative -and $boundSurfaceRemains -and [datetime]::UtcNow -lt $Deadline) {
@@ -2336,11 +2393,6 @@ function Wait-BoundProcessUiSurfaceClosed {
                             }
                         } catch { if ([datetime]::UtcNow -ge $Deadline) { throw }; $boundSaveRoleStatus = 'unavailable'; $filenameStatus = 'unavailable' }
                     }
-                    $successorDialogs = @($topLevelRecords | Where-Object {
-                        [long]$_.HandleValue -ne $boundHandleValue -and -not $baselineHandleValues.Contains([long]$_.HandleValue) -and
-                            $null -ne $_.PSObject.Properties['ClassName'] -and ([string]$_.ClassName).Equals('#32770',[StringComparison]::OrdinalIgnoreCase) -and
-                            $null -ne $_.PSObject.Properties['IsVisible'] -and [bool]$_.IsVisible
-                    })
                     $successorRoleStatus = if ($successorDialogs.Count -eq 0) { 'not-observed' } else { 'available' }
                     $successorCounts = [ordered]@{yes=0;no=0;ok=0;continue=0;cancel=0;save=0}
                     if ($successorDialogs.Count -gt 4) { $successorRoleStatus = 'unavailable'; foreach ($key in @($successorCounts.Keys)) { $successorCounts[$key] = -1 } }
@@ -2366,8 +2418,13 @@ function Wait-BoundProcessUiSurfaceClosed {
                     if ([datetime]::UtcNow -ge $Deadline) { break }
                     return
                 }
+                if ($exactResidualProfile -and -not $residualProfileInvalid -and $residualProfileObservations -ge 3) {
+                    if ([datetime]::UtcNow -ge $Deadline) { break }
+                    return
+                }
             } catch {
                 if ([datetime]::UtcNow -ge $Deadline) { break }
+                if ($Stage -ceq 'second-print-dialog' -and $residualObservationBegan) { $residualProfileInvalid = $true }
             }
             if ([datetime]::UtcNow -lt $Deadline) { Start-Sleep -Milliseconds 150 }
         }
