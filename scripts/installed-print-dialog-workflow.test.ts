@@ -156,6 +156,7 @@ public sealed class NativeSaveDialogFixture : IDisposable {
         try{Set-BoundNativeSaveFileNameExact -ProcessId $processIdentifier -ProcessStartUtcTicks $startTicks -Binding $binding -Value $value -DeadlineTickCount $deadlineTick}catch{$rejected=$true}
         if(-not$rejected-or$fixture.SaveClicked){throw 'A native filename growth race reached the Save action.'}
         Set-BoundNativeSaveFileNameExact -ProcessId $processIdentifier -ProcessStartUtcTicks $startTicks -Binding $binding -Value $value -DeadlineTickCount $deadlineTick
+        if(-not[Smacrobat.PrintVerification.NativeWindows]::SaveFileNameEqualsExact($processIdentifier,$startTicks,$fixture.RootHandle,$fixture.EditHandle,$value,$deadlineTick)){throw 'The exact native filename diagnostic did not revalidate the real edit.'}
         Invoke-BoundNativeSaveButtonExact -ProcessId $processIdentifier -ProcessStartUtcTicks $startTicks -Binding $binding -DeadlineTickCount $deadlineTick
         if($fixture.ReadEdit()-cne$value-or-not$fixture.SaveClicked-or-not$fixture.SaveClickMessage){throw 'The real native save mutations were not observed.'}
         $fixture.ArmSaveReparentRace();$rejected=$false
@@ -182,9 +183,10 @@ public sealed class NativeSaveDialogFixture : IDisposable {
       function Get-ValidatedBindingNativeRoles{param($Binding)$Binding.nativeRoles}
       function Set-BoundNativeSaveFileNameExact{param([int]$ProcessId,[long]$ProcessStartUtcTicks,$Binding,[string]$Value,[long]$DeadlineTickCount)if($DeadlineTickCount-le[Environment]::TickCount64-or$DeadlineTickCount-[Environment]::TickCount64-gt5000){throw 'Save action escaped the shared remaining deadline.'};$script:actionDeadline=$DeadlineTickCount;$script:events.Add('set-name')|Out-Null}
       function Invoke-BoundNativeSaveButtonExact{param([int]$ProcessId,[long]$ProcessStartUtcTicks,$Binding,[long]$DeadlineTickCount)if($DeadlineTickCount-ne$script:actionDeadline){throw 'Save actions did not share one absolute deadline.'};$script:saveClicked=$true;$script:events.Add('save-click')|Out-Null}
-      function Wait-BoundProcessUiSurfaceClosed{param([int]$ProcessId,$Binding,[string]$Stage,[datetime]$Deadline,[string[]]$AllowedSurfaceIdentities=@())
+      function Wait-BoundProcessUiSurfaceClosed{param([int]$ProcessId,$Binding,[string]$Stage,[datetime]$Deadline,[string[]]$AllowedSurfaceIdentities=@(),[long]$ProcessStartUtcTicks=0,[string]$ExpectedNativeSaveFileName='',[string]$ActionTransport='unavailable')
         if(-not$script:saveClicked){throw 'The verifier waited for baseline restoration before completing Save.'}
         if($AllowedSurfaceIdentities.Count-ne0){throw 'Final lifecycle cleanup retained an allowed transient surface.'}
+        if([object]::ReferenceEquals($Binding,$script:saveBinding)-and($ProcessStartUtcTicks-ne638500000000000000L-or$ExpectedNativeSaveFileName-cne'C:\fixture\proof.pdf'-or$ActionTransport-cne'native-bm-click-delivered')){throw 'Save close diagnostics lost their exact process, filename, or action transport inputs.'}
         Assert-NativePrintDeadline $Deadline
         if([object]::ReferenceEquals($Binding,$script:saveBinding)){$script:events.Add('wait-save-close')|Out-Null}elseif([object]::ReferenceEquals($Binding,$script:printBinding)){$script:events.Add('wait-print-close')|Out-Null}else{throw 'Unknown lifecycle binding.'}
       }
@@ -193,6 +195,18 @@ public sealed class NativeSaveDialogFixture : IDisposable {
       if($actual-cne'select,print,bind-save,set-name,save-click,wait-save-close,wait-print-close'){throw "Native print lifecycle order changed: $actual"}
     `);
     expect(result.status, result.stderr || result.stdout).toBe(0);
+    const source = readFileSync('scripts/installed-print-dialog.ps1', 'utf8');
+    const submit = source.slice(source.indexOf('function Submit-NativePrintToPdf'), source.indexOf('function Wait-StablePrintFile'));
+    const nativeAction = submit.indexOf('Invoke-BoundNativeSaveButtonExact');
+    const nativeTransport = submit.indexOf("$saveActionTransport = 'native-bm-click-delivered'");
+    const uiaAction = submit.indexOf('Invoke-ProcessUiElement -Element $save');
+    const uiaTransport = submit.indexOf("$saveActionTransport = 'uia-invoke-returned'");
+    const closeReceipt = submit.indexOf('-ActionTransport $saveActionTransport');
+    expect(nativeAction).toBeGreaterThanOrEqual(0);
+    expect(nativeTransport).toBeGreaterThan(nativeAction);
+    expect(uiaAction).toBeGreaterThan(nativeTransport);
+    expect(uiaTransport).toBeGreaterThan(uiaAction);
+    expect(closeReceipt).toBeGreaterThan(uiaTransport);
   });
 
   it('rejects ambiguous foreign reparented cyclic and changed native save roles before mutation', () => {
@@ -658,6 +672,7 @@ public sealed class NativeSaveDialogFixture : IDisposable {
       $allowedSurface=New-NativeHostedElement 40 400 'ControlType.Window' ''
       $allowedButtonReplacement=New-NativeHostedElement 41 400 'ControlType.Button' ''
       $nativeSaveRoot=New-NativeHostedElement 50 500 'ControlType.Window' ''
+      $confirmation=New-NativeHostedElement 60 600 'ControlType.Window' ''
       $hostedBaseline=@($main)
       foreach($index in 1..3){$hostedBaseline+=New-NativeHostedElement (10+$index) (110+$index) 'ControlType.Pane' ''}
       $hostedPost=@($hostedBaseline)+@($dialog)
@@ -682,6 +697,13 @@ public sealed class NativeSaveDialogFixture : IDisposable {
               [pscustomobject]@{HandleValue=508L;ParentHandleValue=500L;ProcessId=7319;ClassName='Button';ControlId=2;ButtonStyle=0;IsVisible=$true;IsEnabled=$true;IsLabelSave=$false;IsLabelCancel=$true}
             )
           }
+          if($rootHandle-eq600){
+            return @(
+              [pscustomobject]@{HandleValue=600L;ParentHandleValue=0L;ProcessId=7319;ClassName='#32770';ControlId=0;ButtonStyle=-1;IsVisible=$true;IsEnabled=$true;IsLabelYes=$false;IsLabelNo=$false;IsLabelOk=$false;IsLabelContinue=$false;IsLabelCancel=$false;IsLabelSave=$false;Element=$confirmation},
+              [pscustomobject]@{HandleValue=601L;ParentHandleValue=600L;ProcessId=7319;ClassName='Button';ControlId=6;ButtonStyle=0;IsVisible=$true;IsEnabled=$true;IsLabelYes=$true;IsLabelNo=$false;IsLabelOk=$false;IsLabelContinue=$false;IsLabelCancel=$false;IsLabelSave=$false},
+              [pscustomobject]@{HandleValue=602L;ParentHandleValue=600L;ProcessId=7319;ClassName='Button';ControlId=7;ButtonStyle=0;IsVisible=$true;IsEnabled=$true;IsLabelYes=$false;IsLabelNo=$true;IsLabelOk=$false;IsLabelContinue=$false;IsLabelCancel=$false;IsLabelSave=$false}
+            )
+          }
           if($rootHandle-ne200){throw 'Native enumeration escaped the exact dialog HWND.'}
           $rootRuntimePart=if($script:nativeState-ceq'mismatch'){9}else{2}
           return @(
@@ -697,6 +719,7 @@ public sealed class NativeSaveDialogFixture : IDisposable {
         if($script:nativeState-ceq'changed-baseline'){return @((New-NativeProviderRecord 100 0 $changedMain 'Chrome_WidgetWin_1'))}
         if($script:nativeState-ceq'allowed-nonsurface'){return @((New-NativeProviderRecord 100 0 $main 'Chrome_WidgetWin_1'),(New-NativeProviderRecord 400 0 $allowedButtonReplacement 'Button'))}
         if($script:nativeState-ceq'native-save-with-print'){return @((New-NativeProviderRecord 100 0 $main 'Chrome_WidgetWin_1'),(New-NativeProviderRecord 200 0 (New-NativeHostedElement 2 200 'ControlType.Window' '') '#32770'),[pscustomobject]@{HandleValue=500L;ParentHandleValue=0L;ProcessId=7319;ClassName='#32770';ControlId=0;ButtonStyle=-1;IsVisible=$true;IsEnabled=$true;IsLabelSave=$false;IsLabelCancel=$false;Element=$nativeSaveRoot})}
+        if($script:nativeState-ceq'save-confirmation'){return @((New-NativeProviderRecord 100 0 $main 'Chrome_WidgetWin_1'),[pscustomobject]@{HandleValue=500L;ParentHandleValue=0L;ProcessId=7319;ClassName='#32770';ControlId=0;ButtonStyle=-1;IsVisible=$true;IsEnabled=$true;IsLabelSave=$false;IsLabelCancel=$false;Element=$nativeSaveRoot},[pscustomobject]@{HandleValue=600L;ParentHandleValue=0L;ProcessId=7319;ClassName='#32770';ControlId=0;ButtonStyle=-1;IsVisible=$true;IsEnabled=$true;IsLabelSave=$false;IsLabelCancel=$false;Element=$confirmation})}
         if($script:nativeState-ceq'native-save'){return @((New-NativeProviderRecord 100 0 $main 'Chrome_WidgetWin_1'),[pscustomobject]@{HandleValue=500L;ParentHandleValue=0L;ProcessId=7319;ClassName='#32770';ControlId=0;ButtonStyle=-1;IsVisible=$true;IsEnabled=$true;IsLabelSave=$false;IsLabelCancel=$false;Element=$nativeSaveRoot})}
         if($script:nativeState-ceq'replacement'){return @((New-NativeProviderRecord 100 0 $main 'Chrome_WidgetWin_1'),(New-NativeProviderRecord 300 0 $replacement '#32770'))}
         return @((New-NativeProviderRecord 100 0 $main 'Chrome_WidgetWin_1'),(New-NativeProviderRecord 200 0 (New-NativeHostedElement 2 200 'ControlType.Window' '') '#32770'))
@@ -737,6 +760,15 @@ public sealed class NativeSaveDialogFixture : IDisposable {
       if(-not$rejected){throw 'An active PrintDlgEx surface was reported closed while its exact native Save successor was open.'}
       $script:nativeState='native-save'
       Wait-BoundProcessUiSurfaceClosed -ProcessId 7319 -Binding $binding -Stage 'second-print-dialog' -Deadline ([datetime]::UtcNow.AddSeconds(2)) -AllowedSurfaceIdentities @('hwnd:500|native') -NativeWindowProvider $provider
+      $saveBinding=[pscustomobject]@{surfaceRootIdentity='hwnd:500|native';surfaceElement=$null;baselineIdentities=@('hwnd:100|99:1');trackedIdentities=@('hwnd:500|native','hwnd:507|native','hwnd:508|native','hwnd:505|native');anchorElement=$null;nativeRoles=[pscustomobject]@{cancel='hwnd:508|native';save='hwnd:507|native';filenameEdit='hwnd:505|native'}}
+      $filenameMatch={param($requestedProcessId,$startTicks,$rootHandle,$editHandle,$expectedName,$deadlineTick)if($requestedProcessId-ne7319-or$startTicks-ne638500000000000000L-or$rootHandle-ne500-or$editHandle-ne505-or$expectedName-cne'C:\fixture\proof.pdf'-or$deadlineTick-le[Environment]::TickCount64){throw 'Native close filename diagnostic inputs changed.'};$true}
+      $script:nativeState='save-confirmation';$closeMessage=''
+      try{Wait-BoundProcessUiSurfaceClosed -ProcessId 7319 -Binding $saveBinding -Stage 'save-output-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(350)) -NativeWindowProvider $provider -ProcessStartUtcTicks 638500000000000000L -ExpectedNativeSaveFileName 'C:\fixture\proof.pdf' -NativeSaveFileNameMatchProvider $filenameMatch -ActionTransport 'native-bm-click-delivered'}catch{$closeMessage=$_.Exception.Message}
+      if($closeMessage-cnotmatch'"inventoryStatus":"native-close-observed"'-or$closeMessage-cnotmatch'"actionTransport":"native-bm-click-delivered"'-or$closeMessage-cnotmatch'"baselineExpectedCount":1'-or$closeMessage-cnotmatch'"baselineExactSurfaceCount":1'-or$closeMessage-cnotmatch'"boundSurfaceStatus":"present"'-or$closeMessage-cnotmatch'"boundSaveRoleStatus":"complete"'-or$closeMessage-cnotmatch'"filenameStatus":"exact"'-or$closeMessage-cnotmatch'"successorDialogCount":1'-or$closeMessage-cnotmatch'"successorRoleStatus":"available"'-or$closeMessage-cnotmatch'"yes":1'-or$closeMessage-cnotmatch'"no":1'){throw 'Native close diagnostic did not distinguish an exact filename and successor confirmation.'}
+      if($closeMessage-cmatch'(?i)(hwnd:|C:\\|fixture|proof\.pdf|HandleValue|ParentHandleValue|99:|7319)'){throw 'Native close diagnostic leaked a handle, path, identity, or process ID.'}
+      $script:expiredCloseProbes=0;$expiredProvider={param($requestedProcessId,[long]$rootHandle,[bool]$topLevelOnly)$script:expiredCloseProbes++;throw 'Expired close diagnostic performed a provider call.'};$expiredMessage=''
+      try{Wait-BoundProcessUiSurfaceClosed -ProcessId 7319 -Binding $saveBinding -Stage 'save-output-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(-1)) -NativeWindowProvider $expiredProvider -ProcessStartUtcTicks 638500000000000000L -ExpectedNativeSaveFileName 'C:\fixture\proof.pdf' -ActionTransport 'native-bm-click-delivered'}catch{$expiredMessage=$_.Exception.Message}
+      if($script:expiredCloseProbes-ne0-or$expiredMessage-cnotmatch'"inventoryStatus":"unavailable"'-or$expiredMessage-cnotmatch'"boundSurfaceStatus":"unknown"'-or$expiredMessage-cnotmatch'"actionTransport":"native-bm-click-delivered"'){throw 'Unavailable close diagnostic invented an observed bound state or probed after expiry.'}
       $script:nativeState='replacement';$rejected=$false
       try{Wait-BoundProcessUiSurfaceClosed -ProcessId 7319 -Binding $binding -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(250)) -NativeWindowProvider $provider}catch{$rejected=$true}
       if(-not$rejected){throw 'A replacement HWND surface was accepted as close.'}
