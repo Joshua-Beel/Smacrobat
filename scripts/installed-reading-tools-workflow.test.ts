@@ -38,19 +38,100 @@ describe('installed signed reading-tools verifier', () => {
     expect(parsed.status, parsed.stderr || parsed.stdout).toBe(0);
     expect(source).toContain('AutomationElement]::ProcessIdProperty, $ApplicationProcessId');
     expect(source).toContain('TreeScope]::Children,$condition');
-    expect(source).toContain("$collection.Count -gt 8");
-    expect(source).toContain('MaximumCount 256');
-    expect(source).toContain('$Dialog.Current.ProcessId -ne $ApplicationProcessId');
-    expect(source).toContain('[Windows.Automation.AndCondition]::new($processCondition,$editTypeCondition)');
-    expect(source).toContain('[Windows.Automation.AndCondition]::new($processCondition,$buttonTypeCondition)');
+    expect(source).toContain("$elements.Count -gt 8");
+    expect(source).toContain('[Windows.Automation.OrCondition]::new($windowCondition,$paneCondition)');
+    expect(source).toContain('Test-ReadingAutomationDescendantOfSurface');
+    expect(source).toContain('Wait-ReadingProcessUiSurfaceClosed');
+    expect(source).toContain('[Windows.Automation.AndCondition]::new($processCondition,$typeCondition)');
     expect(source).toContain("-Kind 'filename editor'");
     expect(source).toContain("-Kind 'Open button'");
-    expect(source).toContain("ClassName -ceq '#32770'");
+    expect(source).not.toContain("ClassName -ceq '#32770'");
+    expect(source).not.toContain("Current.Name -ceq 'Open' -and $_.Current.IsEnabled");
     expect(source).toContain("AutomationId -in @('1001','1148')");
     expect(source).toContain("AutomationId -ceq '1'");
     expect(source).toContain('[Windows.Automation.ValuePattern]::Pattern');
     expect(source).toContain('[Windows.Automation.InvokePattern]::Pattern');
+    expect(source.indexOf('$baseline = @(Get-ReadingProcessUiSurfaceSnapshot')).toBeLessThan(source.indexOf('$clicked = Invoke-WebDriverScript'));
     expect(source).not.toMatch(/SendKeys|mouse_event|SetCursorPos|click_input|screenX|screenY|__TAURI_INTERNALS__/i);
+  });
+
+  it('binds one unnamed owned Window or Pane by runtime delta and rejects ambiguity or baseline replacement', () => {
+    const check = extractFunctions('scripts/installed-reading-tools.ps1', ['Assert-ReadingSurfaceSnapshot', 'Wait-NewProcessBoundOpenSurface', 'Assert-ReadingSurfaceBinding', 'Wait-ReadingProcessUiSurfaceClosed'], String.raw`
+      $script:ReadingPins=[ordered]@{UiAutomationPollMilliseconds=1}
+      function New-Surface([string]$identity,[string]$type,[int]$processId,[string]$name=''){
+        [pscustomobject]@{runtimeIdentity=$identity;controlType=$type;isEnabled=$true;isOffscreen=$false;element=[pscustomobject]@{Current=[pscustomobject]@{ProcessId=$processId;Name=$name}}}
+      }
+      $baseline=@(New-Surface '1:1' 'Window' 42 'PDF Workstation')
+      $unnamed=New-Surface '1:2' 'Pane' 42 ''
+      $now=[datetime]'2026-01-01T00:00:00Z';$clock={$script:now};$sleep={param($milliseconds)$script:now=$script:now.AddMilliseconds($milliseconds)}
+      $bound=Wait-NewProcessBoundOpenSurface -ApplicationProcessId 42 -Baseline $baseline -Deadline $now.AddSeconds(1) -SnapshotProvider { @($baseline+$unnamed) } -SleepProvider $sleep -UtcNowProvider $clock
+      if($bound.surfaceRuntimeIdentity-cne'1:2'-or$bound.surfaceControlType-cne'Pane'-or[bool]$bound.surfaceElement.Current.Name){throw 'Unnamed owned pane was not bound by runtime delta.'}
+      Wait-ReadingProcessUiSurfaceClosed -Binding $bound -ApplicationProcessId 42 -Deadline $now.AddSeconds(1) -SnapshotProvider { @($baseline) } -SleepProvider $sleep -UtcNowProvider $clock
+      $ambiguous=$false;try{Wait-NewProcessBoundOpenSurface -ApplicationProcessId 42 -Baseline $baseline -Deadline $now.AddSeconds(1) -SnapshotProvider { @($baseline+$unnamed+(New-Surface '1:3' 'Window' 42 '')) } -SleepProvider $sleep -UtcNowProvider $clock}catch{$ambiguous=$_.Exception.Message-ceq'More than one new process-bound native picker surface appeared.'}
+      if(-not$ambiguous){throw 'Ambiguous new picker surfaces were accepted.'}
+      $replaced=$false;try{Wait-NewProcessBoundOpenSurface -ApplicationProcessId 42 -Baseline $baseline -Deadline $now.AddSeconds(1) -SnapshotProvider { @($unnamed) } -SleepProvider $sleep -UtcNowProvider $clock}catch{$replaced=$_.Exception.Message-ceq'The pre-click top-level UI baseline was replaced while opening the native picker.'}
+      if(-not$replaced){throw 'Baseline replacement was accepted.'}
+    `);
+    const result = runPowerShell(check);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
+  it('rejects matching controls outside the exact bound picker surface', () => {
+    const check = extractFunctions('scripts/installed-reading-tools.ps1', ['Get-ReadingAutomationRuntimeIdentity', 'Assert-ReadingSurfaceBinding', 'Test-ReadingAutomationDescendantOfSurface', 'Get-ReadingBoundAutomationChildren'], String.raw`
+      function New-Element([int[]]$runtime,[int]$processId,$parent){
+        $element=[pscustomobject]@{Current=[pscustomobject]@{ProcessId=$processId};Parent=$parent;Runtime=$runtime}
+        $element|Add-Member ScriptMethod GetRuntimeId { return [int[]]$this.Runtime }
+        return $element
+      }
+      $deadline=[datetime]::UtcNow.AddSeconds(5)
+      $root=New-Element @(1,2) 42 $null;$otherRoot=New-Element @(1,3) 42 $null
+      $inside=New-Element @(1,2,1) 42 $root;$outside=New-Element @(1,3,1) 42 $otherRoot
+      $binding=[pscustomobject]@{surfaceRuntimeIdentity='1:2';surfaceControlType='Pane';surfaceElement=$root;baselineIdentities=[string[]]@('1:1')}
+      $rejected=$false;try{Get-ReadingBoundAutomationChildren -Binding $binding -ApplicationProcessId 42 -ControlType Edit -Deadline $deadline -ElementProvider { @($inside,$outside) } -ParentProvider { param($element)$element.Parent }}catch{$rejected=$_.Exception.Message-ceq'A native picker control escaped the exact bound process-owned surface.'}
+      if(-not$rejected){throw 'A matching control outside the bound picker surface was accepted.'}
+      $accepted=@(Get-ReadingBoundAutomationChildren -Binding $binding -ApplicationProcessId 42 -ControlType Edit -Deadline $deadline -ElementProvider { @($inside) } -ParentProvider { param($element)$element.Parent })
+      if($accepted.Count-ne1-or-not[object]::ReferenceEquals($accepted[0],$inside)){throw 'The exact bound descendant control was not retained.'}
+    `);
+    const result = runPowerShell(check);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
+  it('fails closed when a surface snapshot completes after its deadline', () => {
+    const check = extractFunctions('scripts/installed-reading-tools.ps1', ['Assert-ReadingSurfaceSnapshot', 'Wait-NewProcessBoundOpenSurface'], String.raw`
+      $script:ReadingPins=[ordered]@{UiAutomationPollMilliseconds=1}
+      function New-Surface([string]$identity,[string]$type,[int]$processId){[pscustomobject]@{runtimeIdentity=$identity;controlType=$type;isEnabled=$true;isOffscreen=$false;element=[pscustomobject]@{Current=[pscustomobject]@{ProcessId=$processId}}}}
+      $baseline=@(New-Surface '1:1' 'Window' 42);$new=New-Surface '1:2' 'Pane' 42
+      $script:now=[datetime]'2026-01-01T00:00:00Z';$deadline=$script:now.AddMilliseconds(10);$clock={$script:now};$probes=0
+      $rejected=$false;try{Wait-NewProcessBoundOpenSurface -ApplicationProcessId 42 -Baseline $baseline -Deadline $deadline -SnapshotProvider { $script:probes++;$script:now=$deadline;@($baseline+$new) } -SleepProvider { throw 'Sleep was reached after a delayed read.' } -UtcNowProvider $clock}catch{$rejected=$_.Exception.Message-like'No single new process-bound native picker surface appeared*'}
+      if(-not$rejected-or$probes-ne1){throw 'A post-deadline picker snapshot was accepted.'}
+    `);
+    const result = runPowerShell(check);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
+  it('does not write or invoke when UI Automation pattern acquisition reaches the deadline', () => {
+    const check = extractFunctions('scripts/installed-reading-tools.ps1', ['Set-ReadingAutomationValueBeforeDeadline', 'Invoke-ReadingAutomationButtonBeforeDeadline'], String.raw`
+      $script:valueWrites=0;$script:buttonInvokes=0
+      $valuePattern=[pscustomobject]@{Current=[pscustomobject]@{IsReadOnly=$false}}
+      $valuePattern|Add-Member ScriptMethod SetValue { param($value)$script:valueWrites++ }
+      $invokePattern=[pscustomobject]@{}
+      $invokePattern|Add-Member ScriptMethod Invoke { $script:buttonInvokes++ }
+      $script:testValuePattern=$valuePattern;$script:testInvokePattern=$invokePattern
+      $element=[pscustomobject]@{}
+      $script:now=[datetime]'2026-01-01T00:00:00Z';$deadline=$script:now.AddMilliseconds(10);$clock={$script:now}
+      $valueRejected=$false
+      try{Set-ReadingAutomationValueBeforeDeadline -Element $element -Value 'fixture.pdf' -Deadline $deadline -UtcNowProvider $clock -PatternProvider { param($candidate,$patternRef)$script:now=$deadline;$patternRef.Value=$script:testValuePattern;$true }}catch{$valueRejected=$_.Exception.Message-ceq'The process-bound filename mutation deadline expired.'}
+      if(-not$valueRejected-or$valueWrites-ne0){throw 'Filename ValuePattern mutated after delayed acquisition expired the deadline.'}
+      $script:now=[datetime]'2026-01-01T00:00:00Z';$deadline=$script:now.AddMilliseconds(10);$invokeRejected=$false
+      try{Invoke-ReadingAutomationButtonBeforeDeadline -Element $element -Deadline $deadline -UtcNowProvider $clock -PatternProvider { param($candidate,$patternRef)$script:now=$deadline;$patternRef.Value=$script:testInvokePattern;$true }}catch{$invokeRejected=$_.Exception.Message-ceq'The process-bound native Open mutation deadline expired.'}
+      if(-not$invokeRejected-or$buttonInvokes-ne0){throw 'InvokePattern mutated after delayed acquisition expired the deadline.'}
+      $script:now=[datetime]'2026-01-01T00:00:00Z';$deadline=$script:now.AddSeconds(1)
+      Set-ReadingAutomationValueBeforeDeadline -Element $element -Value 'fixture.pdf' -Deadline $deadline -UtcNowProvider $clock -PatternProvider { param($candidate,$patternRef)$patternRef.Value=$script:testValuePattern;$true }
+      Invoke-ReadingAutomationButtonBeforeDeadline -Element $element -Deadline $deadline -UtcNowProvider $clock -PatternProvider { param($candidate,$patternRef)$patternRef.Value=$script:testInvokePattern;$true }
+      if($valueWrites-ne1-or$buttonInvokes-ne1){throw 'Timely UI Automation mutations did not execute exactly once.'}
+    `);
+    const result = runPowerShell(check);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
   });
 
   it('rejects a native picker child from a mismatched process', () => {

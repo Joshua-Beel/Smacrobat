@@ -154,27 +154,97 @@ function Get-ReadingAutomationElements {
     return $values
 }
 
-function Wait-ProcessBoundOpenDialog {
-    param([Parameter(Mandatory = $true)][int]$ApplicationProcessId,[Parameter(Mandatory = $true)][datetime]$Deadline)
-    Add-Type -AssemblyName UIAutomationClient
-    Add-Type -AssemblyName UIAutomationTypes
-    $processCondition = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ProcessIdProperty, $ApplicationProcessId)
-    $windowCondition = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty, [Windows.Automation.ControlType]::Window)
-    $condition = [Windows.Automation.AndCondition]::new($processCondition,$windowCondition)
-    do {
+function Get-ReadingAutomationRuntimeIdentity {
+    param([Parameter(Mandatory = $true)]$Element,[Parameter(Mandatory = $true)][int]$ApplicationProcessId,[Parameter(Mandatory = $true)][datetime]$Deadline)
+    if ([datetime]::UtcNow -ge $Deadline) { throw 'The process-bound UI Automation identity deadline expired.' }
+    if ([int]$Element.Current.ProcessId -ne $ApplicationProcessId) { throw 'A process-bound UI Automation element had a mismatched process identifier.' }
+    try { $runtimeId = @($Element.GetRuntimeId()) } catch { throw 'A process-bound UI Automation runtime identity was unavailable.' }
+    if ([datetime]::UtcNow -ge $Deadline) { throw 'The process-bound UI Automation identity deadline expired.' }
+    if ($runtimeId.Count -lt 1 -or $runtimeId.Count -gt 64 -or @($runtimeId | Where-Object { $_ -isnot [int] }).Count -ne 0) {
+        throw 'A process-bound UI Automation runtime identity was invalid.'
+    }
+    return (($runtimeId | ForEach-Object { ([int]$_).ToString([Globalization.CultureInfo]::InvariantCulture) }) -join ':')
+}
+
+function Get-ReadingProcessUiSurfaceSnapshot {
+    param([Parameter(Mandatory = $true)][int]$ApplicationProcessId,[Parameter(Mandatory = $true)][datetime]$Deadline,[scriptblock]$ElementProvider)
+    if ([datetime]::UtcNow -ge $Deadline) { throw 'The process-bound top-level UI snapshot deadline expired.' }
+    if ($ElementProvider) {
+        $elements = @(& $ElementProvider $ApplicationProcessId)
+    } else {
+        Add-Type -AssemblyName UIAutomationClient
+        Add-Type -AssemblyName UIAutomationTypes
+        $processCondition = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ProcessIdProperty, $ApplicationProcessId)
+        $windowCondition = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty, [Windows.Automation.ControlType]::Window)
+        $paneCondition = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty, [Windows.Automation.ControlType]::Pane)
+        $surfaceTypeCondition = [Windows.Automation.OrCondition]::new($windowCondition,$paneCondition)
+        $condition = [Windows.Automation.AndCondition]::new($processCondition,$surfaceTypeCondition)
         $collection = [Windows.Automation.AutomationElement]::RootElement.FindAll([Windows.Automation.TreeScope]::Children,$condition)
-        if ($collection.Count -gt 8) { throw 'The application exposed too many process-bound top-level windows.' }
-        $topLevelWindows = @()
-        for ($index = 0; $index -lt $collection.Count; $index++) { $topLevelWindows += $collection.Item($index) }
-        $windows = @($topLevelWindows | Where-Object {
-            $_.Current.ProcessId -eq $ApplicationProcessId -and $_.Current.ClassName -ceq '#32770' -and
-            $_.Current.Name -ceq 'Open' -and $_.Current.IsEnabled -and -not $_.Current.IsOffscreen
-        })
-        if ($windows.Count -eq 1) { return $windows[0] }
-        if ($windows.Count -gt 1) { throw 'More than one process-bound native Open dialog was visible.' }
-        Start-Sleep -Milliseconds $script:ReadingPins.UiAutomationPollMilliseconds
-    } while ([datetime]::UtcNow -lt $Deadline)
-    throw 'The exact process-bound native Open dialog did not appear.'
+        $elements = @()
+        for ($index = 0; $index -lt $collection.Count; $index++) { $elements += $collection.Item($index) }
+    }
+    if ([datetime]::UtcNow -ge $Deadline) { throw 'The process-bound top-level UI snapshot exceeded its deadline.' }
+    if ($elements.Count -gt 8) { throw 'The application exposed too many process-bound top-level surfaces.' }
+    $identities = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $snapshot = @()
+    foreach ($element in $elements) {
+        if ([datetime]::UtcNow -ge $Deadline) { throw 'The process-bound top-level UI snapshot exceeded its deadline.' }
+        if ([int]$element.Current.ProcessId -ne $ApplicationProcessId) { throw 'A top-level UI surface had a mismatched process identifier.' }
+        $controlType = if ($element.Current.ControlType -eq [Windows.Automation.ControlType]::Window) { 'Window' } elseif ($element.Current.ControlType -eq [Windows.Automation.ControlType]::Pane) { 'Pane' } else { throw 'A top-level UI surface had an unexpected control type.' }
+        $identity = Get-ReadingAutomationRuntimeIdentity -Element $element -ApplicationProcessId $ApplicationProcessId -Deadline $Deadline
+        if (-not $identities.Add($identity)) { throw 'A process-bound top-level UI runtime identity was duplicated.' }
+        $snapshot += [pscustomobject]@{ runtimeIdentity=$identity;controlType=$controlType;isEnabled=[bool]$element.Current.IsEnabled;isOffscreen=[bool]$element.Current.IsOffscreen;element=$element }
+    }
+    if ([datetime]::UtcNow -ge $Deadline) { throw 'The process-bound top-level UI snapshot exceeded its deadline.' }
+    return $snapshot
+}
+
+function Assert-ReadingSurfaceSnapshot {
+    param([Parameter(Mandatory = $true)][object[]]$Snapshot,[Parameter(Mandatory = $true)][int]$ApplicationProcessId,[Parameter(Mandatory = $true)][string]$Kind)
+    if ($Snapshot.Count -lt 1 -or $Snapshot.Count -gt 8) { throw "$Kind was missing or outside its element-count cap." }
+    $identities = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($entry in $Snapshot) {
+        $properties = @($entry.PSObject.Properties.Name | Sort-Object -CaseSensitive)
+        if (($properties -join ',') -cne 'controlType,element,isEnabled,isOffscreen,runtimeIdentity' -or [string]$entry.runtimeIdentity -cnotmatch '^-?\d+(?::-?\d+){0,63}$' -or -not $identities.Add([string]$entry.runtimeIdentity) -or [string]$entry.controlType -notin @('Window','Pane') -or [int]$entry.element.Current.ProcessId -ne $ApplicationProcessId) {
+            throw "$Kind was invalid or ambiguous."
+        }
+    }
+    return ,$identities
+}
+
+function Wait-NewProcessBoundOpenSurface {
+    param(
+        [Parameter(Mandatory = $true)][int]$ApplicationProcessId,
+        [Parameter(Mandatory = $true)][object[]]$Baseline,
+        [Parameter(Mandatory = $true)][datetime]$Deadline,
+        [scriptblock]$SnapshotProvider,
+        [scriptblock]$SleepProvider,
+        [scriptblock]$UtcNowProvider
+    )
+    $baselineIdentities = Assert-ReadingSurfaceSnapshot -Snapshot $Baseline -ApplicationProcessId $ApplicationProcessId -Kind 'The pre-click top-level UI baseline'
+    $diagnostic = [ordered]@{schemaVersion=1;baselineCount=[int]$Baseline.Count;currentCount=0;newCount=0;windowCount=0;paneCount=0;baselineMissingCount=0}
+    $now = if ($UtcNowProvider) { [datetime](& $UtcNowProvider) } else { [datetime]::UtcNow }
+    while ($now -lt $Deadline) {
+        $current = @(if ($SnapshotProvider) { & $SnapshotProvider $ApplicationProcessId $Deadline } else { Get-ReadingProcessUiSurfaceSnapshot -ApplicationProcessId $ApplicationProcessId -Deadline $Deadline })
+        $now = if ($UtcNowProvider) { [datetime](& $UtcNowProvider) } else { [datetime]::UtcNow }
+        if ($now -ge $Deadline) { break }
+        $currentIdentities = Assert-ReadingSurfaceSnapshot -Snapshot $current -ApplicationProcessId $ApplicationProcessId -Kind 'The post-click top-level UI snapshot'
+        $missing = @($Baseline | Where-Object { -not $currentIdentities.Contains([string]$_.runtimeIdentity) })
+        $newSurfaces = @($current | Where-Object { -not $baselineIdentities.Contains([string]$_.runtimeIdentity) })
+        $diagnostic.currentCount = [int]$current.Count; $diagnostic.newCount = [int]$newSurfaces.Count
+        $diagnostic.windowCount = [int]@($current | Where-Object { [string]$_.controlType -ceq 'Window' }).Count
+        $diagnostic.paneCount = [int]@($current | Where-Object { [string]$_.controlType -ceq 'Pane' }).Count
+        $diagnostic.baselineMissingCount = [int]$missing.Count
+        if ($missing.Count -ne 0) { throw 'The pre-click top-level UI baseline was replaced while opening the native picker.' }
+        if ($newSurfaces.Count -gt 1) { throw 'More than one new process-bound native picker surface appeared.' }
+        if ($newSurfaces.Count -eq 1) {
+            if (-not [bool]$newSurfaces[0].isEnabled -or [bool]$newSurfaces[0].isOffscreen) { throw 'The new process-bound native picker surface was not enabled and visible.' }
+            return [pscustomobject]@{surfaceRuntimeIdentity=[string]$newSurfaces[0].runtimeIdentity;surfaceControlType=[string]$newSurfaces[0].controlType;surfaceElement=$newSurfaces[0].element;baselineIdentities=[string[]]@($baselineIdentities)}
+        }
+        if ($SleepProvider) { & $SleepProvider $script:ReadingPins.UiAutomationPollMilliseconds } else { Start-Sleep -Milliseconds $script:ReadingPins.UiAutomationPollMilliseconds }
+        $now = if ($UtcNowProvider) { [datetime](& $UtcNowProvider) } else { [datetime]::UtcNow }
+    }
+    throw "No single new process-bound native picker surface appeared; diagnostic=$($diagnostic | ConvertTo-Json -Compress)"
 }
 
 function Assert-ReadingAutomationChildProcessId {
@@ -184,38 +254,108 @@ function Assert-ReadingAutomationChildProcessId {
     }
 }
 
-function Submit-ProcessBoundOpenDialog {
-    param([Parameter(Mandatory = $true)]$Dialog,[Parameter(Mandatory = $true)][int]$ApplicationProcessId,[Parameter(Mandatory = $true)][string]$Path)
-    if ($Dialog.Current.ProcessId -ne $ApplicationProcessId) { throw 'The native Open dialog does not belong to the exact installed application process.' }
-    $processCondition = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ProcessIdProperty, $ApplicationProcessId)
-    $descendants = @(Get-ReadingAutomationElements -Root $Dialog -Condition $processCondition -MaximumCount 256)
-    if ($descendants.Count -lt 2 -or @($descendants | Where-Object { $_.Current.ProcessId -ne $ApplicationProcessId }).Count -ne 0) {
-        throw 'The native Open dialog child inventory is outside the exact process-bound contract.'
+function Assert-ReadingSurfaceBinding {
+    param([Parameter(Mandatory = $true)]$Binding,[Parameter(Mandatory = $true)][int]$ApplicationProcessId,[Parameter(Mandatory = $true)][datetime]$Deadline,[switch]$AllowUnavailableSurface)
+    $properties = @($Binding.PSObject.Properties.Name | Sort-Object -CaseSensitive)
+    if (($properties -join ',') -cne 'baselineIdentities,surfaceControlType,surfaceElement,surfaceRuntimeIdentity' -or [string]$Binding.surfaceControlType -notin @('Window','Pane') -or @($Binding.baselineIdentities).Count -lt 1 -or @($Binding.baselineIdentities).Count -gt 8) {
+        throw 'The native picker surface binding was invalid.'
     }
-    $editTypeCondition = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty, [Windows.Automation.ControlType]::Edit)
-    $editCondition = [Windows.Automation.AndCondition]::new($processCondition,$editTypeCondition)
-    $edits = @(Get-ReadingAutomationElements -Root $Dialog -Condition $editCondition | Where-Object {
+    if (-not $AllowUnavailableSurface) {
+        $observedIdentity = Get-ReadingAutomationRuntimeIdentity -Element $Binding.surfaceElement -ApplicationProcessId $ApplicationProcessId -Deadline $Deadline
+        if ($observedIdentity -cne [string]$Binding.surfaceRuntimeIdentity) { throw 'The native picker surface runtime identity changed before its action.' }
+    }
+}
+
+function Test-ReadingAutomationDescendantOfSurface {
+    param([Parameter(Mandatory = $true)]$Element,[Parameter(Mandatory = $true)]$Binding,[Parameter(Mandatory = $true)][int]$ApplicationProcessId,[Parameter(Mandatory = $true)][datetime]$Deadline,[scriptblock]$ParentProvider)
+    $cursor = $Element
+    for ($depth = 0; $depth -lt 64 -and $null -ne $cursor; $depth++) {
+        $identity = Get-ReadingAutomationRuntimeIdentity -Element $cursor -ApplicationProcessId $ApplicationProcessId -Deadline $Deadline
+        if ($identity -ceq [string]$Binding.surfaceRuntimeIdentity) { return $true }
+        $cursor = if ($ParentProvider) { & $ParentProvider $cursor } else { [Windows.Automation.TreeWalker]::RawViewWalker.GetParent($cursor) }
+        if ($null -ne $cursor -and [int]$cursor.Current.ProcessId -ne $ApplicationProcessId) { return $false }
+    }
+    return $false
+}
+
+function Get-ReadingBoundAutomationChildren {
+    param([Parameter(Mandatory = $true)]$Binding,[Parameter(Mandatory = $true)][int]$ApplicationProcessId,[Parameter(Mandatory = $true)][ValidateSet('Edit','Button')][string]$ControlType,[Parameter(Mandatory = $true)][datetime]$Deadline,[scriptblock]$ElementProvider,[scriptblock]$ParentProvider)
+    Assert-ReadingSurfaceBinding -Binding $Binding -ApplicationProcessId $ApplicationProcessId -Deadline $Deadline
+    if ($ElementProvider) {
+        $elements = @(& $ElementProvider $Binding.surfaceElement $ApplicationProcessId $ControlType)
+    } else {
+        $processCondition = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ProcessIdProperty, $ApplicationProcessId)
+        $typeValue = if ($ControlType -ceq 'Edit') { [Windows.Automation.ControlType]::Edit } else { [Windows.Automation.ControlType]::Button }
+        $typeCondition = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty, $typeValue)
+        $condition = [Windows.Automation.AndCondition]::new($processCondition,$typeCondition)
+        $elements = @(Get-ReadingAutomationElements -Root $Binding.surfaceElement -Condition $condition)
+    }
+    foreach ($element in $elements) {
+        if ([int]$element.Current.ProcessId -ne $ApplicationProcessId -or -not (Test-ReadingAutomationDescendantOfSurface -Element $element -Binding $Binding -ApplicationProcessId $ApplicationProcessId -Deadline $Deadline -ParentProvider $ParentProvider)) {
+            throw 'A native picker control escaped the exact bound process-owned surface.'
+        }
+    }
+    return $elements
+}
+
+function Wait-ReadingProcessUiSurfaceClosed {
+    param([Parameter(Mandatory = $true)]$Binding,[Parameter(Mandatory = $true)][int]$ApplicationProcessId,[Parameter(Mandatory = $true)][datetime]$Deadline,[scriptblock]$SnapshotProvider,[scriptblock]$SleepProvider,[scriptblock]$UtcNowProvider)
+    Assert-ReadingSurfaceBinding -Binding $Binding -ApplicationProcessId $ApplicationProcessId -Deadline $Deadline -AllowUnavailableSurface
+    $baselineIdentities = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($identity in @($Binding.baselineIdentities)) { if (-not $baselineIdentities.Add([string]$identity)) { throw 'The native picker surface baseline was ambiguous.' } }
+    $now = if ($UtcNowProvider) { [datetime](& $UtcNowProvider) } else { [datetime]::UtcNow }
+    while ($now -lt $Deadline) {
+        $current = @(if ($SnapshotProvider) { & $SnapshotProvider $ApplicationProcessId $Deadline } else { Get-ReadingProcessUiSurfaceSnapshot -ApplicationProcessId $ApplicationProcessId -Deadline $Deadline })
+        $now = if ($UtcNowProvider) { [datetime](& $UtcNowProvider) } else { [datetime]::UtcNow }
+        if ($now -ge $Deadline) { break }
+        $currentIdentities = Assert-ReadingSurfaceSnapshot -Snapshot $current -ApplicationProcessId $ApplicationProcessId -Kind 'The post-submit top-level UI snapshot'
+        if (@($Binding.baselineIdentities | Where-Object { -not $currentIdentities.Contains([string]$_) }).Count -ne 0) { throw 'The pre-click top-level UI baseline was replaced while closing the native picker.' }
+        $remainingNew = @($current | Where-Object { -not $baselineIdentities.Contains([string]$_.runtimeIdentity) })
+        if (-not $currentIdentities.Contains([string]$Binding.surfaceRuntimeIdentity)) {
+            if ($remainingNew.Count -ne 0) { throw 'The exact native picker surface was replaced before closing.' }
+            return
+        }
+        if ($remainingNew.Count -ne 1 -or [string]$remainingNew[0].runtimeIdentity -cne [string]$Binding.surfaceRuntimeIdentity) { throw 'The native picker surface topology changed before closing.' }
+        if ($SleepProvider) { & $SleepProvider $script:ReadingPins.UiAutomationPollMilliseconds } else { Start-Sleep -Milliseconds $script:ReadingPins.UiAutomationPollMilliseconds }
+        $now = if ($UtcNowProvider) { [datetime](& $UtcNowProvider) } else { [datetime]::UtcNow }
+    }
+    throw 'The exact process-bound native picker surface did not close.'
+}
+
+function Set-ReadingAutomationValueBeforeDeadline {
+    param([Parameter(Mandatory = $true)]$Element,[Parameter(Mandatory = $true)][string]$Value,[Parameter(Mandatory = $true)][datetime]$Deadline,[scriptblock]$PatternProvider,[scriptblock]$UtcNowProvider)
+    $valuePattern = $null
+    $available = if ($PatternProvider) { [bool](& $PatternProvider $Element ([ref]$valuePattern)) } else { $Element.TryGetCurrentPattern([Windows.Automation.ValuePattern]::Pattern, [ref]$valuePattern) }
+    if (-not $available -or $valuePattern.Current.IsReadOnly) { throw 'The process-bound filename editor did not expose a writable ValuePattern.' }
+    $now = if ($UtcNowProvider) { [datetime](& $UtcNowProvider) } else { [datetime]::UtcNow }
+    if ($now -ge $Deadline) { throw 'The process-bound filename mutation deadline expired.' }
+    $valuePattern.SetValue($Value)
+}
+
+function Invoke-ReadingAutomationButtonBeforeDeadline {
+    param([Parameter(Mandatory = $true)]$Element,[Parameter(Mandatory = $true)][datetime]$Deadline,[scriptblock]$PatternProvider,[scriptblock]$UtcNowProvider)
+    $invokePattern = $null
+    $available = if ($PatternProvider) { [bool](& $PatternProvider $Element ([ref]$invokePattern)) } else { $Element.TryGetCurrentPattern([Windows.Automation.InvokePattern]::Pattern, [ref]$invokePattern) }
+    if (-not $available) { throw 'The process-bound native Open button did not expose InvokePattern.' }
+    $now = if ($UtcNowProvider) { [datetime](& $UtcNowProvider) } else { [datetime]::UtcNow }
+    if ($now -ge $Deadline) { throw 'The process-bound native Open mutation deadline expired.' }
+    $invokePattern.Invoke()
+}
+
+function Submit-ProcessBoundOpenDialog {
+    param([Parameter(Mandatory = $true)]$Binding,[Parameter(Mandatory = $true)][int]$ApplicationProcessId,[Parameter(Mandatory = $true)][string]$Path,[Parameter(Mandatory = $true)][datetime]$Deadline)
+    $edits = @(Get-ReadingBoundAutomationChildren -Binding $Binding -ApplicationProcessId $ApplicationProcessId -ControlType Edit -Deadline $Deadline | Where-Object {
         $_.Current.IsEnabled -and -not $_.Current.IsOffscreen -and $_.Current.AutomationId -in @('1001','1148')
     })
     if ($edits.Count -ne 1) { throw 'The process-bound native Open dialog did not expose one exact filename editor.' }
     Assert-ReadingAutomationChildProcessId -Elements $edits -ApplicationProcessId $ApplicationProcessId -Kind 'filename editor'
-    $valuePattern = $null
-    if (-not $edits[0].TryGetCurrentPattern([Windows.Automation.ValuePattern]::Pattern, [ref]$valuePattern) -or $valuePattern.Current.IsReadOnly) {
-        throw 'The process-bound filename editor did not expose a writable ValuePattern.'
-    }
-    $valuePattern.SetValue($Path)
-    $buttonTypeCondition = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty, [Windows.Automation.ControlType]::Button)
-    $buttonCondition = [Windows.Automation.AndCondition]::new($processCondition,$buttonTypeCondition)
-    $buttons = @(Get-ReadingAutomationElements -Root $Dialog -Condition $buttonCondition | Where-Object {
+    Set-ReadingAutomationValueBeforeDeadline -Element $edits[0] -Value $Path -Deadline $Deadline
+    $buttons = @(Get-ReadingBoundAutomationChildren -Binding $Binding -ApplicationProcessId $ApplicationProcessId -ControlType Button -Deadline $Deadline | Where-Object {
         $_.Current.IsEnabled -and -not $_.Current.IsOffscreen -and $_.Current.AutomationId -ceq '1' -and $_.Current.Name -ceq 'Open'
     })
     if ($buttons.Count -ne 1) { throw 'The process-bound native Open dialog did not expose one exact Open button.' }
     Assert-ReadingAutomationChildProcessId -Elements $buttons -ApplicationProcessId $ApplicationProcessId -Kind 'Open button'
-    $invokePattern = $null
-    if (-not $buttons[0].TryGetCurrentPattern([Windows.Automation.InvokePattern]::Pattern, [ref]$invokePattern)) {
-        throw 'The process-bound native Open button did not expose InvokePattern.'
-    }
-    $invokePattern.Invoke()
+    Invoke-ReadingAutomationButtonBeforeDeadline -Element $buttons[0] -Deadline $Deadline
 }
 
 function Get-ReadingHomeScript {
@@ -232,10 +372,13 @@ const b=[...document.querySelectorAll('button')].filter(x=>x.textContent.trim()=
 
 function Open-ReadingUserFile {
     param([Parameter(Mandatory = $true)][string]$SessionId,[Parameter(Mandatory = $true)][int]$ApplicationProcessId,[Parameter(Mandatory = $true)][string]$Path,[Parameter(Mandatory = $true)][datetime]$Deadline)
+    $baseline = @(Get-ReadingProcessUiSurfaceSnapshot -ApplicationProcessId $ApplicationProcessId -Deadline $Deadline)
+    $null = Assert-ReadingSurfaceSnapshot -Snapshot $baseline -ApplicationProcessId $ApplicationProcessId -Kind 'The pre-click top-level UI baseline'
     $clicked = Invoke-WebDriverScript -SessionId $SessionId -Deadline $Deadline -Script (Get-ReadingOpenFileScript)
     if ($clicked -isnot [bool] -or -not $clicked) { throw 'The exact installed Open a file control was unavailable.' }
-    $dialog = Wait-ProcessBoundOpenDialog -ApplicationProcessId $ApplicationProcessId -Deadline $Deadline
-    Submit-ProcessBoundOpenDialog -Dialog $dialog -ApplicationProcessId $ApplicationProcessId -Path $Path
+    $surface = Wait-NewProcessBoundOpenSurface -ApplicationProcessId $ApplicationProcessId -Baseline $baseline -Deadline $Deadline
+    Submit-ProcessBoundOpenDialog -Binding $surface -ApplicationProcessId $ApplicationProcessId -Path $Path -Deadline $Deadline
+    Wait-ReadingProcessUiSurfaceClosed -Binding $surface -ApplicationProcessId $ApplicationProcessId -Deadline $Deadline
 }
 
 function Get-ReadingOwnedExecutableDiagnostic {

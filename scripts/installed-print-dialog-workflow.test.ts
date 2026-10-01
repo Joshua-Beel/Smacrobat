@@ -168,7 +168,7 @@ describe('installed native print dialog verifier', () => {
     expect(result.status, result.stderr || result.stdout).toBe(0);
   });
 
-  it('enumerates descendants only below validated owned top-level roots and fails closed after a delayed rooted scan', () => {
+  it('enumerates only targeted descendants below validated owned roots and fails closed after a delayed query', () => {
     const result = runPowerShell7(String.raw`
       $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
       Set-Location -LiteralPath '${process.cwd().replaceAll("'", "''")}'
@@ -183,7 +183,7 @@ describe('installed native print dialog verifier', () => {
       $child=New-EnumerationElement 7319 2 'ControlType.Button'
       $child2=New-EnumerationElement 7319 3 'ControlType.Edit'
       $finder={param($root,$scope,$condition)
-        $script:enumerationCalls+=([pscustomobject]@{Root=$root;Scope=$scope})
+        $script:enumerationCalls+=([pscustomobject]@{Root=$root;Scope=$scope;ConditionType=$condition.GetType().Name})
         if([object]::ReferenceEquals($root,$desktop)){
           if($scope-ne[Windows.Automation.TreeScope]::Children){throw 'Desktop-wide descendants were scanned.'}
           return @($top)
@@ -197,7 +197,7 @@ describe('installed native print dialog verifier', () => {
         $script:descendantCase=[string]$fixture.Name;$script:enumerationCalls=@()
         $items=@(Get-ProcessUiElements -ProcessId 7319 -Deadline ([datetime]::UtcNow.AddSeconds(1)) -DesktopProvider { $desktop } -FindAllProvider $finder)
         if($items.Count-ne[int]$fixture.Count-or-not[object]::ReferenceEquals($items[0],$top)){throw ('Rooted UIA '+$fixture.Name+' result did not retain array Count under strict mode.')}
-        if($script:enumerationCalls.Count-ne2-or$script:enumerationCalls[0].Scope-ne[Windows.Automation.TreeScope]::Children-or$script:enumerationCalls[1].Scope-ne[Windows.Automation.TreeScope]::Descendants){throw 'UIA enumeration did not use desktop-children then owned-root-descendants.'}
+        if($script:enumerationCalls.Count-ne2-or$script:enumerationCalls[0].Scope-ne[Windows.Automation.TreeScope]::Children-or$script:enumerationCalls[0].ConditionType-cne'PropertyCondition'-or$script:enumerationCalls[1].Scope-ne[Windows.Automation.TreeScope]::Descendants-or$script:enumerationCalls[1].ConditionType-cne'AndCondition'){throw 'UIA enumeration did not use process-owned roots then the native targeted condition.'}
       }
       if(-not[object]::ReferenceEquals($items[1],$child)-or-not[object]::ReferenceEquals($items[2],$child2)){throw 'Rooted UIA enumeration did not merge bounded unique runtime identities.'}
       $script:lateRootedCallReturned=$false
@@ -209,7 +209,13 @@ describe('installed native print dialog verifier', () => {
     const source = readFileSync('scripts/installed-print-dialog.ps1', 'utf8');
     expect(source).toContain('$desktop.FindAll([Windows.Automation.TreeScope]::Children');
     expect(source).not.toContain('$desktop.FindAll([Windows.Automation.TreeScope]::Descendants');
-    expect(source).toContain('$root.FindAll([Windows.Automation.TreeScope]::Descendants');
+    expect(source.match(/\.FindAll\(\[Windows\.Automation\.TreeScope\]::Descendants,/g)).toHaveLength(2);
+    expect(source.match(/\.FindAll\(\[Windows\.Automation\.TreeScope\]::Descendants,\$descendantCondition\)/g)).toHaveLength(2);
+    expect(source).not.toMatch(/FindAll\(\[Windows\.Automation\.TreeScope\]::Descendants,\s*\[Windows\.Automation\.Condition\]::TrueCondition/);
+    expect(source).toContain('function New-PrintTargetUiCondition');
+    expect(source).toContain('function New-PrintSurfaceUiCondition');
+    expect(source).toContain('[Windows.Automation.OrCondition]::new');
+    expect(source).toContain('[Windows.Automation.AndCondition]::new');
     expect(source).toContain('$topLevel = @(if ($FindAllProvider)');
     expect(source).toContain('$descendants = @(if ($FindAllProvider)');
     expect(source).toContain('$elements = @(if ($ElementProvider)');
@@ -277,38 +283,58 @@ describe('installed native print dialog verifier', () => {
       $main=New-TreeElement 7319 1 'ControlType.Window' 'PDF Workstation' $desktop
       $pane=New-TreeElement 7319 2 'ControlType.Pane' '' $desktop
       $outside=New-TreeElement 7319 3 'ControlType.Button' 'Cancel' $main
+      $existingSibling=New-TreeElement 7319 14 'ControlType.Pane' '' $pane
       $dialog=New-TreeElement 7319 4 'ControlType.Pane' '' $pane
       $inside=New-TreeElement 7319 5 'ControlType.Button' 'Cancel' $dialog
       $print=New-TreeElement 7319 6 'ControlType.Button' 'Print' $dialog
-      $script:treeElements=@($main,$pane,$outside)
-      $provider={param($requestedProcessId,$windowsOnly)if($windowsOnly){@($main,$pane)}else{@($script:treeElements)}}
+      $current=New-TreeElement 7319 12 'ControlType.RadioButton' 'Current Page' $dialog
+      $combo=New-TreeElement 7319 13 'ControlType.ComboBox' '' $dialog
+      $script:treeElements=@($main,$pane,$outside,$existingSibling)
+      $provider={param($requestedProcessId,$windowsOnly,$kind)
+        if($windowsOnly){return @($main,$pane)}
+        if($kind-ceq'surfaces'){return @($script:treeElements|Where-Object{$_.Current.ControlType.ProgrammaticName-in@('ControlType.Window','ControlType.Pane')})}
+        return @($script:treeElements|Where-Object{
+          $type=[string]$_.Current.ControlType.ProgrammaticName;$name=[string]$_.Current.Name
+          ($type-ceq'ControlType.Button'-and$name-in@('Cancel','Print','Save'))-or
+          ($type-ceq'ControlType.RadioButton'-and$name-in@('Current Page','Current page'))-or$type-ceq'ControlType.ComboBox'
+        })
+      }
       $parents={param($element)$element.Parent}
       $baseline=@(Get-ProcessUiTreeSnapshot -ProcessId 7319 -Deadline ([datetime]::UtcNow.AddSeconds(1)) -ElementProvider $provider -ParentProvider $parents)
-      $script:treeElements=@($main,$pane,$outside,$dialog,$inside,$print)
+      $script:treeElements=@($main,$pane,$outside,$existingSibling,$dialog,$inside,$print,$current,$combo)
       $binding=Wait-NewProcessUiSurface -ProcessId 7319 -Baseline $baseline -AnchorNames @('Cancel') -AnchorControlTypes @('ControlType.Button') -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddSeconds(1)) -ElementProvider $provider -ParentProvider $parents
-      if([string]$binding.surfaceRootIdentity-cne'77:4'-or@($binding.trackedIdentities).Count-ne3){throw 'Descendant delta did not bind its exact common ancestor inside the unchanged top-level pane.'}
+      if([string]$binding.surfaceRootIdentity-cne'77:4'-or@($binding.trackedIdentities).Count-ne4){throw 'Descendant delta did not bind its exact independently observed surface and target set.'}
       $found=Find-BoundProcessUiElement -ProcessId 7319 -Binding $binding -Names @('Cancel') -ControlTypes @('ControlType.Button') -Deadline ([datetime]::UtcNow.AddSeconds(1)) -ElementProvider $provider -ParentProvider $parents
       if(-not[object]::ReferenceEquals($found,$inside)){throw 'A baseline matching control outside the descendant delta was accepted.'}
-      $other=New-TreeElement 7319 7 'ControlType.Button' 'Other' $main
-      $script:treeElements=@($main,$pane,$outside,$dialog,$inside,$print,$other)
+      $script:treeElements=@($main,$pane,$outside,$existingSibling,$dialog,$inside,$current,$combo)
+      $message='';try{Wait-NewProcessUiSurface -ProcessId 7319 -Baseline $baseline -AnchorNames @('Cancel') -AnchorControlTypes @('ControlType.Button') -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(50)) -ElementProvider $provider -ParentProvider $parents|Out-Null}catch{$message=$_.Exception.Message}
+      if($message-cnotmatch'one process-owned descendant surface'){throw 'A partial print-dialog target set without Print was accepted.'}
+      $other=New-TreeElement 7319 7 'ControlType.Button' 'Save' $main
+      $script:treeElements=@($main,$pane,$outside,$existingSibling,$dialog,$inside,$print,$current,$combo,$other)
       $message='';try{Wait-NewProcessUiSurface -ProcessId 7319 -Baseline $baseline -AnchorNames @('Cancel') -AnchorControlTypes @('ControlType.Button') -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(50)) -ElementProvider $provider -ParentProvider $parents|Out-Null}catch{$message=$_.Exception.Message}
       if($message-cnotmatch'one process-owned descendant surface'-or$message-cnotmatch'baselineUiStructure='-or$message-cnotmatch'postUiStructure='-or$message-cnotmatch'newUiStructure='){throw 'Mixed-root descendant delta did not fail with bounded evidence.'}
       if($message-match'(?i)(runtimeIdentity|77:|PDF Workstation|bounding|rectangle|caption|"name"|"text"|"path"|"processid"|7319)'){throw 'Descendant-delta diagnostics leaked private UI data.'}
-      $sibling=New-TreeElement 7319 8 'ControlType.Pane' '' $pane
-      $outsidePrint=New-TreeElement 7319 9 'ControlType.Button' 'Print' $sibling
-      $script:treeElements=@($main,$pane,$outside,$dialog,$inside,$print,$sibling,$outsidePrint)
+      $outsidePrint=New-TreeElement 7319 9 'ControlType.Button' 'Print' $existingSibling
+      $script:treeElements=@($main,$pane,$outside,$existingSibling,$dialog,$inside,$print,$current,$combo,$outsidePrint)
       $message='';try{Wait-NewProcessUiSurface -ProcessId 7319 -Baseline $baseline -AnchorNames @('Cancel') -AnchorControlTypes @('ControlType.Button') -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(50)) -ElementProvider $provider -ParentProvider $parents|Out-Null}catch{$message=$_.Exception.Message}
       if($message-cnotmatch'one process-owned descendant surface'-or$outsidePrint.Clicked){throw 'A same-top-level sibling Print widened the bound surface or was clicked.'}
-      $outsideCancel=New-TreeElement 7319 10 'ControlType.Button' 'Cancel' $sibling
-      $script:treeElements=@($main,$pane,$outside,$dialog,$inside,$print,$sibling,$outsidePrint,$outsideCancel)
+      $outsideCancel=New-TreeElement 7319 10 'ControlType.Button' 'Cancel' $existingSibling
+      $script:treeElements=@($main,$pane,$outside,$existingSibling,$dialog,$inside,$print,$current,$combo,$outsidePrint,$outsideCancel)
       $message='';try{Wait-NewProcessUiSurface -ProcessId 7319 -Baseline $baseline -AnchorNames @('Cancel') -AnchorControlTypes @('ControlType.Button') -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(50)) -ElementProvider $provider -ParentProvider $parents|Out-Null}catch{$message=$_.Exception.Message}
       if($message-cnotmatch'one process-owned descendant surface'-or$outsidePrint.Clicked-or$outsideCancel.Clicked){throw 'Matching controls in a sibling subtree were accepted or clicked.'}
-      $script:treeElements=@($main,$pane,$outside)
+      $script:treeElements=@($main,$pane,$outside,$existingSibling,$dialog)
+      $message='';try{Wait-BoundProcessUiSurfaceClosed -ProcessId 7319 -Binding $binding -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(50)) -ElementProvider $provider -ParentProvider $parents}catch{$message=$_.Exception.Message}
+      if($message-cnotmatch'retained'){throw 'Target disappearance falsely proved close while the bound surface remained.'}
+      $replacement=New-TreeElement 7319 15 'ControlType.Pane' '' $pane
+      $script:treeElements=@($main,$pane,$outside,$existingSibling,$replacement)
+      $message='';try{Wait-BoundProcessUiSurfaceClosed -ProcessId 7319 -Binding $binding -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(50)) -ElementProvider $provider -ParentProvider $parents}catch{$message=$_.Exception.Message}
+      if($message-cnotmatch'retained'){throw 'A replacement native surface falsely proved close.'}
+      $script:treeElements=@($main,$pane,$outside,$existingSibling)
       Wait-BoundProcessUiSurfaceClosed -ProcessId 7319 -Binding $binding -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddSeconds(1)) -ElementProvider $provider -ParentProvider $parents
       $foreign=New-TreeElement 7320 11 'ControlType.Button' 'Cancel' $pane
-      $script:treeElements=@($main,$pane,$outside,$foreign)
+      $script:treeElements=@($main,$pane,$outside,$existingSibling,$foreign)
       $rejected=$false;try{Get-ProcessUiTreeSnapshot -ProcessId 7319 -Deadline ([datetime]::UtcNow.AddSeconds(1)) -ElementProvider $provider -ParentProvider $parents|Out-Null}catch{$rejected=$true};if(-not$rejected){throw 'A foreign descendant was accepted.'}
-      $script:treeElements=@($main,$pane,$outside,$dialog,$inside)
+      $script:treeElements=@($main,$pane,$outside,$existingSibling,$dialog,$inside)
       $slowParents={param($element)Start-Sleep -Milliseconds 80;$element.Parent}
       $rejected=$false;try{Get-ProcessUiTreeSnapshot -ProcessId 7319 -Deadline ([datetime]::UtcNow.AddMilliseconds(20)) -ElementProvider $provider -ParentProvider $slowParents|Out-Null}catch{$rejected=$true};if(-not$rejected){throw 'A parent read completed successfully after its deadline.'}
     `);
