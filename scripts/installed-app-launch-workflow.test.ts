@@ -158,6 +158,7 @@ describe('hosted installed signed application launch proof', () => {
       $app='C:\fixture\pdf-workstation.exe';$edge='C:\fixture\msedgedriver.exe';$ocr='C:\fixture\tesseract.exe';$web='C:\fixture\msedgewebview2.exe'
       $core=@([pscustomobject]@{ProcessId=101;ParentProcessId=900;Path=$app},[pscustomobject]@{ProcessId=102;ParentProcessId=900;Path=$edge},[pscustomobject]@{ProcessId=103;ParentProcessId=101;Path=$web},[pscustomobject]@{ProcessId=104;ParentProcessId=101;Path=$ocr})
       $console=@([pscustomobject]@{ProcessId=105;ParentProcessId=900;Path=$conhost},[pscustomobject]@{ProcessId=106;ParentProcessId=103;Path=$conhost})
+      $ocrConsole=[pscustomobject]@{ProcessId=109;ParentProcessId=104;Path=$conhost}
       $valid=@($core+$console)
       $sequentialRoot=@($core+$console[0]+[pscustomobject]@{ProcessId=107;ParentProcessId=900;Path=$conhost})
       $sequentialWebView=@($core+$console[1]+[pscustomobject]@{ProcessId=108;ParentProcessId=103;Path=$conhost})
@@ -165,6 +166,8 @@ describe('hosted installed signed application launch proof', () => {
       if((Assert-TrustedConsoleHostTopology -Owned $valid -RootProcessId 900 -SystemDirectory $system -SignatureProvider $signature -VersionInfoProvider $version)-ne2){throw 'Trusted console-host topology was not accepted.'}
       if((Assert-TrustedConsoleHostTopology -Owned $valid -RootProcessId 900 -SystemDirectory $system)-ne2){throw 'The installed System32 console-host identity was not accepted.'}
       Assert-OwnedLaunchExecutables -Owned $valid -ApplicationPath $app -EdgeDriverPath $edge -OcrEnginePath $ocr -RootProcessId 900 -SystemDirectory $system -ConsoleHostSignatureProvider $signature -ConsoleHostVersionInfoProvider $version
+      Assert-OwnedLaunchExecutables -Owned @($valid+$ocrConsole) -ApplicationPath $app -EdgeDriverPath $edge -OcrEnginePath $ocr -RootProcessId 900 -SystemDirectory $system -ConsoleHostSignatureProvider $signature -ConsoleHostVersionInfoProvider $version
+      $requiredAdditionalRejected=$false;try{Assert-TrustedConsoleHostTopology -Owned @($valid+$ocrConsole) -RootProcessId 900 -SystemDirectory $system -SignatureProvider $signature -VersionInfoProvider $version -AdditionalTrustedParentPath $ocr -AdditionalTrustedParentCategory 'ocr-engine'|Out-Null}catch{$requiredAdditionalRejected=$true};if(-not$requiredAdditionalRejected){throw 'Required root and WebView mode accepted an additional parent category.'}
       Assert-OwnedLaunchExecutables -Owned $core -ApplicationPath $app -EdgeDriverPath $edge -OcrEnginePath $ocr
       foreach($subset in @(
         [pscustomobject]@{owned=@($core);expected=0},
@@ -184,9 +187,10 @@ describe('hosted installed signed application launch proof', () => {
         @($core+[pscustomobject]@{ProcessId=105;ParentProcessId=999;Path=$conhost},$console[1]),
         @($core+[pscustomobject]@{ProcessId=105;ParentProcessId=900;Path='C:\fixture\conhost.exe'},$console[1]),
         @($core+[pscustomobject]@{ProcessId=105;ParentProcessId=900;Path=$conhost},[pscustomobject]@{ProcessId=105;ParentProcessId=103;Path=$conhost}),
-        @($core+[pscustomobject]@{ProcessId=0;ParentProcessId=900;Path=$conhost},$console[1])
+        @($core+[pscustomobject]@{ProcessId=0;ParentProcessId=900;Path=$conhost},$console[1]),
+        @($valid+[pscustomobject]@{ProcessId=110;ParentProcessId=101;Path='C:\fixture\foreign.exe'},[pscustomobject]@{ProcessId=111;ParentProcessId=110;Path=$conhost})
       )
-      foreach($case in $cases){$rejected=$false;try{Assert-TrustedConsoleHostTopology -Owned $case -RootProcessId 900 -AllowAbsent -SystemDirectory $system -SignatureProvider $signature -VersionInfoProvider $version|Out-Null}catch{$rejected=$true;if($_.Exception.Message-match'fixture|999|900|105|106|107'){throw 'Console-host rejection leaked captured identity.'}};if(-not$rejected){throw 'Unsafe optional console-host topology was accepted.'}}
+      foreach($case in $cases){$rejected=$false;try{Assert-TrustedConsoleHostTopology -Owned $case -RootProcessId 900 -AllowAbsent -SystemDirectory $system -SignatureProvider $signature -VersionInfoProvider $version -AdditionalTrustedParentPath $ocr -AdditionalTrustedParentCategory 'ocr-engine'|Out-Null}catch{$rejected=$true;if($_.Exception.Message-match'fixture|999|900|105|106|107|109|110|111'){throw 'Console-host rejection leaked captured identity.'}};if(-not$rejected){throw 'Unsafe optional console-host topology was accepted.'}}
       foreach($providerCase in @(
         [pscustomobject]@{signature={param($path)[pscustomobject]@{Status='Valid';Publisher='Other';HasTimestamp=$true}};version=$version},
         [pscustomobject]@{signature=$signature;version={param($path)[pscustomobject]@{CompanyName='Microsoft Corporation';ProductName='Other';InternalName='ConHost';FileDescription='Console Window Host'}}}
@@ -198,6 +202,11 @@ describe('hosted installed signed application launch proof', () => {
     `);
     const result = runPowerShell(source);
     expect(result.status, result.stderr || result.stdout).toBe(0);
+    const launchSource = readFileSync('scripts/installed-app-launch.ps1', 'utf8');
+    expect(launchSource.match(/-AdditionalTrustedParentPath \$OcrEnginePath -AdditionalTrustedParentCategory 'ocr-engine'/g)).toHaveLength(1);
+    for (const path of ['scripts/installed-reading-tools.ps1', 'scripts/installed-persistence.ps1', 'scripts/installed-print-dialog.ps1']) {
+      expect(readFileSync(path, 'utf8')).not.toContain('AdditionalTrustedParent');
+    }
   });
 
   it('validates exact UI/runtime/cleanup results before producing sanitized launch evidence', () => {
@@ -236,6 +245,7 @@ describe('hosted installed signed application launch proof', () => {
 
   it('keeps the real WebDriver client loopback-only, bounded, exact-oracle, and truth-bound on cleanup', () => {
     const launch = readFileSync('scripts/installed-app-launch.ps1', 'utf8');
+    expect(launch).toContain('CleanupProcessTimeoutMilliseconds = 30000');
     expect(launch).toContain('Assert-FixedWebDriverPortsFree');
     expect(launch).toContain("--native-driver=$EdgeDriverPath");
     expect(launch).toContain("webviewOptions = [ordered]@{ userDataFolder = $ProfileRoot }");
@@ -575,7 +585,7 @@ $info=[Diagnostics.ProcessStartInfo]::new();$info.FileName=$Pwsh;$info.UseShellE
 
   it('does not retry a timed-out session POST and still stops the owned process tree', () => {
     const source = extractFunctions('scripts/installed-app-launch.ps1', ['Invoke-RealInstalledAppLaunch'], String.raw`
-      $script:LaunchPins=[ordered]@{TotalTimeoutMilliseconds=60000;CleanupProcessTimeoutMilliseconds=10000;CleanupProcessPollMilliseconds=1;WebDriverPort=4444;NativeDriverPort=4445}
+      $script:LaunchPins=[ordered]@{TotalTimeoutMilliseconds=60000;CleanupProcessTimeoutMilliseconds=30000;CleanupProcessPollMilliseconds=1;WebDriverPort=4444;NativeDriverPort=4445}
       $script:sessionPosts=0;$script:deleteRequests=0;$script:driverStopped=$false
       $driver=[pscustomobject]@{HasExited=$false;Id=1234}
       $capture=[pscustomobject]@{Process=$driver;Exceeded=$false};$capture|Add-Member ScriptMethod Start {};$capture|Add-Member ScriptMethod Dispose {}

@@ -270,6 +270,9 @@ describe('installed persistence WebDriver proof', () => {
     expect(result.status, result.stderr || result.stdout).toBe(0);
     expect(source).toContain('Invoke-SessionDeleteOutcome');
     expect(source).toContain('Stop-OwnedLaunchProcesses');
+    expect(source).toContain('$processCleanupDeadline = [datetime]::UtcNow.AddMilliseconds($script:LaunchPins.CleanupProcessTimeoutMilliseconds)');
+    expect(source).toContain('Wait-LaunchProcessQuiescence -Deadline $processCleanupDeadline');
+    expect(source).toContain('-not $processesQuiescent');
     expect(source).toContain('Assert-LaunchCleanupState');
     expect(source).toContain("throw 'Persistence launch cleanup was incomplete.'");
     expect(source).toContain('relevantProcessesRemaining = 0');

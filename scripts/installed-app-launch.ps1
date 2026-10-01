@@ -7,7 +7,7 @@ $script:LaunchPins = [ordered]@{
     TotalTimeoutMilliseconds = 60000
     RequestTimeoutMilliseconds = 10000
     SessionCreationTimeoutMilliseconds = 30000
-    CleanupProcessTimeoutMilliseconds = 10000
+    CleanupProcessTimeoutMilliseconds = 30000
     CleanupProcessPollMilliseconds = 100
     OcrUiTextBytesMaximum = 65536
     WebDriverErrorBytesMaximum = 4096
@@ -234,10 +234,19 @@ function Assert-TrustedConsoleHostTopology {
         [switch]$AllowAbsent,
         [string]$SystemDirectory,
         [scriptblock]$SignatureProvider,
-        [scriptblock]$VersionInfoProvider
+        [scriptblock]$VersionInfoProvider,
+        [string]$AdditionalTrustedParentPath,
+        [ValidateSet('ocr-engine')][string]$AdditionalTrustedParentCategory
     )
     $items = @($Owned)
     if ($script:LaunchPins.OwnedProcessMaximum -ne 128 -or $items.Count -gt $script:LaunchPins.OwnedProcessMaximum) { throw 'The captured launch inventory is outside its process-count bound.' }
+    $hasAdditionalParentPath = -not [string]::IsNullOrWhiteSpace($AdditionalTrustedParentPath)
+    $hasAdditionalParentCategory = -not [string]::IsNullOrWhiteSpace($AdditionalTrustedParentCategory)
+    if ($hasAdditionalParentPath -ne $hasAdditionalParentCategory -or
+        ($hasAdditionalParentPath -and (-not $AllowAbsent -or $AdditionalTrustedParentCategory -cne 'ocr-engine' -or -not [IO.Path]::GetFileName($AdditionalTrustedParentPath).Equals('tesseract.exe',[StringComparison]::OrdinalIgnoreCase)))) {
+        throw 'The additional trusted console-host parent configuration is invalid.'
+    }
+    $expectedAdditionalParentPath = if ($hasAdditionalParentPath) { [IO.Path]::GetFullPath($AdditionalTrustedParentPath) } else { '' }
     $consoleHosts = @($items | Where-Object { [IO.Path]::GetFileName([string]$_.Path).Equals('conhost.exe',[StringComparison]::OrdinalIgnoreCase) })
     if ($AllowAbsent -and $consoleHosts.Count -eq 0) { return 0 }
     if ([string]::IsNullOrWhiteSpace($SystemDirectory)) { $SystemDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::System) }
@@ -247,6 +256,7 @@ function Assert-TrustedConsoleHostTopology {
     }
     $ownedIds = [Collections.Generic.HashSet[int]]::new()
     $webViewIds = [Collections.Generic.HashSet[int]]::new()
+    $additionalParentIds = [Collections.Generic.HashSet[int]]::new()
     foreach ($process in $items) {
         $processIdProperty = $process.PSObject.Properties['ProcessId']
         $processId = 0
@@ -254,9 +264,14 @@ function Assert-TrustedConsoleHostTopology {
             throw 'The captured console-host topology has an invalid process identity.'
         }
         if ([IO.Path]::GetFileName([string]$process.Path).Equals('msedgewebview2.exe',[StringComparison]::OrdinalIgnoreCase)) { $null = $webViewIds.Add($processId) }
+        if ($hasAdditionalParentPath -and [IO.Path]::GetFileName([string]$process.Path).Equals('tesseract.exe',[StringComparison]::OrdinalIgnoreCase) -and
+            ([IO.Path]::GetFullPath([string]$process.Path)).Equals($expectedAdditionalParentPath,[StringComparison]::OrdinalIgnoreCase)) {
+            $null = $additionalParentIds.Add($processId)
+        }
     }
     $rootParents = 0
     $webViewParents = 0
+    $additionalParents = 0
     foreach ($consoleHost in $consoleHosts) {
         if ([int]$consoleHost.ProcessId -eq $RootProcessId) { throw 'The captured console-host topology has an invalid process identity.' }
         $parentProperty = $consoleHost.PSObject.Properties['ParentProcessId']
@@ -266,9 +281,11 @@ function Assert-TrustedConsoleHostTopology {
         }
         if ($parentProcessId -eq $RootProcessId) { $rootParents++ }
         elseif ($webViewIds.Contains($parentProcessId)) { $webViewParents++ }
-        else { throw 'A captured Windows console host was outside the owned root and WebView parent topology.' }
+        elseif ($additionalParentIds.Contains($parentProcessId)) { $additionalParents++ }
+        else { throw 'A captured Windows console host was outside the trusted captured parent topology.' }
     }
-    if (-not $AllowAbsent -and ($rootParents -lt 1 -or $webViewParents -lt 1)) {
+    if ($rootParents + $webViewParents + $additionalParents -ne $consoleHosts.Count -or
+        (-not $AllowAbsent -and ($rootParents -lt 1 -or $webViewParents -lt 1))) {
         throw 'The captured Windows console-host parent categories do not match the trusted topology.'
     }
     $null = Assert-NoReparseAncestors -Path $expectedPath
@@ -314,7 +331,7 @@ function Assert-OwnedLaunchExecutables {
         -not $leaf.Equals('conhost.exe',[StringComparison]::OrdinalIgnoreCase)
     })
     if ($unknown.Count -ne 0) { throw 'The owned launch tree contains an unexpected executable.' }
-    $null = Assert-TrustedConsoleHostTopology -Owned $Owned -RootProcessId $RootProcessId -AllowAbsent -SystemDirectory $SystemDirectory -SignatureProvider $ConsoleHostSignatureProvider -VersionInfoProvider $ConsoleHostVersionInfoProvider
+    $null = Assert-TrustedConsoleHostTopology -Owned $Owned -RootProcessId $RootProcessId -AllowAbsent -SystemDirectory $SystemDirectory -SignatureProvider $ConsoleHostSignatureProvider -VersionInfoProvider $ConsoleHostVersionInfoProvider -AdditionalTrustedParentPath $OcrEnginePath -AdditionalTrustedParentCategory 'ocr-engine'
 }
 
 function Get-UniqueOwnedLaunchProcesses {

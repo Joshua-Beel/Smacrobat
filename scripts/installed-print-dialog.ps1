@@ -1,8 +1,8 @@
 $script:PrintPins = [ordered]@{
     PrinterName = 'Microsoft Print to PDF'
-    TotalTimeoutMilliseconds = 120000
+    TotalTimeoutMilliseconds = 240000
     PortHandoffTimeoutMilliseconds = 300000
-    NativeDialogTimeoutMilliseconds = 20000
+    NativeDialogTimeoutMilliseconds = 120000
     OutputTimeoutMilliseconds = 45000
     UiElementMaximum = 2048
     OutputBytesMaximum = 64MB
@@ -1121,7 +1121,7 @@ function Invoke-RealInstalledPrintDialog {
     )
     $driverCapture = $null; $driver = $null; $sessionId = $null; $captured = @(); $result = $null
     $sessionDeleteOutcome = 'requestfailed'; $driverExited = $false
-    $driverStopOutcome = 'not-invoked'; $residualCategory = 'multiple'
+    $driverStopOutcome = 'not-invoked'; $processesQuiescent = $false; $residualCategory = 'multiple'
     $capturedOutcomes = [pscustomobject]@{ application='absent';tauriDriver='absent';edgeDriver='absent';webview='absent';ocrEngine='absent';other='absent' }
     $residualFacts = [pscustomobject]@{ ownership='none';application=$false;tauriDriver=$false;edgeDriver=$false;webview=$false;ocrEngine=$false;other=$false }
     try {
@@ -1216,14 +1216,17 @@ return document.querySelectorAll('dialog[aria-labelledby="print-title"]').length
         if ($sessionId) { $sessionDeleteOutcome = Invoke-SessionDeleteOutcome -SessionId $sessionId -Deadline $cleanupDeadline }
         if ($driver) {
             try { $captured += @(Get-OwnedLaunchProcesses -RootProcessId $driver.Id -StartedAfter $startedAfter); $captured = @(Get-UniqueOwnedLaunchProcesses -Processes $captured) } catch { }
-            $capturedOutcomes = Stop-OwnedLaunchProcesses -TauriDriver $driver -Captured $captured -Deadline $cleanupDeadline
+            $processCleanupDeadline = [datetime]::UtcNow.AddMilliseconds($script:LaunchPins.CleanupProcessTimeoutMilliseconds)
+            $capturedOutcomes = Stop-OwnedLaunchProcesses -TauriDriver $driver -Captured $captured -Deadline $processCleanupDeadline
             $driverStopOutcome = [string]$capturedOutcomes.rootOutcome; $driverExited = [bool]$driver.HasExited
-            $remaining = @(Get-LaunchProcessSnapshot); $residualCategory = Get-LaunchResidualCategory -Processes $remaining
+            $quiescence = Wait-LaunchProcessQuiescence -Deadline $processCleanupDeadline
+            $processesQuiescent = [bool]$quiescence.stable
+            $remaining = @($quiescence.processes); $residualCategory = Get-LaunchResidualCategory -Processes $remaining
             $residualFacts = Get-LaunchResidualFacts -Processes $remaining -Captured $captured
         }
         if ($driverCapture) { $driverCapture.Dispose() }
     }
-    $clear = $residualCategory -ceq 'none'
+    $clear = $processesQuiescent -and $residualCategory -ceq 'none'
     Assert-LaunchCleanupState -Result $result -SessionDeleteOutcome $sessionDeleteOutcome -DriverExited $driverExited -RelevantProcessesClear $clear -DriverStopOutcome $driverStopOutcome -ResidualCategory $residualCategory -CapturedApplication $capturedOutcomes.application -CapturedTauriDriver $capturedOutcomes.tauriDriver -CapturedEdgeDriver $capturedOutcomes.edgeDriver -CapturedWebView $capturedOutcomes.webview -CapturedOcrEngine $capturedOutcomes.ocrEngine -CapturedOther $capturedOutcomes.other -ResidualOwnership $residualFacts.ownership -ResidualApplication $residualFacts.application -ResidualTauriDriver $residualFacts.tauriDriver -ResidualEdgeDriver $residualFacts.edgeDriver -ResidualWebView $residualFacts.webview -ResidualOcrEngine $residualFacts.ocrEngine -ResidualOther $residualFacts.other
     $result | Add-Member sessionDeleted ($sessionDeleteOutcome -ceq 'verified')
     $result | Add-Member ownedProcessTreeStopped $driverExited

@@ -44,7 +44,7 @@ describe('installed native print dialog verifier', () => {
       Set-Location -LiteralPath '${process.cwd().replaceAll("'", "''")}'
       . ./scripts/installed-app-launch.ps1
       . ./scripts/installed-print-dialog.ps1
-      if($script:PrintPins.PortHandoffTimeoutMilliseconds-ne300000-or$script:PrintPins.TotalTimeoutMilliseconds-ne120000){throw 'Print handoff or shared timeout pin changed.'}
+      if($script:PrintPins.PortHandoffTimeoutMilliseconds-ne300000-or$script:PrintPins.TotalTimeoutMilliseconds-ne240000-or$script:PrintPins.NativeDialogTimeoutMilliseconds-ne120000){throw 'Print handoff, shared, or native timeout pin changed.'}
       $tokens=$null;$errors=$null
       $ast=[Management.Automation.Language.Parser]::ParseFile('${process.cwd().replaceAll("'", "''")}\scripts\installed-print-dialog.ps1',[ref]$tokens,[ref]$errors)
       if($errors.Count){throw 'Installed print script did not parse.'}
@@ -354,10 +354,19 @@ describe('installed native print dialog verifier', () => {
       $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
       Set-Location -LiteralPath '${process.cwd().replaceAll("'", "''")}'
       . ./scripts/installed-print-dialog.ps1
-      $total=[datetime]::UtcNow.AddSeconds(1);$phase=Get-PrintPhaseDeadline -TotalDeadline $total -MaximumMilliseconds 60000
-      if($phase-gt$total){throw 'Phase deadline escaped total deadline.'}
+      $total=[datetime]::UtcNow.AddSeconds(1);$phase=Get-PrintPhaseDeadline -TotalDeadline $total -MaximumMilliseconds $script:PrintPins.NativeDialogTimeoutMilliseconds
+      if($phase.Ticks-ne$total.Ticks){throw 'Native phase deadline was not capped by the shared total deadline.'}
       foreach($bad in @(0,-1)){$rejected=$false;try{Get-PrintPhaseDeadline -TotalDeadline $total -MaximumMilliseconds $bad}catch{$rejected=$true};if(-not$rejected){throw 'Invalid phase duration accepted.'}}
       $rejected=$false;try{Get-PrintPhaseDeadline -TotalDeadline ([datetime]::UtcNow.AddMilliseconds(-1)) -MaximumMilliseconds 1}catch{$rejected=$true};if(-not$rejected){throw 'Expired total deadline accepted.'}
+      $script:expiredActionPatternReads=0
+      $expiredActionElement=[pscustomobject]@{Current=[pscustomobject]@{ProcessId=7319}}
+      $expiredActionElement|Add-Member -MemberType ScriptMethod -Name TryGetCurrentPattern -Value {$script:expiredActionPatternReads++;return $true}
+      foreach($operation in @(
+        {Invoke-ProcessUiElement -Element $expiredActionElement -ProcessId 7319 -Deadline ([datetime]::UtcNow.AddMilliseconds(-1))},
+        {Select-ProcessUiElement -Element $expiredActionElement -ProcessId 7319 -Deadline ([datetime]::UtcNow.AddMilliseconds(-1))},
+        {Set-ProcessUiElementValue -Element $expiredActionElement -ProcessId 7319 -Value 'fixture' -Deadline ([datetime]::UtcNow.AddMilliseconds(-1))}
+      )){$rejected=$false;try{&$operation}catch{$rejected=$true};if(-not$rejected){throw 'Expired native action was accepted.'}}
+      if($script:expiredActionPatternReads-ne0){throw 'Expired native action queried or invoked a UI Automation pattern.'}
       $script:topologyCalls=0
       function Assert-TrustedConsoleHostTopology {param([object[]]$Owned,[int]$RootProcessId,[string]$SystemDirectory,[scriptblock]$SignatureProvider,[scriptblock]$VersionInfoProvider)
         $script:topologyCalls++;$trusted=@($Owned|Where-Object{[IO.Path]::GetFileName([string]$_.Path)-ieq'conhost.exe'});$webviewIds=@($Owned|Where-Object{[IO.Path]::GetFileName([string]$_.Path)-ieq'msedgewebview2.exe'}|ForEach-Object{[int]$_.ProcessId})
@@ -393,5 +402,8 @@ describe('installed native print dialog verifier', () => {
     expect(source).not.toMatch(/Assert-TrustedConsoleHostTopology[^\r\n]*-AllowAbsent/);
     expect(source.match(/\[int\]\$trustedConsoleHost(?:s|Count) -lt 2/g)).toHaveLength(2);
     expect(source).not.toMatch(/\[int\]\$trustedConsoleHost(?:s|Count) -ne 2/);
+    expect(source).toContain('$processCleanupDeadline = [datetime]::UtcNow.AddMilliseconds($script:LaunchPins.CleanupProcessTimeoutMilliseconds)');
+    expect(source).toContain('Wait-LaunchProcessQuiescence -Deadline $processCleanupDeadline');
+    expect(source).toContain('$clear = $processesQuiescent -and $residualCategory');
   });
 });

@@ -295,7 +295,7 @@ function Invoke-RealPersistenceLaunch {
     $script:LaunchPins.SessionCreationTimeoutMilliseconds = $script:PersistencePins.SessionCreationTimeoutMilliseconds
     $driverCapture = $null; $driver = $null; $sessionId = $null; $captured = @(); $result = $null; $status = $null
     $sessionDeleteOutcome = 'requestfailed'; $driverExited = $false
-    $driverStopOutcome = 'not-invoked'; $residualCategory = 'multiple'; $remaining = -1
+    $driverStopOutcome = 'not-invoked'; $processesQuiescent = $false; $residualCategory = 'multiple'; $remaining = -1
     $capturedOutcomes = [pscustomobject]@{ application = 'absent'; tauriDriver = 'absent'; edgeDriver = 'absent'; webview = 'absent'; ocrEngine = 'absent'; other = 'absent' }
     $residualFacts = [pscustomobject]@{ ownership = 'none'; application = $false; tauriDriver = $false; edgeDriver = $false; webview = $false; ocrEngine = $false; other = $false }
     try {
@@ -345,17 +345,20 @@ function Invoke-RealPersistenceLaunch {
         if ($sessionId) { $sessionDeleteOutcome = Invoke-SessionDeleteOutcome -SessionId $sessionId -Deadline $cleanupDeadline }
         if ($driver) {
             try { $captured += @(Get-OwnedLaunchProcesses -RootProcessId $driver.Id -StartedAfter $startedAfter); $captured = @(Get-UniqueOwnedLaunchProcesses -Processes $captured) } catch { }
-            $capturedOutcomes = Stop-OwnedLaunchProcesses -TauriDriver $driver -Captured $captured -Deadline ([datetime]::UtcNow.AddMilliseconds($script:LaunchPins.CleanupProcessTimeoutMilliseconds))
+            $processCleanupDeadline = [datetime]::UtcNow.AddMilliseconds($script:LaunchPins.CleanupProcessTimeoutMilliseconds)
+            $capturedOutcomes = Stop-OwnedLaunchProcesses -TauriDriver $driver -Captured $captured -Deadline $processCleanupDeadline
             $driverStopOutcome = [string]$capturedOutcomes.rootOutcome
-            $remainingProcesses = @(Get-LaunchProcessSnapshot); $remaining = $remainingProcesses.Count
+            $quiescence = Wait-LaunchProcessQuiescence -Deadline $processCleanupDeadline
+            $processesQuiescent = [bool]$quiescence.stable
+            $remainingProcesses = @($quiescence.processes); $remaining = $remainingProcesses.Count
             $residualCategory = Get-LaunchResidualCategory -Processes $remainingProcesses
             $residualFacts = Get-LaunchResidualFacts -Processes $remainingProcesses -Captured $captured
             $driverExited = [bool]$driver.HasExited
         }
         if ($driverCapture) { $driverCapture.Dispose() }
     }
-    Assert-LaunchCleanupState -Result $result -SessionDeleteOutcome $sessionDeleteOutcome -DriverExited $driverExited -RelevantProcessesClear ($residualCategory -ceq 'none') -DriverStopOutcome $driverStopOutcome -ResidualCategory $residualCategory -CapturedApplication $capturedOutcomes.application -CapturedTauriDriver $capturedOutcomes.tauriDriver -CapturedEdgeDriver $capturedOutcomes.edgeDriver -CapturedWebView $capturedOutcomes.webview -CapturedOcrEngine $capturedOutcomes.ocrEngine -CapturedOther $capturedOutcomes.other -ResidualOwnership $residualFacts.ownership -ResidualApplication $residualFacts.application -ResidualTauriDriver $residualFacts.tauriDriver -ResidualEdgeDriver $residualFacts.edgeDriver -ResidualWebView $residualFacts.webview -ResidualOcrEngine $residualFacts.ocrEngine -ResidualOther $residualFacts.other
-    if ($sessionDeleteOutcome -cne 'verified' -or -not $driverExited -or $remaining -ne 0) { throw 'Persistence launch cleanup was incomplete.' }
+    Assert-LaunchCleanupState -Result $result -SessionDeleteOutcome $sessionDeleteOutcome -DriverExited $driverExited -RelevantProcessesClear ($processesQuiescent -and $residualCategory -ceq 'none') -DriverStopOutcome $driverStopOutcome -ResidualCategory $residualCategory -CapturedApplication $capturedOutcomes.application -CapturedTauriDriver $capturedOutcomes.tauriDriver -CapturedEdgeDriver $capturedOutcomes.edgeDriver -CapturedWebView $capturedOutcomes.webview -CapturedOcrEngine $capturedOutcomes.ocrEngine -CapturedOther $capturedOutcomes.other -ResidualOwnership $residualFacts.ownership -ResidualApplication $residualFacts.application -ResidualTauriDriver $residualFacts.tauriDriver -ResidualEdgeDriver $residualFacts.edgeDriver -ResidualWebView $residualFacts.webview -ResidualOcrEngine $residualFacts.ocrEngine -ResidualOther $residualFacts.other
+    if ($sessionDeleteOutcome -cne 'verified' -or -not $driverExited -or -not $processesQuiescent -or $remaining -ne 0) { throw 'Persistence launch cleanup was incomplete.' }
     $result | Add-Member -NotePropertyName sessionDeleted -NotePropertyValue $true
     $result | Add-Member -NotePropertyName ownedProcessTreeStopped -NotePropertyValue $true
     $result | Add-Member -NotePropertyName relevantProcessesRemaining -NotePropertyValue 0
