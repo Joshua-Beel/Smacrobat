@@ -2179,6 +2179,7 @@ function Wait-BoundProcessUiSurfaceClosed {
     foreach ($identity in @($Binding.baselineIdentities)) { if ([string]::IsNullOrWhiteSpace([string]$identity) -or -not $baselineIdentities.Add([string]$identity)) { throw 'Native process UI close baseline identity set was invalid.' } }
     $structure = Get-SanitizedProcessUiStructureJson -ProcessId $ProcessId -DeadlineExpired
     $closeState = Get-SanitizedNativeCloseStateJson -Stage $Stage -InventoryStatus 'unavailable' -ActionTransport $ActionTransport -BaselineExpectedCount $baselineIdentities.Count -BaselineExactSurfaceCount -1 -BoundSurfaceStatus 'unknown' -BoundSaveRoleStatus 'unavailable' -FilenameStatus 'unavailable' -UnexpectedSurfaceCount -1 -SuccessorDialogCount -1 -SuccessorRoleStatus 'unavailable' -SuccessorYesCount -1 -SuccessorNoCount -1 -SuccessorOkCount -1 -SuccessorContinueCount -1 -SuccessorCancelCount -1 -SuccessorSaveCount -1
+    $deferUnexpectedSurfaceCheck = $Stage -ceq 'save-output-dialog'
     if ([string]$Binding.surfaceRootIdentity -cmatch '^hwnd:') {
         $boundIdentity = [string]$Binding.surfaceRootIdentity
         $boundHandleValue = Get-NativeSurfaceHandleValue -Identity $boundIdentity
@@ -2277,7 +2278,7 @@ function Wait-BoundProcessUiSurfaceClosed {
                     $closeState = Get-SanitizedNativeCloseStateJson -Stage $Stage -InventoryStatus 'native-close-observed' -ActionTransport $ActionTransport -BaselineExpectedCount $baselineIdentities.Count -BaselineExactSurfaceCount $baselineExactSurfaceCount -BoundSurfaceStatus $boundSurfaceStatus -BoundSaveRoleStatus $boundSaveRoleStatus -FilenameStatus $filenameStatus -UnexpectedSurfaceCount $unexpectedSurfaceCount -SuccessorDialogCount $successorDialogs.Count -SuccessorRoleStatus $successorRoleStatus -SuccessorYesCount $successorCounts.yes -SuccessorNoCount $successorCounts.no -SuccessorOkCount $successorCounts.ok -SuccessorContinueCount $successorCounts.continue -SuccessorCancelCount $successorCounts.cancel -SuccessorSaveCount $successorCounts.save
                     $nextDetailedDiagnostic = [datetime]::UtcNow.AddSeconds(1)
                 }
-                if (-not $boundSurfaceRemains -and $baselinePresent -and $allowedPresent -and -not $unexpectedSurface) {
+                if (-not $boundSurfaceRemains -and $baselinePresent -and $allowedPresent -and ($deferUnexpectedSurfaceCheck -or -not $unexpectedSurface)) {
                     if ([datetime]::UtcNow -ge $Deadline) { break }
                     return
                 }
@@ -2286,7 +2287,8 @@ function Wait-BoundProcessUiSurfaceClosed {
             }
             if ([datetime]::UtcNow -lt $Deadline) { Start-Sleep -Milliseconds 150 }
         }
-        throw "Native print UI stage '$Stage' retained its bound HWND surface or an unbound replacement surface after close; uiStructure=$structure; closeState=$closeState."
+        $nativeCloseFailure = if ($deferUnexpectedSurfaceCheck) { 'retained its bound HWND surface or changed the exact baseline during Save close' } else { 'retained its bound HWND surface or an unbound replacement surface after close' }
+        throw "Native print UI stage '$Stage' $nativeCloseFailure; uiStructure=$structure; closeState=$closeState."
     }
     while ([datetime]::UtcNow -lt $Deadline) {
         $current = @(Get-ProcessUiTreeSnapshot -ProcessId $ProcessId -Deadline $Deadline -ElementProvider $ElementProvider -ParentProvider $ParentProvider)
@@ -2296,6 +2298,8 @@ function Wait-BoundProcessUiSurfaceClosed {
         foreach ($entry in $current) { $byIdentity.Add([string]$entry.runtimeIdentity,$entry) }
         $trackedRemain = @($current | Where-Object { $tracked.Contains([string]$_.runtimeIdentity) }).Count
         $boundSurfaceRemains = $byIdentity.ContainsKey([string]$Binding.surfaceRootIdentity)
+        $baselinePresent = $true
+        foreach ($identity in $baselineIdentities) { if (-not $byIdentity.ContainsKey($identity)) { $baselinePresent = $false; break } }
         $allowedPresent = $true
         foreach ($identity in $allowedSurfaces) { if (-not $byIdentity.ContainsKey($identity) -or -not [bool]$byIdentity[$identity].isSurface) { $allowedPresent = $false; break } }
         $unexpectedSurface = $false
@@ -2306,13 +2310,14 @@ function Wait-BoundProcessUiSurfaceClosed {
             }
             if (-not $isAllowed) { $unexpectedSurface = $true; break }
         }
-        if ($trackedRemain -eq 0 -and -not $boundSurfaceRemains -and $allowedPresent -and -not $unexpectedSurface) {
+        if ($trackedRemain -eq 0 -and -not $boundSurfaceRemains -and $baselinePresent -and $allowedPresent -and ($deferUnexpectedSurfaceCheck -or -not $unexpectedSurface)) {
             if ([datetime]::UtcNow -ge $Deadline) { break }
             return
         }
         if ([datetime]::UtcNow -lt $Deadline) { Start-Sleep -Milliseconds 150 }
     }
-    throw "Native print UI stage '$Stage' retained its bound surface, targeted identities, or an unbound replacement surface after close; uiStructure=$structure."
+    $uiaCloseFailure = if ($deferUnexpectedSurfaceCheck) { 'retained its bound surface or targeted identities, or changed the exact baseline during Save close' } else { 'retained its bound surface, targeted identities, or an unbound replacement surface after close' }
+    throw "Native print UI stage '$Stage' $uiaCloseFailure; uiStructure=$structure."
 }
 
 function Wait-ProcessTopLevelUiBaselineRestored {
