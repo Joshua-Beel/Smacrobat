@@ -145,57 +145,87 @@ function Wait-ReadingClipboardReceipt {
     throw 'The Windows clipboard did not receive the exact selected embedded text.'
 }
 
-function Get-ReadingAutomationElements {
-    param([Parameter(Mandatory = $true)]$Root,[Parameter(Mandatory = $true)]$Condition,[ValidateRange(1,512)][int]$MaximumCount = 256)
-    $collection = $Root.FindAll([Windows.Automation.TreeScope]::Descendants, $Condition)
-    if ($collection.Count -gt $MaximumCount) { throw 'Process-bound UI Automation exceeded its element-count cap.' }
-    $values = @()
-    for ($index = 0; $index -lt $collection.Count; $index++) { $values += $collection.Item($index) }
-    return $values
+function Initialize-ReadingNativePickerApi {
+    if ($null -ne ('ReadingNativePickerApi' -as [type])) { return }
+    $source = @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class ReadingNativePickerApi {
+    public delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr parameter);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr parameter);
+    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumWindowsProc callback, IntPtr parameter);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassNameW(IntPtr hwnd, StringBuilder className, int maximum);
+    [DllImport("user32.dll")] public static extern int GetDlgCtrlID(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern bool IsWindowEnabled(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
+    [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", CharSet=CharSet.Unicode, SetLastError=true)]
+    public static extern IntPtr SendMessageTimeoutText(IntPtr hwnd, uint message, IntPtr wParam, string text, uint flags, uint timeout, out IntPtr result);
+    [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", SetLastError=true)]
+    public static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam, uint flags, uint timeout, out IntPtr result);
+}
+'@
+    $null = Add-Type -TypeDefinition $source
 }
 
-function Get-ReadingAutomationRuntimeIdentity {
-    param([Parameter(Mandatory = $true)]$Element,[Parameter(Mandatory = $true)][int]$ApplicationProcessId,[Parameter(Mandatory = $true)][datetime]$Deadline)
-    if ([datetime]::UtcNow -ge $Deadline) { throw 'The process-bound UI Automation identity deadline expired.' }
-    if ([int]$Element.Current.ProcessId -ne $ApplicationProcessId) { throw 'A process-bound UI Automation element had a mismatched process identifier.' }
-    try { $runtimeId = @($Element.GetRuntimeId()) } catch { throw 'A process-bound UI Automation runtime identity was unavailable.' }
-    if ([datetime]::UtcNow -ge $Deadline) { throw 'The process-bound UI Automation identity deadline expired.' }
-    if ($runtimeId.Count -lt 1 -or $runtimeId.Count -gt 64 -or @($runtimeId | Where-Object { $_ -isnot [int] }).Count -ne 0) {
-        throw 'A process-bound UI Automation runtime identity was invalid.'
-    }
-    return (($runtimeId | ForEach-Object { ([int]$_).ToString([Globalization.CultureInfo]::InvariantCulture) }) -join ':')
+function Get-ReadingWindowProcessId {
+    param([Parameter(Mandatory = $true)][IntPtr]$Handle)
+    $ownerProcessId = [uint32]0
+    $null = [ReadingNativePickerApi]::GetWindowThreadProcessId($Handle,[ref]$ownerProcessId)
+    return [int]$ownerProcessId
+}
+
+function Get-ReadingWindowClassName {
+    param([Parameter(Mandatory = $true)][IntPtr]$Handle)
+    $builder = [Text.StringBuilder]::new(256)
+    $length = [ReadingNativePickerApi]::GetClassNameW($Handle,$builder,$builder.Capacity)
+    if ($length -lt 1 -or $length -ge $builder.Capacity) { return '' }
+    return $builder.ToString()
+}
+
+function Get-ReadingHandleIdentity {
+    param([Parameter(Mandatory = $true)][IntPtr]$Handle)
+    $value = $Handle.ToInt64()
+    if ($value -le 0) { throw 'A native picker HWND identity was invalid.' }
+    return $value.ToString([Globalization.CultureInfo]::InvariantCulture)
 }
 
 function Get-ReadingProcessUiSurfaceSnapshot {
     param([Parameter(Mandatory = $true)][int]$ApplicationProcessId,[Parameter(Mandatory = $true)][datetime]$Deadline,[scriptblock]$ElementProvider)
     if ([datetime]::UtcNow -ge $Deadline) { throw 'The process-bound top-level UI snapshot deadline expired.' }
     if ($ElementProvider) {
-        $elements = @(& $ElementProvider $ApplicationProcessId)
+        return @(& $ElementProvider $ApplicationProcessId)
     } else {
-        Add-Type -AssemblyName UIAutomationClient
-        Add-Type -AssemblyName UIAutomationTypes
-        $processCondition = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ProcessIdProperty, $ApplicationProcessId)
-        $windowCondition = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty, [Windows.Automation.ControlType]::Window)
-        $paneCondition = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty, [Windows.Automation.ControlType]::Pane)
-        $surfaceTypeCondition = [Windows.Automation.OrCondition]::new($windowCondition,$paneCondition)
-        $condition = [Windows.Automation.AndCondition]::new($processCondition,$surfaceTypeCondition)
-        $collection = [Windows.Automation.AutomationElement]::RootElement.FindAll([Windows.Automation.TreeScope]::Children,$condition)
-        $elements = @()
-        for ($index = 0; $index -lt $collection.Count; $index++) { $elements += $collection.Item($index) }
+        Initialize-ReadingNativePickerApi
+        $handles = [Collections.Generic.List[IntPtr]]::new(); $state = [pscustomobject]@{expired=$false;exceeded=$false}
+        $callback = [ReadingNativePickerApi+EnumWindowsProc]{
+            param([IntPtr]$handle,[IntPtr]$parameter)
+            if ([datetime]::UtcNow -ge $Deadline) { $state.expired = $true; return $false }
+            if ((Get-ReadingWindowProcessId -Handle $handle) -eq $ApplicationProcessId -and [ReadingNativePickerApi]::IsWindowVisible($handle)) {
+                $handles.Add($handle)
+                if ($handles.Count -gt 8) { $state.exceeded = $true; return $false }
+            }
+            return $true
+        }
+        $null = [ReadingNativePickerApi]::EnumWindows($callback,[IntPtr]::Zero)
+        if ($state.expired -or [datetime]::UtcNow -ge $Deadline) { throw 'The process-bound top-level HWND snapshot exceeded its deadline.' }
+        if ($state.exceeded -or $handles.Count -gt 8) { throw 'The application exposed too many process-bound top-level HWNDs.' }
+        $elements = @($handles)
     }
-    if ([datetime]::UtcNow -ge $Deadline) { throw 'The process-bound top-level UI snapshot exceeded its deadline.' }
-    if ($elements.Count -gt 8) { throw 'The application exposed too many process-bound top-level surfaces.' }
     $identities = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $snapshot = @()
-    foreach ($element in $elements) {
-        if ([datetime]::UtcNow -ge $Deadline) { throw 'The process-bound top-level UI snapshot exceeded its deadline.' }
-        if ([int]$element.Current.ProcessId -ne $ApplicationProcessId) { throw 'A top-level UI surface had a mismatched process identifier.' }
-        $controlType = if ($element.Current.ControlType -eq [Windows.Automation.ControlType]::Window) { 'Window' } elseif ($element.Current.ControlType -eq [Windows.Automation.ControlType]::Pane) { 'Pane' } else { throw 'A top-level UI surface had an unexpected control type.' }
-        $identity = Get-ReadingAutomationRuntimeIdentity -Element $element -ApplicationProcessId $ApplicationProcessId -Deadline $Deadline
-        if (-not $identities.Add($identity)) { throw 'A process-bound top-level UI runtime identity was duplicated.' }
-        $snapshot += [pscustomobject]@{ runtimeIdentity=$identity;controlType=$controlType;isEnabled=[bool]$element.Current.IsEnabled;isOffscreen=[bool]$element.Current.IsOffscreen;element=$element }
+    foreach ($handle in $elements) {
+        if ([datetime]::UtcNow -ge $Deadline) { throw 'The process-bound top-level HWND snapshot exceeded its deadline.' }
+        $ownerProcessId = Get-ReadingWindowProcessId -Handle $handle
+        if ($ownerProcessId -ne $ApplicationProcessId) { throw 'A top-level HWND had a mismatched process identifier.' }
+        $identity = Get-ReadingHandleIdentity -Handle $handle
+        if (-not $identities.Add($identity)) { throw 'A process-bound top-level HWND identity was duplicated.' }
+        $snapshot += [pscustomobject]@{ runtimeIdentity=$identity;controlType='Hwnd';isEnabled=[ReadingNativePickerApi]::IsWindowEnabled($handle);isOffscreen=(-not [ReadingNativePickerApi]::IsWindowVisible($handle));processId=$ownerProcessId;handle=$handle }
     }
-    if ([datetime]::UtcNow -ge $Deadline) { throw 'The process-bound top-level UI snapshot exceeded its deadline.' }
+    if ([datetime]::UtcNow -ge $Deadline) { throw 'The process-bound top-level HWND snapshot exceeded its deadline.' }
     return $snapshot
 }
 
@@ -205,7 +235,7 @@ function Assert-ReadingSurfaceSnapshot {
     $identities = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($entry in $Snapshot) {
         $properties = @($entry.PSObject.Properties.Name | Sort-Object -CaseSensitive)
-        if (($properties -join ',') -cne 'controlType,element,isEnabled,isOffscreen,runtimeIdentity' -or [string]$entry.runtimeIdentity -cnotmatch '^-?\d+(?::-?\d+){0,63}$' -or -not $identities.Add([string]$entry.runtimeIdentity) -or [string]$entry.controlType -notin @('Window','Pane') -or [int]$entry.element.Current.ProcessId -ne $ApplicationProcessId) {
+        if (($properties -join ',') -cne 'controlType,handle,isEnabled,isOffscreen,processId,runtimeIdentity' -or [string]$entry.runtimeIdentity -cnotmatch '^\d{1,20}$' -or -not $identities.Add([string]$entry.runtimeIdentity) -or [string]$entry.controlType -cne 'Hwnd' -or [int]$entry.processId -ne $ApplicationProcessId -or [IntPtr]$entry.handle -eq [IntPtr]::Zero) {
             throw "$Kind was invalid or ambiguous."
         }
     }
@@ -217,36 +247,38 @@ function Get-ReadingPickerTargetSnapshot {
         [Parameter(Mandatory = $true)][int]$ApplicationProcessId,
         [Parameter(Mandatory = $true)][object[]]$Surfaces,
         [Parameter(Mandatory = $true)][datetime]$Deadline,
-        [scriptblock]$TargetProvider,
-        [scriptblock]$ParentProvider
+        [scriptblock]$TargetProvider
     )
     $surfaceIdentities = Assert-ReadingSurfaceSnapshot -Snapshot $Surfaces -ApplicationProcessId $ApplicationProcessId -Kind 'The picker target surface snapshot'
     if ($TargetProvider) { return @(& $TargetProvider $Surfaces $ApplicationProcessId $Deadline) }
-    $targets = @()
+    Initialize-ReadingNativePickerApi
+    $targets = [Collections.Generic.List[object]]::new(); $targetIdentities = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($surface in $Surfaces) {
-        foreach ($targetKind in @('filename','open')) {
-            if ([datetime]::UtcNow -ge $Deadline) { throw 'The native picker target snapshot deadline expired.' }
-            $processCondition = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ProcessIdProperty, $ApplicationProcessId)
-            $typeValue = if ($targetKind -ceq 'filename') { [Windows.Automation.ControlType]::Edit } else { [Windows.Automation.ControlType]::Button }
-            $typeCondition = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty, $typeValue)
-            $condition = [Windows.Automation.AndCondition]::new($processCondition,$typeCondition)
-            $elements = @(Get-ReadingAutomationElements -Root $surface.element -Condition $condition)
-            foreach ($element in $elements) {
-                if ([datetime]::UtcNow -ge $Deadline) { throw 'The native picker target snapshot deadline expired.' }
-                $isTarget = if ($targetKind -ceq 'filename') { [string]$element.Current.AutomationId -in @('1001','1148') } else { [string]$element.Current.AutomationId -ceq '1' -and [string]$element.Current.Name -ceq 'Open' }
-                if (-not $isTarget) { continue }
-                $surfaceBinding = [pscustomobject]@{surfaceRuntimeIdentity=[string]$surface.runtimeIdentity}
-                if (-not (Test-ReadingAutomationDescendantOfSurface -Element $element -Binding $surfaceBinding -ApplicationProcessId $ApplicationProcessId -Deadline $Deadline -ParentProvider $ParentProvider)) {
-                    throw 'A native picker target escaped its observed process-owned surface.'
-                }
-                $identity = Get-ReadingAutomationRuntimeIdentity -Element $element -ApplicationProcessId $ApplicationProcessId -Deadline $Deadline
-                $targets += [pscustomobject]@{runtimeIdentity=$identity;surfaceRuntimeIdentity=[string]$surface.runtimeIdentity;targetKind=$targetKind;isEnabled=[bool]$element.Current.IsEnabled;isOffscreen=[bool]$element.Current.IsOffscreen;element=$element}
-                if ($targets.Count -gt 32) { throw 'The native picker target snapshot exceeded its element-count cap.' }
+        $state = [pscustomobject]@{childCount=0;expired=$false;exceeded=$false}
+        $callback = [ReadingNativePickerApi+EnumWindowsProc]{
+            param([IntPtr]$handle,[IntPtr]$parameter)
+            if ([datetime]::UtcNow -ge $Deadline) { $state.expired = $true; return $false }
+            $state.childCount++
+            if ($state.childCount -gt 256) { $state.exceeded = $true; return $false }
+            $ownerProcessId = Get-ReadingWindowProcessId -Handle $handle
+            if ($ownerProcessId -ne $ApplicationProcessId) { return $true }
+            $controlId = [ReadingNativePickerApi]::GetDlgCtrlID($handle)
+            $className = Get-ReadingWindowClassName -Handle $handle
+            $targetKind = if ($className -ceq 'Edit' -and $controlId -in @(1001,1148)) { 'filename' } elseif ($className -ceq 'Button' -and $controlId -eq 1) { 'open' } else { '' }
+            if ($targetKind) {
+                $identity = Get-ReadingHandleIdentity -Handle $handle
+                if (-not $targetIdentities.Add($identity)) { $state.exceeded = $true; return $false }
+                $targets.Add([pscustomobject]@{runtimeIdentity=$identity;surfaceRuntimeIdentity=[string]$surface.runtimeIdentity;targetKind=$targetKind;isEnabled=[ReadingNativePickerApi]::IsWindowEnabled($handle);isOffscreen=(-not [ReadingNativePickerApi]::IsWindowVisible($handle));processId=$ownerProcessId;handle=$handle})
+                if ($targets.Count -gt 32) { $state.exceeded = $true; return $false }
             }
+            return $true
         }
+        $null = [ReadingNativePickerApi]::EnumChildWindows([IntPtr]$surface.handle,$callback,[IntPtr]::Zero)
+        if ($state.expired -or [datetime]::UtcNow -ge $Deadline) { throw 'The native picker HWND snapshot deadline expired.' }
+        if ($state.exceeded) { throw 'The native picker HWND snapshot exceeded its bounded child or target count.' }
     }
-    if ([datetime]::UtcNow -ge $Deadline) { throw 'The native picker target snapshot deadline expired.' }
-    return $targets
+    if ([datetime]::UtcNow -ge $Deadline) { throw 'The native picker HWND snapshot deadline expired.' }
+    return @($targets)
 }
 
 function Assert-ReadingPickerTargetSnapshot {
@@ -255,7 +287,7 @@ function Assert-ReadingPickerTargetSnapshot {
     $identities = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($entry in $Snapshot) {
         $properties = @($entry.PSObject.Properties.Name | Sort-Object -CaseSensitive)
-        if (($properties -join ',') -cne 'element,isEnabled,isOffscreen,runtimeIdentity,surfaceRuntimeIdentity,targetKind' -or [string]$entry.runtimeIdentity -cnotmatch '^-?\d+(?::-?\d+){0,63}$' -or -not $identities.Add([string]$entry.runtimeIdentity) -or -not $SurfaceIdentities.Contains([string]$entry.surfaceRuntimeIdentity) -or [string]$entry.targetKind -notin @('filename','open') -or [int]$entry.element.Current.ProcessId -ne $ApplicationProcessId) {
+        if (($properties -join ',') -cne 'handle,isEnabled,isOffscreen,processId,runtimeIdentity,surfaceRuntimeIdentity,targetKind' -or [string]$entry.runtimeIdentity -cnotmatch '^\d{1,20}$' -or -not $identities.Add([string]$entry.runtimeIdentity) -or -not $SurfaceIdentities.Contains([string]$entry.surfaceRuntimeIdentity) -or [string]$entry.targetKind -notin @('filename','open') -or [int]$entry.processId -ne $ApplicationProcessId -or [IntPtr]$entry.handle -eq [IntPtr]::Zero) {
             throw "$Kind was invalid, cross-surface, or ambiguous."
         }
     }
@@ -302,7 +334,7 @@ function Wait-ReadingProcessBoundPickerTargets {
             $surface = @($currentSurfaces | Where-Object { [string]$_.runtimeIdentity -ceq [string]$newFilename[0].surfaceRuntimeIdentity })
             if ($surface.Count -ne 1 -or -not [bool]$surface[0].isEnabled -or [bool]$surface[0].isOffscreen -or -not [bool]$newFilename[0].isEnabled -or [bool]$newFilename[0].isOffscreen -or -not [bool]$newOpen[0].isEnabled -or [bool]$newOpen[0].isOffscreen) { throw 'The bound native picker surface or targets were not uniquely enabled and visible.' }
             if ($newSurfaces.Count -eq 1 -and [string]$newSurfaces[0].runtimeIdentity -cne [string]$surface[0].runtimeIdentity) { throw 'A sibling native surface appeared outside the bound picker target surface.' }
-            return [pscustomobject]@{surfaceRuntimeIdentity=[string]$surface[0].runtimeIdentity;surfaceControlType=[string]$surface[0].controlType;surfaceElement=$surface[0].element;baselineIdentities=[string[]]@($baselineSurfaceIdentities);baselineTargetIdentities=[string[]]@($baselineTargetIdentities);dedicatedNewSurface=($newSurfaces.Count -eq 1);filenameRuntimeIdentity=[string]$newFilename[0].runtimeIdentity;filenameElement=$newFilename[0].element;openButtonRuntimeIdentity=[string]$newOpen[0].runtimeIdentity;openButtonElement=$newOpen[0].element}
+            return [pscustomobject]@{surfaceRuntimeIdentity=[string]$surface[0].runtimeIdentity;surfaceControlType=[string]$surface[0].controlType;surfaceHandle=[IntPtr]$surface[0].handle;baselineIdentities=[string[]]@($baselineSurfaceIdentities);baselineTargetIdentities=[string[]]@($baselineTargetIdentities);dedicatedNewSurface=($newSurfaces.Count -eq 1);filenameRuntimeIdentity=[string]$newFilename[0].runtimeIdentity;filenameHandle=[IntPtr]$newFilename[0].handle;openButtonRuntimeIdentity=[string]$newOpen[0].runtimeIdentity;openButtonHandle=[IntPtr]$newOpen[0].handle}
         }
         if ($SleepProvider) { & $SleepProvider $script:ReadingPins.UiAutomationPollMilliseconds } else { Start-Sleep -Milliseconds $script:ReadingPins.UiAutomationPollMilliseconds }
         $now = if ($UtcNowProvider) { [datetime](& $UtcNowProvider) } else { [datetime]::UtcNow }
@@ -310,38 +342,23 @@ function Wait-ReadingProcessBoundPickerTargets {
     throw "No single new process-bound native picker target pair appeared; diagnostic=$($diagnostic | ConvertTo-Json -Compress)"
 }
 
-function Assert-ReadingAutomationChildProcessId {
-    param([Parameter(Mandatory = $true)][object[]]$Elements,[Parameter(Mandatory = $true)][int]$ApplicationProcessId,[Parameter(Mandatory = $true)][string]$Kind)
-    if (@($Elements | Where-Object { $_.Current.ProcessId -ne $ApplicationProcessId }).Count -ne 0) {
-        throw "A process-bound native Open dialog $Kind child has a mismatched process identifier."
-    }
-}
-
 function Assert-ReadingSurfaceBinding {
     param([Parameter(Mandatory = $true)]$Binding,[Parameter(Mandatory = $true)][int]$ApplicationProcessId,[Parameter(Mandatory = $true)][datetime]$Deadline,[switch]$AllowUnavailableTargets)
     $properties = @($Binding.PSObject.Properties.Name | Sort-Object -CaseSensitive)
-    if (($properties -join ',') -cne 'baselineIdentities,baselineTargetIdentities,dedicatedNewSurface,filenameElement,filenameRuntimeIdentity,openButtonElement,openButtonRuntimeIdentity,surfaceControlType,surfaceElement,surfaceRuntimeIdentity' -or [string]$Binding.surfaceControlType -notin @('Window','Pane') -or @($Binding.baselineIdentities).Count -lt 1 -or @($Binding.baselineIdentities).Count -gt 8 -or @($Binding.baselineTargetIdentities).Count -gt 32 -or [string]$Binding.filenameRuntimeIdentity -cnotmatch '^-?\d+(?::-?\d+){0,63}$' -or [string]$Binding.openButtonRuntimeIdentity -cnotmatch '^-?\d+(?::-?\d+){0,63}$') {
+    if (($properties -join ',') -cne 'baselineIdentities,baselineTargetIdentities,dedicatedNewSurface,filenameHandle,filenameRuntimeIdentity,openButtonHandle,openButtonRuntimeIdentity,surfaceControlType,surfaceHandle,surfaceRuntimeIdentity' -or [string]$Binding.surfaceControlType -cne 'Hwnd' -or @($Binding.baselineIdentities).Count -lt 1 -or @($Binding.baselineIdentities).Count -gt 8 -or @($Binding.baselineTargetIdentities).Count -gt 32 -or [string]$Binding.filenameRuntimeIdentity -cnotmatch '^\d{1,20}$' -or [string]$Binding.openButtonRuntimeIdentity -cnotmatch '^\d{1,20}$' -or [IntPtr]$Binding.surfaceHandle -eq [IntPtr]::Zero -or [IntPtr]$Binding.filenameHandle -eq [IntPtr]::Zero -or [IntPtr]$Binding.openButtonHandle -eq [IntPtr]::Zero) {
         throw 'The native picker surface binding was invalid.'
     }
     if (-not $AllowUnavailableTargets) {
-        $observedIdentity = Get-ReadingAutomationRuntimeIdentity -Element $Binding.surfaceElement -ApplicationProcessId $ApplicationProcessId -Deadline $Deadline
-        if ($observedIdentity -cne [string]$Binding.surfaceRuntimeIdentity) { throw 'The native picker surface runtime identity changed before its action.' }
-        $observedFilenameIdentity = Get-ReadingAutomationRuntimeIdentity -Element $Binding.filenameElement -ApplicationProcessId $ApplicationProcessId -Deadline $Deadline
-        $observedOpenIdentity = Get-ReadingAutomationRuntimeIdentity -Element $Binding.openButtonElement -ApplicationProcessId $ApplicationProcessId -Deadline $Deadline
-        if ($observedFilenameIdentity -cne [string]$Binding.filenameRuntimeIdentity -or $observedOpenIdentity -cne [string]$Binding.openButtonRuntimeIdentity) { throw 'A bound native picker target runtime identity changed before its action.' }
+        Initialize-ReadingNativePickerApi
+        if ([datetime]::UtcNow -ge $Deadline) { throw 'The native picker HWND binding deadline expired.' }
+        foreach ($handle in @([IntPtr]$Binding.surfaceHandle,[IntPtr]$Binding.filenameHandle,[IntPtr]$Binding.openButtonHandle)) {
+            if (-not [ReadingNativePickerApi]::IsWindow($handle) -or (Get-ReadingWindowProcessId -Handle $handle) -ne $ApplicationProcessId) { throw 'A bound native picker HWND was unavailable or had a mismatched process identifier.' }
+        }
+        if ((Get-ReadingHandleIdentity -Handle ([IntPtr]$Binding.surfaceHandle)) -cne [string]$Binding.surfaceRuntimeIdentity -or (Get-ReadingHandleIdentity -Handle ([IntPtr]$Binding.filenameHandle)) -cne [string]$Binding.filenameRuntimeIdentity -or (Get-ReadingHandleIdentity -Handle ([IntPtr]$Binding.openButtonHandle)) -cne [string]$Binding.openButtonRuntimeIdentity) { throw 'A bound native picker HWND identity changed before its action.' }
+        if ([ReadingNativePickerApi]::GetAncestor([IntPtr]$Binding.filenameHandle,2) -ne [IntPtr]$Binding.surfaceHandle -or [ReadingNativePickerApi]::GetAncestor([IntPtr]$Binding.openButtonHandle,2) -ne [IntPtr]$Binding.surfaceHandle) { throw 'A bound native picker target escaped the exact owned HWND before its action.' }
+        if ((Get-ReadingWindowClassName -Handle ([IntPtr]$Binding.filenameHandle)) -cne 'Edit' -or [ReadingNativePickerApi]::GetDlgCtrlID([IntPtr]$Binding.filenameHandle) -notin @(1001,1148) -or (Get-ReadingWindowClassName -Handle ([IntPtr]$Binding.openButtonHandle)) -cne 'Button' -or [ReadingNativePickerApi]::GetDlgCtrlID([IntPtr]$Binding.openButtonHandle) -ne 1) { throw 'A bound native picker HWND no longer matched the exact filename or Open control contract.' }
+        if ([datetime]::UtcNow -ge $Deadline) { throw 'The native picker HWND binding deadline expired.' }
     }
-}
-
-function Test-ReadingAutomationDescendantOfSurface {
-    param([Parameter(Mandatory = $true)]$Element,[Parameter(Mandatory = $true)]$Binding,[Parameter(Mandatory = $true)][int]$ApplicationProcessId,[Parameter(Mandatory = $true)][datetime]$Deadline,[scriptblock]$ParentProvider)
-    $cursor = $Element
-    for ($depth = 0; $depth -lt 64 -and $null -ne $cursor; $depth++) {
-        $identity = Get-ReadingAutomationRuntimeIdentity -Element $cursor -ApplicationProcessId $ApplicationProcessId -Deadline $Deadline
-        if ($identity -ceq [string]$Binding.surfaceRuntimeIdentity) { return $true }
-        $cursor = if ($ParentProvider) { & $ParentProvider $cursor } else { [Windows.Automation.TreeWalker]::RawViewWalker.GetParent($cursor) }
-        if ($null -ne $cursor -and [int]$cursor.Current.ProcessId -ne $ApplicationProcessId) { return $false }
-    }
-    return $false
 }
 
 function Wait-ReadingProcessUiSurfaceClosed {
@@ -390,35 +407,56 @@ function Wait-ReadingProcessUiSurfaceClosed {
     throw 'The exact process-bound native picker surface did not close.'
 }
 
-function Set-ReadingAutomationValueBeforeDeadline {
-    param([Parameter(Mandatory = $true)]$Element,[Parameter(Mandatory = $true)][string]$Value,[Parameter(Mandatory = $true)][datetime]$Deadline,[scriptblock]$PatternProvider,[scriptblock]$UtcNowProvider)
-    $valuePattern = $null
-    $available = if ($PatternProvider) { [bool](& $PatternProvider $Element ([ref]$valuePattern)) } else { $Element.TryGetCurrentPattern([Windows.Automation.ValuePattern]::Pattern, [ref]$valuePattern) }
-    if (-not $available -or $valuePattern.Current.IsReadOnly) { throw 'The process-bound filename editor did not expose a writable ValuePattern.' }
+function Set-ReadingNativePickerValueBeforeDeadline {
+    param([Parameter(Mandatory = $true)][IntPtr]$Handle,[Parameter(Mandatory = $true)][string]$Value,[Parameter(Mandatory = $true)][datetime]$Deadline,[scriptblock]$MessageProvider,[scriptblock]$UtcNowProvider)
     $now = if ($UtcNowProvider) { [datetime](& $UtcNowProvider) } else { [datetime]::UtcNow }
     if ($now -ge $Deadline) { throw 'The process-bound filename mutation deadline expired.' }
-    $valuePattern.SetValue($Value)
+    $remaining = [int][Math]::Floor(($Deadline - $now).TotalMilliseconds)
+    if ($remaining -lt 1) { throw 'The process-bound filename mutation deadline expired.' }
+    $timeout = [uint32][Math]::Min(5000,$remaining)
+    if ($MessageProvider) {
+        $receipts = @(& $MessageProvider $Handle $Value $timeout)
+        if ($receipts.Count -ne 1) { throw 'The bounded WM_SETTEXT provider returned an invalid receipt.' }
+        $receipt = $receipts[0]; $properties = @($receipt.PSObject.Properties.Name | Sort-Object -CaseSensitive)
+        if (($properties -join ',') -cne 'delivered,result' -or $receipt.delivered -isnot [bool] -or $receipt.result -isnot [IntPtr]) { throw 'The bounded WM_SETTEXT provider returned an invalid receipt.' }
+        $sent = [bool]$receipt.delivered; $messageResult = [IntPtr]$receipt.result
+    } else {
+        Initialize-ReadingNativePickerApi
+        $messageResult = [IntPtr]::Zero
+        $sent = [ReadingNativePickerApi]::SendMessageTimeoutText($Handle,0x000C,[IntPtr]::Zero,$Value,3,$timeout,[ref]$messageResult) -ne [IntPtr]::Zero
+    }
+    if (-not $sent) { throw 'The process-bound filename HWND did not accept bounded WM_SETTEXT.' }
+    if ($messageResult -eq [IntPtr]::Zero) { throw 'The process-bound filename HWND reported that WM_SETTEXT did not set the value.' }
 }
 
-function Invoke-ReadingAutomationButtonBeforeDeadline {
-    param([Parameter(Mandatory = $true)]$Element,[Parameter(Mandatory = $true)][datetime]$Deadline,[scriptblock]$PatternProvider,[scriptblock]$UtcNowProvider)
-    $invokePattern = $null
-    $available = if ($PatternProvider) { [bool](& $PatternProvider $Element ([ref]$invokePattern)) } else { $Element.TryGetCurrentPattern([Windows.Automation.InvokePattern]::Pattern, [ref]$invokePattern) }
-    if (-not $available) { throw 'The process-bound native Open button did not expose InvokePattern.' }
+function Invoke-ReadingNativePickerButtonBeforeDeadline {
+    param([Parameter(Mandatory = $true)][IntPtr]$Handle,[Parameter(Mandatory = $true)][datetime]$Deadline,[scriptblock]$MessageProvider,[scriptblock]$UtcNowProvider)
     $now = if ($UtcNowProvider) { [datetime](& $UtcNowProvider) } else { [datetime]::UtcNow }
     if ($now -ge $Deadline) { throw 'The process-bound native Open mutation deadline expired.' }
-    $invokePattern.Invoke()
+    $remaining = [int][Math]::Floor(($Deadline - $now).TotalMilliseconds)
+    if ($remaining -lt 1) { throw 'The process-bound native Open mutation deadline expired.' }
+    $timeout = [uint32][Math]::Min(5000,$remaining)
+    if ($MessageProvider) {
+        $receipts = @(& $MessageProvider $Handle $timeout)
+        if ($receipts.Count -ne 1) { throw 'The bounded BM_CLICK provider returned an invalid receipt.' }
+        $receipt = $receipts[0]; $properties = @($receipt.PSObject.Properties.Name | Sort-Object -CaseSensitive)
+        if (($properties -join ',') -cne 'delivered,result' -or $receipt.delivered -isnot [bool] -or $receipt.result -isnot [IntPtr]) { throw 'The bounded BM_CLICK provider returned an invalid receipt.' }
+        $sent = [bool]$receipt.delivered; $messageResult = [IntPtr]$receipt.result
+    } else {
+        Initialize-ReadingNativePickerApi
+        $messageResult = [IntPtr]::Zero
+        $sent = [ReadingNativePickerApi]::SendMessageTimeout($Handle,0x00F5,[IntPtr]::Zero,[IntPtr]::Zero,3,$timeout,[ref]$messageResult) -ne [IntPtr]::Zero
+    }
+    if (-not $sent) { throw 'The process-bound native Open HWND did not accept bounded BM_CLICK.' }
 }
 
 function Submit-ProcessBoundOpenDialog {
     param([Parameter(Mandatory = $true)]$Binding,[Parameter(Mandatory = $true)][int]$ApplicationProcessId,[Parameter(Mandatory = $true)][string]$Path,[Parameter(Mandatory = $true)][datetime]$Deadline)
     Assert-ReadingSurfaceBinding -Binding $Binding -ApplicationProcessId $ApplicationProcessId -Deadline $Deadline
-    $filename = $Binding.filenameElement; $openButton = $Binding.openButtonElement
-    if (-not [bool]$filename.Current.IsEnabled -or [bool]$filename.Current.IsOffscreen -or [string]$filename.Current.AutomationId -notin @('1001','1148')) { throw 'The exact bound filename editor was no longer actionable.' }
-    if (-not [bool]$openButton.Current.IsEnabled -or [bool]$openButton.Current.IsOffscreen -or [string]$openButton.Current.AutomationId -cne '1' -or [string]$openButton.Current.Name -cne 'Open') { throw 'The exact bound native Open action was no longer actionable.' }
-    if (-not (Test-ReadingAutomationDescendantOfSurface -Element $filename -Binding $Binding -ApplicationProcessId $ApplicationProcessId -Deadline $Deadline) -or -not (Test-ReadingAutomationDescendantOfSurface -Element $openButton -Binding $Binding -ApplicationProcessId $ApplicationProcessId -Deadline $Deadline)) { throw 'A bound native picker target escaped the exact owned surface before its action.' }
-    Set-ReadingAutomationValueBeforeDeadline -Element $filename -Value $Path -Deadline $Deadline
-    Invoke-ReadingAutomationButtonBeforeDeadline -Element $openButton -Deadline $Deadline
+    if (-not [ReadingNativePickerApi]::IsWindowEnabled([IntPtr]$Binding.filenameHandle) -or -not [ReadingNativePickerApi]::IsWindowVisible([IntPtr]$Binding.filenameHandle)) { throw 'The exact bound filename HWND was no longer actionable.' }
+    if (-not [ReadingNativePickerApi]::IsWindowEnabled([IntPtr]$Binding.openButtonHandle) -or -not [ReadingNativePickerApi]::IsWindowVisible([IntPtr]$Binding.openButtonHandle)) { throw 'The exact bound native Open HWND was no longer actionable.' }
+    Set-ReadingNativePickerValueBeforeDeadline -Handle ([IntPtr]$Binding.filenameHandle) -Value $Path -Deadline $Deadline
+    Invoke-ReadingNativePickerButtonBeforeDeadline -Handle ([IntPtr]$Binding.openButtonHandle) -Deadline $Deadline
 }
 
 function Get-ReadingHomeScript {

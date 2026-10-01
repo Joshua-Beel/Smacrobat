@@ -70,6 +70,146 @@ function Initialize-PrintUiAutomation {
     }
 }
 
+function Initialize-PrintNativeWindowInterop {
+    if ('Smacrobat.PrintVerification.NativeWindows' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace Smacrobat.PrintVerification {
+    public sealed class NativeWindowRecord {
+        public long HandleValue { get; set; }
+        public long ParentHandleValue { get; set; }
+    }
+
+    public static class NativeWindows {
+        private delegate bool EnumWindowProc(IntPtr hwnd, IntPtr state);
+        [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowProc callback, IntPtr state);
+        [DllImport("user32.dll")] private static extern bool EnumChildWindows(IntPtr parent, EnumWindowProc callback, IntPtr state);
+        [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
+        [DllImport("user32.dll")] private static extern bool IsWindow(IntPtr hwnd);
+        [DllImport("user32.dll")] private static extern IntPtr GetParent(IntPtr hwnd);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr hwnd, StringBuilder value, int maximum);
+        [DllImport("user32.dll")] private static extern int GetDlgCtrlID(IntPtr hwnd);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint message, IntPtr wParam, string lParam, uint flags, uint timeout, out IntPtr result);
+        [DllImport("user32.dll", SetLastError = true)] private static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam, uint flags, uint timeout, out IntPtr result);
+        private const uint CB_GETCOUNT = 0x0146;
+        private const uint CB_GETCURSEL = 0x0147;
+        private const uint CB_SETCURSEL = 0x014E;
+        private const uint CB_FINDSTRINGEXACT = 0x0158;
+        private const uint WM_COMMAND = 0x0111;
+        private const int CBN_SELCHANGE = 1;
+        private const int CB_ERR = -1;
+        private const uint SMTO_ABORTIFHUNG = 0x0002;
+
+        private static bool IsOwned(IntPtr hwnd, int processId) {
+            uint owner;
+            GetWindowThreadProcessId(hwnd, out owner);
+            return owner == (uint)processId;
+        }
+
+        public static NativeWindowRecord[] Enumerate(int processId, long rootHandleValue, bool topLevelOnly) {
+            if (processId <= 0) throw new ArgumentOutOfRangeException(nameof(processId));
+            var result = new List<NativeWindowRecord>();
+            if (rootHandleValue == 0) {
+                EnumWindows((hwnd, state) => {
+                    if (IsOwned(hwnd, processId)) result.Add(new NativeWindowRecord { HandleValue = hwnd.ToInt64(), ParentHandleValue = 0 });
+                    return true;
+                }, IntPtr.Zero);
+                if (topLevelOnly) return result.ToArray();
+                var roots = result.ToArray();
+                foreach (var root in roots) {
+                    EnumChildWindows(new IntPtr(root.HandleValue), (hwnd, state) => {
+                        if (IsOwned(hwnd, processId)) result.Add(new NativeWindowRecord { HandleValue = hwnd.ToInt64(), ParentHandleValue = GetParent(hwnd).ToInt64() });
+                        return true;
+                    }, IntPtr.Zero);
+                }
+                return result.ToArray();
+            }
+            var rootHandle = new IntPtr(rootHandleValue);
+            if (!IsWindow(rootHandle) || !IsOwned(rootHandle, processId)) throw new InvalidOperationException("Native print surface was not owned by the application process.");
+            result.Add(new NativeWindowRecord { HandleValue = rootHandleValue, ParentHandleValue = 0 });
+            if (!topLevelOnly) {
+                EnumChildWindows(rootHandle, (hwnd, state) => {
+                    if (IsOwned(hwnd, processId)) result.Add(new NativeWindowRecord { HandleValue = hwnd.ToInt64(), ParentHandleValue = GetParent(hwnd).ToInt64() });
+                    return true;
+                }, IntPtr.Zero);
+            }
+            return result.ToArray();
+        }
+
+        private static uint Remaining(long deadline) {
+            long remaining = deadline - Environment.TickCount64;
+            if (remaining <= 0) throw new TimeoutException("Native combo message deadline expired.");
+            return (uint)Math.Min(remaining, UInt32.MaxValue);
+        }
+
+        private static IntPtr Call(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam, long deadline) {
+            IntPtr result;
+            if (SendMessageTimeout(hwnd, message, wParam, lParam, SMTO_ABORTIFHUNG, Remaining(deadline), out result) == IntPtr.Zero) throw new TimeoutException("Native combo message timed out.");
+            return result;
+        }
+
+        private static IntPtr CallText(IntPtr hwnd, uint message, IntPtr wParam, string lParam, long deadline) {
+            IntPtr result;
+            if (SendMessageTimeout(hwnd, message, wParam, lParam, SMTO_ABORTIFHUNG, Remaining(deadline), out result) == IntPtr.Zero) throw new TimeoutException("Native combo text message timed out.");
+            return result;
+        }
+
+        public static bool IsUniqueExactIndex(int count, int first, int next) {
+            return count >= 0 && count <= 256 && first >= 0 && first < count && next == first;
+        }
+
+        public static bool AllEqualToIndex(int expected, params int[] observed) {
+            if (expected < 0 || observed == null || observed.Length == 0) return false;
+            foreach (int value in observed) if (value != expected) return false;
+            return true;
+        }
+
+        private static int ExactComboIndex(int processId, long handleValue, string value, long deadline) {
+            if (String.IsNullOrEmpty(value) || value.Length > 260) return CB_ERR;
+            var hwnd = new IntPtr(handleValue);
+            if (!IsWindow(hwnd) || !IsOwned(hwnd, processId)) return CB_ERR;
+            var className = new StringBuilder(64);
+            if (GetClassName(hwnd, className, className.Capacity) <= 0 || !String.Equals(className.ToString(), "ComboBox", StringComparison.Ordinal)) return CB_ERR;
+            int count = Call(hwnd, CB_GETCOUNT, IntPtr.Zero, IntPtr.Zero, deadline).ToInt32();
+            if (count < 0 || count > 256) return CB_ERR;
+            int match = CallText(hwnd, CB_FINDSTRINGEXACT, new IntPtr(-1), value, deadline).ToInt32();
+            int next = CallText(hwnd, CB_FINDSTRINGEXACT, new IntPtr(match), value, deadline).ToInt32();
+            if (!IsUniqueExactIndex(count, match, next)) return CB_ERR;
+            return match;
+        }
+
+        public static bool ComboContainsExact(int processId, long handleValue, string value, int timeoutMilliseconds) {
+            if (timeoutMilliseconds <= 0 || timeoutMilliseconds > 120000) throw new ArgumentOutOfRangeException(nameof(timeoutMilliseconds));
+            return ExactComboIndex(processId, handleValue, value, Environment.TickCount64 + timeoutMilliseconds) != CB_ERR;
+        }
+
+        public static bool SelectComboExact(int processId, long handleValue, string value, int timeoutMilliseconds) {
+            if (timeoutMilliseconds <= 0 || timeoutMilliseconds > 120000) throw new ArgumentOutOfRangeException(nameof(timeoutMilliseconds));
+            long deadline = Environment.TickCount64 + timeoutMilliseconds;
+            int index = ExactComboIndex(processId, handleValue, value, deadline);
+            if (index == CB_ERR) return false;
+            var hwnd = new IntPtr(handleValue);
+            int recheckedIndex = ExactComboIndex(processId, handleValue, value, deadline);
+            if (!AllEqualToIndex(index, recheckedIndex)) return false;
+            if (Call(hwnd, CB_SETCURSEL, new IntPtr(index), IntPtr.Zero, deadline).ToInt32() == CB_ERR) return false;
+            if (!AllEqualToIndex(index, ExactComboIndex(processId, handleValue, value, deadline), Call(hwnd, CB_GETCURSEL, IntPtr.Zero, IntPtr.Zero, deadline).ToInt32())) return false;
+            var parent = GetParent(hwnd);
+            int controlId = GetDlgCtrlID(hwnd);
+            if (parent == IntPtr.Zero || !IsOwned(parent, processId) || controlId <= 0) return false;
+            long command = ((long)CBN_SELCHANGE << 16) | ((uint)controlId & 0xffffU);
+            Call(parent, WM_COMMAND, new IntPtr(command), hwnd, deadline);
+            if (!AllEqualToIndex(index, ExactComboIndex(processId, handleValue, value, deadline), Call(hwnd, CB_GETCURSEL, IntPtr.Zero, IntPtr.Zero, deadline).ToInt32())) return false;
+            return true;
+        }
+    }
+}
+'@
+}
+
 function New-PrintTargetUiCondition {
     param([Parameter(Mandatory = $true)][int]$ProcessId)
     Initialize-PrintUiAutomation
@@ -415,6 +555,151 @@ function Get-ProcessUiRuntimeIdentity {
     return (($runtime | ForEach-Object { ([int]$_).ToString([Globalization.CultureInfo]::InvariantCulture) }) -join ':')
 }
 
+function Test-PrintTargetUiElement {
+    param([Parameter(Mandatory = $true)]$Element,[Parameter(Mandatory = $true)][datetime]$Deadline)
+    if ([datetime]::UtcNow -ge $Deadline) { throw 'Native window target classification deadline expired.' }
+    $type = Get-UiControlTypeName -Element $Element
+    if ([datetime]::UtcNow -ge $Deadline) { throw 'Native window target classification deadline expired.' }
+    $name = [string]$Element.Current.Name
+    if ([datetime]::UtcNow -ge $Deadline) { throw 'Native window target classification deadline expired.' }
+    $automationId = [string]$Element.Current.AutomationId
+    if ([datetime]::UtcNow -ge $Deadline) { throw 'Native window target classification deadline expired.' }
+    return (
+        ($type -ceq 'ControlType.Button' -and $name -in @('Cancel','Print','Save')) -or
+        ($type -ceq 'ControlType.RadioButton' -and $name -in @('Current Page','Current page')) -or
+        ($type -in @('ControlType.ListItem','ControlType.Button','ControlType.RadioButton','ControlType.ComboBox') -and $name.Equals($script:PrintPins.PrinterName,[StringComparison]::OrdinalIgnoreCase)) -or
+        $type -in @('ControlType.ComboBox','ControlType.List') -or
+        ($type -ceq 'ControlType.Edit' -and ($automationId -in @('1001','FileNameControlHost') -or $name -in @('File name:','File name')))
+    )
+}
+
+function Get-ProcessNativeWindowSnapshot {
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)][datetime]$Deadline,
+        [long]$RootHandleValue = 0,
+        [switch]$TopLevelOnly,
+        [scriptblock]$WindowProvider
+    )
+    if ([datetime]::UtcNow -ge $Deadline) { throw 'Native window snapshot deadline expired.' }
+    Initialize-PrintUiAutomation
+    $records = @(if ($WindowProvider) { & $WindowProvider $ProcessId $RootHandleValue ([bool]$TopLevelOnly) } else {
+        Initialize-PrintNativeWindowInterop
+        [Smacrobat.PrintVerification.NativeWindows]::Enumerate($ProcessId,$RootHandleValue,[bool]$TopLevelOnly)
+    })
+    if ([datetime]::UtcNow -ge $Deadline) { throw 'Native window enumeration exceeded its deadline.' }
+    if ($records.Count -lt 1 -or $records.Count -gt $script:PrintPins.UiElementMaximum) { throw 'Native window enumeration was missing or oversized.' }
+    $byHandle = @{}
+    foreach ($record in $records) {
+        $handleValue = [long]$record.HandleValue
+        $parentHandleValue = [long]$record.ParentHandleValue
+        if ($handleValue -eq 0 -or $byHandle.ContainsKey($handleValue)) { throw 'Native window enumeration contained an invalid or duplicated handle.' }
+        $elementProperty = $record.PSObject.Properties['Element']
+        $element = if ($null -ne $elementProperty) { $elementProperty.Value } else { [Windows.Automation.AutomationElement]::FromHandle([IntPtr]::new($handleValue)) }
+        if ($null -eq $element) { throw 'Native window did not expose an AutomationElement.' }
+        Assert-ProcessUiElement -Element $element -ProcessId $ProcessId
+        if ([datetime]::UtcNow -ge $Deadline) { throw 'Native window element conversion exceeded its deadline.' }
+        $runtimeIdentity = Get-ProcessUiRuntimeIdentity -Element $element -ProcessId $ProcessId -Deadline $Deadline
+        $identity = 'hwnd:' + $handleValue.ToString([Globalization.CultureInfo]::InvariantCulture) + '|' + $runtimeIdentity
+        $byHandle.Add($handleValue,[pscustomobject]@{ handleValue=$handleValue;parentHandleValue=$parentHandleValue;runtimeIdentity=$identity;element=$element })
+    }
+    $snapshot = @()
+    foreach ($record in $byHandle.Values) {
+        if ([datetime]::UtcNow -ge $Deadline) { throw 'Native window snapshot exceeded its deadline.' }
+        $parentIdentity = $null
+        if ([long]$record.parentHandleValue -ne 0) {
+            if (-not $byHandle.ContainsKey([long]$record.parentHandleValue)) { throw 'Native window ancestry referenced an unobserved parent.' }
+            $parentIdentity = [string]$byHandle[[long]$record.parentHandleValue].runtimeIdentity
+        }
+        $controlType = Get-UiControlTypeName -Element $record.element
+        if ([datetime]::UtcNow -ge $Deadline) { throw 'Native window snapshot exceeded its deadline.' }
+        $snapshot += [pscustomobject]@{
+            runtimeIdentity=[string]$record.runtimeIdentity
+            parentRuntimeIdentity=$parentIdentity
+            controlType=$controlType
+            isTarget=(Test-PrintTargetUiElement -Element $record.element -Deadline $Deadline)
+            isSurface=$controlType -in @('ControlType.Window','ControlType.Pane')
+            element=$record.element
+        }
+    }
+    if ($TopLevelOnly -and @($snapshot | Where-Object { $null -ne $_.parentRuntimeIdentity }).Count -ne 0) { throw 'Native top-level window snapshot contained descendants.' }
+    if ([datetime]::UtcNow -ge $Deadline) { throw 'Native window snapshot exceeded its deadline.' }
+    return $snapshot
+}
+
+function Get-NativeSurfaceHandleValue {
+    param([Parameter(Mandatory = $true)][string]$Identity)
+    if ($Identity -cnotmatch '^hwnd:(-?[0-9]+)\|') { throw 'Native surface identity was invalid.' }
+    $value = 0L
+    if (-not [long]::TryParse($Matches[1],[Globalization.NumberStyles]::Integer,[Globalization.CultureInfo]::InvariantCulture,[ref]$value) -or $value -eq 0) { throw 'Native surface handle was invalid.' }
+    return $value
+}
+
+function Wait-NewProcessNativeWindowSurface {
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)][object[]]$Baseline,
+        [Parameter(Mandatory = $true)][string[]]$AnchorNames,
+        [Parameter(Mandatory = $true)][string[]]$AnchorControlTypes,
+        [Parameter(Mandatory = $true)][ValidateSet('first-print-dialog','second-print-dialog','save-output-dialog')][string]$Stage,
+        [Parameter(Mandatory = $true)][datetime]$Deadline,
+        [scriptblock]$WindowProvider
+    )
+    $baselineIdentities = Get-ProcessUiSnapshotIdentitySet -Snapshot $Baseline -Kind 'Native window baseline'
+    $structure = Get-SanitizedProcessUiStructureJson -ProcessId $ProcessId -DeadlineExpired
+    while ([datetime]::UtcNow -lt $Deadline) {
+        try {
+            $topLevel = @(Get-ProcessNativeWindowSnapshot -ProcessId $ProcessId -Deadline $Deadline -TopLevelOnly -WindowProvider $WindowProvider)
+            $newRoots = @($topLevel | Where-Object { -not $baselineIdentities.Contains([string]$_.runtimeIdentity) })
+            if ($newRoots.Count -ne 1 -or -not [bool]$newRoots[0].isSurface) { throw 'Native window delta did not expose exactly one owned surface.' }
+            $rootHandleValue = Get-NativeSurfaceHandleValue -Identity ([string]$newRoots[0].runtimeIdentity)
+            $current = @(Get-ProcessNativeWindowSnapshot -ProcessId $ProcessId -RootHandleValue $rootHandleValue -Deadline $Deadline -WindowProvider $WindowProvider)
+            $currentRoots = @($current | Where-Object { $null -eq $_.parentRuntimeIdentity -and [string]$_.runtimeIdentity -ceq [string]$newRoots[0].runtimeIdentity -and [bool]$_.isSurface })
+            if ($currentRoots.Count -ne 1) { throw 'Native window root identity changed during exact descendant enumeration.' }
+            $structure = Get-SanitizedObservedUiStructureJson -ProcessId $ProcessId -Elements @($current | ForEach-Object { $_.element }) -Scope 'process-descendants'
+            if ([datetime]::UtcNow -ge $Deadline) { break }
+            $targets = @($current | Where-Object { [bool]$_.isTarget })
+            $anchors = @(); $cancelButtons = 0; $printButtons = 0; $saveButtons = 0; $currentPageRadios = 0; $printerControls = 0; $comboBoxes = 0; $printerLists = 0; $filenameEdits = 0
+            foreach ($entry in $targets) {
+                Assert-ProcessUiElement -Element $entry.element -ProcessId $ProcessId
+                if ([datetime]::UtcNow -ge $Deadline) { break }
+                $name = [string]$entry.element.Current.Name
+                $automationId = [string]$entry.element.Current.AutomationId
+                if ([datetime]::UtcNow -ge $Deadline) { break }
+                if ([string]$entry.controlType -ceq 'ControlType.Button' -and $name.Equals('Cancel',[StringComparison]::OrdinalIgnoreCase)) { $cancelButtons++ }
+                if ([string]$entry.controlType -ceq 'ControlType.Button' -and $name.Equals('Print',[StringComparison]::OrdinalIgnoreCase)) { $printButtons++ }
+                if ([string]$entry.controlType -ceq 'ControlType.Button' -and $name.Equals('Save',[StringComparison]::OrdinalIgnoreCase)) { $saveButtons++ }
+                if ([string]$entry.controlType -ceq 'ControlType.RadioButton' -and $name -in @('Current Page','Current page')) { $currentPageRadios++ }
+                if ($name.Equals($script:PrintPins.PrinterName,[StringComparison]::OrdinalIgnoreCase)) { $printerControls++ }
+                if ([string]$entry.controlType -ceq 'ControlType.ComboBox') { $comboBoxes++ }
+                if ([string]$entry.controlType -ceq 'ControlType.List') { $printerLists++ }
+                if ([string]$entry.controlType -ceq 'ControlType.Edit' -and ($automationId -in @('1001','FileNameControlHost') -or $name -in @('File name:','File name'))) { $filenameEdits++ }
+                if ($AnchorControlTypes.Contains([string]$entry.controlType) -and @($AnchorNames | Where-Object { $name.Equals($_,[StringComparison]::OrdinalIgnoreCase) }).Count -eq 1) { $anchors += $entry }
+            }
+            $requiredTargetSet = if ($Stage -ceq 'save-output-dialog') {
+                $saveButtons -eq 1 -and $filenameEdits -eq 1
+            } else {
+                $cancelButtons -eq 1 -and $printButtons -eq 1 -and $currentPageRadios -eq 1 -and
+                    $printerControls -le 1 -and $comboBoxes -le 8 -and $printerLists -le 1 -and ($printerControls -eq 1 -or $comboBoxes -ge 1 -or $printerLists -eq 1)
+            }
+            if ($anchors.Count -eq 1 -and $requiredTargetSet) {
+                if ([datetime]::UtcNow -ge $Deadline) { break }
+                return [pscustomobject]@{
+                    surfaceRootIdentity=[string]$newRoots[0].runtimeIdentity
+                    surfaceElement=$currentRoots[0].element
+                    baselineIdentities=[string[]]@($baselineIdentities)
+                    trackedIdentities=[string[]]@($current | ForEach-Object { [string]$_.runtimeIdentity })
+                    anchorElement=$anchors[0].element
+                }
+            }
+        } catch {
+            if ([datetime]::UtcNow -ge $Deadline) { break }
+        }
+        if ([datetime]::UtcNow -lt $Deadline) { Start-Sleep -Milliseconds 150 }
+    }
+    throw "Native print UI stage '$Stage' did not expose one complete process-owned HWND surface; uiStructure=$structure."
+}
+
 function Get-ProcessUiTreeSnapshot {
     param(
         [Parameter(Mandatory = $true)][int]$ProcessId,
@@ -685,7 +970,8 @@ function Get-BoundProcessUiEntries {
         [Parameter(Mandatory = $true)]$Binding,
         [Parameter(Mandatory = $true)][datetime]$Deadline,
         [scriptblock]$ElementProvider,
-        [scriptblock]$ParentProvider
+        [scriptblock]$ParentProvider,
+        [scriptblock]$NativeWindowProvider
     )
     Assert-PrintExactProperties -Value $Binding -Expected @('surfaceRootIdentity','surfaceElement','baselineIdentities','trackedIdentities','anchorElement') -Kind 'Native process UI surface binding'
     if (@($Binding.baselineIdentities).Count -lt 1 -or @($Binding.baselineIdentities).Count -gt $script:PrintPins.UiElementMaximum -or
@@ -694,12 +980,22 @@ function Get-BoundProcessUiEntries {
     }
     $baselineIdentities = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($identity in @($Binding.baselineIdentities)) { if ([string]::IsNullOrWhiteSpace([string]$identity) -or -not $baselineIdentities.Add([string]$identity)) { throw 'Native process UI surface baseline was invalid.' } }
-    $snapshot = @(Get-ProcessUiTreeSnapshot -ProcessId $ProcessId -Deadline $Deadline -RootElement $Binding.surfaceElement -ElementProvider $ElementProvider -ParentProvider $ParentProvider)
+    $isNativeWindowBinding = [string]$Binding.surfaceRootIdentity -cmatch '^hwnd:'
+    $snapshot = @(if ($isNativeWindowBinding) {
+        $rootHandleValue = Get-NativeSurfaceHandleValue -Identity ([string]$Binding.surfaceRootIdentity)
+        Get-ProcessNativeWindowSnapshot -ProcessId $ProcessId -RootHandleValue $rootHandleValue -Deadline $Deadline -WindowProvider $NativeWindowProvider
+    } else {
+        Get-ProcessUiTreeSnapshot -ProcessId $ProcessId -Deadline $Deadline -RootElement $Binding.surfaceElement -ElementProvider $ElementProvider -ParentProvider $ParentProvider
+    })
     $byIdentity = @{}
     foreach ($entry in $snapshot) { $byIdentity.Add([string]$entry.runtimeIdentity,$entry) }
     if (-not $byIdentity.ContainsKey([string]$Binding.surfaceRootIdentity)) { throw 'Native process UI surface root disappeared before its action.' }
     if (-not [object]::ReferenceEquals($byIdentity[[string]$Binding.surfaceRootIdentity].element,$Binding.surfaceElement)) {
         $observedRootIdentity = Get-ProcessUiRuntimeIdentity -Element $Binding.surfaceElement -ProcessId $ProcessId -Deadline $Deadline
+        if ($isNativeWindowBinding) {
+            $rootHandleValue = Get-NativeSurfaceHandleValue -Identity ([string]$Binding.surfaceRootIdentity)
+            $observedRootIdentity = 'hwnd:' + $rootHandleValue.ToString([Globalization.CultureInfo]::InvariantCulture) + '|' + $observedRootIdentity
+        }
         if ($observedRootIdentity -cne [string]$Binding.surfaceRootIdentity) { throw 'Native process UI surface root identity changed before its action.' }
     }
     $boundEntries = @()
@@ -721,10 +1017,11 @@ function Find-BoundProcessUiElement {
         [switch]$AllowNone,
         [Parameter(Mandatory = $true)][datetime]$Deadline,
         [scriptblock]$ElementProvider,
-        [scriptblock]$ParentProvider
+        [scriptblock]$ParentProvider,
+        [scriptblock]$NativeWindowProvider
     )
     $targetElements = @()
-    foreach ($entry in @(Get-BoundProcessUiEntries -ProcessId $ProcessId -Binding $Binding -Deadline $Deadline -ElementProvider $ElementProvider -ParentProvider $ParentProvider)) {
+    foreach ($entry in @(Get-BoundProcessUiEntries -ProcessId $ProcessId -Binding $Binding -Deadline $Deadline -ElementProvider $ElementProvider -ParentProvider $ParentProvider -NativeWindowProvider $NativeWindowProvider)) {
         if ($ControlTypes.Count -gt 0 -and -not $ControlTypes.Contains([string]$entry.controlType)) { continue }
         Assert-ProcessUiElement -Element $entry.element -ProcessId $ProcessId
         if ([datetime]::UtcNow -ge $Deadline) { throw 'Native process UI target deadline expired.' }
@@ -753,11 +1050,12 @@ function Wait-BoundProcessUiElement {
         [Parameter(Mandatory = $true)][string[]]$Names,
         [Parameter(Mandatory = $true)][string[]]$ControlTypes,
         [Parameter(Mandatory = $true)][ValidateSet('current-page-control')][string]$Stage,
-        [Parameter(Mandatory = $true)][datetime]$Deadline
+        [Parameter(Mandatory = $true)][datetime]$Deadline,
+        [scriptblock]$NativeWindowProvider
     )
     while ([datetime]::UtcNow -lt $Deadline) {
         try {
-            $target = Find-BoundProcessUiElement -ProcessId $ProcessId -Binding $Binding -Names $Names -ControlTypes $ControlTypes -AllowNone -Deadline $Deadline
+            $target = Find-BoundProcessUiElement -ProcessId $ProcessId -Binding $Binding -Names $Names -ControlTypes $ControlTypes -AllowNone -Deadline $Deadline -NativeWindowProvider $NativeWindowProvider
             if ($null -ne $target) {
                 if ([datetime]::UtcNow -ge $Deadline) { break }
                 return $target
@@ -777,9 +1075,10 @@ function Get-BoundProcessUiElementsByControlType {
         [Parameter(Mandatory = $true)][string]$ControlType,
         [Parameter(Mandatory = $true)][datetime]$Deadline,
         [scriptblock]$ElementProvider,
-        [scriptblock]$ParentProvider
+        [scriptblock]$ParentProvider,
+        [scriptblock]$NativeWindowProvider
     )
-    return @(Get-BoundProcessUiEntries -ProcessId $ProcessId -Binding $Binding -Deadline $Deadline -ElementProvider $ElementProvider -ParentProvider $ParentProvider | Where-Object { [string]$_.controlType -ceq $ControlType } | ForEach-Object { $_.element })
+    return @(Get-BoundProcessUiEntries -ProcessId $ProcessId -Binding $Binding -Deadline $Deadline -ElementProvider $ElementProvider -ParentProvider $ParentProvider -NativeWindowProvider $NativeWindowProvider | Where-Object { [string]$_.controlType -ceq $ControlType } | ForEach-Object { $_.element })
 }
 
 function Wait-BoundProcessUiSurfaceClosed {
@@ -790,7 +1089,8 @@ function Wait-BoundProcessUiSurfaceClosed {
         [Parameter(Mandatory = $true)][datetime]$Deadline,
         [string[]]$AllowedSurfaceIdentities = @(),
         [scriptblock]$ElementProvider,
-        [scriptblock]$ParentProvider
+        [scriptblock]$ParentProvider,
+        [scriptblock]$NativeWindowProvider
     )
     Assert-PrintExactProperties -Value $Binding -Expected @('surfaceRootIdentity','surfaceElement','baselineIdentities','trackedIdentities','anchorElement') -Kind 'Native process UI surface binding'
     if (@($Binding.trackedIdentities).Count -lt 1 -or @($Binding.trackedIdentities).Count -gt $script:PrintPins.UiElementMaximum) { throw 'Native process UI tracked identity count was invalid.' }
@@ -803,6 +1103,28 @@ function Wait-BoundProcessUiSurfaceClosed {
     $baselineIdentities = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($identity in @($Binding.baselineIdentities)) { if ([string]::IsNullOrWhiteSpace([string]$identity) -or -not $baselineIdentities.Add([string]$identity)) { throw 'Native process UI close baseline identity set was invalid.' } }
     $structure = Get-SanitizedProcessUiStructureJson -ProcessId $ProcessId -DeadlineExpired
+    if ([string]$Binding.surfaceRootIdentity -cmatch '^hwnd:') {
+        while ([datetime]::UtcNow -lt $Deadline) {
+            try {
+                $current = @(Get-ProcessNativeWindowSnapshot -ProcessId $ProcessId -Deadline $Deadline -TopLevelOnly -WindowProvider $NativeWindowProvider)
+                $structure = Get-SanitizedObservedUiStructureJson -ProcessId $ProcessId -Elements @($current | ForEach-Object { $_.element }) -Scope 'top-level'
+                $byIdentity = @{}
+                foreach ($entry in $current) { $byIdentity.Add([string]$entry.runtimeIdentity,$entry) }
+                $boundSurfaceRemains = $byIdentity.ContainsKey([string]$Binding.surfaceRootIdentity)
+                $allowedPresent = $true
+                foreach ($identity in $allowedSurfaces) { if (-not $byIdentity.ContainsKey($identity) -or -not [bool]$byIdentity[$identity].isSurface) { $allowedPresent = $false; break } }
+                $unexpectedSurface = @($current | Where-Object { -not $baselineIdentities.Contains([string]$_.runtimeIdentity) -and -not $allowedSurfaces.Contains([string]$_.runtimeIdentity) }).Count -gt 0
+                if (-not $boundSurfaceRemains -and $allowedPresent -and -not $unexpectedSurface) {
+                    if ([datetime]::UtcNow -ge $Deadline) { break }
+                    return
+                }
+            } catch {
+                if ([datetime]::UtcNow -ge $Deadline) { break }
+            }
+            if ([datetime]::UtcNow -lt $Deadline) { Start-Sleep -Milliseconds 150 }
+        }
+        throw "Native print UI stage '$Stage' retained its bound HWND surface or an unbound replacement surface after close; uiStructure=$structure."
+    }
     while ([datetime]::UtcNow -lt $Deadline) {
         $current = @(Get-ProcessUiTreeSnapshot -ProcessId $ProcessId -Deadline $Deadline -ElementProvider $ElementProvider -ParentProvider $ParentProvider)
         $structure = Get-SanitizedObservedUiStructureJson -ProcessId $ProcessId -Elements @($current | ForEach-Object { $_.element }) -Scope 'process-descendants'
@@ -1014,10 +1336,15 @@ function Cancel-NativePrintDialog {
     param(
         [Parameter(Mandatory = $true)][int]$ProcessId,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Baseline,
+        [AllowEmptyCollection()][object[]]$NativeBaseline = @(),
         [Parameter(Mandatory = $true)][ValidateSet('first-print-dialog','second-print-dialog')][string]$Stage,
         [Parameter(Mandatory = $true)][datetime]$Deadline
     )
-    $surface = Wait-NewProcessUiSurface -ProcessId $ProcessId -Baseline $Baseline -AnchorNames @('Cancel') -AnchorControlTypes @('ControlType.Button') -Stage $Stage -Deadline $Deadline
+    $surface = if ($NativeBaseline.Count -gt 0) {
+        Wait-NewProcessNativeWindowSurface -ProcessId $ProcessId -Baseline $NativeBaseline -AnchorNames @('Cancel') -AnchorControlTypes @('ControlType.Button') -Stage $Stage -Deadline $Deadline
+    } else {
+        Wait-NewProcessUiSurface -ProcessId $ProcessId -Baseline $Baseline -AnchorNames @('Cancel') -AnchorControlTypes @('ControlType.Button') -Stage $Stage -Deadline $Deadline
+    }
     Assert-NativePrintDeadline -Deadline $Deadline
     $cancel = Find-BoundProcessUiElement -ProcessId $ProcessId -Binding $surface -Names @('Cancel') -ControlTypes @('ControlType.Button') -Deadline $Deadline
     Invoke-ProcessUiElement -Element $cancel -ProcessId $ProcessId -Deadline $Deadline
@@ -1025,31 +1352,89 @@ function Cancel-NativePrintDialog {
     return $surface
 }
 
+function Find-BoundNativePrinterElement {
+    param([Parameter(Mandatory = $true)][int]$ProcessId,[Parameter(Mandatory = $true)]$Binding,[Parameter(Mandatory = $true)][datetime]$Deadline,[scriptblock]$NativeWindowProvider,[scriptblock]$TargetProvider)
+    $entries = @(Get-BoundProcessUiEntries -ProcessId $ProcessId -Binding $Binding -Deadline $Deadline -NativeWindowProvider $NativeWindowProvider)
+    $lists = @($entries | Where-Object { [string]$_.controlType -ceq 'ControlType.List' })
+    if ($lists.Count -gt 1) { throw 'Native print dialog exposed an ambiguous printer list.' }
+    $printerMatches = @()
+    foreach ($list in $lists) {
+        Assert-ProcessUiElement -Element $list.element -ProcessId $ProcessId
+        if ([datetime]::UtcNow -ge $Deadline) { throw 'Native printer-list query deadline expired.' }
+        foreach ($element in @(if ($TargetProvider) { & $TargetProvider $ProcessId $list.element } else { Get-ProcessUiElements -ProcessId $ProcessId -RootElement $list.element -Deadline $Deadline })) {
+            Assert-ProcessUiElement -Element $element -ProcessId $ProcessId
+            if ([datetime]::UtcNow -ge $Deadline) { throw 'Native printer-list query deadline expired.' }
+            $name = [string]$element.Current.Name
+            $type = Get-UiControlTypeName -Element $element
+            if ([datetime]::UtcNow -ge $Deadline) { throw 'Native printer-list query deadline expired.' }
+            if ($name.Equals($script:PrintPins.PrinterName,[StringComparison]::OrdinalIgnoreCase) -and $type -in @('ControlType.ListItem','ControlType.Button','ControlType.RadioButton')) { $printerMatches += $element }
+        }
+    }
+    if ($printerMatches.Count -eq 0) { return $null }
+    if ($printerMatches.Count -ne 1) { throw 'Microsoft Print to PDF was ambiguous inside the exact native printer list.' }
+    return $printerMatches[0]
+}
+
+function Select-BoundNativeComboItemExact {
+    param([Parameter(Mandatory = $true)][int]$ProcessId,[Parameter(Mandatory = $true)]$Binding,[Parameter(Mandatory = $true)][string]$Value,[Parameter(Mandatory = $true)][datetime]$Deadline,[scriptblock]$ComboContainsProvider,[scriptblock]$ComboSelectProvider,[scriptblock]$NativeWindowProvider)
+    if (($null -eq $ComboContainsProvider) -xor ($null -eq $ComboSelectProvider)) { throw 'Native printer combo test providers were incomplete.' }
+    if ($null -eq $ComboContainsProvider) { Initialize-PrintNativeWindowInterop }
+    $comboMatches = @()
+    foreach ($entry in @(Get-BoundProcessUiEntries -ProcessId $ProcessId -Binding $Binding -Deadline $Deadline -NativeWindowProvider $NativeWindowProvider | Where-Object { [string]$_.controlType -ceq 'ControlType.ComboBox' })) {
+        if ([datetime]::UtcNow -ge $Deadline) { throw 'Native printer combo query deadline expired.' }
+        $handleValue = Get-NativeSurfaceHandleValue -Identity ([string]$entry.runtimeIdentity)
+        $remainingMilliseconds = [int][Math]::Min(120000,[Math]::Max(1,[Math]::Ceiling(($Deadline - [datetime]::UtcNow).TotalMilliseconds)))
+        $contains = if ($ComboContainsProvider) { & $ComboContainsProvider $ProcessId $handleValue $Value $remainingMilliseconds } else { [Smacrobat.PrintVerification.NativeWindows]::ComboContainsExact($ProcessId,$handleValue,$Value,$remainingMilliseconds) }
+        if ($contains -isnot [bool]) { throw 'Native printer combo exact lookup returned an invalid result.' }
+        if ($contains) { $comboMatches += $handleValue }
+        if ([datetime]::UtcNow -ge $Deadline) { throw 'Native printer combo query deadline expired.' }
+    }
+    if ($comboMatches.Count -eq 0) { return $false }
+    if ($comboMatches.Count -ne 1) { throw 'Microsoft Print to PDF was ambiguous inside native printer combo boxes.' }
+    if ([datetime]::UtcNow -ge $Deadline) { throw 'Native printer combo action deadline expired.' }
+    $remainingMilliseconds = [int][Math]::Min(120000,[Math]::Max(1,[Math]::Ceiling(($Deadline - [datetime]::UtcNow).TotalMilliseconds)))
+    $selected = if ($ComboSelectProvider) { & $ComboSelectProvider $ProcessId ([long]$comboMatches[0]) $Value $remainingMilliseconds } else { [Smacrobat.PrintVerification.NativeWindows]::SelectComboExact($ProcessId,[long]$comboMatches[0],$Value,$remainingMilliseconds) }
+    if ($selected -isnot [bool] -or -not $selected) { throw 'Microsoft Print to PDF could not be selected in its exact native combo box.' }
+    if ([datetime]::UtcNow -ge $Deadline) { throw 'Native printer combo action exceeded its deadline.' }
+    return $true
+}
+
 function Select-PdfPrinterAndCurrentPage {
-    param([Parameter(Mandatory = $true)][int]$ProcessId,[Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Baseline,[Parameter(Mandatory = $true)][datetime]$Deadline)
-    $surface = Wait-NewProcessUiSurface -ProcessId $ProcessId -Baseline $Baseline -AnchorNames @('Cancel') -AnchorControlTypes @('ControlType.Button') -Stage 'second-print-dialog' -Deadline $Deadline
+    param([Parameter(Mandatory = $true)][int]$ProcessId,[Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Baseline,[AllowEmptyCollection()][object[]]$NativeBaseline = @(),[Parameter(Mandatory = $true)][datetime]$Deadline)
+    $surface = if ($NativeBaseline.Count -gt 0) {
+        Wait-NewProcessNativeWindowSurface -ProcessId $ProcessId -Baseline $NativeBaseline -AnchorNames @('Cancel') -AnchorControlTypes @('ControlType.Button') -Stage 'second-print-dialog' -Deadline $Deadline
+    } else {
+        Wait-NewProcessUiSurface -ProcessId $ProcessId -Baseline $Baseline -AnchorNames @('Cancel') -AnchorControlTypes @('ControlType.Button') -Stage 'second-print-dialog' -Deadline $Deadline
+    }
     $printer = $null
+    $printerSelectedByNativeCombo = $false
     Assert-NativePrintDeadline -Deadline $Deadline
     try { $printer = Find-BoundProcessUiElement -ProcessId $ProcessId -Binding $surface -Names @($script:PrintPins.PrinterName) -Deadline $Deadline } catch {
         Assert-NativePrintDeadline -Deadline $Deadline
-        $combos = @(Get-BoundProcessUiElementsByControlType -ProcessId $ProcessId -Binding $surface -ControlType 'ControlType.ComboBox' -Deadline $Deadline)
-        if ($combos.Count -gt 8) { throw 'Native print dialog exposed too many combo boxes.' }
-        foreach ($combo in $combos) {
-            Assert-NativePrintDeadline -Deadline $Deadline
-            Assert-ProcessUiElement -Element $combo -ProcessId $ProcessId
-            $expand = $null
-            if ($combo.TryGetCurrentPattern([Windows.Automation.ExpandCollapsePattern]::Pattern,[ref]$expand)) {
+        if ([string]$surface.surfaceRootIdentity -cmatch '^hwnd:') {
+            $printer = Find-BoundNativePrinterElement -ProcessId $ProcessId -Binding $surface -Deadline $Deadline
+            if ($null -eq $printer) { $printerSelectedByNativeCombo = Select-BoundNativeComboItemExact -ProcessId $ProcessId -Binding $surface -Value $script:PrintPins.PrinterName -Deadline $Deadline }
+        }
+        if ($null -eq $printer -and -not $printerSelectedByNativeCombo) {
+            $combos = @(Get-BoundProcessUiElementsByControlType -ProcessId $ProcessId -Binding $surface -ControlType 'ControlType.ComboBox' -Deadline $Deadline)
+            if ($combos.Count -gt 8) { throw 'Native print dialog exposed too many combo boxes.' }
+            foreach ($combo in $combos) {
                 Assert-NativePrintDeadline -Deadline $Deadline
-                ([Windows.Automation.ExpandCollapsePattern]$expand).Expand()
-                Start-Sleep -Milliseconds 100
-                Assert-NativePrintDeadline -Deadline $Deadline
-                try { $printer = Find-BoundProcessUiElement -ProcessId $ProcessId -Binding $surface -Names @($script:PrintPins.PrinterName) -AllowNone -Deadline $Deadline } catch { }
-                if ($null -ne $printer) { break }
+                Assert-ProcessUiElement -Element $combo -ProcessId $ProcessId
+                $expand = $null
+                if ($combo.TryGetCurrentPattern([Windows.Automation.ExpandCollapsePattern]::Pattern,[ref]$expand)) {
+                    Assert-NativePrintDeadline -Deadline $Deadline
+                    ([Windows.Automation.ExpandCollapsePattern]$expand).Expand()
+                    Start-Sleep -Milliseconds 100
+                    Assert-NativePrintDeadline -Deadline $Deadline
+                    try { $printer = Find-BoundProcessUiElement -ProcessId $ProcessId -Binding $surface -Names @($script:PrintPins.PrinterName) -AllowNone -Deadline $Deadline } catch { }
+                    if ($null -ne $printer) { break }
+                }
             }
         }
     }
-    if ($null -eq $printer) { throw 'Microsoft Print to PDF was not exposed by the process-bound native dialog.' }
-    Select-ProcessUiElement -Element $printer -ProcessId $ProcessId -Deadline $Deadline
+    if ($null -eq $printer -and -not $printerSelectedByNativeCombo) { throw 'Microsoft Print to PDF was not exposed by the process-bound native dialog.' }
+    if ($null -ne $printer) { Select-ProcessUiElement -Element $printer -ProcessId $ProcessId -Deadline $Deadline }
     $current = Wait-BoundProcessUiElement -ProcessId $ProcessId -Binding $surface -Names @('Current Page','Current page') -ControlTypes @('ControlType.RadioButton') -Stage 'current-page-control' -Deadline $Deadline
     Select-ProcessUiElement -Element $current -ProcessId $ProcessId -Deadline $Deadline
     return $surface
@@ -1059,14 +1444,19 @@ function Submit-NativePrintToPdf {
     param(
         [Parameter(Mandatory = $true)][int]$ProcessId,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Baseline,
+        [AllowEmptyCollection()][object[]]$NativeBaseline = @(),
         [Parameter(Mandatory = $true)][string]$OutputPath,
         [Parameter(Mandatory = $true)][datetime]$Deadline
     )
-    $surface = Select-PdfPrinterAndCurrentPage -ProcessId $ProcessId -Baseline $Baseline -Deadline $Deadline
+    $surface = Select-PdfPrinterAndCurrentPage -ProcessId $ProcessId -Baseline $Baseline -NativeBaseline $NativeBaseline -Deadline $Deadline
     Assert-NativePrintDeadline -Deadline $Deadline
     $print = Find-BoundProcessUiElement -ProcessId $ProcessId -Binding $surface -Names @('Print') -ControlTypes @('ControlType.Button') -Deadline $Deadline
     Invoke-ProcessUiElement -Element $print -ProcessId $ProcessId -Deadline $Deadline
-    $saveSurface = Wait-NewProcessUiSurface -ProcessId $ProcessId -Baseline $Baseline -AnchorNames @('Save') -AnchorControlTypes @('ControlType.Button') -Stage 'save-output-dialog' -Deadline $Deadline
+    $saveSurface = if ($NativeBaseline.Count -gt 0) {
+        Wait-NewProcessNativeWindowSurface -ProcessId $ProcessId -Baseline $NativeBaseline -AnchorNames @('Save') -AnchorControlTypes @('ControlType.Button') -Stage 'save-output-dialog' -Deadline $Deadline
+    } else {
+        Wait-NewProcessUiSurface -ProcessId $ProcessId -Baseline $Baseline -AnchorNames @('Save') -AnchorControlTypes @('ControlType.Button') -Stage 'save-output-dialog' -Deadline $Deadline
+    }
     Wait-BoundProcessUiSurfaceClosed -ProcessId $ProcessId -Binding $surface -Stage 'second-print-dialog' -Deadline $Deadline -AllowedSurfaceIdentities @([string]$saveSurface.surfaceRootIdentity)
     Assert-NativePrintDeadline -Deadline $Deadline
     try {
@@ -1330,20 +1720,20 @@ return document.querySelectorAll('dialog[aria-labelledby="print-title"]').length
 
         $nativeDeadline = Get-PrintPhaseDeadline -TotalDeadline $deadline -MaximumMilliseconds $script:PrintPins.NativeDialogTimeoutMilliseconds
         $originalNativeBaseline = @(Get-ProcessTopLevelUiSnapshot -ProcessId $appProcessId -Deadline $nativeDeadline)
-        $firstNativeControlBaseline = @(Get-ProcessUiTreeSnapshot -ProcessId $appProcessId -Deadline $nativeDeadline)
+        $firstNativeWindowBaseline = @(Get-ProcessNativeWindowSnapshot -ProcessId $appProcessId -Deadline $nativeDeadline -TopLevelOnly)
         Open-NativePrintDialogFromWebView -SessionId $sessionId -Deadline $nativeDeadline
-        $null = Cancel-NativePrintDialog -ProcessId $appProcessId -Baseline $firstNativeControlBaseline -Stage 'first-print-dialog' -Deadline $nativeDeadline
+        $null = Cancel-NativePrintDialog -ProcessId $appProcessId -Baseline @() -NativeBaseline $firstNativeWindowBaseline -Stage 'first-print-dialog' -Deadline $nativeDeadline
         Wait-ProcessTopLevelUiBaselineRestored -ProcessId $appProcessId -Baseline $originalNativeBaseline -Stage 'first-native-cleanup' -Deadline $nativeDeadline
         $cancelStatus = Wait-WebPrintStatus -SessionId $sessionId -Prefix 'Printing canceled.' -Deadline $deadline
 
         $nativeDeadline = Get-PrintPhaseDeadline -TotalDeadline $deadline -MaximumMilliseconds $script:PrintPins.NativeDialogTimeoutMilliseconds
         $secondNativeBaseline = @(Get-ProcessTopLevelUiSnapshot -ProcessId $appProcessId -Deadline $nativeDeadline)
         Assert-ProcessTopLevelUiBaselineMatch -ProcessId $appProcessId -Expected $originalNativeBaseline -Actual $secondNativeBaseline -Deadline $nativeDeadline
-        $secondNativeControlBaseline = @(Get-ProcessUiTreeSnapshot -ProcessId $appProcessId -Deadline $nativeDeadline)
+        $secondNativeWindowBaseline = @(Get-ProcessNativeWindowSnapshot -ProcessId $appProcessId -Deadline $nativeDeadline -TopLevelOnly)
         Open-NativePrintDialogFromWebView -SessionId $sessionId -Deadline $nativeDeadline
         $output = [ordered]@{ status='explicit-unavailable';bytes=$null;sha256=$null;pages=$null;widthPoints=$null;heightPoints=$null;sourceFingerprintSha256=$null;outputFingerprintSha256=$null;correlation=$null;meanAbsoluteDifference=$null }
         if ([bool]$PrinterFacts.microsoftPrintToPdfAvailable) {
-            Submit-NativePrintToPdf -ProcessId $appProcessId -Baseline $secondNativeControlBaseline -OutputPath $OutputPdfPath -Deadline $nativeDeadline
+            Submit-NativePrintToPdf -ProcessId $appProcessId -Baseline @() -NativeBaseline $secondNativeWindowBaseline -OutputPath $OutputPdfPath -Deadline $nativeDeadline
             $item = Wait-StablePrintFile -Path $OutputPdfPath -Deadline (Get-PrintPhaseDeadline -TotalDeadline $deadline -MaximumMilliseconds $script:PrintPins.OutputTimeoutMilliseconds)
             $submitted = Wait-WebPrintStatus -SessionId $sessionId -Prefix '1 page submitted to the printer.' -Deadline $deadline
             $sourceProof = Get-PdfiumPrintProof -PdfiumPath $PdfiumPath -PdfPath $SamplePath
@@ -1356,7 +1746,7 @@ return document.querySelectorAll('dialog[aria-labelledby="print-title"]').length
                 correlation=[double]$comparison.correlation;meanAbsoluteDifference=[double]$comparison.meanAbsoluteDifference
             }
         } else {
-            $null = Cancel-NativePrintDialog -ProcessId $appProcessId -Baseline $secondNativeControlBaseline -Stage 'second-print-dialog' -Deadline $nativeDeadline
+            $null = Cancel-NativePrintDialog -ProcessId $appProcessId -Baseline @() -NativeBaseline $secondNativeWindowBaseline -Stage 'second-print-dialog' -Deadline $nativeDeadline
             $null = Wait-WebPrintStatus -SessionId $sessionId -Prefix 'Printing canceled.' -Deadline $deadline
         }
         Close-WebPrintDialog -SessionId $sessionId -Deadline $deadline

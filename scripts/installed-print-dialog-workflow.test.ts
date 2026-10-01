@@ -343,8 +343,8 @@ describe('installed native print dialog verifier', () => {
     expect(source.match(/Find-BoundProcessUiElement/g)?.length).toBeGreaterThanOrEqual(8);
     expect(source).toContain('TreeWalker]::RawViewWalker.GetParent');
     expect(source).toContain('-not $baselineIdentities.Contains($surfaceRootIdentity)');
-    expect(source).toContain('$firstNativeControlBaseline = @(Get-ProcessUiTreeSnapshot');
-    expect(source).toContain('$secondNativeControlBaseline = @(Get-ProcessUiTreeSnapshot');
+    expect(source).not.toContain('$firstNativeControlBaseline = @(Get-ProcessUiTreeSnapshot');
+    expect(source).not.toContain('$secondNativeControlBaseline = @(Get-ProcessUiTreeSnapshot');
   });
 
   it('uses an exact rooted target query after the hosted surface-only delta', () => {
@@ -402,13 +402,109 @@ describe('installed native print dialog verifier', () => {
     expect(result.status, result.stderr || result.stdout).toBe(0);
   });
 
+  it('uses exact owned HWND controls when the hosted UIA descendant provider stalls', () => {
+    const source = readFileSync('scripts/installed-print-dialog.ps1', 'utf8');
+    expect(source).toContain('$firstNativeWindowBaseline = @(Get-ProcessNativeWindowSnapshot');
+    expect(source).toContain('-NativeBaseline $firstNativeWindowBaseline');
+    expect(source).toContain('-NativeBaseline $secondNativeWindowBaseline');
+    expect(source).toContain('Get-ProcessUiElements -ProcessId $ProcessId -RootElement $list.element -Deadline $Deadline');
+    expect(source).toContain('[Smacrobat.PrintVerification.NativeWindows]::ComboContainsExact');
+    expect(source).toContain('[Smacrobat.PrintVerification.NativeWindows]::SelectComboExact');
+    expect(source).toContain('CB_FINDSTRINGEXACT');
+    expect(source).toContain('CB_GETCURSEL');
+    expect(source).not.toMatch(/CB_GETLBTEXT(?:LEN)?/);
+    expect(source.match(/ExactComboIndex\(processId, handleValue, value, deadline\)/g)?.length).toBeGreaterThanOrEqual(4);
+    const result = runPowerShell7(String.raw`
+      $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
+      Set-Location -LiteralPath '${process.cwd().replaceAll("'", "''")}'
+      . ./scripts/installed-print-dialog.ps1
+      Initialize-PrintNativeWindowInterop
+      if(-not[Smacrobat.PrintVerification.NativeWindows]::IsUniqueExactIndex(3,1,1)-or[Smacrobat.PrintVerification.NativeWindows]::IsUniqueExactIndex(3,1,2)){throw 'Duplicate exact native combo indexes were not rejected.'}
+      if(-not[Smacrobat.PrintVerification.NativeWindows]::AllEqualToIndex(1,[int[]]@(1,1,1))-or[Smacrobat.PrintVerification.NativeWindows]::AllEqualToIndex(1,[int[]]@(1,2,1))){throw 'Native combo mutation/recheck results were not rejected.'}
+      function New-NativeHostedElement([int]$runtimePart,[long]$handle,[string]$type,[string]$name,[string]$automationId=''){
+        $element=[pscustomobject]@{RuntimePart=$runtimePart;Current=[pscustomobject]@{ProcessId=7319;NativeWindowHandle=[int]$handle;ControlType=[pscustomobject]@{ProgrammaticName=$type};Name=$name;AutomationId=$automationId}}
+        $element|Add-Member -MemberType ScriptMethod -Name GetRuntimeId -Value {[int[]]@(99,$this.RuntimePart)}
+        return $element
+      }
+      $main=New-NativeHostedElement 1 100 'ControlType.Window' ''
+      $dialog=New-NativeHostedElement 2 200 'ControlType.Window' ''
+      $cancel=New-NativeHostedElement 3 201 'ControlType.Button' 'Cancel'
+      $print=New-NativeHostedElement 4 202 'ControlType.Button' 'Print'
+      $currentPage=New-NativeHostedElement 5 203 'ControlType.RadioButton' 'Current Page'
+      $printerList=New-NativeHostedElement 6 204 'ControlType.List' ''
+      $printerCombo=New-NativeHostedElement 10 205 'ControlType.ComboBox' ''
+      $printerItem=New-NativeHostedElement 8 0 'ControlType.ListItem' 'Microsoft Print to PDF'
+      $replacement=New-NativeHostedElement 7 300 'ControlType.Window' ''
+      $hostedBaseline=@($main)
+      foreach($index in 1..3){$hostedBaseline+=New-NativeHostedElement (10+$index) (110+$index) 'ControlType.Pane' ''}
+      $hostedPost=@($hostedBaseline)+@($dialog)
+      foreach($index in 1..30){$hostedPost+=New-NativeHostedElement (40+$index) (240+$index) 'ControlType.Pane' ''}
+      $baselineReceipt=Get-SanitizedObservedUiStructureJson -ProcessId 7319 -Elements $hostedBaseline -Scope 'process-descendants'
+      $postReceipt=Get-SanitizedObservedUiStructureJson -ProcessId 7319 -Elements $hostedPost -Scope 'process-descendants'
+      if($baselineReceipt-cnotmatch'"processElementCount":4'-or$baselineReceipt-cnotmatch'"windowCount":1'-or$baselineReceipt-cnotmatch'"paneCount":3'){throw 'Hosted HWND baseline topology fixture changed.'}
+      if($postReceipt-cnotmatch'"processElementCount":35'-or$postReceipt-cnotmatch'"windowCount":2'-or$postReceipt-cnotmatch'"paneCount":33'){throw 'Hosted HWND post topology fixture changed.'}
+      $script:nativeState='baseline';$script:uiaTreeCalls=0
+      function Get-ProcessUiTreeSnapshot {$script:uiaTreeCalls++;throw 'The hosted rooted UIA provider stalled.'}
+      $provider={param($requestedProcessId,[long]$rootHandle,[bool]$topLevelOnly)
+        if($rootHandle-ne0){
+          if($rootHandle-ne200){throw 'Native enumeration escaped the exact dialog HWND.'}
+          $rootRuntimePart=if($script:nativeState-ceq'mismatch'){9}else{2}
+          return @(
+            [pscustomobject]@{HandleValue=200L;ParentHandleValue=0L;Element=(New-NativeHostedElement $rootRuntimePart 200 'ControlType.Window' '')},
+            [pscustomobject]@{HandleValue=201L;ParentHandleValue=200L;Element=$cancel},
+            [pscustomobject]@{HandleValue=202L;ParentHandleValue=200L;Element=$print},
+            [pscustomobject]@{HandleValue=203L;ParentHandleValue=200L;Element=$currentPage},
+            [pscustomobject]@{HandleValue=204L;ParentHandleValue=200L;Element=$printerList},
+            [pscustomobject]@{HandleValue=205L;ParentHandleValue=200L;Element=$printerCombo}
+          )
+        }
+        if($script:nativeState-ceq'baseline'-or$script:nativeState-ceq'closed'){return @([pscustomobject]@{HandleValue=100L;ParentHandleValue=0L;Element=$main})}
+        if($script:nativeState-ceq'replacement'){return @([pscustomobject]@{HandleValue=100L;ParentHandleValue=0L;Element=$main},[pscustomobject]@{HandleValue=300L;ParentHandleValue=0L;Element=$replacement})}
+        return @([pscustomobject]@{HandleValue=100L;ParentHandleValue=0L;Element=$main},[pscustomobject]@{HandleValue=200L;ParentHandleValue=0L;Element=(New-NativeHostedElement 2 200 'ControlType.Window' '')})
+      }
+      $baseline=@(Get-ProcessNativeWindowSnapshot -ProcessId 7319 -Deadline ([datetime]::UtcNow.AddSeconds(2)) -TopLevelOnly -WindowProvider $provider)
+      $script:nativeState='mismatch';$rejected=$false
+      try{Wait-NewProcessNativeWindowSurface -ProcessId 7319 -Baseline $baseline -AnchorNames @('Cancel') -AnchorControlTypes @('ControlType.Button') -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(250)) -WindowProvider $provider|Out-Null}catch{$rejected=$true}
+      if(-not$rejected){throw 'A replaced HWND runtime identity was accepted during binding.'}
+      $script:nativeState='open'
+      $binding=Wait-NewProcessNativeWindowSurface -ProcessId 7319 -Baseline $baseline -AnchorNames @('Cancel') -AnchorControlTypes @('ControlType.Button') -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddSeconds(2)) -WindowProvider $provider
+      if([string]$binding.surfaceRootIdentity-cnotmatch'^hwnd:200\|'-or@($binding.trackedIdentities).Count-ne6-or$script:uiaTreeCalls-ne0){throw 'Exact HWND binding did not bypass the stalled UIA tree provider.'}
+      $found=Find-BoundProcessUiElement -ProcessId 7319 -Binding $binding -Names @('Cancel') -ControlTypes @('ControlType.Button') -Deadline ([datetime]::UtcNow.AddSeconds(2)) -NativeWindowProvider $provider
+      if(-not[object]::ReferenceEquals($found,$cancel)){throw 'The exact bound HWND control was not preserved.'}
+      $targetProvider={param($requestedProcessId,$rootElement)if(-not[object]::ReferenceEquals($rootElement,$printerList)){throw 'Printer query escaped the exact list HWND.'};@($printerItem)}
+      $foundPrinter=Find-BoundNativePrinterElement -ProcessId 7319 -Binding $binding -Deadline ([datetime]::UtcNow.AddSeconds(2)) -NativeWindowProvider $provider -TargetProvider $targetProvider
+      if(-not[object]::ReferenceEquals($foundPrinter,$printerItem)){throw 'The exact printer item was not found below its bound list HWND.'}
+      $script:comboSelectCalls=0
+      $duplicateContains={param($requestedProcessId,$handleValue,$value,$remainingMilliseconds)$false}
+      $selection={param($requestedProcessId,$handleValue,$value,$remainingMilliseconds)$script:comboSelectCalls++;$true}
+      $selected=Select-BoundNativeComboItemExact -ProcessId 7319 -Binding $binding -Value 'Microsoft Print to PDF' -Deadline ([datetime]::UtcNow.AddSeconds(2)) -NativeWindowProvider $provider -ComboContainsProvider $duplicateContains -ComboSelectProvider $selection
+      if($selected-or$script:comboSelectCalls-ne0){throw 'A duplicate exact combo result reached selection.'}
+      $uniqueContains={param($requestedProcessId,$handleValue,$value,$remainingMilliseconds)$true}
+      $mutationSelect={param($requestedProcessId,$handleValue,$value,$remainingMilliseconds)$script:comboSelectCalls++;$false}
+      $rejected=$false;try{Select-BoundNativeComboItemExact -ProcessId 7319 -Binding $binding -Value 'Microsoft Print to PDF' -Deadline ([datetime]::UtcNow.AddSeconds(2)) -NativeWindowProvider $provider -ComboContainsProvider $uniqueContains -ComboSelectProvider $mutationSelect|Out-Null}catch{$rejected=$true}
+      if(-not$rejected-or$script:comboSelectCalls-ne1){throw 'A combo mutation/recheck failure was accepted.'}
+      $successSelect={param($requestedProcessId,$handleValue,$value,$remainingMilliseconds)$script:comboSelectCalls++;$true}
+      $selected=Select-BoundNativeComboItemExact -ProcessId 7319 -Binding $binding -Value 'Microsoft Print to PDF' -Deadline ([datetime]::UtcNow.AddSeconds(2)) -NativeWindowProvider $provider -ComboContainsProvider $uniqueContains -ComboSelectProvider $successSelect
+      if(-not$selected-or$script:comboSelectCalls-ne2){throw 'An exact stable combo selection was not accepted.'}
+      $script:nativeState='replacement';$rejected=$false
+      try{Wait-BoundProcessUiSurfaceClosed -ProcessId 7319 -Binding $binding -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(250)) -NativeWindowProvider $provider}catch{$rejected=$true}
+      if(-not$rejected){throw 'A replacement HWND surface was accepted as close.'}
+      $script:nativeState='closed'
+      Wait-BoundProcessUiSurfaceClosed -ProcessId 7319 -Binding $binding -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddSeconds(2)) -NativeWindowProvider $provider
+      $slowProvider={param($requestedProcessId,[long]$rootHandle,[bool]$topLevelOnly)Start-Sleep -Milliseconds 40;@([pscustomobject]@{HandleValue=100L;ParentHandleValue=0L;Element=$main})}
+      $rejected=$false;try{Get-ProcessNativeWindowSnapshot -ProcessId 7319 -Deadline ([datetime]::UtcNow.AddMilliseconds(20)) -TopLevelOnly -WindowProvider $slowProvider|Out-Null}catch{$rejected=$true}
+      if(-not$rejected){throw 'A native HWND snapshot completed after its deadline.'}
+    `);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
   it('maps every native wait callsite to its exact diagnostic stage', () => {
     const result = runPowerShell7(String.raw`
       $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
       $tokens=$null;$errors=$null
       $ast=[Management.Automation.Language.Parser]::ParseFile('${process.cwd().replaceAll("'", "''")}\\scripts\\installed-print-dialog.ps1',[ref]$tokens,[ref]$errors)
       if($errors.Count){throw 'Installed print script did not parse.'}
-      $calls=@($ast.FindAll({param($node)$node-is[Management.Automation.Language.CommandAst]-and$node.GetCommandName()-in@('Wait-ProcessUiElement','Wait-ProcessUiWindowClosed','Wait-NewProcessUiSurface','Wait-BoundProcessUiElement','Wait-BoundProcessUiSurfaceClosed','Wait-ProcessTopLevelUiBaselineRestored')},$true))
+      $calls=@($ast.FindAll({param($node)$node-is[Management.Automation.Language.CommandAst]-and$node.GetCommandName()-in@('Wait-ProcessUiElement','Wait-ProcessUiWindowClosed','Wait-NewProcessUiSurface','Wait-NewProcessNativeWindowSurface','Wait-BoundProcessUiElement','Wait-BoundProcessUiSurfaceClosed','Wait-ProcessTopLevelUiBaselineRestored')},$true))
       $actual=@($calls|ForEach-Object{
         $elements=@($_.CommandElements);$stageIndex=-1
         for($index=0;$index-lt$elements.Count;$index++){if($elements[$index]-is[Management.Automation.Language.CommandParameterAst]-and$elements[$index].ParameterName-ceq'Stage'){$stageIndex=$index;break}}
@@ -421,6 +517,7 @@ describe('installed native print dialog verifier', () => {
       }|Sort-Object)
       $expected=@(
         'Wait-NewProcessUiSurface:$Stage','Wait-NewProcessUiSurface:save-output-dialog','Wait-NewProcessUiSurface:second-print-dialog',
+        'Wait-NewProcessNativeWindowSurface:$Stage','Wait-NewProcessNativeWindowSurface:save-output-dialog','Wait-NewProcessNativeWindowSurface:second-print-dialog',
         'Wait-BoundProcessUiSurfaceClosed:$Stage','Wait-BoundProcessUiSurfaceClosed:save-output-dialog','Wait-BoundProcessUiSurfaceClosed:second-print-dialog',
         'Wait-BoundProcessUiElement:current-page-control',
         'Wait-ProcessTopLevelUiBaselineRestored:final-native-cleanup','Wait-ProcessTopLevelUiBaselineRestored:first-native-cleanup'
