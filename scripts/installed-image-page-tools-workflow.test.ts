@@ -50,10 +50,40 @@ describe('installed image page-tools verifier', () => {
     expect(source).toContain("-ActionTransport 'native-bm-click-delivered'");
     expect(source).toContain('-ApplicationProcessStartUtcTicks $ProcessStartUtcTicks');
     expect(source).toContain('-Environment (Get-MinimalWindowsProcessEnvironment)');
+    expect(source).not.toContain('\\"');
     expect(source).not.toMatch(/\bAssert-FileReceipt\b/);
     expect(source).not.toMatch(/SendKeys|mouse_event|SetCursorPos|ClickInput|pyautogui|__TAURI_INTERNALS__/i);
     expect(source.indexOf('$nativeBaseline = @(Get-ProcessNativeWindowSnapshot')).toBeLessThan(source.indexOf("textContent.trim()==='Create PDF'"));
     expect(source.indexOf('Submit-ProcessBoundOpenDialog')).toBeLessThan(source.indexOf('Invoke-ImagePageNativeSave -ProcessId'));
+  });
+
+  it('passes complete Create and Export dialog selector scripts to WebDriver', () => {
+    const result = runPowerShell(String.raw`
+      $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
+      Set-Location -LiteralPath '${process.cwd().replaceAll("'", "''")}'
+      . ./scripts/installed-image-page-tools.ps1
+      $script:captured=[Collections.Generic.List[string]]::new()
+      function Invoke-WebDriverScript{param($SessionId,$Script,$Deadline)$script:captured.Add([string]$Script);return $false}
+      function Get-ReadingProcessUiSurfaceSnapshot{@()}
+      function Assert-ReadingSurfaceSnapshot{@()}
+      function Get-ReadingPickerTargetSnapshot{@()}
+      function Assert-ReadingPickerTargetSnapshot{}
+      function Get-ProcessNativeWindowSnapshot{@()}
+      try{Invoke-ImagePageCreateNativeFlow -SessionId 'session' -ProcessId 42 -ProcessStartUtcTicks 10 -SourceImagePath 'C:\proof\source.png' -CreatedPdfPath 'C:\proof\created.pdf' -Deadline ([datetime]::UtcNow.AddSeconds(5))}catch{}
+      try{Invoke-ImagePageExportNativeFlow -SessionId 'session' -ProcessId 42 -ProcessStartUtcTicks 10 -ExportedPngPath 'C:\proof\exported.png' -Deadline ([datetime]::UtcNow.AddSeconds(5))}catch{}
+      $expectedCreate=@'
+const d=document.querySelector('dialog[aria-labelledby="create-pdf-title"]');const b=d?[...d.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Create PDF'):[];if(b.length===1)b[0].click();return b.length===1;
+'@
+      $expectedExport=@'
+const d=document.querySelector('dialog[aria-labelledby="export-image-title"]');const b=d?[...d.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Export PNG'):[];if(b.length===1)b[0].click();return b.length===1;
+'@
+      if($script:captured.Count-ne2-or$script:captured[0]-cne$expectedCreate-or$script:captured[1]-cne$expectedExport){throw ('WebDriver selector scripts were truncated or changed: '+($script:captured|ConvertTo-Json -Compress))}
+      $tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile((Resolve-Path './scripts/installed-image-page-tools.ps1'),[ref]$tokens,[ref]$errors)
+      $dialogScripts=@($ast.FindAll({param($node)$node-is[Management.Automation.Language.StringConstantExpressionAst]-and$node.Value-like'*aria-labelledby*'},$true)|ForEach-Object Value)
+      $createDefaults=@($dialogScripts|Where-Object{$_-like'*Page size*'});$exportDefaults=@($dialogScripts|Where-Object{$_-like'*Image resolution*'})
+      if($errors.Count-or$dialogScripts.Count-ne6-or$createDefaults.Count-ne1-or-not$createDefaults[0].Contains('dialog[aria-labelledby="create-pdf-title"]')-or-not$createDefaults[0].Contains('select[aria-label="Page size"]')-or$exportDefaults.Count-ne1-or-not$exportDefaults[0].Contains('dialog[aria-labelledby="export-image-title"]')-or-not$exportDefaults[0].Contains('select[aria-label="Image resolution"]')){throw 'One or more evaluated image WebDriver dialog scripts are truncated or changed.'}
+    `);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
   });
 
   it('launches the verifier with only the exact allowlisted environment and excludes ambient tokens', () => {
