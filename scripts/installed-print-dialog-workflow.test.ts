@@ -166,6 +166,35 @@ public sealed class NativeSaveDialogFixture : IDisposable {
     expect(result.status, result.stderr || result.stdout).toBe(0);
   });
 
+  it('completes the exact Save action before proving the active print lifecycle returned to baseline', () => {
+    const result = runPowerShell7(String.raw`
+      $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
+      Set-Location -LiteralPath '${process.cwd().replaceAll("'", "''")}'
+      . ./scripts/installed-print-dialog.ps1
+      $script:events=[Collections.Generic.List[string]]::new();$script:saveClicked=$false;$script:actionDeadline=0L
+      $script:sharedDeadline=[datetime]::UtcNow.AddSeconds(5)
+      $script:printBinding=[pscustomobject]@{surfaceRootIdentity='hwnd:200|99:2';surfaceElement=$null;baselineIdentities=@('hwnd:100|99:1');trackedIdentities=@('hwnd:200|99:2');anchorElement=$null;nativeRoles=[pscustomobject]@{cancel='hwnd:201|native';print='hwnd:202|native';currentPage='hwnd:203|native';printerList='hwnd:204|native'}}
+      $script:saveBinding=[pscustomobject]@{surfaceRootIdentity='hwnd:500|native';surfaceElement=$null;baselineIdentities=@('hwnd:100|99:1');trackedIdentities=@('hwnd:500|native','hwnd:507|native','hwnd:508|native','hwnd:505|native');anchorElement=$null;nativeRoles=[pscustomobject]@{cancel='hwnd:508|native';save='hwnd:507|native';filenameEdit='hwnd:505|native'}}
+      function Assert-NativePrintDeadline{param([datetime]$Deadline)if($Deadline-ne$script:sharedDeadline){throw 'The shared lifecycle deadline changed.'}}
+      function Select-PdfPrinterAndCurrentPage{param([int]$ProcessId,[long]$ProcessStartUtcTicks,[object[]]$Baseline,[object[]]$NativeBaseline,[datetime]$Deadline)$script:events.Add('select')|Out-Null;Assert-NativePrintDeadline $Deadline;$script:printBinding}
+      function Invoke-BoundNativeButtonRole{param([int]$ProcessId,$Binding,[string]$Role,[datetime]$Deadline)if($Role-cne'print'){throw 'Unexpected native role.'};$script:events.Add('print')|Out-Null;$true}
+      function Wait-NewProcessNativeWindowSurface{param([int]$ProcessId,[object[]]$Baseline,[string[]]$AnchorNames,[string[]]$AnchorControlTypes,[string]$Stage,[datetime]$Deadline)if($Stage-cne'save-output-dialog'){throw 'Unexpected native stage.'};Assert-NativePrintDeadline $Deadline;$script:events.Add('bind-save')|Out-Null;$script:saveBinding}
+      function Get-ValidatedBindingNativeRoles{param($Binding)$Binding.nativeRoles}
+      function Set-BoundNativeSaveFileNameExact{param([int]$ProcessId,[long]$ProcessStartUtcTicks,$Binding,[string]$Value,[long]$DeadlineTickCount)if($DeadlineTickCount-le[Environment]::TickCount64-or$DeadlineTickCount-[Environment]::TickCount64-gt5000){throw 'Save action escaped the shared remaining deadline.'};$script:actionDeadline=$DeadlineTickCount;$script:events.Add('set-name')|Out-Null}
+      function Invoke-BoundNativeSaveButtonExact{param([int]$ProcessId,[long]$ProcessStartUtcTicks,$Binding,[long]$DeadlineTickCount)if($DeadlineTickCount-ne$script:actionDeadline){throw 'Save actions did not share one absolute deadline.'};$script:saveClicked=$true;$script:events.Add('save-click')|Out-Null}
+      function Wait-BoundProcessUiSurfaceClosed{param([int]$ProcessId,$Binding,[string]$Stage,[datetime]$Deadline,[string[]]$AllowedSurfaceIdentities=@())
+        if(-not$script:saveClicked){throw 'The verifier waited for baseline restoration before completing Save.'}
+        if($AllowedSurfaceIdentities.Count-ne0){throw 'Final lifecycle cleanup retained an allowed transient surface.'}
+        Assert-NativePrintDeadline $Deadline
+        if([object]::ReferenceEquals($Binding,$script:saveBinding)){$script:events.Add('wait-save-close')|Out-Null}elseif([object]::ReferenceEquals($Binding,$script:printBinding)){$script:events.Add('wait-print-close')|Out-Null}else{throw 'Unknown lifecycle binding.'}
+      }
+      Submit-NativePrintToPdf -ProcessId 7319 -ProcessStartUtcTicks 638500000000000000L -Baseline @() -NativeBaseline @([pscustomobject]@{runtimeIdentity='hwnd:100|99:1'}) -OutputPath 'C:\fixture\proof.pdf' -Deadline $script:sharedDeadline
+      $actual=[string]::Join(',',$script:events)
+      if($actual-cne'select,print,bind-save,set-name,save-click,wait-save-close,wait-print-close'){throw "Native print lifecycle order changed: $actual"}
+    `);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
   it('rejects ambiguous foreign reparented cyclic and changed native save roles before mutation', () => {
     const result = runPowerShell7(String.raw`
       $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
@@ -667,6 +696,7 @@ public sealed class NativeSaveDialogFixture : IDisposable {
         if($script:nativeState-ceq'baseline'-or$script:nativeState-ceq'closed'){return @((New-NativeProviderRecord 100 0 $main 'Chrome_WidgetWin_1'))}
         if($script:nativeState-ceq'changed-baseline'){return @((New-NativeProviderRecord 100 0 $changedMain 'Chrome_WidgetWin_1'))}
         if($script:nativeState-ceq'allowed-nonsurface'){return @((New-NativeProviderRecord 100 0 $main 'Chrome_WidgetWin_1'),(New-NativeProviderRecord 400 0 $allowedButtonReplacement 'Button'))}
+        if($script:nativeState-ceq'native-save-with-print'){return @((New-NativeProviderRecord 100 0 $main 'Chrome_WidgetWin_1'),(New-NativeProviderRecord 200 0 (New-NativeHostedElement 2 200 'ControlType.Window' '') '#32770'),[pscustomobject]@{HandleValue=500L;ParentHandleValue=0L;ProcessId=7319;ClassName='#32770';ControlId=0;ButtonStyle=-1;IsVisible=$true;IsEnabled=$true;IsLabelSave=$false;IsLabelCancel=$false;Element=$nativeSaveRoot})}
         if($script:nativeState-ceq'native-save'){return @((New-NativeProviderRecord 100 0 $main 'Chrome_WidgetWin_1'),[pscustomobject]@{HandleValue=500L;ParentHandleValue=0L;ProcessId=7319;ClassName='#32770';ControlId=0;ButtonStyle=-1;IsVisible=$true;IsEnabled=$true;IsLabelSave=$false;IsLabelCancel=$false;Element=$nativeSaveRoot})}
         if($script:nativeState-ceq'replacement'){return @((New-NativeProviderRecord 100 0 $main 'Chrome_WidgetWin_1'),(New-NativeProviderRecord 300 0 $replacement '#32770'))}
         return @((New-NativeProviderRecord 100 0 $main 'Chrome_WidgetWin_1'),(New-NativeProviderRecord 200 0 (New-NativeHostedElement 2 200 'ControlType.Window' '') '#32770'))
@@ -702,6 +732,9 @@ public sealed class NativeSaveDialogFixture : IDisposable {
       $script:nativeState='allowed-nonsurface';$rejected=$false
       try{Wait-BoundProcessUiSurfaceClosed -ProcessId 7319 -Binding $binding -Stage 'second-print-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(250)) -AllowedSurfaceIdentities @('hwnd:400|99:40') -NativeWindowProvider $provider}catch{$rejected=$true}
       if(-not$rejected){throw 'A changed non-surface successor with the allowed HWND was accepted.'}
+      $script:nativeState='native-save-with-print';$rejected=$false
+      try{Wait-BoundProcessUiSurfaceClosed -ProcessId 7319 -Binding $binding -Stage 'second-print-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(250)) -AllowedSurfaceIdentities @('hwnd:500|native') -NativeWindowProvider $provider}catch{$rejected=$true}
+      if(-not$rejected){throw 'An active PrintDlgEx surface was reported closed while its exact native Save successor was open.'}
       $script:nativeState='native-save'
       Wait-BoundProcessUiSurfaceClosed -ProcessId 7319 -Binding $binding -Stage 'second-print-dialog' -Deadline ([datetime]::UtcNow.AddSeconds(2)) -AllowedSurfaceIdentities @('hwnd:500|native') -NativeWindowProvider $provider
       $script:nativeState='replacement';$rejected=$false

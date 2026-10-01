@@ -2750,7 +2750,6 @@ function Submit-NativePrintToPdf {
     } else {
         Wait-NewProcessUiSurface -ProcessId $ProcessId -Baseline $Baseline -AnchorNames @('Save') -AnchorControlTypes @('ControlType.Button') -Stage 'save-output-dialog' -Deadline $Deadline
     }
-    Wait-BoundProcessUiSurfaceClosed -ProcessId $ProcessId -Binding $surface -Stage 'second-print-dialog' -Deadline $Deadline -AllowedSurfaceIdentities @([string]$saveSurface.surfaceRootIdentity)
     Assert-NativePrintDeadline -Deadline $Deadline
     $saveRoles = Get-ValidatedBindingNativeRoles -Binding $saveSurface
     if ($null -ne $saveRoles -and $null -ne $saveRoles.PSObject.Properties['save']) {
@@ -2771,6 +2770,7 @@ function Submit-NativePrintToPdf {
         Invoke-ProcessUiElement -Element $save -ProcessId $ProcessId -Deadline $Deadline
     }
     Wait-BoundProcessUiSurfaceClosed -ProcessId $ProcessId -Binding $saveSurface -Stage 'save-output-dialog' -Deadline $Deadline
+    Wait-BoundProcessUiSurfaceClosed -ProcessId $ProcessId -Binding $surface -Stage 'second-print-dialog' -Deadline $Deadline
 }
 
 function Wait-StablePrintFile {
