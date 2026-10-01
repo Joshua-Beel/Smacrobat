@@ -212,6 +212,19 @@ function Write-SanitizedReadingRecord {
         }
         selection = [ordered]@{
             processBoundPickerVerified=[bool]$UiResult.processBoundPickerVerified
+            nativeFilenameControlCategory=[string]$UiResult.nativeFilenameControlCategory
+            postOpen=[ordered]@{
+                documentTabCount=[int]$UiResult.postOpenDocumentTabCount
+                activeTabCount=[int]$UiResult.postOpenActiveTabCount
+                activeFilenameMatched=[bool]$UiResult.postOpenActiveFilenameMatched
+                pageCount=[int]$UiResult.postOpenPageCount
+                renderedPageCount=[int]$UiResult.postOpenRenderedPageCount
+                imageCount=[int]$UiResult.postOpenImageCount
+                loadedImageCount=[int]$UiResult.postOpenLoadedImageCount
+                textLayerCount=[int]$UiResult.postOpenTextLayerCount
+                pageOneGlyphCount=[int]$UiResult.postOpenPageOneGlyphCount
+                pageTextStatusCount=[int]$UiResult.postOpenPageTextStatusCount
+            }
             method = 'programmatic-dom-range-plus-real-windows-clipboard'
             programmaticDomSelectionVerified=[bool]$UiResult.programmaticDomSelectionVerified
             geometryInsidePage=[bool]$UiResult.selectionGeometryInsidePage

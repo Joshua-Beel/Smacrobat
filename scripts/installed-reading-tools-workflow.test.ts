@@ -63,13 +63,13 @@ describe('installed signed reading-tools verifier', () => {
     const check = extractFunctions('scripts/installed-reading-tools.ps1', ['Assert-ReadingSurfaceSnapshot', 'Assert-ReadingPickerTargetSnapshot', 'Wait-ReadingProcessBoundPickerTargets', 'Assert-ReadingSurfaceBinding', 'Wait-ReadingProcessUiSurfaceClosed'], String.raw`
       $script:ReadingPins=[ordered]@{UiAutomationPollMilliseconds=1}
       function New-Surface([string]$identity,[int]$processId){[pscustomobject]@{runtimeIdentity=$identity;controlType='Hwnd';isEnabled=$true;isOffscreen=$false;processId=$processId;handle=[IntPtr][int64]$identity}}
-      function New-Target([string]$identity,[string]$surface,[string]$kind,[int]$processId){[pscustomobject]@{runtimeIdentity=$identity;surfaceRuntimeIdentity=$surface;targetKind=$kind;isEnabled=$true;isOffscreen=$false;processId=$processId;handle=[IntPtr][int64]$identity}}
+      function New-Target([string]$identity,[string]$surface,[string]$kind,[int]$processId){$category=if($kind-ceq'filename'){'edit-1001'}else{'button-idok'};[pscustomobject]@{runtimeIdentity=$identity;surfaceRuntimeIdentity=$surface;targetKind=$kind;nativeControlCategory=$category;isEnabled=$true;isOffscreen=$false;processId=$processId;handle=[IntPtr][int64]$identity}}
       $window=New-Surface '101' 42;$pane=New-Surface '102' 42;$baseline=@($window,$pane)
       $baselineControl=New-Target '109' '101' 'open' 42;$baselineTargets=@($baselineControl)
       $filename=New-Target '120' '102' 'filename' 42;$open=New-Target '121' '102' 'open' 42
       $script:now=[datetime]'2026-01-01T00:00:00Z';$clock={$script:now};$sleep={param($milliseconds)$script:now=$script:now.AddMilliseconds($milliseconds)}
       $bound=Wait-ReadingProcessBoundPickerTargets -ApplicationProcessId 42 -BaselineSurfaces $baseline -BaselineTargets $baselineTargets -Deadline $script:now.AddSeconds(1) -SurfaceSnapshotProvider { $baseline } -TargetSnapshotProvider { @($baselineControl,$filename,$open) } -SleepProvider $sleep -UtcNowProvider $clock
-      if($bound.surfaceRuntimeIdentity-cne'102'-or[bool]$bound.dedicatedNewSurface-or$bound.filenameRuntimeIdentity-cne'120'-or$bound.openButtonRuntimeIdentity-cne'121'){throw 'Stable-surface picker targets were not bound exactly.'}
+      if($bound.surfaceRuntimeIdentity-cne'102'-or[bool]$bound.dedicatedNewSurface-or$bound.filenameRuntimeIdentity-cne'120'-or$bound.filenameControlCategory-cne'edit-1001'-or$bound.openButtonRuntimeIdentity-cne'121'){throw 'Stable-surface picker targets were not bound exactly.'}
       $movedFilename=New-Target '120' '101' 'filename' 42;$movedOpen=New-Target '121' '101' 'open' 42;$movedRejected=$false
       try{Wait-ReadingProcessUiSurfaceClosed -Binding $bound -ApplicationProcessId 42 -Deadline $script:now.AddSeconds(1) -SurfaceSnapshotProvider { $baseline } -TargetSnapshotProvider { @($baselineControl,$movedFilename,$movedOpen) } -SleepProvider $sleep -UtcNowProvider $clock}catch{$movedRejected=$_.Exception.Message-ceq'A bound native picker target moved or changed kind before closing.'}
       if(-not$movedRejected){throw 'Bound target identities moved to another baseline surface were accepted as closed.'}
@@ -83,7 +83,7 @@ describe('installed signed reading-tools verifier', () => {
     const check = extractFunctions('scripts/installed-reading-tools.ps1', ['Assert-ReadingSurfaceSnapshot', 'Assert-ReadingPickerTargetSnapshot', 'Wait-ReadingProcessBoundPickerTargets'], String.raw`
       $script:ReadingPins=[ordered]@{UiAutomationPollMilliseconds=1}
       function New-Surface([string]$identity,[int]$processId){[pscustomobject]@{runtimeIdentity=$identity;controlType='Hwnd';isEnabled=$true;isOffscreen=$false;processId=$processId;handle=[IntPtr][int64]$identity}}
-      function New-Target([string]$identity,[string]$surface,[string]$kind,[int]$processId){[pscustomobject]@{runtimeIdentity=$identity;surfaceRuntimeIdentity=$surface;targetKind=$kind;isEnabled=$true;isOffscreen=$false;processId=$processId;handle=[IntPtr][int64]$identity}}
+      function New-Target([string]$identity,[string]$surface,[string]$kind,[int]$processId){$category=if($kind-ceq'filename'){'edit-1001'}else{'button-idok'};[pscustomobject]@{runtimeIdentity=$identity;surfaceRuntimeIdentity=$surface;targetKind=$kind;nativeControlCategory=$category;isEnabled=$true;isOffscreen=$false;processId=$processId;handle=[IntPtr][int64]$identity}}
       $a=New-Surface '101' 42;$b=New-Surface '102' 42;$c=New-Surface '103' 42;$baseline=@($a,$b)
       $filename=New-Target '120' '102' 'filename' 42;$open=New-Target '121' '102' 'open' 42;$otherFilename=New-Target '122' '102' 'filename' 42;$crossOpen=New-Target '123' '101' 'open' 42
       $script:now=[datetime]'2026-01-01T00:00:00Z';$clock={$script:now};$sleep={param($milliseconds)$script:now=$script:now.AddSeconds(1)};$deadline=$script:now.AddMilliseconds(10)
@@ -106,7 +106,7 @@ describe('installed signed reading-tools verifier', () => {
     const check = extractFunctions('scripts/installed-reading-tools.ps1', ['Assert-ReadingSurfaceSnapshot', 'Assert-ReadingPickerTargetSnapshot', 'Wait-ReadingProcessBoundPickerTargets', 'Assert-ReadingSurfaceBinding', 'Wait-ReadingProcessUiSurfaceClosed'], String.raw`
       $script:ReadingPins=[ordered]@{UiAutomationPollMilliseconds=1}
       function New-Surface([string]$identity,[int]$processId){[pscustomobject]@{runtimeIdentity=$identity;controlType='Hwnd';isEnabled=$true;isOffscreen=$false;processId=$processId;handle=[IntPtr][int64]$identity}}
-      function New-Target([string]$identity,[string]$surface,[string]$kind,[int]$processId){[pscustomobject]@{runtimeIdentity=$identity;surfaceRuntimeIdentity=$surface;targetKind=$kind;isEnabled=$true;isOffscreen=$false;processId=$processId;handle=[IntPtr][int64]$identity}}
+      function New-Target([string]$identity,[string]$surface,[string]$kind,[int]$processId){$category=if($kind-ceq'filename'){'edit-1001'}else{'button-idok'};[pscustomobject]@{runtimeIdentity=$identity;surfaceRuntimeIdentity=$surface;targetKind=$kind;nativeControlCategory=$category;isEnabled=$true;isOffscreen=$false;processId=$processId;handle=[IntPtr][int64]$identity}}
       $base=New-Surface '101' 42;$dedicated=New-Surface '102' 42;$filename=New-Target '120' '102' 'filename' 42;$open=New-Target '121' '102' 'open' 42
       $script:now=[datetime]'2026-01-01T00:00:00Z';$deadline=$script:now.AddMilliseconds(10);$clock={$script:now};$probes=0
       $late=$false;try{Wait-ReadingProcessBoundPickerTargets -ApplicationProcessId 42 -BaselineSurfaces @($base) -BaselineTargets @() -Deadline $deadline -SurfaceSnapshotProvider { @($base,$dedicated) } -TargetSnapshotProvider { $script:probes++;$script:now=$deadline;@($filename,$open) } -SleepProvider { throw 'Late read reached sleep.' } -UtcNowProvider $clock}catch{$late=$_.Exception.Message-like'No single new process-bound native picker target pair appeared*'}
@@ -152,9 +152,9 @@ describe('installed signed reading-tools verifier', () => {
   it('rejects a native picker target record from a mismatched process', () => {
     const check = extractFunctions('scripts/installed-reading-tools.ps1', ['Assert-ReadingPickerTargetSnapshot'], String.raw`
       $surfaces=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal);$null=$surfaces.Add('101')
-      $good=[pscustomobject]@{runtimeIdentity='120';surfaceRuntimeIdentity='101';targetKind='filename';isEnabled=$true;isOffscreen=$false;processId=42;handle=[IntPtr]120}
+      $good=[pscustomobject]@{runtimeIdentity='120';surfaceRuntimeIdentity='101';targetKind='filename';nativeControlCategory='edit-1001';isEnabled=$true;isOffscreen=$false;processId=42;handle=[IntPtr]120}
       Assert-ReadingPickerTargetSnapshot -Snapshot @($good) -ApplicationProcessId 42 -SurfaceIdentities $surfaces -Kind 'The test picker targets'
-      $bad=[pscustomobject]@{runtimeIdentity='121';surfaceRuntimeIdentity='101';targetKind='open';isEnabled=$true;isOffscreen=$false;processId=43;handle=[IntPtr]121}
+      $bad=[pscustomobject]@{runtimeIdentity='121';surfaceRuntimeIdentity='101';targetKind='open';nativeControlCategory='button-idok';isEnabled=$true;isOffscreen=$false;processId=43;handle=[IntPtr]121}
       $rejected=$false;try{Assert-ReadingPickerTargetSnapshot -Snapshot @($bad) -ApplicationProcessId 42 -SurfaceIdentities $surfaces -Kind 'The test picker targets'}catch{$rejected=$true}
       if(-not$rejected){throw 'Mismatched picker child process was accepted.'}
     `);
@@ -219,6 +219,7 @@ describe('installed signed reading-tools verifier', () => {
     expect(source).toContain('LaunchTimeoutMilliseconds = 180000');
     expect(source).toContain('NativePickerTimeoutMilliseconds = 180000');
     expect(source).toContain('ProductTimeoutMilliseconds = 180000');
+    expect(source).toContain('PostOpenTimeoutMilliseconds = 30000');
     expect(source).toContain('PortReleaseTimeoutMilliseconds = 180000');
     expect(source).toContain('$null = Wait-FixedWebDriverPortsFree -Deadline');
     expect(source).not.toContain('function Wait-ReadingWebDriverPortsFree');
@@ -248,6 +249,13 @@ describe('installed signed reading-tools verifier', () => {
     `);
     const result = runPowerShell(check);
     expect(result.status, result.stderr || result.stdout).toBe(0);
+    const scriptResult = runPowerShell(extractFunctions('scripts/installed-reading-tools.ps1', ['Get-ReadingPostOpenScript'], String.raw`
+      (Get-ReadingPostOpenScript -ExpectedName 'reading-source.pdf')|ConvertTo-Json -Compress
+    `));
+    expect(scriptResult.status, scriptResult.stderr || scriptResult.stdout).toBe(0);
+    const postOpenScript = JSON.parse(scriptResult.stdout.trim()) as string;
+    expect(() => new Function('document', postOpenScript)).not.toThrow();
+    expect(postOpenScript).not.toMatch(/\.path|textContent\s*[,}]/);
     const source = readFileSync('scripts/installed-reading-tools.ps1', 'utf8');
     const open = source.indexOf('Open-ReadingUserFile -SessionId $sessionId -ApplicationProcessId $applicationProcessId -Path $PlainFixture -Deadline $plainPickerDeadline');
     const product = source.indexOf('$plainProductDeadline = New-ReadingPhaseDeadline -Phase product');
@@ -262,6 +270,31 @@ describe('installed signed reading-tools verifier', () => {
     expect((invokeSource.match(/New-ReadingPhaseDeadline -Phase /g) || []).length).toBe(9);
     expect((invokeSource.match(/Assert-ReadingPhaseTransition -Deadline /g) || []).length).toBe(8);
     expect(invokeSource).toContain('Assert-ReadingProfileScope -ProfileRoot $ProfileRoot -SettingsRoot $SettingsRoot -Binding $profileBinding\n\n        Assert-ReadingPhaseTransition -Deadline $launchDeadline -Phase launch\n        $plainPickerDeadline = New-ReadingPhaseDeadline -Phase native-picker');
+  });
+
+  it('proves the allowlisted document identity before render waits and emits only bounded post-open facts', () => {
+    const check = extractFunctions('scripts/installed-reading-tools.ps1', ['Assert-ReadingPostOpenState', 'Wait-ReadingPostOpenState'], String.raw`
+      $script:ReadingPins=[ordered]@{PostOpenTimeoutMilliseconds=30000;UiAutomationPollMilliseconds=1}
+      function New-State([int]$tabs,[int]$active,[bool]$matched,[int]$inputs,[int]$pages,[int]$rendered,[int]$images,[int]$loaded,[int]$layers,[int]$glyphs,[int]$statuses,[int]$dialogs,[int]$alerts){[pscustomobject]@{schemaVersion=[long]1;documentTabCount=[long]$tabs;activeTabCount=[long]$active;activeFilenameMatches=$matched;pageInputCount=[long]$inputs;pageCount=[long]$pages;renderedPageCount=[long]$rendered;imageCount=[long]$images;loadedImageCount=[long]$loaded;textLayerCount=[long]$layers;pageOneGlyphCount=[long]$glyphs;pageTextStatusCount=[long]$statuses;passwordDialogCount=[long]$dialogs;alertCount=[long]$alerts}}
+      $script:now=[datetime]::SpecifyKind([datetime]'2026-01-01T00:00:00',[DateTimeKind]::Utc);$clock={$script:now};$sleep={param($milliseconds)$script:now=$script:now.AddMilliseconds($milliseconds)};$script:probes=0
+      $receipt=Wait-ReadingPostOpenState -SessionId 'session' -ExpectedName 'reading-source.pdf' -ExpectedPages 6 -NativeControlCategory 'edit-1001' -Deadline $script:now.AddSeconds(5) -StateProvider {$script:probes++;if($script:probes-eq1){New-State 0 0 $false 0 0 0 0 0 0 0 0 0 0}else{New-State 1 1 $true 1 6 1 1 0 0 0 0 0 0}} -SleepProvider $sleep -UtcNowProvider $clock
+      if($probes-ne2-or$receipt.nativeFilenameControlCategory-cne'edit-1001'-or$receipt.documentTabCount-ne1-or-not$receipt.activeFilenameMatches-or$receipt.pageCount-ne6-or$receipt.renderedPageCount-ne1-or$receipt.textLayerCount-ne0){throw 'The exact post-open receipt was not retained.'}
+      $script:probes=0;$wrongRejected=$false;$wrongMessage=''
+      try{Wait-ReadingPostOpenState -SessionId 'session' -ExpectedName 'reading-source.pdf' -ExpectedPages 6 -NativeControlCategory 'edit-1148' -Deadline $script:now.AddSeconds(5) -StateProvider {$script:probes++;New-State 1 1 $false 1 6 1 1 1 0 0 0 0 0} -SleepProvider $sleep -UtcNowProvider $clock}catch{$wrongMessage=$_.Exception.Message;$wrongRejected=$wrongMessage-like'The native picker did not open the exact allowlisted plain fixture*'}
+      if(-not$wrongRejected-or$probes-ne1-or$wrongMessage-notmatch'"nativeFilenameControlCategory":"edit-1148"'-or$wrongMessage-notmatch'"activeFilenameMatches":false'-or$wrongMessage-match'(?i)(reading-source|[A-Z]:\\|A place for your PDFs)'){throw 'Wrong-document rejection was late or leaked raw state.'}
+      $script:probes=0;$script:sleeps=0;$deadline=$script:now.AddMilliseconds(5);$lateRejected=$false
+      try{Wait-ReadingPostOpenState -SessionId 'session' -ExpectedName 'reading-source.pdf' -ExpectedPages 6 -NativeControlCategory 'edit-1001' -Deadline $deadline -StateProvider {$script:probes++;$script:now=$deadline;New-State 1 1 $true 1 6 1 1 1 1 30 0 0 0} -SleepProvider {$script:sleeps++} -UtcNowProvider $clock}catch{$lateRejected=$_.Exception.Message-like'The exact allowlisted plain fixture did not appear*'}
+      if(-not$lateRejected-or$probes-ne1-or$sleeps-ne0){throw 'A post-deadline document identity read was accepted.'}
+      $script:ReadingPins.PostOpenTimeoutMilliseconds=30001;$capRejected=$false
+      try{Wait-ReadingPostOpenState -SessionId 'session' -ExpectedName 'reading-source.pdf' -ExpectedPages 6 -NativeControlCategory 'edit-1001' -Deadline $script:now.AddSeconds(60) -StateProvider {throw 'The over-cap timeout reached a state read.'} -UtcNowProvider $clock}catch{$capRejected=$_.Exception.Message-ceq'The post-open document-state timeout exceeded its exact cap.'}
+      if(-not$capRejected){throw 'An over-cap post-open timeout was accepted.'}
+    `);
+    const result = runPowerShell(check);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+    const source = readFileSync('scripts/installed-reading-tools.ps1', 'utf8');
+    expect(source).toContain('activeFilenameMatches:name===expected');
+    expect(source).not.toContain('activeFilename:name');
+    expect(source.indexOf("$postOpen = Wait-ReadingPostOpenState")).toBeLessThan(source.indexOf('$null = Wait-ReadingDocument -SessionId $sessionId -Pages 6'));
   });
 
   it('uses the signed Home marker and the unique global Open action when Home has two Open buttons', () => {
@@ -417,6 +450,10 @@ describe('installed signed reading-tools verifier', () => {
     expect(verify).toContain('clipboardSha256');
     expect(verify).toContain("method = 'programmatic-dom-range-plus-real-windows-clipboard'");
     expect(verify).toContain('programmaticDomSelectionVerified');
+    expect(verify).toContain('nativeFilenameControlCategory=[string]$UiResult.nativeFilenameControlCategory');
+    expect(verify).toContain('activeFilenameMatched=[bool]$UiResult.postOpenActiveFilenameMatched');
+    expect(verify).toContain('pageOneGlyphCount=[int]$UiResult.postOpenPageOneGlyphCount');
+    expect(verify).toContain('pageTextStatusCount=[int]$UiResult.postOpenPageTextStatusCount');
     expect(verify).toContain('uiReentryRequiredAfterCloseAndReopen');
     expect(verify).toContain('passwordStoragePersistenceInspected=$false');
     expect(verify).toContain('artifactIdentifierIncluded = $false');

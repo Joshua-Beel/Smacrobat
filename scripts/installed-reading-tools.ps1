@@ -11,6 +11,7 @@ $script:ReadingPins = [ordered]@{
     LaunchTimeoutMilliseconds = 180000
     NativePickerTimeoutMilliseconds = 180000
     ProductTimeoutMilliseconds = 180000
+    PostOpenTimeoutMilliseconds = 30000
     PortReleaseTimeoutMilliseconds = 180000
     UiAutomationPollMilliseconds = 100
     ClipboardPollMilliseconds = 100
@@ -288,7 +289,8 @@ function Get-ReadingPickerTargetSnapshot {
             if ($targetKind) {
                 $identity = Get-ReadingHandleIdentity -Handle $handle
                 if (-not $targetIdentities.Add($identity)) { $state.exceeded = $true; return $false }
-                $targets.Add([pscustomobject]@{runtimeIdentity=$identity;surfaceRuntimeIdentity=[string]$surface.runtimeIdentity;targetKind=$targetKind;isEnabled=[ReadingNativePickerApi]::IsWindowEnabled($handle);isOffscreen=(-not [ReadingNativePickerApi]::IsWindowVisible($handle));processId=$ownerProcessId;handle=$handle})
+                $nativeControlCategory = if ($targetKind -ceq 'filename') { "edit-$controlId" } else { 'button-idok' }
+                $targets.Add([pscustomobject]@{runtimeIdentity=$identity;surfaceRuntimeIdentity=[string]$surface.runtimeIdentity;targetKind=$targetKind;nativeControlCategory=$nativeControlCategory;isEnabled=[ReadingNativePickerApi]::IsWindowEnabled($handle);isOffscreen=(-not [ReadingNativePickerApi]::IsWindowVisible($handle));processId=$ownerProcessId;handle=$handle})
                 if ($targets.Count -gt 32) { $state.exceeded = $true; return $false }
             }
             return $true
@@ -307,7 +309,8 @@ function Assert-ReadingPickerTargetSnapshot {
     $identities = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($entry in $Snapshot) {
         $properties = @($entry.PSObject.Properties.Name | Sort-Object -CaseSensitive)
-        if (($properties -join ',') -cne 'handle,isEnabled,isOffscreen,processId,runtimeIdentity,surfaceRuntimeIdentity,targetKind' -or [string]$entry.runtimeIdentity -cnotmatch '^\d{1,20}$' -or -not $identities.Add([string]$entry.runtimeIdentity) -or -not $SurfaceIdentities.Contains([string]$entry.surfaceRuntimeIdentity) -or [string]$entry.targetKind -notin @('filename','open') -or [int]$entry.processId -ne $ApplicationProcessId -or [IntPtr]$entry.handle -eq [IntPtr]::Zero) {
+        $categoryValid = ([string]$entry.targetKind -ceq 'filename' -and [string]$entry.nativeControlCategory -in @('edit-1001','edit-1148')) -or ([string]$entry.targetKind -ceq 'open' -and [string]$entry.nativeControlCategory -ceq 'button-idok')
+        if (($properties -join ',') -cne 'handle,isEnabled,isOffscreen,nativeControlCategory,processId,runtimeIdentity,surfaceRuntimeIdentity,targetKind' -or [string]$entry.runtimeIdentity -cnotmatch '^\d{1,20}$' -or -not $identities.Add([string]$entry.runtimeIdentity) -or -not $SurfaceIdentities.Contains([string]$entry.surfaceRuntimeIdentity) -or -not $categoryValid -or [int]$entry.processId -ne $ApplicationProcessId -or [IntPtr]$entry.handle -eq [IntPtr]::Zero) {
             throw "$Kind was invalid, cross-surface, or ambiguous."
         }
     }
@@ -354,7 +357,7 @@ function Wait-ReadingProcessBoundPickerTargets {
             $surface = @($currentSurfaces | Where-Object { [string]$_.runtimeIdentity -ceq [string]$newFilename[0].surfaceRuntimeIdentity })
             if ($surface.Count -ne 1 -or -not [bool]$surface[0].isEnabled -or [bool]$surface[0].isOffscreen -or -not [bool]$newFilename[0].isEnabled -or [bool]$newFilename[0].isOffscreen -or -not [bool]$newOpen[0].isEnabled -or [bool]$newOpen[0].isOffscreen) { throw 'The bound native picker surface or targets were not uniquely enabled and visible.' }
             if ($newSurfaces.Count -eq 1 -and [string]$newSurfaces[0].runtimeIdentity -cne [string]$surface[0].runtimeIdentity) { throw 'A sibling native surface appeared outside the bound picker target surface.' }
-            return [pscustomobject]@{surfaceRuntimeIdentity=[string]$surface[0].runtimeIdentity;surfaceControlType=[string]$surface[0].controlType;surfaceHandle=[IntPtr]$surface[0].handle;baselineIdentities=[string[]]@($baselineSurfaceIdentities);baselineTargetIdentities=[string[]]@($baselineTargetIdentities);dedicatedNewSurface=($newSurfaces.Count -eq 1);filenameRuntimeIdentity=[string]$newFilename[0].runtimeIdentity;filenameHandle=[IntPtr]$newFilename[0].handle;openButtonRuntimeIdentity=[string]$newOpen[0].runtimeIdentity;openButtonHandle=[IntPtr]$newOpen[0].handle}
+            return [pscustomobject]@{surfaceRuntimeIdentity=[string]$surface[0].runtimeIdentity;surfaceControlType=[string]$surface[0].controlType;surfaceHandle=[IntPtr]$surface[0].handle;baselineIdentities=[string[]]@($baselineSurfaceIdentities);baselineTargetIdentities=[string[]]@($baselineTargetIdentities);dedicatedNewSurface=($newSurfaces.Count -eq 1);filenameRuntimeIdentity=[string]$newFilename[0].runtimeIdentity;filenameHandle=[IntPtr]$newFilename[0].handle;filenameControlCategory=[string]$newFilename[0].nativeControlCategory;openButtonRuntimeIdentity=[string]$newOpen[0].runtimeIdentity;openButtonHandle=[IntPtr]$newOpen[0].handle}
         }
         if ($SleepProvider) { & $SleepProvider $script:ReadingPins.UiAutomationPollMilliseconds } else { Start-Sleep -Milliseconds $script:ReadingPins.UiAutomationPollMilliseconds }
         $now = if ($UtcNowProvider) { [datetime](& $UtcNowProvider) } else { [datetime]::UtcNow }
@@ -365,7 +368,7 @@ function Wait-ReadingProcessBoundPickerTargets {
 function Assert-ReadingSurfaceBinding {
     param([Parameter(Mandatory = $true)]$Binding,[Parameter(Mandatory = $true)][int]$ApplicationProcessId,[Parameter(Mandatory = $true)][datetime]$Deadline,[switch]$AllowUnavailableTargets)
     $properties = @($Binding.PSObject.Properties.Name | Sort-Object -CaseSensitive)
-    if (($properties -join ',') -cne 'baselineIdentities,baselineTargetIdentities,dedicatedNewSurface,filenameHandle,filenameRuntimeIdentity,openButtonHandle,openButtonRuntimeIdentity,surfaceControlType,surfaceHandle,surfaceRuntimeIdentity' -or [string]$Binding.surfaceControlType -cne 'Hwnd' -or @($Binding.baselineIdentities).Count -lt 1 -or @($Binding.baselineIdentities).Count -gt 8 -or @($Binding.baselineTargetIdentities).Count -gt 32 -or [string]$Binding.filenameRuntimeIdentity -cnotmatch '^\d{1,20}$' -or [string]$Binding.openButtonRuntimeIdentity -cnotmatch '^\d{1,20}$' -or [IntPtr]$Binding.surfaceHandle -eq [IntPtr]::Zero -or [IntPtr]$Binding.filenameHandle -eq [IntPtr]::Zero -or [IntPtr]$Binding.openButtonHandle -eq [IntPtr]::Zero) {
+    if (($properties -join ',') -cne 'baselineIdentities,baselineTargetIdentities,dedicatedNewSurface,filenameControlCategory,filenameHandle,filenameRuntimeIdentity,openButtonHandle,openButtonRuntimeIdentity,surfaceControlType,surfaceHandle,surfaceRuntimeIdentity' -or [string]$Binding.surfaceControlType -cne 'Hwnd' -or [string]$Binding.filenameControlCategory -notin @('edit-1001','edit-1148') -or @($Binding.baselineIdentities).Count -lt 1 -or @($Binding.baselineIdentities).Count -gt 8 -or @($Binding.baselineTargetIdentities).Count -gt 32 -or [string]$Binding.filenameRuntimeIdentity -cnotmatch '^\d{1,20}$' -or [string]$Binding.openButtonRuntimeIdentity -cnotmatch '^\d{1,20}$' -or [IntPtr]$Binding.surfaceHandle -eq [IntPtr]::Zero -or [IntPtr]$Binding.filenameHandle -eq [IntPtr]::Zero -or [IntPtr]$Binding.openButtonHandle -eq [IntPtr]::Zero) {
         throw 'The native picker surface binding was invalid.'
     }
     if (-not $AllowUnavailableTargets) {
@@ -376,7 +379,8 @@ function Assert-ReadingSurfaceBinding {
         }
         if ((Get-ReadingHandleIdentity -Handle ([IntPtr]$Binding.surfaceHandle)) -cne [string]$Binding.surfaceRuntimeIdentity -or (Get-ReadingHandleIdentity -Handle ([IntPtr]$Binding.filenameHandle)) -cne [string]$Binding.filenameRuntimeIdentity -or (Get-ReadingHandleIdentity -Handle ([IntPtr]$Binding.openButtonHandle)) -cne [string]$Binding.openButtonRuntimeIdentity) { throw 'A bound native picker HWND identity changed before its action.' }
         if ([ReadingNativePickerApi]::GetAncestor([IntPtr]$Binding.filenameHandle,2) -ne [IntPtr]$Binding.surfaceHandle -or [ReadingNativePickerApi]::GetAncestor([IntPtr]$Binding.openButtonHandle,2) -ne [IntPtr]$Binding.surfaceHandle) { throw 'A bound native picker target escaped the exact owned HWND before its action.' }
-        if ((Get-ReadingWindowClassName -Handle ([IntPtr]$Binding.filenameHandle)) -cne 'Edit' -or [ReadingNativePickerApi]::GetDlgCtrlID([IntPtr]$Binding.filenameHandle) -notin @(1001,1148) -or (Get-ReadingWindowClassName -Handle ([IntPtr]$Binding.openButtonHandle)) -cne 'Button' -or [ReadingNativePickerApi]::GetDlgCtrlID([IntPtr]$Binding.openButtonHandle) -ne 1) { throw 'A bound native picker HWND no longer matched the exact filename or Open control contract.' }
+        $expectedFilenameControlId = if ([string]$Binding.filenameControlCategory -ceq 'edit-1001') { 1001 } else { 1148 }
+        if ((Get-ReadingWindowClassName -Handle ([IntPtr]$Binding.filenameHandle)) -cne 'Edit' -or [ReadingNativePickerApi]::GetDlgCtrlID([IntPtr]$Binding.filenameHandle) -ne $expectedFilenameControlId -or (Get-ReadingWindowClassName -Handle ([IntPtr]$Binding.openButtonHandle)) -cne 'Button' -or [ReadingNativePickerApi]::GetDlgCtrlID([IntPtr]$Binding.openButtonHandle) -ne 1) { throw 'A bound native picker HWND no longer matched the exact filename or Open control contract.' }
         if ([datetime]::UtcNow -ge $Deadline) { throw 'The native picker HWND binding deadline expired.' }
     }
 }
@@ -502,6 +506,58 @@ function Open-ReadingUserFile {
     $surface = Wait-ReadingProcessBoundPickerTargets -ApplicationProcessId $ApplicationProcessId -BaselineSurfaces $baseline -BaselineTargets $baselineTargets -Deadline $Deadline
     Submit-ProcessBoundOpenDialog -Binding $surface -ApplicationProcessId $ApplicationProcessId -Path $Path -Deadline $Deadline
     Wait-ReadingProcessUiSurfaceClosed -Binding $surface -ApplicationProcessId $ApplicationProcessId -Deadline $Deadline
+    return [string]$surface.filenameControlCategory
+}
+
+function Get-ReadingPostOpenScript {
+    param([Parameter(Mandatory = $true)][ValidateSet('reading-source.pdf')][string]$ExpectedName)
+    $expected = $ExpectedName | ConvertTo-Json -Compress
+    return @"
+const expected=$expected,tabs=[...document.querySelectorAll('div')].filter(x=>x.querySelector(':scope>button>span')&&x.querySelector(':scope>button[aria-label^="Close "]')),active=tabs.filter(x=>typeof x.className==='string'&&x.className.includes('selectedTab')),name=active.length===1?(active[0].querySelector(':scope>button>span')?.textContent||'').trim():'',input=document.querySelector('input[aria-label="Page number"]'),pages=[...document.querySelectorAll('[aria-label^="Page "]')].filter(x=>/^Page \d+$/.test(x.getAttribute('aria-label')||'')),images=[...document.querySelectorAll('img[alt^="Page "]')].filter(x=>/^Page \d+$/.test(x.getAttribute('alt')||'')),layers=[...document.querySelectorAll('[data-testid="text-layer"]')],pageOne=document.querySelector('[aria-label="Page 1"]');return {schemaVersion:1,documentTabCount:tabs.length,activeTabCount:active.length,activeFilenameMatches:name===expected,pageInputCount:document.querySelectorAll('input[aria-label="Page number"]').length,pageCount:Number.parseInt(input?.max||'0',10)||0,renderedPageCount:pages.length,imageCount:images.length,loadedImageCount:images.filter(x=>x.complete&&x.naturalWidth>0&&x.naturalHeight>0).length,textLayerCount:layers.length,pageOneGlyphCount:pageOne?.querySelector('[data-testid="text-layer"]')?.querySelectorAll('[data-geometry-index]').length||0,pageTextStatusCount:pageOne?.querySelectorAll('[role="status"]').length||0,passwordDialogCount:document.querySelectorAll('dialog[aria-labelledby="password-title"]').length,alertCount:document.querySelectorAll('[role="alert"]').length};
+"@
+}
+
+function Assert-ReadingPostOpenState {
+    param([Parameter(Mandatory = $true)]$State)
+    $properties = @($State.PSObject.Properties.Name | Sort-Object -CaseSensitive)
+    if (($properties -join ',') -cne 'activeFilenameMatches,activeTabCount,alertCount,documentTabCount,imageCount,loadedImageCount,pageCount,pageInputCount,pageOneGlyphCount,pageTextStatusCount,passwordDialogCount,renderedPageCount,schemaVersion,textLayerCount' -or [int]$State.schemaVersion -ne 1 -or $State.activeFilenameMatches -isnot [bool]) { throw 'The post-open document state had an invalid schema.' }
+    foreach ($name in @('activeTabCount','alertCount','documentTabCount','imageCount','loadedImageCount','pageCount','pageInputCount','pageTextStatusCount','passwordDialogCount','renderedPageCount','textLayerCount')) {
+        $value = $State.PSObject.Properties[$name].Value
+        if (($value -isnot [int] -and $value -isnot [long]) -or [long]$value -lt 0 -or [long]$value -gt 4096) { throw 'The post-open document state exceeded its count contract.' }
+    }
+    if (($State.pageOneGlyphCount -isnot [int] -and $State.pageOneGlyphCount -isnot [long]) -or [long]$State.pageOneGlyphCount -lt 0 -or [long]$State.pageOneGlyphCount -gt 100000 -or [long]$State.loadedImageCount -gt [long]$State.imageCount) { throw 'The post-open document state exceeded its render contract.' }
+}
+
+function Wait-ReadingPostOpenState {
+    param(
+        [Parameter(Mandatory = $true)][string]$SessionId,
+        [Parameter(Mandatory = $true)][ValidateSet('reading-source.pdf')][string]$ExpectedName,
+        [Parameter(Mandatory = $true)][ValidateRange(1,4096)][int]$ExpectedPages,
+        [Parameter(Mandatory = $true)][ValidateSet('edit-1001','edit-1148')][string]$NativeControlCategory,
+        [Parameter(Mandatory = $true)][datetime]$Deadline,
+        [scriptblock]$StateProvider,
+        [scriptblock]$SleepProvider,
+        [scriptblock]$UtcNowProvider
+    )
+    $now = if ($UtcNowProvider) { [datetime](& $UtcNowProvider) } else { [datetime]::UtcNow }
+    $postOpenTimeout = [int]$script:ReadingPins.PostOpenTimeoutMilliseconds
+    if ($postOpenTimeout -lt 1 -or $postOpenTimeout -gt 30000) { throw 'The post-open document-state timeout exceeded its exact cap.' }
+    $postOpenDeadline = $now.AddMilliseconds($postOpenTimeout)
+    if ($postOpenDeadline -gt $Deadline) { $postOpenDeadline = $Deadline }
+    $diagnostic = [ordered]@{schemaVersion=1;nativeFilenameControlCategory=$NativeControlCategory;documentTabCount=0;activeTabCount=0;activeFilenameMatches=$false;pageInputCount=0;pageCount=0;renderedPageCount=0;imageCount=0;loadedImageCount=0;textLayerCount=0;pageOneGlyphCount=0;pageTextStatusCount=0;passwordDialogCount=0;alertCount=0}
+    while ($now -lt $postOpenDeadline) {
+        $state = if ($StateProvider) { & $StateProvider } else { Invoke-WebDriverScript -SessionId $SessionId -Deadline $postOpenDeadline -Script (Get-ReadingPostOpenScript -ExpectedName $ExpectedName) }
+        $now = if ($UtcNowProvider) { [datetime](& $UtcNowProvider) } else { [datetime]::UtcNow }
+        if ($now -ge $postOpenDeadline) { break }
+        Assert-ReadingPostOpenState -State $state
+        foreach ($name in @('documentTabCount','activeTabCount','activeFilenameMatches','pageInputCount','pageCount','renderedPageCount','imageCount','loadedImageCount','textLayerCount','pageOneGlyphCount','pageTextStatusCount','passwordDialogCount','alertCount')) { $diagnostic[$name] = $state.PSObject.Properties[$name].Value }
+        $wrongDocument = [int]$state.documentTabCount -gt 1 -or ([int]$state.documentTabCount -eq 1 -and ([int]$state.activeTabCount -ne 1 -or -not [bool]$state.activeFilenameMatches)) -or ([int]$state.pageCount -gt 0 -and [int]$state.pageCount -ne $ExpectedPages) -or [int]$state.alertCount -gt 0 -or [int]$state.passwordDialogCount -gt 0
+        if ($wrongDocument) { throw "The native picker did not open the exact allowlisted plain fixture; diagnostic=$($diagnostic | ConvertTo-Json -Compress)" }
+        if ([int]$state.documentTabCount -eq 1 -and [int]$state.activeTabCount -eq 1 -and [bool]$state.activeFilenameMatches -and [int]$state.pageInputCount -eq 1 -and [int]$state.pageCount -eq $ExpectedPages) { return [pscustomobject]$diagnostic }
+        if ($SleepProvider) { & $SleepProvider $script:ReadingPins.UiAutomationPollMilliseconds } else { Start-Sleep -Milliseconds $script:ReadingPins.UiAutomationPollMilliseconds }
+        $now = if ($UtcNowProvider) { [datetime](& $UtcNowProvider) } else { [datetime]::UtcNow }
+    }
+    throw "The exact allowlisted plain fixture did not appear after native picker close; diagnostic=$($diagnostic | ConvertTo-Json -Compress)"
 }
 
 function Get-ReadingOwnedExecutableDiagnostic {
@@ -670,11 +726,14 @@ function Invoke-RealInstalledReadingTools {
 
         Assert-ReadingPhaseTransition -Deadline $launchDeadline -Phase launch
         $plainPickerDeadline = New-ReadingPhaseDeadline -Phase native-picker
-        Open-ReadingUserFile -SessionId $sessionId -ApplicationProcessId $applicationProcessId -Path $PlainFixture -Deadline $plainPickerDeadline
+        $plainPickerControlCategory = Open-ReadingUserFile -SessionId $sessionId -ApplicationProcessId $applicationProcessId -Path $PlainFixture -Deadline $plainPickerDeadline
         Assert-ReadingPhaseTransition -Deadline $plainPickerDeadline -Phase native-picker
         $plainProductDeadline = New-ReadingPhaseDeadline -Phase product
+        $postOpen = Wait-ReadingPostOpenState -SessionId $sessionId -ExpectedName 'reading-source.pdf' -ExpectedPages 6 -NativeControlCategory $plainPickerControlCategory -Deadline $plainProductDeadline
         $null = Wait-ReadingDocument -SessionId $sessionId -Pages 6 -Deadline $plainProductDeadline
-        $layer = Wait-WebDriverOracle -SessionId $sessionId -Deadline $plainProductDeadline -Kind 'embedded text layer' -Script "const p=document.querySelector('[aria-label=`"Page 1`"]'),l=p?.querySelector('[data-testid=`"text-layer`"]'),i=p?.querySelector('img[alt=`"Page 1`"]');return {ready:!!l&&!!i&&i.complete,glyphs:l?.querySelectorAll('[data-geometry-index]').length||0};" -Predicate { param($v) [bool]$v.ready -and [int]$v.glyphs -gt 20 }
+        try {
+            $layer = Wait-WebDriverOracle -SessionId $sessionId -Deadline $plainProductDeadline -Kind 'embedded text layer' -Script "const p=document.querySelector('[aria-label=`"Page 1`"]'),l=p?.querySelector('[data-testid=`"text-layer`"]'),i=p?.querySelector('img[alt=`"Page 1`"]');return {ready:!!l&&!!i&&i.complete,glyphs:l?.querySelectorAll('[data-geometry-index]').length||0};" -Predicate { param($v) [bool]$v.ready -and [int]$v.glyphs -gt 20 }
+        } catch { throw "Embedded text layer verification failed after the sanitized post-open receipt; diagnostic=$($postOpen | ConvertTo-Json -Compress)" }
         $selectionScript = @'
 const target='A place for your PDFs.',p=document.querySelector('[aria-label="Page 1"]'),l=p?.querySelector('[data-testid="text-layer"]'),i=p?.querySelector('img[alt="Page 1"]');if(!l||!i)return {ready:false,exact:false,utf16:0,rects:0,inside:false};const s=[...l.querySelectorAll('[data-geometry-index]')],joined=s.map(x=>x.textContent||'').join(''),start=joined.indexOf(target);if(start<0)return {ready:true,exact:false,utf16:0,rects:0,inside:false};let offset=0,first=null,last=null,firstOffset=0,lastOffset=0;for(const x of s){const text=x.textContent||'',next=offset+text.length;if(first===null&&start>=offset&&start<next){first=x;firstOffset=start-offset}if(start+target.length>offset&&start+target.length<=next){last=x;lastOffset=start+target.length-offset;break}offset=next}if(!first||!last)return {ready:true,exact:false,utf16:0,rects:0,inside:false};const r=document.createRange();r.setStart(first.firstChild,firstOffset);r.setEnd(last.firstChild,lastOffset);const sel=getSelection();sel.removeAllRanges();sel.addRange(r);const rects=[...r.getClientRects()],page=i.getBoundingClientRect(),inside=rects.length>0&&rects.every(x=>x.width>0&&x.height>0&&x.left>=page.left-2&&x.top>=page.top-2&&x.right<=page.right+2&&x.bottom<=page.bottom+2);return {ready:true,exact:sel.toString()===target,utf16:sel.toString().length,rects:rects.length,inside};
 '@
@@ -707,7 +766,7 @@ const a=document.querySelector('aside[aria-label="Find in document"]'),live=[...
 
         Assert-ReadingPhaseTransition -Deadline $plainProductDeadline -Phase product
         $passwordPickerDeadline = New-ReadingPhaseDeadline -Phase native-picker
-        Open-ReadingUserFile -SessionId $sessionId -ApplicationProcessId $applicationProcessId -Path $ProtectedFixture -Deadline $passwordPickerDeadline
+        $null = Open-ReadingUserFile -SessionId $sessionId -ApplicationProcessId $applicationProcessId -Path $ProtectedFixture -Deadline $passwordPickerDeadline
         Assert-ReadingPhaseTransition -Deadline $passwordPickerDeadline -Phase native-picker
         $passwordProductDeadline = New-ReadingPhaseDeadline -Phase product
         $prompt = Wait-WebDriverOracle -SessionId $sessionId -Deadline $passwordProductDeadline -Kind 'password prompt' -Script "const d=document.querySelector('dialog[aria-labelledby=`"password-title`"]'),i=d?.querySelector('input[type=`"password`"]');return {one:!!d&&!!i&&i.value==='',message:[...d?.querySelectorAll('p')||[]].some(x=>x.textContent.trim()==='Your password is used only to open this document.')};" -Predicate { param($v) [bool]$v.one -and [bool]$v.message }
@@ -718,7 +777,7 @@ const a=document.querySelector('aside[aria-label="Find in document"]'),live=[...
         Close-ActiveReadingDocument -SessionId $sessionId -Deadline $passwordProductDeadline
         Assert-ReadingPhaseTransition -Deadline $passwordProductDeadline -Phase product
         $reopenPickerDeadline = New-ReadingPhaseDeadline -Phase native-picker
-        Open-ReadingUserFile -SessionId $sessionId -ApplicationProcessId $applicationProcessId -Path $ProtectedFixture -Deadline $reopenPickerDeadline
+        $null = Open-ReadingUserFile -SessionId $sessionId -ApplicationProcessId $applicationProcessId -Path $ProtectedFixture -Deadline $reopenPickerDeadline
         Assert-ReadingPhaseTransition -Deadline $reopenPickerDeadline -Phase native-picker
         $reopenProductDeadline = New-ReadingPhaseDeadline -Phase product
         $reopened = Wait-WebDriverOracle -SessionId $sessionId -Deadline $reopenProductDeadline -Kind 'transient password reopen' -Script "const d=document.querySelector('dialog[aria-labelledby=`"password-title`"]'),i=d?.querySelector('input[type=`"password`"]');return {prompt:!!d,empty:i?.value===''};" -Predicate { param($v) [bool]$v.prompt -and [bool]$v.empty }
@@ -726,7 +785,7 @@ const a=document.querySelector('aside[aria-label="Find in document"]'),live=[...
         Start-Sleep -Milliseconds 250
         Assert-ReadingPhaseTransition -Deadline $reopenProductDeadline -Phase product
         $postCancelPickerDeadline = New-ReadingPhaseDeadline -Phase native-picker
-        Open-ReadingUserFile -SessionId $sessionId -ApplicationProcessId $applicationProcessId -Path $ProtectedFixture -Deadline $postCancelPickerDeadline
+        $null = Open-ReadingUserFile -SessionId $sessionId -ApplicationProcessId $applicationProcessId -Path $ProtectedFixture -Deadline $postCancelPickerDeadline
         Assert-ReadingPhaseTransition -Deadline $postCancelPickerDeadline -Phase native-picker
         $postCancelProductDeadline = New-ReadingPhaseDeadline -Phase product
         $afterCancel = Wait-WebDriverOracle -SessionId $sessionId -Deadline $postCancelProductDeadline -Kind 'post-cancel password reopen' -Script "const d=document.querySelector('dialog[aria-labelledby=`"password-title`"]'),i=d?.querySelector('input[type=`"password`"]');return {prompt:!!d,empty:i?.value===''};" -Predicate { param($v) [bool]$v.prompt -and [bool]$v.empty }
@@ -741,6 +800,17 @@ const a=document.querySelector('aside[aria-label="Find in document"]'),live=[...
             returnedRuntimeVersion = $returnedRuntimeVersion
             profileBinding = $profileBinding
             processBoundPickerVerified = $true
+            nativeFilenameControlCategory = [string]$plainPickerControlCategory
+            postOpenDocumentTabCount = [int]$postOpen.documentTabCount
+            postOpenActiveTabCount = [int]$postOpen.activeTabCount
+            postOpenActiveFilenameMatched = [bool]$postOpen.activeFilenameMatches
+            postOpenPageCount = [int]$postOpen.pageCount
+            postOpenRenderedPageCount = [int]$postOpen.renderedPageCount
+            postOpenImageCount = [int]$postOpen.imageCount
+            postOpenLoadedImageCount = [int]$postOpen.loadedImageCount
+            postOpenTextLayerCount = [int]$postOpen.textLayerCount
+            postOpenPageOneGlyphCount = [int]$postOpen.pageOneGlyphCount
+            postOpenPageTextStatusCount = [int]$postOpen.pageTextStatusCount
             programmaticDomSelectionVerified = $true
             selectionGeometryInsidePage = [bool]$selection.inside
             selectionClientRectCount = [int]$selection.rects
