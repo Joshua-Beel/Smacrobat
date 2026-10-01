@@ -1,0 +1,119 @@
+name: Manual signed expanded page tools verification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: signed-expanded-page-tools-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  expanded-page-tools:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - name: Require a manual master dispatch
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REPOSITORY -cne 'Joshua-Beel/Smacrobat' -or
+              $env:GITHUB_EVENT_NAME -cne 'workflow_dispatch' -or
+              $env:GITHUB_REF -cne 'refs/heads/master') {
+            throw 'Dispatch expanded page-tools verification only from the master branch.'
+          }
+
+      - name: Initialize fresh runner paths
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP) -or [string]::IsNullOrWhiteSpace($env:GITHUB_ENV)) {
+            throw 'GitHub-hosted runner path variables are unavailable.'
+          }
+          $root = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\')
+          $values = @(
+            "SIGNED_ARTIFACT_ROOT=$root\pdf-workstation-expanded-signed-artifact"
+            "EXPANDED_WORK_ROOT=$root\pdf-workstation-expanded-work"
+            "EXPANDED_OUTPUT_ROOT=$root\pdf-workstation-expanded-output"
+            "WEBDRIVER_ROOT=$root\pdf-workstation-expanded-webdriver"
+          )
+          $writer = [IO.StreamWriter]::new($env:GITHUB_ENV,$true,[Text.UTF8Encoding]::new($false))
+          try { foreach ($value in $values) { $writer.WriteLine([string]$value) } } finally { $writer.Dispose() }
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify the exact clean dispatched source
+        shell: pwsh
+        run: |
+          $head = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $head -cne $env:GITHUB_SHA) { throw 'Checked-out HEAD does not match github.sha.' }
+          git diff --quiet --
+          if ($LASTEXITCODE -ne 0) { throw 'Tracked working-tree files changed after checkout.' }
+          git diff --cached --quiet --
+          if ($LASTEXITCODE -ne 0) { throw 'The tracked index changed after checkout.' }
+          git cat-file -e '67d238218f4796ba7b8505d072868da0f397174a^{commit}'
+          if ($LASTEXITCODE -ne 0) { throw 'The exact signed source commit is unavailable.' }
+
+      - name: Prepare exact hosted WebDriver inputs
+        shell: pwsh
+        run: |
+          ./scripts/setup-installed-app-webdriver.ps1 -OutputRoot $env:WEBDRIVER_ROOT
+
+      - name: Recheck clean source after driver preparation
+        shell: pwsh
+        run: |
+          $head = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $head -cne $env:GITHUB_SHA) { throw 'Checked-out HEAD changed during WebDriver preparation.' }
+          git diff --quiet --
+          if ($LASTEXITCODE -ne 0) { throw 'Tracked working-tree files changed during WebDriver preparation.' }
+          git diff --cached --quiet --
+          if ($LASTEXITCODE -ne 0) { throw 'The tracked index changed during WebDriver preparation.' }
+
+      - name: Verify exact signed artifact metadata
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          if (Test-Path -LiteralPath $env:SIGNED_ARTIFACT_ROOT) { throw 'Signed artifact download root must be fresh.' }
+          $headers = @{ Authorization="Bearer $env:GITHUB_TOKEN";Accept='application/vnd.github+json';'X-GitHub-Api-Version'='2022-11-28' }
+          $artifact = Invoke-RestMethod -Uri 'https://api.github.com/repos/Joshua-Beel/Smacrobat/actions/artifacts/11005152678' -Headers $headers
+          if ([uint64]$artifact.id -ne 11005152678 -or
+              [string]$artifact.name -cne 'signed-ocr-installer-67d238218f4796ba7b8505d072868da0f397174a' -or
+              [uint64]$artifact.size_in_bytes -ne 10437483 -or
+              [string]$artifact.digest -cne 'sha256:c0e89b5ae821d5875c31855c6596a7d47b7ca052468a026745a5d638e50ca569' -or
+              [uint64]$artifact.workflow_run.id -ne 36499724415 -or
+              [string]$artifact.workflow_run.head_sha -cne '67d238218f4796ba7b8505d072868da0f397174a' -or [bool]$artifact.expired) {
+            throw 'Signed expanded page-tools artifact metadata does not match the pinned successful run.'
+          }
+
+      - name: Download exact signed application artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: '11005152678'
+          github-token: ${{ github.token }}
+          repository: Joshua-Beel/Smacrobat
+          run-id: '36499724415'
+          merge-multiple: true
+          path: ${{ env.SIGNED_ARTIFACT_ROOT }}
+
+      - name: Verify signed installed expanded page tools
+        shell: pwsh
+        run: |
+          ./scripts/verify-signed-expanded-page-tools.ps1 `
+            -SignedArtifactRoot $env:SIGNED_ARTIFACT_ROOT `
+            -WorkRoot $env:EXPANDED_WORK_ROOT `
+            -OutputRoot $env:EXPANDED_OUTPUT_ROOT `
+            -WebDriverRoot $env:WEBDRIVER_ROOT
+
+      - name: Upload only the sanitized expanded page-tools record
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: signed-expanded-page-tools-verification-${{ github.sha }}
+          path: ${{ env.EXPANDED_OUTPUT_ROOT }}/expanded-page-tools-verification.json
+          if-no-files-found: ignore

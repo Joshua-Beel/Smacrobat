@@ -1,16 +1,20 @@
 import { describe, expect, it } from 'vitest';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 
 function runPowerShell(source: string) {
-  const root = `target/installed-launch-test-${randomUUID()}`;
-  mkdirSync(root, { recursive: true });
-  const path = `${root}/run.ps1`;
-  writeFileSync(path, source, 'utf8');
-  return spawnSync('pwsh.exe', ['-NoProfile', '-NonInteractive', '-File', path], {
-    encoding: 'utf8', timeout: 60_000,
-  });
+  const root = mkdtempSync(join(tmpdir(), 'smacrobat-installed-launch-'));
+  const path = join(root, 'run.ps1');
+  try {
+    writeFileSync(path, source, 'utf8');
+    return spawnSync('pwsh.exe', ['-NoProfile', '-NonInteractive', '-File', path], {
+      encoding: 'utf8', timeout: 60_000, env: { ...process.env, SMACROBAT_TEST_ROOT: root },
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 }
 
 function extractFunctions(script: string, names: string[], body: string) {
@@ -32,6 +36,42 @@ function extractFunctions(script: string, names: string[], body: string) {
 }
 
 describe('hosted installed signed application launch proof', () => {
+  it('starts verifier children with only the exact minimal environment and excludes ambient tokens', () => {
+    const source = extractFunctions('scripts/installed-app-launch.ps1', ['Get-MinimalWindowsProcessEnvironment', 'Start-BoundedDiscardProcess'], String.raw`
+      $env:SMACROBAT_AMBIENT_TOKEN='must-not-cross-process-boundary'
+      $minimal=Get-MinimalWindowsProcessEnvironment
+      $expected=@('COMSPEC','SystemRoot','WINDIR','LOCALAPPDATA','APPDATA','USERPROFILE','TEMP','TMP','PATH','PATHEXT')
+      if((@($minimal.Keys|Sort-Object -CaseSensitive)-join ',')-cne(@($expected|Sort-Object -CaseSensitive)-join ',')){throw 'Minimal environment allowlist changed.'}
+      $pwsh=(Get-Process -Id $PID).Path
+      $command='if($env:SMACROBAT_AMBIENT_TOKEN){exit 41};if([string]::IsNullOrWhiteSpace($env:SystemRoot)-or[string]::IsNullOrWhiteSpace($env:TEMP)){exit 42};exit 0'
+      $capture=Start-BoundedDiscardProcess -Path $pwsh -Arguments @('-NoProfile','-NonInteractive','-Command',$command) -Environment $minimal
+      try{$capture.Start();if(-not$capture.Process.WaitForExit(10000)){throw 'Minimal-environment child did not exit.'};$capture.Process.WaitForExit();if($capture.Process.ExitCode-ne0){throw ('Minimal-environment child rejected its environment: '+$capture.Process.ExitCode)}}finally{$capture.Dispose()}
+      $hostile=[ordered]@{};foreach($name in $expected){$hostile[$name]=$minimal[$name]};$hostile['SMACROBAT_AMBIENT_TOKEN']='secret'
+      $rejected=$false;try{Start-BoundedDiscardProcess -Path $pwsh -Arguments @('-NoProfile') -Environment $hostile|Out-Null}catch{$rejected=$_.Exception.Message-ceq'The child-process environment did not match the exact minimal allowlist.'}
+      if(-not$rejected){throw 'Unexpected child-process environment entry was accepted.'}
+    `);
+    const result = runPowerShell(source);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
+  it('supplies the exact minimal environment to every production bounded child launch', () => {
+    const result = runPowerShell(String.raw`
+      $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
+      Set-Location -LiteralPath '${process.cwd().replaceAll("'", "''")}'
+      $calls=0
+      foreach($file in @(Get-ChildItem -LiteralPath ./scripts -Recurse -File -Filter '*.ps1')){
+        $tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile($file.FullName,[ref]$tokens,[ref]$errors)
+        if($errors.Count){throw ('Production script did not parse: '+$file.Name)}
+        foreach($command in @($ast.FindAll({param($node)$node-is[Management.Automation.Language.CommandAst]-and$node.GetCommandName()-ceq'Start-BoundedDiscardProcess'},$true))){
+          $calls++;$text=$command.Extent.Text
+          if($text-cnotmatch '(?s)-Environment\s+\(Get-MinimalWindowsProcessEnvironment\)'){throw ('Production bounded child launch inherited ambient environment: '+$file.Name)}
+        }
+      }
+      if($calls-lt7){throw 'Production bounded child launch inventory was unexpectedly incomplete.'}
+    `);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
   it('bounds trickled response bodies by one deadline and rejects late oracle results', () => {
     const source = extractFunctions('scripts/installed-app-launch.ps1', ['Get-LaunchRemainingMilliseconds', 'Read-BoundedLoopbackResponseText', 'Wait-WebDriverOracle'], String.raw`
       $script:LaunchPins=[ordered]@{SessionCreationTimeoutMilliseconds=180000;RequestBytesMaximum=1024}
@@ -132,7 +172,7 @@ public sealed class NonCooperativeResponseStream : MemoryStream {
           @('tauri-driver-2.0.6/Cargo.toml','tauri-driver-2.0.6/Cargo.lock','tauri-driver-2.0.6/../escape'),
           @('tauri-driver-2.0.6/Cargo.toml','tauri-driver-2.0.6/Cargo.lock','tauri-driver-2.0.6/src/main.rs','tauri-driver-2.0.6/.cargo/config.toml')
         )){$rejected=$false;try{Assert-SafeCrateEntries -Entries $bad}catch{$rejected=$true};if(-not$rejected){throw 'Unsafe crate entry accepted.'}}
-        $root=Join-Path (Resolve-Path target) ('crate-tree-'+[Guid]::NewGuid().ToString('N'));$source=Join-Path $root 'source';$outside=Join-Path $root 'outside'
+        $root=Join-Path $env:SMACROBAT_TEST_ROOT ('crate-tree-'+[Guid]::NewGuid().ToString('N'));$source=Join-Path $root 'source';$outside=Join-Path $root 'outside'
         [IO.Directory]::CreateDirectory($source)|Out-Null;[IO.Directory]::CreateDirectory($outside)|Out-Null
         New-Item -ItemType Junction -Path (Join-Path $source 'link') -Target $outside|Out-Null
         $rejected=$false;try{Assert-ExtractedCrateTree -Source $source}catch{$rejected=$true};if(-not$rejected){throw 'Extracted reparse point accepted.'}
@@ -153,7 +193,7 @@ public sealed class NonCooperativeResponseStream : MemoryStream {
     const source = extractFunctions('scripts/setup-installed-app-webdriver.ps1', ['Expand-ExactEdgeDriver'], String.raw`
       Add-Type -AssemblyName System.IO.Compression.FileSystem
       $script:DriverPins=[ordered]@{MaximumEdgeEntries=16;MaximumEdgeArchiveBytes=32MB;MaximumEdgeExpandedBytes=64MB}
-      $root=Join-Path (Resolve-Path target) ('edge-archive-'+[Guid]::NewGuid().ToString('N'));[IO.Directory]::CreateDirectory($root)|Out-Null
+      $root=Join-Path $env:SMACROBAT_TEST_ROOT ('edge-archive-'+[Guid]::NewGuid().ToString('N'));[IO.Directory]::CreateDirectory($root)|Out-Null
       function New-TestArchive([string]$path,[string[]]$names){$zip=[IO.Compression.ZipFile]::Open($path,[IO.Compression.ZipArchiveMode]::Create);try{foreach($name in $names){$entry=$zip.CreateEntry($name);$stream=$entry.Open();try{$stream.WriteByte(1)}finally{$stream.Dispose()}}}finally{$zip.Dispose()}}
       foreach($case in @(
         [pscustomobject]@{name='traversal';entries=@('../msedgedriver.exe')},
@@ -187,7 +227,7 @@ public sealed class NonCooperativeResponseStream : MemoryStream {
       )){$rejected=$false;try{Assert-NativeDriverStatus -Status $bad -ExpectedVersion $version}catch{$rejected=$true};if(-not$rejected){throw 'Unsafe native status accepted.'}}
       $responses=[Collections.Generic.Queue[object]]::new();$responses.Enqueue('not-ready');$responses.Enqueue($status);$provider={param($deadline)$next=$responses.Dequeue();if($next-is[string]){throw $next};$next}.GetNewClosure()
       if((Wait-NativeDriverStatus -ExpectedVersion $version -Deadline ([datetime]::UtcNow.AddSeconds(2)) -TauriDriver ([pscustomobject]@{HasExited=$false}) -StatusProvider $provider)-cne$version-or$responses.Count-ne0){throw 'Native readiness retry changed.'}
-      $profile=Join-Path (Resolve-Path target) ('profile-binding-'+[Guid]::NewGuid().ToString('N'));$settings=Join-Path (Resolve-Path target) ('settings-binding-'+[Guid]::NewGuid().ToString('N'));$applicationProfile=Join-Path $settings 'EBWebView'
+      $profile=Join-Path $env:SMACROBAT_TEST_ROOT ('profile-binding-'+[Guid]::NewGuid().ToString('N'));$settings=Join-Path $env:SMACROBAT_TEST_ROOT ('settings-binding-'+[Guid]::NewGuid().ToString('N'));$applicationProfile=Join-Path $settings 'EBWebView'
       if((Get-ExactProfileBinding -Candidate $profile -RequestedProfile $profile -SettingsRoot $settings)-cne'requested-profile'){throw 'Exact requested profile was not bound.'}
       if((Get-ExactProfileBinding -Candidate $applicationProfile -RequestedProfile $profile -SettingsRoot $settings)-cne'tauri-app-settings-ebwebview'){throw 'Exact Tauri application profile was not bound.'}
       $requestedWebView=Join-Path $profile 'EBWebView';if((Get-ExactProfileBinding -Candidate $requestedWebView -RequestedProfile $profile -SettingsRoot $settings)-cne'requested-ebwebview'){throw 'Exact evidence-backed requested EBWebView profile was not bound.'}
@@ -269,7 +309,7 @@ public sealed class NonCooperativeResponseStream : MemoryStream {
     const source = extractFunctions('scripts/installed-app-launch.ps1', ['Assert-LaunchExactProperties', 'Assert-LaunchReceiptValue', 'Assert-WebDriverReceipt', 'Invoke-InstalledAppLaunchSmoke'], String.raw`
       function Assert-FileReceipt{param([string]$Path,[uint64]$Bytes,[string]$Sha256,[string]$Kind)};function Assert-TrustedWindowsSignature{param([string]$Path,[string]$ExpectedPublisher);[pscustomobject]@{}};function Get-LaunchProcessSnapshot{return @()}
       $script:LaunchPins=[ordered]@{TauriDriverVersion='2.0.6';TauriDriverPackageSha256='24DC39BD26A65361C1C8E067636BBFF1D9DD7E2FC58FF874EDFBA33ACAB0E6D0';EdgePublisher='Microsoft Corporation';OcrUiTextBytesMaximum=65536}
-      $root=Join-Path (Resolve-Path target) ('launch-wrapper-'+[Guid]::NewGuid().ToString('N'));$drivers=Join-Path $root 'drivers';[IO.Directory]::CreateDirectory((Join-Path $drivers 'tauri-driver-install/bin'))|Out-Null;[IO.Directory]::CreateDirectory((Join-Path $drivers 'edge-driver'))|Out-Null
+      $root=Join-Path $env:SMACROBAT_TEST_ROOT ('launch-wrapper-'+[Guid]::NewGuid().ToString('N'));$drivers=Join-Path $root 'drivers';[IO.Directory]::CreateDirectory((Join-Path $drivers 'tauri-driver-install/bin'))|Out-Null;[IO.Directory]::CreateDirectory((Join-Path $drivers 'edge-driver'))|Out-Null
       $receipt=[ordered]@{schemaVersion=1;tauriDriverSource=[ordered]@{version='2.0.6';origin='static.crates.io';bytes=[uint64]1;sha256=$script:LaunchPins.TauriDriverPackageSha256};tauriDriver=[ordered]@{version='2.0.6';cargoVersion='cargo 1.91.0 (abc 2026-01-01)';rustcVersion='rustc 1.91.0 (abc 2026-01-01)';bytes=[uint64]2;sha256=('A'*64)};webView2RuntimeVersion='151.0.4129.50';edgeDriverArchive=[ordered]@{origin='msedgedriver.microsoft.com';bytes=[uint64]3;sha256=('B'*64)};edgeDriver=[ordered]@{version='151.0.4129.78';bytes=[uint64]4;sha256=('C'*64);signatureStatus='Valid';publisher='Microsoft Corporation';hasTimestamp=$true}}
       [IO.File]::WriteAllText((Join-Path $drivers 'webdriver-receipt.json'),($receipt|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
       function Invoke-TestLaunch([string]$label,[scriptblock]$provider,[bool]$extraSettings=$false,[bool]$preexistingChild=$false,[bool]$reparseAncestor=$false){
@@ -487,7 +527,7 @@ public sealed class FixedMemoryStream : MemoryStream {
 
   it('waits boundedly for an inert owned process tree and never kills mismatched identities', () => {
     const source = extractFunctions('scripts/installed-app-launch.ps1', ['Wait-BoundedOwnedProcessExit', 'Get-LaunchProcessCategory', 'Get-CapturedCategoryOutcome', 'Stop-OwnedLaunchProcesses'], String.raw`
-      $root=Join-Path (Resolve-Path target) ('owned-cleanup-'+[Guid]::NewGuid().ToString('N'));[IO.Directory]::CreateDirectory($root)|Out-Null
+      $root=Join-Path $env:SMACROBAT_TEST_ROOT ('owned-cleanup-'+[Guid]::NewGuid().ToString('N'));[IO.Directory]::CreateDirectory($root)|Out-Null
       $pidPath=Join-Path $root 'child.pid';$rootScript=Join-Path $root 'root.ps1';$pwsh=(Get-Process -Id $PID).Path
       $rootSource=@'
 param([string]$ChildPidPath,[string]$PwshPath)
@@ -621,7 +661,7 @@ $child=[Diagnostics.Process]::Start($info);[IO.File]::WriteAllText($ChildPidPath
   it('reports a newly orphaned descendant as uncaptured without weakening identity-bound cleanup', () => {
     const source = extractFunctions('scripts/installed-app-launch.ps1', ['Get-OwnedLaunchProcesses', 'Wait-BoundedOwnedProcessExit', 'Get-LaunchProcessCategory', 'Get-CapturedCategoryOutcome', 'Stop-OwnedLaunchProcesses', 'Get-LaunchResidualFacts', 'Assert-LaunchCleanupState'], String.raw`
       $script:LaunchPins=[ordered]@{ProcessTimestampToleranceTicks=10}
-      $root=Join-Path (Resolve-Path target) ('orphan-diagnostic-'+[Guid]::NewGuid().ToString('N'));[IO.Directory]::CreateDirectory($root)|Out-Null;$gate=Join-Path $root 'spawn.gate';$middlePid=Join-Path $root 'middle.pid';$grandPid=Join-Path $root 'grand.pid';$middleScript=Join-Path $root 'middle.ps1';$rootScript=Join-Path $root 'root.ps1';$pwsh=(Get-Process -Id $PID).Path
+      $root=Join-Path $env:SMACROBAT_TEST_ROOT ('orphan-diagnostic-'+[Guid]::NewGuid().ToString('N'));[IO.Directory]::CreateDirectory($root)|Out-Null;$gate=Join-Path $root 'spawn.gate';$middlePid=Join-Path $root 'middle.pid';$grandPid=Join-Path $root 'grand.pid';$middleScript=Join-Path $root 'middle.ps1';$rootScript=Join-Path $root 'root.ps1';$pwsh=(Get-Process -Id $PID).Path
       $middleSource=@'
 param([string]$Gate,[string]$GrandPid,[string]$Pwsh)
 while(-not(Test-Path -LiteralPath $Gate)){Start-Sleep -Milliseconds 25}
@@ -640,13 +680,13 @@ $info=[Diagnostics.ProcessStartInfo]::new();$info.FileName=$Pwsh;$info.UseShellE
   });
 
   it('does not retry a timed-out session POST and still stops the owned process tree', () => {
-    const source = extractFunctions('scripts/installed-app-launch.ps1', ['Invoke-RealInstalledAppLaunch'], String.raw`
+    const source = extractFunctions('scripts/installed-app-launch.ps1', ['Get-MinimalWindowsProcessEnvironment', 'Invoke-RealInstalledAppLaunch'], String.raw`
       $script:LaunchPins=[ordered]@{TotalTimeoutMilliseconds=60000;CleanupProcessTimeoutMilliseconds=30000;CleanupProcessPollMilliseconds=1;WebDriverPort=4444;NativeDriverPort=4445}
       $script:sessionPosts=0;$script:deleteRequests=0;$script:driverStopped=$false
       $driver=[pscustomobject]@{HasExited=$false;Id=1234}
       $capture=[pscustomobject]@{Process=$driver;Exceeded=$false};$capture|Add-Member ScriptMethod Start {};$capture|Add-Member ScriptMethod Dispose {}
       function Assert-FixedWebDriverPortsFree{}
-      function Start-BoundedDiscardProcess{param([string]$Path,[object[]]$Arguments);$capture}
+      function Start-BoundedDiscardProcess{param([string]$Path,[object[]]$Arguments,[Collections.IDictionary]$Environment);if($Environment.Count-ne10){throw 'Minimal launch environment was not supplied.'};$capture}
       function Invoke-BoundedLoopbackJson{param([string]$Method,[string]$Path,$Body,[datetime]$Deadline,[int]$Port=4444);if($Method-ceq'GET'-and$Path-ceq'/status'){return [pscustomobject]@{value=[pscustomobject]@{ready=$true}}};if($Method-ceq'POST'-and$Path-ceq'/session'){$script:sessionPosts++;throw 'session-timeout'};if($Method-ceq'DELETE'){$script:deleteRequests++};throw 'unexpected-loopback-request'}
       function Wait-NativeDriverStatus{param([string]$ExpectedVersion,[datetime]$Deadline,$TauriDriver);$ExpectedVersion}
       function Get-OwnedLaunchProcesses{param([int]$RootProcessId,[datetime]$StartedAfter);@()}

@@ -1,17 +1,23 @@
 import { describe, expect, it } from 'vitest';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 
 function runPowerShell(source: string) {
-  const root = `target/reading-tools-test-${randomUUID()}`;
-  mkdirSync(root, { recursive: true });
-  const path = `${root}/run.ps1`;
-  writeFileSync(path, source, 'utf8');
-  return spawnSync('pwsh.exe', ['-NoProfile', '-NonInteractive', '-File', path], {
-    encoding: 'utf8',
-    timeout: 30_000,
-  });
+  const root = mkdtempSync(join(tmpdir(), 'smacrobat-reading-tools-'));
+  const path = join(root, 'run.ps1');
+  try {
+    writeFileSync(path, source, 'utf8');
+    return spawnSync('pwsh.exe', ['-NoProfile', '-NonInteractive', '-File', path], {
+      encoding: 'utf8',
+      timeout: 30_000,
+      env: { ...process.env, SMACROBAT_TEST_ROOT: root },
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 }
 
 function extractFunctions(path: string, names: string[], body: string) {
@@ -60,42 +66,44 @@ describe('installed signed reading-tools verifier', () => {
   });
 
   it('binds a new target pair inside one of two stable owned surfaces and tracks stable close', () => {
-    const check = extractFunctions('scripts/installed-reading-tools.ps1', ['Assert-ReadingSurfaceSnapshot', 'Assert-ReadingPickerTargetSnapshot', 'Wait-ReadingProcessBoundPickerTargets', 'Assert-ReadingSurfaceBinding', 'Wait-ReadingProcessUiSurfaceClosed'], String.raw`
+    const check = extractFunctions('scripts/installed-reading-tools.ps1', ['Assert-ReadingApplicationProcessIdentity', 'Assert-ReadingSurfaceSnapshot', 'Assert-ReadingPickerTargetSnapshot', 'Wait-ReadingProcessBoundPickerTargets', 'Assert-ReadingSurfaceBinding', 'Wait-ReadingProcessUiSurfaceClosed'], String.raw`
       $script:ReadingPins=[ordered]@{UiAutomationPollMilliseconds=1}
+      $ticks=638500000000000000;$identity={param($id,$expected,$deadline)[pscustomobject]@{processId=$id;startUtcTicks=$expected}}
       function New-Surface([string]$identity,[int]$processId){[pscustomobject]@{runtimeIdentity=$identity;controlType='Hwnd';isEnabled=$true;isOffscreen=$false;processId=$processId;handle=[IntPtr][int64]$identity}}
       function New-Target([string]$identity,[string]$surface,[string]$kind,[int]$processId){$category=if($kind-ceq'filename'){'edit-1001'}else{'button-idok'};[pscustomobject]@{runtimeIdentity=$identity;surfaceRuntimeIdentity=$surface;targetKind=$kind;nativeControlCategory=$category;isEnabled=$true;isOffscreen=$false;processId=$processId;handle=[IntPtr][int64]$identity}}
       $window=New-Surface '101' 42;$pane=New-Surface '102' 42;$baseline=@($window,$pane)
       $baselineControl=New-Target '109' '101' 'open' 42;$baselineTargets=@($baselineControl)
       $filename=New-Target '120' '102' 'filename' 42;$open=New-Target '121' '102' 'open' 42
-      $script:now=[datetime]'2026-01-01T00:00:00Z';$clock={$script:now};$sleep={param($milliseconds)$script:now=$script:now.AddMilliseconds($milliseconds)}
-      $bound=Wait-ReadingProcessBoundPickerTargets -ApplicationProcessId 42 -BaselineSurfaces $baseline -BaselineTargets $baselineTargets -Deadline $script:now.AddSeconds(1) -SurfaceSnapshotProvider { $baseline } -TargetSnapshotProvider { @($baselineControl,$filename,$open) } -SleepProvider $sleep -UtcNowProvider $clock
+      $script:now=[datetime]::UtcNow;$clock={$script:now};$sleep={param($milliseconds)$script:now=$script:now.AddMilliseconds($milliseconds)}
+      $bound=Wait-ReadingProcessBoundPickerTargets -ApplicationProcessId 42 -ApplicationProcessStartUtcTicks $ticks -BaselineSurfaces $baseline -BaselineTargets $baselineTargets -Deadline $script:now.AddSeconds(1) -SurfaceSnapshotProvider { $baseline } -TargetSnapshotProvider { @($baselineControl,$filename,$open) } -ProcessIdentityProvider $identity -SleepProvider $sleep -UtcNowProvider $clock
       if($bound.surfaceRuntimeIdentity-cne'102'-or[bool]$bound.dedicatedNewSurface-or$bound.filenameRuntimeIdentity-cne'120'-or$bound.filenameControlCategory-cne'edit-1001'-or$bound.openButtonRuntimeIdentity-cne'121'){throw 'Stable-surface picker targets were not bound exactly.'}
       $movedFilename=New-Target '120' '101' 'filename' 42;$movedOpen=New-Target '121' '101' 'open' 42;$movedRejected=$false
-      try{Wait-ReadingProcessUiSurfaceClosed -Binding $bound -ApplicationProcessId 42 -Deadline $script:now.AddSeconds(1) -SurfaceSnapshotProvider { $baseline } -TargetSnapshotProvider { @($baselineControl,$movedFilename,$movedOpen) } -SleepProvider $sleep -UtcNowProvider $clock}catch{$movedRejected=$_.Exception.Message-ceq'A bound native picker target moved or changed kind before closing.'}
+      try{Wait-ReadingProcessUiSurfaceClosed -Binding $bound -ApplicationProcessId 42 -ApplicationProcessStartUtcTicks $ticks -Deadline $script:now.AddSeconds(1) -SurfaceSnapshotProvider { $baseline } -TargetSnapshotProvider { @($baselineControl,$movedFilename,$movedOpen) } -ProcessIdentityProvider $identity -SleepProvider $sleep -UtcNowProvider $clock}catch{$movedRejected=$_.Exception.Message-ceq'A bound native picker target moved or changed kind before closing.'}
       if(-not$movedRejected){throw 'Bound target identities moved to another baseline surface were accepted as closed.'}
-      Wait-ReadingProcessUiSurfaceClosed -Binding $bound -ApplicationProcessId 42 -Deadline $script:now.AddSeconds(1) -SurfaceSnapshotProvider { $baseline } -TargetSnapshotProvider { @($baselineControl) } -SleepProvider $sleep -UtcNowProvider $clock
+      Wait-ReadingProcessUiSurfaceClosed -Binding $bound -ApplicationProcessId 42 -ApplicationProcessStartUtcTicks $ticks -Deadline $script:now.AddSeconds(1) -SurfaceSnapshotProvider { $baseline } -TargetSnapshotProvider { @($baselineControl) } -ProcessIdentityProvider $identity -SleepProvider $sleep -UtcNowProvider $clock
     `);
     const result = runPowerShell(check);
     expect(result.status, result.stderr || result.stdout).toBe(0);
   });
 
   it('rejects baseline, ambiguous, cross-surface, sibling-surface, and replaced picker observations', () => {
-    const check = extractFunctions('scripts/installed-reading-tools.ps1', ['Assert-ReadingSurfaceSnapshot', 'Assert-ReadingPickerTargetSnapshot', 'Wait-ReadingProcessBoundPickerTargets'], String.raw`
+    const check = extractFunctions('scripts/installed-reading-tools.ps1', ['Assert-ReadingApplicationProcessIdentity', 'Assert-ReadingSurfaceSnapshot', 'Assert-ReadingPickerTargetSnapshot', 'Wait-ReadingProcessBoundPickerTargets'], String.raw`
       $script:ReadingPins=[ordered]@{UiAutomationPollMilliseconds=1}
+      $ticks=638500000000000000;$identity={param($id,$expected,$deadline)[pscustomobject]@{processId=$id;startUtcTicks=$expected}}
       function New-Surface([string]$identity,[int]$processId){[pscustomobject]@{runtimeIdentity=$identity;controlType='Hwnd';isEnabled=$true;isOffscreen=$false;processId=$processId;handle=[IntPtr][int64]$identity}}
       function New-Target([string]$identity,[string]$surface,[string]$kind,[int]$processId){$category=if($kind-ceq'filename'){'edit-1001'}else{'button-idok'};[pscustomobject]@{runtimeIdentity=$identity;surfaceRuntimeIdentity=$surface;targetKind=$kind;nativeControlCategory=$category;isEnabled=$true;isOffscreen=$false;processId=$processId;handle=[IntPtr][int64]$identity}}
       $a=New-Surface '101' 42;$b=New-Surface '102' 42;$c=New-Surface '103' 42;$baseline=@($a,$b)
       $filename=New-Target '120' '102' 'filename' 42;$open=New-Target '121' '102' 'open' 42;$otherFilename=New-Target '122' '102' 'filename' 42;$crossOpen=New-Target '123' '101' 'open' 42
-      $script:now=[datetime]'2026-01-01T00:00:00Z';$clock={$script:now};$sleep={param($milliseconds)$script:now=$script:now.AddSeconds(1)};$deadline=$script:now.AddMilliseconds(10)
-      $baselineRejected=$false;try{Wait-ReadingProcessBoundPickerTargets -ApplicationProcessId 42 -BaselineSurfaces $baseline -BaselineTargets @($filename,$open) -Deadline $deadline -SurfaceSnapshotProvider { $baseline } -TargetSnapshotProvider { @($filename,$open) } -SleepProvider $sleep -UtcNowProvider $clock}catch{$baselineRejected=$_.Exception.Message-like'No single new process-bound native picker target pair appeared*'}
+      $script:now=[datetime]::UtcNow;$clock={$script:now};$sleep={param($milliseconds)$script:now=$script:now.AddSeconds(10)};$deadline=$script:now.AddSeconds(5)
+      $baselineRejected=$false;try{Wait-ReadingProcessBoundPickerTargets -ApplicationProcessId 42 -ApplicationProcessStartUtcTicks $ticks -BaselineSurfaces $baseline -BaselineTargets @($filename,$open) -Deadline $deadline -SurfaceSnapshotProvider { $baseline } -TargetSnapshotProvider { @($filename,$open) } -ProcessIdentityProvider $identity -SleepProvider $sleep -UtcNowProvider $clock}catch{$baselineRejected=$_.Exception.Message-like'No single new process-bound native picker target pair appeared*'}
       if(-not$baselineRejected){throw 'Pre-click target controls were rebound as a picker.'}
-      $script:now=[datetime]'2026-01-01T00:00:00Z';$deadline=$script:now.AddSeconds(1);$ambiguous=$false;try{Wait-ReadingProcessBoundPickerTargets -ApplicationProcessId 42 -BaselineSurfaces $baseline -BaselineTargets @() -Deadline $deadline -SurfaceSnapshotProvider { $baseline } -TargetSnapshotProvider { @($filename,$otherFilename,$open) } -SleepProvider $sleep -UtcNowProvider $clock}catch{$ambiguous=$_.Exception.Message-ceq'The new native picker targets were ambiguous.'}
+      $script:now=[datetime]::UtcNow;$deadline=$script:now.AddSeconds(1);$ambiguous=$false;try{Wait-ReadingProcessBoundPickerTargets -ApplicationProcessId 42 -ApplicationProcessStartUtcTicks $ticks -BaselineSurfaces $baseline -BaselineTargets @() -Deadline $deadline -SurfaceSnapshotProvider { $baseline } -TargetSnapshotProvider { @($filename,$otherFilename,$open) } -ProcessIdentityProvider $identity -SleepProvider $sleep -UtcNowProvider $clock}catch{$ambiguous=$_.Exception.Message-ceq'The new native picker targets were ambiguous.'}
       if(-not$ambiguous){throw 'Ambiguous picker targets were accepted.'}
-      $cross=$false;try{Wait-ReadingProcessBoundPickerTargets -ApplicationProcessId 42 -BaselineSurfaces $baseline -BaselineTargets @() -Deadline $deadline -SurfaceSnapshotProvider { $baseline } -TargetSnapshotProvider { @($filename,$crossOpen) } -SleepProvider $sleep -UtcNowProvider $clock}catch{$cross=$_.Exception.Message-ceq'The new native picker targets appeared on different owned surfaces.'}
+      $cross=$false;try{Wait-ReadingProcessBoundPickerTargets -ApplicationProcessId 42 -ApplicationProcessStartUtcTicks $ticks -BaselineSurfaces $baseline -BaselineTargets @() -Deadline $deadline -SurfaceSnapshotProvider { $baseline } -TargetSnapshotProvider { @($filename,$crossOpen) } -ProcessIdentityProvider $identity -SleepProvider $sleep -UtcNowProvider $clock}catch{$cross=$_.Exception.Message-ceq'The new native picker targets appeared on different owned surfaces.'}
       if(-not$cross){throw 'Cross-surface picker targets were accepted.'}
-      $sibling=$false;try{Wait-ReadingProcessBoundPickerTargets -ApplicationProcessId 42 -BaselineSurfaces $baseline -BaselineTargets @() -Deadline $deadline -SurfaceSnapshotProvider { @($baseline+$c) } -TargetSnapshotProvider { @($filename,$open) } -SleepProvider $sleep -UtcNowProvider $clock}catch{$sibling=$_.Exception.Message-ceq'A sibling native surface appeared outside the bound picker target surface.'}
+      $sibling=$false;try{Wait-ReadingProcessBoundPickerTargets -ApplicationProcessId 42 -ApplicationProcessStartUtcTicks $ticks -BaselineSurfaces $baseline -BaselineTargets @() -Deadline $deadline -SurfaceSnapshotProvider { @($baseline+$c) } -TargetSnapshotProvider { @($filename,$open) } -ProcessIdentityProvider $identity -SleepProvider $sleep -UtcNowProvider $clock}catch{$sibling=$_.Exception.Message-ceq'A sibling native surface appeared outside the bound picker target surface.'}
       if(-not$sibling){throw 'A sibling new surface outside the target pair was accepted.'}
-      $replaced=$false;try{Wait-ReadingProcessBoundPickerTargets -ApplicationProcessId 42 -BaselineSurfaces $baseline -BaselineTargets @() -Deadline $deadline -SurfaceSnapshotProvider { @($b) } -TargetSnapshotProvider { @($filename,$open) } -SleepProvider $sleep -UtcNowProvider $clock}catch{$replaced=$_.Exception.Message-ceq'The pre-click top-level UI baseline was replaced while opening the native picker.'}
+      $replaced=$false;try{Wait-ReadingProcessBoundPickerTargets -ApplicationProcessId 42 -ApplicationProcessStartUtcTicks $ticks -BaselineSurfaces $baseline -BaselineTargets @() -Deadline $deadline -SurfaceSnapshotProvider { @($b) } -TargetSnapshotProvider { @($filename,$open) } -ProcessIdentityProvider $identity -SleepProvider $sleep -UtcNowProvider $clock}catch{$replaced=$_.Exception.Message-ceq'The pre-click top-level UI baseline was replaced while opening the native picker.'}
       if(-not$replaced){throw 'Baseline surface replacement was accepted.'}
     `);
     const result = runPowerShell(check);
@@ -103,18 +111,19 @@ describe('installed signed reading-tools verifier', () => {
   });
 
   it('fails closed when bounded HWND target enumeration reaches the deadline and keeps a dedicated surface until it closes', () => {
-    const check = extractFunctions('scripts/installed-reading-tools.ps1', ['Assert-ReadingSurfaceSnapshot', 'Assert-ReadingPickerTargetSnapshot', 'Wait-ReadingProcessBoundPickerTargets', 'Assert-ReadingSurfaceBinding', 'Wait-ReadingProcessUiSurfaceClosed'], String.raw`
+    const check = extractFunctions('scripts/installed-reading-tools.ps1', ['Assert-ReadingApplicationProcessIdentity', 'Assert-ReadingSurfaceSnapshot', 'Assert-ReadingPickerTargetSnapshot', 'Wait-ReadingProcessBoundPickerTargets', 'Assert-ReadingSurfaceBinding', 'Wait-ReadingProcessUiSurfaceClosed'], String.raw`
       $script:ReadingPins=[ordered]@{UiAutomationPollMilliseconds=1}
+      $ticks=638500000000000000;$identity={param($id,$expected,$deadline)[pscustomobject]@{processId=$id;startUtcTicks=$expected}}
       function New-Surface([string]$identity,[int]$processId){[pscustomobject]@{runtimeIdentity=$identity;controlType='Hwnd';isEnabled=$true;isOffscreen=$false;processId=$processId;handle=[IntPtr][int64]$identity}}
       function New-Target([string]$identity,[string]$surface,[string]$kind,[int]$processId){$category=if($kind-ceq'filename'){'edit-1001'}else{'button-idok'};[pscustomobject]@{runtimeIdentity=$identity;surfaceRuntimeIdentity=$surface;targetKind=$kind;nativeControlCategory=$category;isEnabled=$true;isOffscreen=$false;processId=$processId;handle=[IntPtr][int64]$identity}}
       $base=New-Surface '101' 42;$dedicated=New-Surface '102' 42;$filename=New-Target '120' '102' 'filename' 42;$open=New-Target '121' '102' 'open' 42
-      $script:now=[datetime]'2026-01-01T00:00:00Z';$deadline=$script:now.AddMilliseconds(10);$clock={$script:now};$probes=0
-      $late=$false;try{Wait-ReadingProcessBoundPickerTargets -ApplicationProcessId 42 -BaselineSurfaces @($base) -BaselineTargets @() -Deadline $deadline -SurfaceSnapshotProvider { @($base,$dedicated) } -TargetSnapshotProvider { $script:probes++;$script:now=$deadline;@($filename,$open) } -SleepProvider { throw 'Late read reached sleep.' } -UtcNowProvider $clock}catch{$late=$_.Exception.Message-like'No single new process-bound native picker target pair appeared*'}
+      $script:now=[datetime]::UtcNow;$deadline=$script:now.AddSeconds(5);$clock={$script:now};$probes=0
+      $late=$false;try{Wait-ReadingProcessBoundPickerTargets -ApplicationProcessId 42 -ApplicationProcessStartUtcTicks $ticks -BaselineSurfaces @($base) -BaselineTargets @() -Deadline $deadline -SurfaceSnapshotProvider { @($base,$dedicated) } -TargetSnapshotProvider { $script:probes++;$script:now=$deadline;@($filename,$open) } -ProcessIdentityProvider $identity -SleepProvider { throw 'Late read reached sleep.' } -UtcNowProvider $clock}catch{$late=$_.Exception.Message-like'No single new process-bound native picker target pair appeared*'}
       if(-not$late-or$probes-ne1){throw 'A post-deadline target snapshot was accepted.'}
-      $script:now=[datetime]'2026-01-01T00:00:00Z';$deadline=$script:now.AddSeconds(1)
-      $bound=Wait-ReadingProcessBoundPickerTargets -ApplicationProcessId 42 -BaselineSurfaces @($base) -BaselineTargets @() -Deadline $deadline -SurfaceSnapshotProvider { @($base,$dedicated) } -TargetSnapshotProvider { @($filename,$open) } -SleepProvider { } -UtcNowProvider $clock
+      $script:now=[datetime]::UtcNow;$deadline=$script:now.AddSeconds(1)
+      $bound=Wait-ReadingProcessBoundPickerTargets -ApplicationProcessId 42 -ApplicationProcessStartUtcTicks $ticks -BaselineSurfaces @($base) -BaselineTargets @() -Deadline $deadline -SurfaceSnapshotProvider { @($base,$dedicated) } -TargetSnapshotProvider { @($filename,$open) } -ProcessIdentityProvider $identity -SleepProvider { } -UtcNowProvider $clock
       $script:closeProbe=0
-      Wait-ReadingProcessUiSurfaceClosed -Binding $bound -ApplicationProcessId 42 -Deadline $deadline -SurfaceSnapshotProvider { $script:closeProbe++;if($script:closeProbe-eq1){@($base,$dedicated)}else{@($base)} } -TargetSnapshotProvider { @() } -SleepProvider { } -UtcNowProvider $clock
+      Wait-ReadingProcessUiSurfaceClosed -Binding $bound -ApplicationProcessId 42 -ApplicationProcessStartUtcTicks $ticks -Deadline $deadline -SurfaceSnapshotProvider { $script:closeProbe++;if($script:closeProbe-eq1){@($base,$dedicated)}else{@($base)} } -TargetSnapshotProvider { @() } -ProcessIdentityProvider $identity -SleepProvider { } -UtcNowProvider $clock
       if($closeProbe-ne2){throw 'Dedicated surface close accepted mere target disappearance.'}
     `);
     const result = runPowerShell(check);
@@ -144,6 +153,29 @@ describe('installed signed reading-tools verifier', () => {
       $clickRejected=$false
       try{Invoke-ReadingNativePickerButtonBeforeDeadline -Handle ([IntPtr]121) -Deadline $deadline -UtcNowProvider $clock -MessageProvider { [pscustomobject]@{delivered=$false;result=[IntPtr]1} }}catch{$clickRejected=$_.Exception.Message-ceq'The process-bound native Open HWND did not accept bounded BM_CLICK.'}
       if(-not$clickRejected){throw 'An undelivered BM_CLICK was accepted from its message result alone.'}
+    `);
+    const result = runPowerShell(check);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
+  it('revalidates process start ticks after the filename write and refuses Open after PID reuse', () => {
+    const check = extractFunctions('scripts/installed-reading-tools.ps1', ['Assert-ReadingApplicationProcessIdentity', 'Submit-ProcessBoundOpenDialog'], String.raw`
+      Add-Type -TypeDefinition @'
+using System;
+public static class ReadingNativePickerApi {
+  public static bool IsWindowEnabled(IntPtr handle) { return true; }
+  public static bool IsWindowVisible(IntPtr handle) { return true; }
+}
+'@
+      $ticks=638500000000000000;$script:replaced=$false;$script:writes=0;$script:clicks=0
+      $identity={param($id,$expected,$deadline)[pscustomobject]@{processId=$id;startUtcTicks=if($script:replaced){$expected+1}else{$expected}}}
+      function Assert-ReadingSurfaceBinding {param($Binding,$ApplicationProcessId,$ApplicationProcessStartUtcTicks,$Deadline,$ProcessIdentityProvider) Assert-ReadingApplicationProcessIdentity -ApplicationProcessId $ApplicationProcessId -ApplicationProcessStartUtcTicks $ApplicationProcessStartUtcTicks -Deadline $Deadline -ProcessIdentityProvider $ProcessIdentityProvider}
+      function Set-ReadingNativePickerValueBeforeDeadline {param($Handle,$Value,$Deadline)$script:writes++;$script:replaced=$true}
+      function Invoke-ReadingNativePickerButtonBeforeDeadline {param($Handle,$Deadline)$script:clicks++}
+      $binding=[pscustomobject]@{filenameHandle=[IntPtr]120;openButtonHandle=[IntPtr]121}
+      $rejected=$false
+      try{Submit-ProcessBoundOpenDialog -Binding $binding -ApplicationProcessId 42 -ApplicationProcessStartUtcTicks $ticks -Path 'fixture.pdf' -Deadline ([datetime]::UtcNow.AddSeconds(5)) -ProcessIdentityProvider $identity}catch{$rejected=$_.Exception.Message-ceq'The native picker application process identity changed.'}
+      if(-not$rejected-or$writes-ne1-or$clicks-ne0){throw 'PID reuse after WM_SETTEXT reached the Open mutation.'}
     `);
     const result = runPowerShell(check);
     expect(result.status, result.stderr || result.stdout).toBe(0);
@@ -257,7 +289,7 @@ describe('installed signed reading-tools verifier', () => {
     expect(() => new Function('document', postOpenScript)).not.toThrow();
     expect(postOpenScript).not.toMatch(/\.path|textContent\s*[,}]/);
     const source = readFileSync('scripts/installed-reading-tools.ps1', 'utf8');
-    const open = source.indexOf('Open-ReadingUserFile -SessionId $sessionId -ApplicationProcessId $applicationProcessId -Path $PlainFixture -Deadline $plainPickerDeadline');
+    const open = source.indexOf('Open-ReadingUserFile -SessionId $sessionId -ApplicationProcessId $applicationProcessId -ApplicationProcessStartUtcTicks $applicationProcessStartUtcTicks -Path $PlainFixture -Deadline $plainPickerDeadline');
     const product = source.indexOf('$plainProductDeadline = New-ReadingPhaseDeadline -Phase product');
     const layer = source.indexOf("$layer = Wait-WebDriverOracle -SessionId $sessionId -Deadline $plainProductDeadline -Kind 'embedded text layer'");
     expect(open).toBeGreaterThan(-1);
@@ -442,7 +474,7 @@ describe('installed signed reading-tools verifier', () => {
     const source = String.raw`
       $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
       . '${process.cwd().replaceAll("'", "''")}\scripts\installed-reading-tools.ps1'
-      $root=Join-Path (Resolve-Path target) ('reading-receipt-'+[Guid]::NewGuid().ToString('N'))
+      $root=Join-Path $env:SMACROBAT_TEST_ROOT ('reading-receipt-'+[Guid]::NewGuid().ToString('N'))
       [IO.Directory]::CreateDirectory($root)|Out-Null
       $path=Join-Path $root 'receipt.bin';[IO.File]::WriteAllBytes($path,[byte[]](1,2,3,4))
       $sha=Get-ExactSha256 -Path $path
@@ -464,7 +496,7 @@ describe('installed signed reading-tools verifier', () => {
     ], String.raw`
       . '${process.cwd().replaceAll("'", "''")}\scripts\installed-reading-tools.ps1'
       $script:ReadingVerificationPins=[ordered]@{ProtectedFixtureBytes=[uint64]912;ProtectedFixtureSha256='9BE85022232671CFD796C711E0B8B06847E7020D49AA07FA20DBD6DADE168A37'}
-      $root=Join-Path (Resolve-Path target) ('reading-fixture-'+[Guid]::NewGuid().ToString('N'))
+      $root=Join-Path $env:SMACROBAT_TEST_ROOT ('reading-fixture-'+[Guid]::NewGuid().ToString('N'))
       [IO.Directory]::CreateDirectory($root)|Out-Null
       New-ProtectedReadingFixture -Destination (Join-Path $root 'first.pdf')
       New-ProtectedReadingFixture -Destination (Join-Path $root 'second.pdf')

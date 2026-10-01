@@ -588,8 +588,39 @@ function Wait-LaunchProcessQuiescence {
     return [pscustomobject]@{ stable = $false; processes = @($latest) }
 }
 
+function Get-MinimalWindowsProcessEnvironment {
+    $names = @('COMSPEC','SystemRoot','WINDIR','LOCALAPPDATA','APPDATA','USERPROFILE','TEMP','TMP','PATH','PATHEXT')
+    $environment = [ordered]@{}
+    foreach ($name in $names) {
+        $value = [Environment]::GetEnvironmentVariable($name,[EnvironmentVariableTarget]::Process)
+        if ([string]::IsNullOrWhiteSpace($value) -or $value.IndexOfAny([char[]]@([char]0,[char]10,[char]13)) -ge 0 -or $value.Length -gt 32767) {
+            throw "The required minimal child-process environment variable $name was unavailable or invalid."
+        }
+        $environment[$name] = $value
+    }
+    return $environment
+}
+
 function Start-BoundedDiscardProcess {
-    param([string]$Path,[string[]]$Arguments,[int]$MaximumCharacters = 65536)
+    param([string]$Path,[string[]]$Arguments,[int]$MaximumCharacters = 65536,[Collections.IDictionary]$Environment)
+    $environmentNames = [string[]]@(); $environmentValues = [string[]]@(); $replaceEnvironment = $null -ne $Environment
+    if ($replaceEnvironment) {
+        $allowed = @('COMSPEC','SystemRoot','WINDIR','LOCALAPPDATA','APPDATA','USERPROFILE','TEMP','TMP','PATH','PATHEXT')
+        $actual = @($Environment.Keys | ForEach-Object { [string]$_ })
+        if ($actual.Count -ne $allowed.Count -or (Compare-Object ($allowed | Sort-Object -CaseSensitive) ($actual | Sort-Object -CaseSensitive) -CaseSensitive)) {
+            throw 'The child-process environment did not match the exact minimal allowlist.'
+        }
+        $totalCharacters = 0
+        foreach ($name in $allowed) {
+            $value = [string]$Environment[$name]
+            if ([string]::IsNullOrWhiteSpace($value) -or $value.IndexOfAny([char[]]@([char]0,[char]10,[char]13)) -ge 0 -or $value.Length -gt 32767) {
+                throw 'A minimal child-process environment value was unavailable or invalid.'
+            }
+            $totalCharacters += $name.Length + $value.Length
+            $environmentNames += $name; $environmentValues += $value
+        }
+        if ($totalCharacters -gt 65536) { throw 'The minimal child-process environment exceeded its character cap.' }
+    }
     if (-not ('BoundedDiscardProcess' -as [type])) {
         Add-Type -TypeDefinition @'
 using System;
@@ -601,9 +632,13 @@ public sealed class BoundedDiscardProcess : IDisposable {
   private int exceeded;
   public bool Exceeded { get { return Volatile.Read(ref exceeded) != 0; } }
   private readonly int maximum;
-  public BoundedDiscardProcess(string path, string[] arguments, int maximumCharacters) {
+  public BoundedDiscardProcess(string path, string[] arguments, int maximumCharacters, string[] environmentNames, string[] environmentValues, bool replaceEnvironment) {
     maximum = maximumCharacters;
     var start = new ProcessStartInfo { FileName = path, UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
+    if (replaceEnvironment) {
+      start.Environment.Clear();
+      for (var index = 0; index < environmentNames.Length; index++) start.Environment[environmentNames[index]] = environmentValues[index];
+    }
     foreach (var argument in arguments) start.ArgumentList.Add(argument);
     Process = new Process { StartInfo = start };
     DataReceivedEventHandler count = (_, e) => { if (e.Data != null && Interlocked.Add(ref characters, e.Data.Length + 1) > maximum) Interlocked.Exchange(ref exceeded, 1); };
@@ -615,7 +650,7 @@ public sealed class BoundedDiscardProcess : IDisposable {
 }
 '@
     }
-    return [BoundedDiscardProcess]::new($Path, $Arguments, $MaximumCharacters)
+    return [BoundedDiscardProcess]::new($Path, $Arguments, $MaximumCharacters, $environmentNames, $environmentValues, $replaceEnvironment)
 }
 
 function Wait-BoundedOwnedProcessExit {
@@ -831,7 +866,7 @@ function Invoke-RealInstalledAppLaunch {
             "--port=$($script:LaunchPins.WebDriverPort)",
             "--native-port=$($script:LaunchPins.NativeDriverPort)",
             "--native-driver=$EdgeDriverPath"
-        )
+        ) -Environment (Get-MinimalWindowsProcessEnvironment)
         $driverCapture.Start()
         $driver = $driverCapture.Process
         do {

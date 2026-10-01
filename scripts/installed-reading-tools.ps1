@@ -241,11 +241,30 @@ function Get-ReadingHandleIdentity {
     return $value.ToString([Globalization.CultureInfo]::InvariantCulture)
 }
 
+function Assert-ReadingApplicationProcessIdentity {
+    param(
+        [Parameter(Mandatory = $true)][int]$ApplicationProcessId,
+        [Parameter(Mandatory = $true)][long]$ApplicationProcessStartUtcTicks,
+        [Parameter(Mandatory = $true)][datetime]$Deadline,
+        [scriptblock]$ProcessIdentityProvider
+    )
+    if ($ApplicationProcessId -le 0 -or $ApplicationProcessStartUtcTicks -le 0 -or [datetime]::UtcNow -ge $Deadline) { throw 'The native picker application process identity or deadline was invalid.' }
+    $facts = if ($ProcessIdentityProvider) { & $ProcessIdentityProvider $ApplicationProcessId $ApplicationProcessStartUtcTicks $Deadline } else {
+        $process = Get-Process -Id $ApplicationProcessId -ErrorAction Stop
+        try { [pscustomobject]@{ processId=[int]$process.Id;startUtcTicks=[long]$process.StartTime.ToUniversalTime().Ticks } } finally { $process.Dispose() }
+    }
+    $properties = @($facts.PSObject.Properties.Name | Sort-Object -CaseSensitive)
+    if (($properties -join ',') -cne 'processId,startUtcTicks' -or [int]$facts.processId -ne $ApplicationProcessId -or [long]$facts.startUtcTicks -ne $ApplicationProcessStartUtcTicks -or [datetime]::UtcNow -ge $Deadline) {
+        throw 'The native picker application process identity changed.'
+    }
+}
+
 function Get-ReadingProcessUiSurfaceSnapshot {
-    param([Parameter(Mandatory = $true)][int]$ApplicationProcessId,[Parameter(Mandatory = $true)][datetime]$Deadline,[scriptblock]$ElementProvider)
+    param([Parameter(Mandatory = $true)][int]$ApplicationProcessId,[Parameter(Mandatory = $true)][long]$ApplicationProcessStartUtcTicks,[Parameter(Mandatory = $true)][datetime]$Deadline,[scriptblock]$ElementProvider,[scriptblock]$ProcessIdentityProvider)
+    Assert-ReadingApplicationProcessIdentity -ApplicationProcessId $ApplicationProcessId -ApplicationProcessStartUtcTicks $ApplicationProcessStartUtcTicks -Deadline $Deadline -ProcessIdentityProvider $ProcessIdentityProvider
     if ([datetime]::UtcNow -ge $Deadline) { throw 'The process-bound top-level UI snapshot deadline expired.' }
     if ($ElementProvider) {
-        return @(& $ElementProvider $ApplicationProcessId)
+        $elements = @(& $ElementProvider $ApplicationProcessId $ApplicationProcessStartUtcTicks $Deadline)
     } else {
         Initialize-ReadingNativePickerApi
         $handles = [Collections.Generic.List[IntPtr]]::new(); $state = [pscustomobject]@{expired=$false;exceeded=$false}
@@ -263,6 +282,7 @@ function Get-ReadingProcessUiSurfaceSnapshot {
         if ($state.exceeded -or $handles.Count -gt 8) { throw 'The application exposed too many process-bound top-level HWNDs.' }
         $elements = @($handles)
     }
+    Assert-ReadingApplicationProcessIdentity -ApplicationProcessId $ApplicationProcessId -ApplicationProcessStartUtcTicks $ApplicationProcessStartUtcTicks -Deadline $Deadline -ProcessIdentityProvider $ProcessIdentityProvider
     $identities = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $snapshot = @()
     foreach ($handle in $elements) {
@@ -293,12 +313,15 @@ function Assert-ReadingSurfaceSnapshot {
 function Get-ReadingPickerTargetSnapshot {
     param(
         [Parameter(Mandatory = $true)][int]$ApplicationProcessId,
+        [Parameter(Mandatory = $true)][long]$ApplicationProcessStartUtcTicks,
         [Parameter(Mandatory = $true)][object[]]$Surfaces,
         [Parameter(Mandatory = $true)][datetime]$Deadline,
-        [scriptblock]$TargetProvider
+        [scriptblock]$TargetProvider,
+        [scriptblock]$ProcessIdentityProvider
     )
+    Assert-ReadingApplicationProcessIdentity -ApplicationProcessId $ApplicationProcessId -ApplicationProcessStartUtcTicks $ApplicationProcessStartUtcTicks -Deadline $Deadline -ProcessIdentityProvider $ProcessIdentityProvider
     $surfaceIdentities = Assert-ReadingSurfaceSnapshot -Snapshot $Surfaces -ApplicationProcessId $ApplicationProcessId -Kind 'The picker target surface snapshot'
-    if ($TargetProvider) { return @(& $TargetProvider $Surfaces $ApplicationProcessId $Deadline) }
+    if ($TargetProvider) { $providedTargets = @(& $TargetProvider $Surfaces $ApplicationProcessId $ApplicationProcessStartUtcTicks $Deadline); Assert-ReadingApplicationProcessIdentity -ApplicationProcessId $ApplicationProcessId -ApplicationProcessStartUtcTicks $ApplicationProcessStartUtcTicks -Deadline $Deadline -ProcessIdentityProvider $ProcessIdentityProvider; return $providedTargets }
     Initialize-ReadingNativePickerApi
     $targets = [Collections.Generic.List[object]]::new(); $targetIdentities = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($surface in $Surfaces) {
@@ -326,6 +349,7 @@ function Get-ReadingPickerTargetSnapshot {
         if ($state.expired -or [datetime]::UtcNow -ge $Deadline) { throw 'The native picker HWND snapshot deadline expired.' }
         if ($state.exceeded) { throw 'The native picker HWND snapshot exceeded its bounded child or target count.' }
     }
+    Assert-ReadingApplicationProcessIdentity -ApplicationProcessId $ApplicationProcessId -ApplicationProcessStartUtcTicks $ApplicationProcessStartUtcTicks -Deadline $Deadline -ProcessIdentityProvider $ProcessIdentityProvider
     if ([datetime]::UtcNow -ge $Deadline) { throw 'The native picker HWND snapshot deadline expired.' }
     return @($targets)
 }
@@ -347,11 +371,13 @@ function Assert-ReadingPickerTargetSnapshot {
 function Wait-ReadingProcessBoundPickerTargets {
     param(
         [Parameter(Mandatory = $true)][int]$ApplicationProcessId,
+        [Parameter(Mandatory = $true)][long]$ApplicationProcessStartUtcTicks,
         [Parameter(Mandatory = $true)][object[]]$BaselineSurfaces,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$BaselineTargets,
         [Parameter(Mandatory = $true)][datetime]$Deadline,
         [scriptblock]$SurfaceSnapshotProvider,
         [scriptblock]$TargetSnapshotProvider,
+        [scriptblock]$ProcessIdentityProvider,
         [scriptblock]$SleepProvider,
         [scriptblock]$UtcNowProvider
     )
@@ -360,13 +386,13 @@ function Wait-ReadingProcessBoundPickerTargets {
     $diagnostic = [ordered]@{schemaVersion=2;baselineSurfaceCount=[int]$BaselineSurfaces.Count;currentSurfaceCount=0;newSurfaceCount=0;baselineTargetCount=[int]$BaselineTargets.Count;currentTargetCount=0;newFilenameCount=0;newOpenCount=0;baselineMissingCount=0}
     $now = if ($UtcNowProvider) { [datetime](& $UtcNowProvider) } else { [datetime]::UtcNow }
     while ($now -lt $Deadline) {
-        $currentSurfaces = @(if ($SurfaceSnapshotProvider) { & $SurfaceSnapshotProvider $ApplicationProcessId $Deadline } else { Get-ReadingProcessUiSurfaceSnapshot -ApplicationProcessId $ApplicationProcessId -Deadline $Deadline })
+        $currentSurfaces = @(if ($SurfaceSnapshotProvider) { Assert-ReadingApplicationProcessIdentity -ApplicationProcessId $ApplicationProcessId -ApplicationProcessStartUtcTicks $ApplicationProcessStartUtcTicks -Deadline $Deadline -ProcessIdentityProvider $ProcessIdentityProvider; & $SurfaceSnapshotProvider $ApplicationProcessId $ApplicationProcessStartUtcTicks $Deadline } else { Get-ReadingProcessUiSurfaceSnapshot -ApplicationProcessId $ApplicationProcessId -ApplicationProcessStartUtcTicks $ApplicationProcessStartUtcTicks -Deadline $Deadline -ProcessIdentityProvider $ProcessIdentityProvider })
         $now = if ($UtcNowProvider) { [datetime](& $UtcNowProvider) } else { [datetime]::UtcNow }
         if ($now -ge $Deadline) { break }
         $currentSurfaceIdentities = Assert-ReadingSurfaceSnapshot -Snapshot $currentSurfaces -ApplicationProcessId $ApplicationProcessId -Kind 'The post-click top-level UI snapshot'
         $missingSurfaces = @($BaselineSurfaces | Where-Object { -not $currentSurfaceIdentities.Contains([string]$_.runtimeIdentity) })
         $newSurfaces = @($currentSurfaces | Where-Object { -not $baselineSurfaceIdentities.Contains([string]$_.runtimeIdentity) })
-        $currentTargets = @(if ($TargetSnapshotProvider) { & $TargetSnapshotProvider $currentSurfaces $ApplicationProcessId $Deadline } else { Get-ReadingPickerTargetSnapshot -Surfaces $currentSurfaces -ApplicationProcessId $ApplicationProcessId -Deadline $Deadline })
+        $currentTargets = @(if ($TargetSnapshotProvider) { Assert-ReadingApplicationProcessIdentity -ApplicationProcessId $ApplicationProcessId -ApplicationProcessStartUtcTicks $ApplicationProcessStartUtcTicks -Deadline $Deadline -ProcessIdentityProvider $ProcessIdentityProvider; & $TargetSnapshotProvider $currentSurfaces $ApplicationProcessId $ApplicationProcessStartUtcTicks $Deadline } else { Get-ReadingPickerTargetSnapshot -Surfaces $currentSurfaces -ApplicationProcessId $ApplicationProcessId -ApplicationProcessStartUtcTicks $ApplicationProcessStartUtcTicks -Deadline $Deadline -ProcessIdentityProvider $ProcessIdentityProvider })
         $now = if ($UtcNowProvider) { [datetime](& $UtcNowProvider) } else { [datetime]::UtcNow }
         if ($now -ge $Deadline) { break }
         $null = Assert-ReadingPickerTargetSnapshot -Snapshot $currentTargets -SurfaceIdentities $currentSurfaceIdentities -ApplicationProcessId $ApplicationProcessId -Kind 'The post-click picker target snapshot'
@@ -393,7 +419,8 @@ function Wait-ReadingProcessBoundPickerTargets {
 }
 
 function Assert-ReadingSurfaceBinding {
-    param([Parameter(Mandatory = $true)]$Binding,[Parameter(Mandatory = $true)][int]$ApplicationProcessId,[Parameter(Mandatory = $true)][datetime]$Deadline,[switch]$AllowUnavailableTargets)
+    param([Parameter(Mandatory = $true)]$Binding,[Parameter(Mandatory = $true)][int]$ApplicationProcessId,[Parameter(Mandatory = $true)][long]$ApplicationProcessStartUtcTicks,[Parameter(Mandatory = $true)][datetime]$Deadline,[switch]$AllowUnavailableTargets,[scriptblock]$ProcessIdentityProvider)
+    Assert-ReadingApplicationProcessIdentity -ApplicationProcessId $ApplicationProcessId -ApplicationProcessStartUtcTicks $ApplicationProcessStartUtcTicks -Deadline $Deadline -ProcessIdentityProvider $ProcessIdentityProvider
     $properties = @($Binding.PSObject.Properties.Name | Sort-Object -CaseSensitive)
     if (($properties -join ',') -cne 'baselineIdentities,baselineTargetIdentities,dedicatedNewSurface,filenameControlCategory,filenameHandle,filenameRuntimeIdentity,openButtonHandle,openButtonRuntimeIdentity,surfaceControlType,surfaceHandle,surfaceRuntimeIdentity' -or [string]$Binding.surfaceControlType -cne 'Hwnd' -or [string]$Binding.filenameControlCategory -notin @('edit-1001','edit-1148') -or @($Binding.baselineIdentities).Count -lt 1 -or @($Binding.baselineIdentities).Count -gt 8 -or @($Binding.baselineTargetIdentities).Count -gt 32 -or [string]$Binding.filenameRuntimeIdentity -cnotmatch '^\d{1,20}$' -or [string]$Binding.openButtonRuntimeIdentity -cnotmatch '^\d{1,20}$' -or [IntPtr]$Binding.surfaceHandle -eq [IntPtr]::Zero -or [IntPtr]$Binding.filenameHandle -eq [IntPtr]::Zero -or [IntPtr]$Binding.openButtonHandle -eq [IntPtr]::Zero) {
         throw 'The native picker surface binding was invalid.'
@@ -408,26 +435,27 @@ function Assert-ReadingSurfaceBinding {
         if ([ReadingNativePickerApi]::GetAncestor([IntPtr]$Binding.filenameHandle,2) -ne [IntPtr]$Binding.surfaceHandle -or [ReadingNativePickerApi]::GetAncestor([IntPtr]$Binding.openButtonHandle,2) -ne [IntPtr]$Binding.surfaceHandle) { throw 'A bound native picker target escaped the exact owned HWND before its action.' }
         $expectedFilenameControlId = if ([string]$Binding.filenameControlCategory -ceq 'edit-1001') { 1001 } else { 1148 }
         if ((Get-ReadingWindowClassName -Handle ([IntPtr]$Binding.filenameHandle)) -cne 'Edit' -or [ReadingNativePickerApi]::GetDlgCtrlID([IntPtr]$Binding.filenameHandle) -ne $expectedFilenameControlId -or (Get-ReadingWindowClassName -Handle ([IntPtr]$Binding.openButtonHandle)) -cne 'Button' -or [ReadingNativePickerApi]::GetDlgCtrlID([IntPtr]$Binding.openButtonHandle) -ne 1) { throw 'A bound native picker HWND no longer matched the exact filename or Open control contract.' }
+        Assert-ReadingApplicationProcessIdentity -ApplicationProcessId $ApplicationProcessId -ApplicationProcessStartUtcTicks $ApplicationProcessStartUtcTicks -Deadline $Deadline -ProcessIdentityProvider $ProcessIdentityProvider
         if ([datetime]::UtcNow -ge $Deadline) { throw 'The native picker HWND binding deadline expired.' }
     }
 }
 
 function Wait-ReadingProcessUiSurfaceClosed {
-    param([Parameter(Mandatory = $true)]$Binding,[Parameter(Mandatory = $true)][int]$ApplicationProcessId,[Parameter(Mandatory = $true)][datetime]$Deadline,[scriptblock]$SurfaceSnapshotProvider,[scriptblock]$TargetSnapshotProvider,[scriptblock]$SleepProvider,[scriptblock]$UtcNowProvider)
-    Assert-ReadingSurfaceBinding -Binding $Binding -ApplicationProcessId $ApplicationProcessId -Deadline $Deadline -AllowUnavailableTargets
+    param([Parameter(Mandatory = $true)]$Binding,[Parameter(Mandatory = $true)][int]$ApplicationProcessId,[Parameter(Mandatory = $true)][long]$ApplicationProcessStartUtcTicks,[Parameter(Mandatory = $true)][datetime]$Deadline,[scriptblock]$SurfaceSnapshotProvider,[scriptblock]$TargetSnapshotProvider,[scriptblock]$ProcessIdentityProvider,[scriptblock]$SleepProvider,[scriptblock]$UtcNowProvider)
+    Assert-ReadingSurfaceBinding -Binding $Binding -ApplicationProcessId $ApplicationProcessId -ApplicationProcessStartUtcTicks $ApplicationProcessStartUtcTicks -Deadline $Deadline -AllowUnavailableTargets -ProcessIdentityProvider $ProcessIdentityProvider
     $baselineIdentities = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($identity in @($Binding.baselineIdentities)) { if (-not $baselineIdentities.Add([string]$identity)) { throw 'The native picker surface baseline was ambiguous.' } }
     $baselineTargetIdentities = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($identity in @($Binding.baselineTargetIdentities)) { if (-not $baselineTargetIdentities.Add([string]$identity)) { throw 'The native picker target baseline was ambiguous.' } }
     $now = if ($UtcNowProvider) { [datetime](& $UtcNowProvider) } else { [datetime]::UtcNow }
     while ($now -lt $Deadline) {
-        $current = @(if ($SurfaceSnapshotProvider) { & $SurfaceSnapshotProvider $ApplicationProcessId $Deadline } else { Get-ReadingProcessUiSurfaceSnapshot -ApplicationProcessId $ApplicationProcessId -Deadline $Deadline })
+        $current = @(if ($SurfaceSnapshotProvider) { Assert-ReadingApplicationProcessIdentity -ApplicationProcessId $ApplicationProcessId -ApplicationProcessStartUtcTicks $ApplicationProcessStartUtcTicks -Deadline $Deadline -ProcessIdentityProvider $ProcessIdentityProvider; & $SurfaceSnapshotProvider $ApplicationProcessId $ApplicationProcessStartUtcTicks $Deadline } else { Get-ReadingProcessUiSurfaceSnapshot -ApplicationProcessId $ApplicationProcessId -ApplicationProcessStartUtcTicks $ApplicationProcessStartUtcTicks -Deadline $Deadline -ProcessIdentityProvider $ProcessIdentityProvider })
         $now = if ($UtcNowProvider) { [datetime](& $UtcNowProvider) } else { [datetime]::UtcNow }
         if ($now -ge $Deadline) { break }
         $currentIdentities = Assert-ReadingSurfaceSnapshot -Snapshot $current -ApplicationProcessId $ApplicationProcessId -Kind 'The post-submit top-level UI snapshot'
         if (@($Binding.baselineIdentities | Where-Object { -not $currentIdentities.Contains([string]$_) }).Count -ne 0) { throw 'The pre-click top-level UI baseline was replaced while closing the native picker.' }
         $remainingNew = @($current | Where-Object { -not $baselineIdentities.Contains([string]$_.runtimeIdentity) })
-        $currentTargets = @(if ($TargetSnapshotProvider) { & $TargetSnapshotProvider $current $ApplicationProcessId $Deadline } else { Get-ReadingPickerTargetSnapshot -Surfaces $current -ApplicationProcessId $ApplicationProcessId -Deadline $Deadline })
+        $currentTargets = @(if ($TargetSnapshotProvider) { Assert-ReadingApplicationProcessIdentity -ApplicationProcessId $ApplicationProcessId -ApplicationProcessStartUtcTicks $ApplicationProcessStartUtcTicks -Deadline $Deadline -ProcessIdentityProvider $ProcessIdentityProvider; & $TargetSnapshotProvider $current $ApplicationProcessId $ApplicationProcessStartUtcTicks $Deadline } else { Get-ReadingPickerTargetSnapshot -Surfaces $current -ApplicationProcessId $ApplicationProcessId -ApplicationProcessStartUtcTicks $ApplicationProcessStartUtcTicks -Deadline $Deadline -ProcessIdentityProvider $ProcessIdentityProvider })
         $now = if ($UtcNowProvider) { [datetime](& $UtcNowProvider) } else { [datetime]::UtcNow }
         if ($now -ge $Deadline) { break }
         $null = Assert-ReadingPickerTargetSnapshot -Snapshot $currentTargets -SurfaceIdentities $currentIdentities -ApplicationProcessId $ApplicationProcessId -Kind 'The post-submit picker target snapshot'
@@ -502,11 +530,14 @@ function Invoke-ReadingNativePickerButtonBeforeDeadline {
 }
 
 function Submit-ProcessBoundOpenDialog {
-    param([Parameter(Mandatory = $true)]$Binding,[Parameter(Mandatory = $true)][int]$ApplicationProcessId,[Parameter(Mandatory = $true)][string]$Path,[Parameter(Mandatory = $true)][datetime]$Deadline)
-    Assert-ReadingSurfaceBinding -Binding $Binding -ApplicationProcessId $ApplicationProcessId -Deadline $Deadline
+    param([Parameter(Mandatory = $true)]$Binding,[Parameter(Mandatory = $true)][int]$ApplicationProcessId,[Parameter(Mandatory = $true)][long]$ApplicationProcessStartUtcTicks,[Parameter(Mandatory = $true)][string]$Path,[Parameter(Mandatory = $true)][datetime]$Deadline,[scriptblock]$ProcessIdentityProvider)
+    Assert-ReadingSurfaceBinding -Binding $Binding -ApplicationProcessId $ApplicationProcessId -ApplicationProcessStartUtcTicks $ApplicationProcessStartUtcTicks -Deadline $Deadline -ProcessIdentityProvider $ProcessIdentityProvider
     if (-not [ReadingNativePickerApi]::IsWindowEnabled([IntPtr]$Binding.filenameHandle) -or -not [ReadingNativePickerApi]::IsWindowVisible([IntPtr]$Binding.filenameHandle)) { throw 'The exact bound filename HWND was no longer actionable.' }
     if (-not [ReadingNativePickerApi]::IsWindowEnabled([IntPtr]$Binding.openButtonHandle) -or -not [ReadingNativePickerApi]::IsWindowVisible([IntPtr]$Binding.openButtonHandle)) { throw 'The exact bound native Open HWND was no longer actionable.' }
+    Assert-ReadingApplicationProcessIdentity -ApplicationProcessId $ApplicationProcessId -ApplicationProcessStartUtcTicks $ApplicationProcessStartUtcTicks -Deadline $Deadline -ProcessIdentityProvider $ProcessIdentityProvider
     Set-ReadingNativePickerValueBeforeDeadline -Handle ([IntPtr]$Binding.filenameHandle) -Value $Path -Deadline $Deadline
+    Assert-ReadingSurfaceBinding -Binding $Binding -ApplicationProcessId $ApplicationProcessId -ApplicationProcessStartUtcTicks $ApplicationProcessStartUtcTicks -Deadline $Deadline -ProcessIdentityProvider $ProcessIdentityProvider
+    Assert-ReadingApplicationProcessIdentity -ApplicationProcessId $ApplicationProcessId -ApplicationProcessStartUtcTicks $ApplicationProcessStartUtcTicks -Deadline $Deadline -ProcessIdentityProvider $ProcessIdentityProvider
     Invoke-ReadingNativePickerButtonBeforeDeadline -Handle ([IntPtr]$Binding.openButtonHandle) -Deadline $Deadline
 }
 
@@ -523,16 +554,16 @@ const b=[...document.querySelectorAll('button')].filter(x=>x.textContent.trim()=
 }
 
 function Open-ReadingUserFile {
-    param([Parameter(Mandatory = $true)][string]$SessionId,[Parameter(Mandatory = $true)][int]$ApplicationProcessId,[Parameter(Mandatory = $true)][string]$Path,[Parameter(Mandatory = $true)][datetime]$Deadline)
-    $baseline = @(Get-ReadingProcessUiSurfaceSnapshot -ApplicationProcessId $ApplicationProcessId -Deadline $Deadline)
+    param([Parameter(Mandatory = $true)][string]$SessionId,[Parameter(Mandatory = $true)][int]$ApplicationProcessId,[Parameter(Mandatory = $true)][long]$ApplicationProcessStartUtcTicks,[Parameter(Mandatory = $true)][string]$Path,[Parameter(Mandatory = $true)][datetime]$Deadline,[scriptblock]$ProcessIdentityProvider)
+    $baseline = @(Get-ReadingProcessUiSurfaceSnapshot -ApplicationProcessId $ApplicationProcessId -ApplicationProcessStartUtcTicks $ApplicationProcessStartUtcTicks -Deadline $Deadline -ProcessIdentityProvider $ProcessIdentityProvider)
     $baselineSurfaceIdentities = Assert-ReadingSurfaceSnapshot -Snapshot $baseline -ApplicationProcessId $ApplicationProcessId -Kind 'The pre-click top-level UI baseline'
-    $baselineTargets = @(Get-ReadingPickerTargetSnapshot -Surfaces $baseline -ApplicationProcessId $ApplicationProcessId -Deadline $Deadline)
+    $baselineTargets = @(Get-ReadingPickerTargetSnapshot -Surfaces $baseline -ApplicationProcessId $ApplicationProcessId -ApplicationProcessStartUtcTicks $ApplicationProcessStartUtcTicks -Deadline $Deadline -ProcessIdentityProvider $ProcessIdentityProvider)
     $null = Assert-ReadingPickerTargetSnapshot -Snapshot $baselineTargets -SurfaceIdentities $baselineSurfaceIdentities -ApplicationProcessId $ApplicationProcessId -Kind 'The pre-click picker target baseline'
     $clicked = Invoke-WebDriverScript -SessionId $SessionId -Deadline $Deadline -Script (Get-ReadingOpenFileScript)
     if ($clicked -isnot [bool] -or -not $clicked) { throw 'The exact installed Open a file control was unavailable.' }
-    $surface = Wait-ReadingProcessBoundPickerTargets -ApplicationProcessId $ApplicationProcessId -BaselineSurfaces $baseline -BaselineTargets $baselineTargets -Deadline $Deadline
-    Submit-ProcessBoundOpenDialog -Binding $surface -ApplicationProcessId $ApplicationProcessId -Path $Path -Deadline $Deadline
-    Wait-ReadingProcessUiSurfaceClosed -Binding $surface -ApplicationProcessId $ApplicationProcessId -Deadline $Deadline
+    $surface = Wait-ReadingProcessBoundPickerTargets -ApplicationProcessId $ApplicationProcessId -ApplicationProcessStartUtcTicks $ApplicationProcessStartUtcTicks -BaselineSurfaces $baseline -BaselineTargets $baselineTargets -Deadline $Deadline -ProcessIdentityProvider $ProcessIdentityProvider
+    Submit-ProcessBoundOpenDialog -Binding $surface -ApplicationProcessId $ApplicationProcessId -ApplicationProcessStartUtcTicks $ApplicationProcessStartUtcTicks -Path $Path -Deadline $Deadline -ProcessIdentityProvider $ProcessIdentityProvider
+    Wait-ReadingProcessUiSurfaceClosed -Binding $surface -ApplicationProcessId $ApplicationProcessId -ApplicationProcessStartUtcTicks $ApplicationProcessStartUtcTicks -Deadline $Deadline -ProcessIdentityProvider $ProcessIdentityProvider
     return [string]$surface.filenameControlCategory
 }
 
@@ -732,8 +763,9 @@ function Invoke-RealInstalledReadingTools {
     $capturedOutcomes = [pscustomobject]@{ application='absent';tauriDriver='absent';edgeDriver='absent';webview='absent';ocrEngine='absent';other='absent' }
     $residualFacts = [pscustomobject]@{ ownership='none';application=$false;tauriDriver=$false;edgeDriver=$false;webview=$false;ocrEngine=$false;other=$false }
     try {
-        $driverCapture = Start-BoundedDiscardProcess -Path $TauriDriverPath -Arguments @("--port=$($script:LaunchPins.WebDriverPort)","--native-port=$($script:LaunchPins.NativeDriverPort)","--native-driver=$EdgeDriverPath")
+        $driverCapture = Start-BoundedDiscardProcess -Path $TauriDriverPath -Arguments @("--port=$($script:LaunchPins.WebDriverPort)","--native-port=$($script:LaunchPins.NativeDriverPort)","--native-driver=$EdgeDriverPath") -Environment (Get-MinimalWindowsProcessEnvironment)
         $driverCapture.Start(); $driver = $driverCapture.Process
+        $status = $null
         do {
             try { $status = Invoke-BoundedLoopbackJson -Method GET -Path '/status' -Deadline $launchDeadline; if ($status.value.ready) { break } } catch { }
             if ($driver.HasExited) { throw 'Pinned tauri-driver exited before reading-tools readiness.' }
@@ -763,14 +795,14 @@ function Invoke-RealInstalledReadingTools {
             Start-Sleep -Milliseconds 100
         } while ([datetime]::UtcNow -lt $launchDeadline)
         if ($apps.Count -ne 1) { throw 'The owned installed application process was unavailable for process-bound UI Automation.' }
-        $applicationProcessId = [int]$apps[0].ProcessId
+        $applicationProcessId = [int]$apps[0].ProcessId; $applicationProcessStartUtcTicks = [long]$apps[0].StartTicks
         Assert-ReadingOwnedExecutables -Owned $captured -ApplicationPath $ApplicationPath -EdgeDriverPath $EdgeDriverPath -RootProcessId $driver.Id
         $profileBinding = if ($returnedUserData) { 'session-capability-' + (Get-ExactProfileBinding -Candidate $returnedUserData -RequestedProfile $ProfileRoot -SettingsRoot $SettingsRoot) } else { Get-OwnedProfileBinding -Owned $captured -RequestedProfile $ProfileRoot -SettingsRoot $SettingsRoot }
         Assert-ReadingProfileScope -ProfileRoot $ProfileRoot -SettingsRoot $SettingsRoot -Binding $profileBinding
 
         Assert-ReadingPhaseTransition -Deadline $launchDeadline -Phase launch
         $plainPickerDeadline = New-ReadingPhaseDeadline -Phase native-picker
-        $plainPickerControlCategory = Open-ReadingUserFile -SessionId $sessionId -ApplicationProcessId $applicationProcessId -Path $PlainFixture -Deadline $plainPickerDeadline
+        $plainPickerControlCategory = Open-ReadingUserFile -SessionId $sessionId -ApplicationProcessId $applicationProcessId -ApplicationProcessStartUtcTicks $applicationProcessStartUtcTicks -Path $PlainFixture -Deadline $plainPickerDeadline
         Assert-ReadingPhaseTransition -Deadline $plainPickerDeadline -Phase native-picker
         $plainProductDeadline = New-ReadingPhaseDeadline -Phase product
         $postOpen = Wait-ReadingPostOpenState -SessionId $sessionId -ExpectedName 'reading-source.pdf' -ExpectedPages 6 -NativeControlCategory $plainPickerControlCategory -Deadline $plainProductDeadline
@@ -811,7 +843,7 @@ const a=document.querySelector('aside[aria-label="Find in document"]'),live=[...
 
         Assert-ReadingPhaseTransition -Deadline $plainProductDeadline -Phase product
         $passwordPickerDeadline = New-ReadingPhaseDeadline -Phase native-picker
-        $null = Open-ReadingUserFile -SessionId $sessionId -ApplicationProcessId $applicationProcessId -Path $ProtectedFixture -Deadline $passwordPickerDeadline
+        $null = Open-ReadingUserFile -SessionId $sessionId -ApplicationProcessId $applicationProcessId -ApplicationProcessStartUtcTicks $applicationProcessStartUtcTicks -Path $ProtectedFixture -Deadline $passwordPickerDeadline
         Assert-ReadingPhaseTransition -Deadline $passwordPickerDeadline -Phase native-picker
         $passwordProductDeadline = New-ReadingPhaseDeadline -Phase product
         $prompt = Wait-WebDriverOracle -SessionId $sessionId -Deadline $passwordProductDeadline -Kind 'password prompt' -Script "const d=document.querySelector('dialog[aria-labelledby=`"password-title`"]'),i=d?.querySelector('input[type=`"password`"]');return {one:!!d&&!!i&&i.value==='',message:[...d?.querySelectorAll('p')||[]].some(x=>x.textContent.trim()==='Your password is used only to open this document.')};" -Predicate { param($v) [bool]$v.one -and [bool]$v.message }
@@ -822,7 +854,7 @@ const a=document.querySelector('aside[aria-label="Find in document"]'),live=[...
         Close-ActiveReadingDocument -SessionId $sessionId -Deadline $passwordProductDeadline
         Assert-ReadingPhaseTransition -Deadline $passwordProductDeadline -Phase product
         $reopenPickerDeadline = New-ReadingPhaseDeadline -Phase native-picker
-        $null = Open-ReadingUserFile -SessionId $sessionId -ApplicationProcessId $applicationProcessId -Path $ProtectedFixture -Deadline $reopenPickerDeadline
+        $null = Open-ReadingUserFile -SessionId $sessionId -ApplicationProcessId $applicationProcessId -ApplicationProcessStartUtcTicks $applicationProcessStartUtcTicks -Path $ProtectedFixture -Deadline $reopenPickerDeadline
         Assert-ReadingPhaseTransition -Deadline $reopenPickerDeadline -Phase native-picker
         $reopenProductDeadline = New-ReadingPhaseDeadline -Phase product
         $reopened = Wait-WebDriverOracle -SessionId $sessionId -Deadline $reopenProductDeadline -Kind 'transient password reopen' -Script "const d=document.querySelector('dialog[aria-labelledby=`"password-title`"]'),i=d?.querySelector('input[type=`"password`"]');return {prompt:!!d,empty:i?.value===''};" -Predicate { param($v) [bool]$v.prompt -and [bool]$v.empty }
@@ -830,7 +862,7 @@ const a=document.querySelector('aside[aria-label="Find in document"]'),live=[...
         Start-Sleep -Milliseconds 250
         Assert-ReadingPhaseTransition -Deadline $reopenProductDeadline -Phase product
         $postCancelPickerDeadline = New-ReadingPhaseDeadline -Phase native-picker
-        $null = Open-ReadingUserFile -SessionId $sessionId -ApplicationProcessId $applicationProcessId -Path $ProtectedFixture -Deadline $postCancelPickerDeadline
+        $null = Open-ReadingUserFile -SessionId $sessionId -ApplicationProcessId $applicationProcessId -ApplicationProcessStartUtcTicks $applicationProcessStartUtcTicks -Path $ProtectedFixture -Deadline $postCancelPickerDeadline
         Assert-ReadingPhaseTransition -Deadline $postCancelPickerDeadline -Phase native-picker
         $postCancelProductDeadline = New-ReadingPhaseDeadline -Phase product
         $afterCancel = Wait-WebDriverOracle -SessionId $sessionId -Deadline $postCancelProductDeadline -Kind 'post-cancel password reopen' -Script "const d=document.querySelector('dialog[aria-labelledby=`"password-title`"]'),i=d?.querySelector('input[type=`"password`"]');return {prompt:!!d,empty:i?.value===''};" -Predicate { param($v) [bool]$v.prompt -and [bool]$v.empty }

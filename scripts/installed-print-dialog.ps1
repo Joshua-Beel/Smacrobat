@@ -3263,7 +3263,7 @@ function Invoke-RealInstalledPrintDialog {
         $null = Wait-FixedWebDriverPortsFree -Deadline $handoffDeadline
         $deadline = [datetime]::UtcNow.AddMilliseconds($script:PrintPins.TotalTimeoutMilliseconds)
         $startedAfter = [datetime]::UtcNow
-        $driverCapture = Start-BoundedDiscardProcess -Path $TauriDriverPath -Arguments @("--port=$($script:LaunchPins.WebDriverPort)","--native-port=$($script:LaunchPins.NativeDriverPort)","--native-driver=$EdgeDriverPath")
+        $driverCapture = Start-BoundedDiscardProcess -Path $TauriDriverPath -Arguments @("--port=$($script:LaunchPins.WebDriverPort)","--native-port=$($script:LaunchPins.NativeDriverPort)","--native-driver=$EdgeDriverPath") -Environment (Get-MinimalWindowsProcessEnvironment)
         $driverCapture.Start(); $driver = $driverCapture.Process
         $status = $null
         do {
