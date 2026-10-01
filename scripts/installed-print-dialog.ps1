@@ -90,6 +90,7 @@ namespace Smacrobat.PrintVerification {
     public sealed class NativeWindowRecord {
         public long HandleValue { get; set; }
         public long ParentHandleValue { get; set; }
+        public int ProcessId { get; set; }
         public string ClassName { get; set; }
         public int ControlId { get; set; }
         public bool IsVisible { get; set; }
@@ -118,6 +119,7 @@ namespace Smacrobat.PrintVerification {
         [DllImport("user32.dll", SetLastError = true)] private static extern int GetWindowLong(IntPtr hwnd, int index);
         [DllImport("kernel32.dll")] private static extern void SetLastError(uint errorCode);
         [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint message, IntPtr wParam, string lParam, uint flags, uint timeout, out IntPtr result);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint message, IntPtr wParam, StringBuilder lParam, uint flags, uint timeout, out IntPtr result);
         [DllImport("user32.dll", SetLastError = true)] private static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam, uint flags, uint timeout, out IntPtr result);
         [DllImport("oleacc.dll")] private static extern int AccessibleObjectFromWindow(IntPtr hwnd, uint objectId, ref Guid interfaceId, [MarshalAs(UnmanagedType.Interface)] out object accessible);
         [DllImport("oleacc.dll")] private static extern int AccessibleChildren([MarshalAs(UnmanagedType.Interface)] object container, int childStart, int childCount, [Out, MarshalAs(UnmanagedType.LPArray, SizeParamIndex = 2)] object[] children, out int obtained);
@@ -129,6 +131,9 @@ namespace Smacrobat.PrintVerification {
         private const uint BM_CLICK = 0x00F5;
         private const uint BM_GETCHECK = 0x00F0;
         private const uint WM_COMMAND = 0x0111;
+        private const uint WM_SETTEXT = 0x000C;
+        private const uint WM_GETTEXT = 0x000D;
+        private const uint WM_GETTEXTLENGTH = 0x000E;
         private const int CBN_SELCHANGE = 1;
         private const int CB_ERR = -1;
         private const uint SMTO_ABORTIFHUNG = 0x0002;
@@ -194,6 +199,8 @@ namespace Smacrobat.PrintVerification {
         }
 
         private static NativeWindowRecord Describe(IntPtr hwnd, IntPtr parent) {
+            uint ownerProcessId;
+            GetWindowThreadProcessId(hwnd, out ownerProcessId);
             var className = new StringBuilder(128);
             int length = GetClassName(hwnd, className, className.Capacity);
             string classValue = length > 0 ? className.ToString() : String.Empty;
@@ -201,7 +208,7 @@ namespace Smacrobat.PrintVerification {
             int labelLength = GetWindowText(hwnd, label, label.Capacity);
             string labelValue = labelLength > 0 ? label.ToString() : String.Empty;
             return new NativeWindowRecord {
-                HandleValue = hwnd.ToInt64(), ParentHandleValue = parent.ToInt64(),
+                HandleValue = hwnd.ToInt64(), ParentHandleValue = parent.ToInt64(), ProcessId = checked((int)ownerProcessId),
                 ClassName = classValue, ControlId = GetDlgCtrlID(hwnd), IsVisible = IsWindowVisible(hwnd), IsEnabled = IsWindowEnabled(hwnd),
                 ButtonStyle = GetButtonStyle(hwnd, classValue),
                 IsLabelPrint = AccessKeyLabelEquals(labelValue, "Print"),
@@ -259,6 +266,93 @@ namespace Smacrobat.PrintVerification {
             IntPtr result;
             if (SendMessageTimeout(hwnd, message, wParam, lParam, SMTO_ABORTIFHUNG, Remaining(deadline), out result) == IntPtr.Zero) throw new TimeoutException("Native combo text message timed out.");
             return result;
+        }
+
+        private static IntPtr CallTextOutput(IntPtr hwnd, uint message, IntPtr wParam, StringBuilder lParam, long deadline) {
+            IntPtr result;
+            if (SendMessageTimeout(hwnd, message, wParam, lParam, SMTO_ABORTIFHUNG, Remaining(deadline), out result) == IntPtr.Zero) throw new TimeoutException("Native text read timed out.");
+            return result;
+        }
+
+        private static string ReadWindowTextBounded(IntPtr hwnd, long deadline) {
+            const int maximumCharacters = 32767;
+            int beforeLength = Call(hwnd, WM_GETTEXTLENGTH, IntPtr.Zero, IntPtr.Zero, deadline).ToInt32();
+            if (beforeLength < 0 || beforeLength >= maximumCharacters) throw new InvalidOperationException("Native control text length was invalid.");
+            var value = new StringBuilder(maximumCharacters + 1);
+            int copied = CallTextOutput(hwnd, WM_GETTEXT, new IntPtr(value.Capacity), value, deadline).ToInt32();
+            if (copied < 0 || copied >= maximumCharacters || value.Length != copied) throw new InvalidOperationException("Native control text read was invalid.");
+            int afterLength = Call(hwnd, WM_GETTEXTLENGTH, IntPtr.Zero, IntPtr.Zero, deadline).ToInt32();
+            if (afterLength != beforeLength || afterLength != copied || value.Length != afterLength) throw new InvalidOperationException("Native control text changed during its bounded read.");
+            return value.ToString();
+        }
+
+        private static void ValidateProcessStart(int processId, long processStartUtcTicks) {
+            using (var process = Process.GetProcessById(processId)) {
+                if (process.StartTime.ToUniversalTime().Ticks != processStartUtcTicks) throw new InvalidOperationException("Native save process identity changed.");
+            }
+        }
+
+        private static bool IsOtherSaveContainerClass(string value) {
+            return !String.IsNullOrEmpty(value) && !value.Equals("#32770", StringComparison.OrdinalIgnoreCase) && !value.Equals("Button", StringComparison.OrdinalIgnoreCase) &&
+                !value.Equals("ComboBox", StringComparison.OrdinalIgnoreCase) && !value.Equals("ComboBoxEx32", StringComparison.OrdinalIgnoreCase) && !value.Equals("Edit", StringComparison.OrdinalIgnoreCase) &&
+                !value.Equals("SysListView32", StringComparison.OrdinalIgnoreCase) && !value.Equals("DirectUIHWND", StringComparison.OrdinalIgnoreCase) && !value.Equals("Static", StringComparison.OrdinalIgnoreCase) &&
+                !value.Equals("SysTabControl32", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string ClassOf(IntPtr hwnd) {
+            var value = new StringBuilder(128);
+            if (GetClassName(hwnd, value, value.Capacity) <= 0) throw new InvalidOperationException("Native save control class was unavailable.");
+            return value.ToString();
+        }
+
+        private static void ValidateSaveRoot(int processId, IntPtr root) {
+            if (!IsWindow(root) || !IsOwned(root, processId) || !IsWindowVisible(root) || !IsWindowEnabled(root) || !ClassOf(root).Equals("#32770", StringComparison.OrdinalIgnoreCase)) throw new InvalidOperationException("Native save dialog root identity changed.");
+        }
+
+        private static void ValidateSaveButton(int processId, IntPtr root, IntPtr button, int controlId, int style, string label, long deadline) {
+            ValidateSaveRoot(processId, root);
+            if (!IsWindow(button) || !IsOwned(button, processId) || GetParent(button) != root || !IsWindowVisible(button) || !IsWindowEnabled(button) ||
+                !ClassOf(button).Equals("Button", StringComparison.OrdinalIgnoreCase) || GetDlgCtrlID(button) != controlId || GetButtonStyle(button, "Button") != style ||
+                !AccessKeyLabelEquals(ReadWindowTextBounded(button, deadline), label)) throw new InvalidOperationException("Native save dialog button identity changed.");
+        }
+
+        private static void ValidateSaveFileNameEdit(int processId, IntPtr root, IntPtr edit) {
+            ValidateSaveRoot(processId, root);
+            if (!IsWindow(edit) || !IsOwned(edit, processId) || !IsWindowVisible(edit) || !IsWindowEnabled(edit) || !ClassOf(edit).Equals("Edit", StringComparison.OrdinalIgnoreCase) || GetDlgCtrlID(edit) != 1001) throw new InvalidOperationException("Native save filename edit identity changed.");
+            var visited = new HashSet<IntPtr>();
+            IntPtr combo = GetParent(edit); IntPtr inner = GetParent(combo); IntPtr direct = GetParent(inner); IntPtr outer = GetParent(direct); IntPtr observedRoot = GetParent(outer);
+            foreach (IntPtr hwnd in new[] { edit, combo, inner, direct, outer, observedRoot }) if (hwnd == IntPtr.Zero || !visited.Add(hwnd) || !IsWindow(hwnd) || !IsOwned(hwnd, processId)) throw new InvalidOperationException("Native save filename ancestry was invalid.");
+            if (observedRoot != root || !ClassOf(combo).Equals("ComboBox", StringComparison.OrdinalIgnoreCase) || GetDlgCtrlID(combo) != 0 || !IsOtherSaveContainerClass(ClassOf(inner)) || GetDlgCtrlID(inner) != 0 ||
+                !ClassOf(direct).Equals("DirectUIHWND", StringComparison.OrdinalIgnoreCase) || GetDlgCtrlID(direct) != 0 || !IsOtherSaveContainerClass(ClassOf(outer)) || GetDlgCtrlID(outer) != 0) throw new InvalidOperationException("Native save filename topology changed.");
+        }
+
+        public static bool SetSaveFileNameExact(int processId, long processStartUtcTicks, long rootHandleValue, long editHandleValue, string value, long deadline) {
+            if (processId <= 0 || processStartUtcTicks <= 0 || rootHandleValue == 0 || editHandleValue == 0 || String.IsNullOrEmpty(value) || value.Length > 32767 || deadline <= Environment.TickCount64 || deadline - Environment.TickCount64 > 120000) throw new ArgumentOutOfRangeException();
+            ValidateProcessStart(processId, processStartUtcTicks);
+            var root = new IntPtr(rootHandleValue); var edit = new IntPtr(editHandleValue);
+            ValidateSaveFileNameEdit(processId, root, edit);
+            if (Environment.TickCount64 >= deadline) throw new TimeoutException("Native save filename deadline expired.");
+            if (CallText(edit, WM_SETTEXT, IntPtr.Zero, value, deadline) == IntPtr.Zero) throw new InvalidOperationException("Native save filename update was rejected.");
+            if (!ReadWindowTextBounded(edit, deadline).Equals(value, StringComparison.Ordinal)) throw new InvalidOperationException("Native save filename was not exactly revalidated.");
+            ValidateProcessStart(processId, processStartUtcTicks);
+            ValidateSaveFileNameEdit(processId, root, edit);
+            if (Environment.TickCount64 >= deadline) throw new TimeoutException("Native save filename deadline expired.");
+            return true;
+        }
+
+        public static bool ClickSaveButtonExact(int processId, long processStartUtcTicks, long rootHandleValue, long buttonHandleValue, long deadline) {
+            if (processId <= 0 || processStartUtcTicks <= 0 || rootHandleValue == 0 || buttonHandleValue == 0 || deadline <= Environment.TickCount64 || deadline - Environment.TickCount64 > 120000) throw new ArgumentOutOfRangeException();
+            ValidateProcessStart(processId, processStartUtcTicks);
+            var root = new IntPtr(rootHandleValue); var button = new IntPtr(buttonHandleValue);
+            ValidateSaveButton(processId, root, button, 1, 1, "Save", deadline);
+            if (Environment.TickCount64 >= deadline) throw new TimeoutException("Native save button deadline expired.");
+            ValidateProcessStart(processId, processStartUtcTicks);
+            ValidateSaveRoot(processId, root);
+            if (!IsWindow(button) || !IsOwned(button, processId) || GetParent(button) != root || !IsWindowVisible(button) || !IsWindowEnabled(button) ||
+                !ClassOf(button).Equals("Button", StringComparison.OrdinalIgnoreCase) || GetDlgCtrlID(button) != 1 || GetButtonStyle(button, "Button") != 1) throw new InvalidOperationException("Native save dialog button topology changed before its action.");
+            if (Environment.TickCount64 >= deadline) throw new TimeoutException("Native save button deadline expired.");
+            Call(button, BM_CLICK, IntPtr.Zero, IntPtr.Zero, deadline);
+            return true;
         }
 
         public static bool ClickButton(int processId, long handleValue, bool requireChecked, int timeoutMilliseconds) {
@@ -1313,6 +1407,66 @@ function Get-ExactNativePrintDialogRoles {
     return [pscustomobject]$roleIdentities
 }
 
+function Get-ExactNativeSaveDialogRoles {
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)][object[]]$SurfaceRecords,
+        [Parameter(Mandatory = $true)][long]$RootHandleValue,
+        [Parameter(Mandatory = $true)][datetime]$Deadline
+    )
+    if ($SurfaceRecords.Count -lt 1 -or $SurfaceRecords.Count -gt $script:PrintPins.UiElementMaximum) { throw 'Native save role inventory was missing or oversized.' }
+    $recordsByHandle = @{}
+    foreach ($record in $SurfaceRecords) {
+        if ([datetime]::UtcNow -ge $Deadline) { throw 'Native save role classification deadline expired.' }
+        $handleProperty = $record.PSObject.Properties['HandleValue']; $parentProperty = $record.PSObject.Properties['ParentHandleValue']; $processProperty = $record.PSObject.Properties['ProcessId']
+        if ($null -eq $handleProperty -or [long]$handleProperty.Value -eq 0 -or $null -eq $parentProperty -or $null -eq $processProperty -or [int]$processProperty.Value -ne $ProcessId) { throw 'Native save role inventory contained a foreign or malformed window.' }
+        $handleValue = [long]$handleProperty.Value
+        if ($recordsByHandle.ContainsKey($handleValue)) { throw 'Native save role inventory duplicated a window.' }
+        $recordsByHandle.Add($handleValue,$record)
+    }
+    if (-not $recordsByHandle.ContainsKey($RootHandleValue)) { return $null }
+    $root = $recordsByHandle[$RootHandleValue]
+    $rootParent = $root.PSObject.Properties['ParentHandleValue']; $rootVisible = $root.PSObject.Properties['IsVisible']; $rootEnabled = $root.PSObject.Properties['IsEnabled']
+    if ($null -eq $rootParent -or [long]$rootParent.Value -ne 0 -or (Get-SanitizedNativeClassBucket -Record $root) -cne 'dialog32770' -or $null -eq $rootVisible -or -not [bool]$rootVisible.Value -or $null -eq $rootEnabled -or -not [bool]$rootEnabled.Value) { return $null }
+    $matchesButton = {
+        param($Record,[int]$ControlId,[string]$StyleBucket,[string]$LabelProperty)
+        $controlIdProperty = $Record.PSObject.Properties['ControlId']; $style = Get-SanitizedNativeButtonStyleBucket -Record $Record
+        $parentProperty = $Record.PSObject.Properties['ParentHandleValue']; $visible = $Record.PSObject.Properties['IsVisible']; $enabled = $Record.PSObject.Properties['IsEnabled']; $label = $Record.PSObject.Properties[$LabelProperty]
+        return (Get-SanitizedNativeClassBucket -Record $Record) -ceq 'button' -and $null -ne $controlIdProperty -and [int]$controlIdProperty.Value -eq $ControlId -and $style -ceq $StyleBucket -and
+            $null -ne $parentProperty -and [long]$parentProperty.Value -eq $RootHandleValue -and $null -ne $visible -and [bool]$visible.Value -and $null -ne $enabled -and [bool]$enabled.Value -and $null -ne $label -and [bool]$label.Value
+    }
+    $saveMatches = @($SurfaceRecords | Where-Object { & $matchesButton $_ 1 'defaultPushButton' 'IsLabelSave' })
+    $cancelMatches = @($SurfaceRecords | Where-Object { & $matchesButton $_ 2 'pushButton' 'IsLabelCancel' })
+    $editCandidates = @($SurfaceRecords | Where-Object {
+        $controlId = $_.PSObject.Properties['ControlId']; $visible = $_.PSObject.Properties['IsVisible']; $enabled = $_.PSObject.Properties['IsEnabled']
+        (Get-SanitizedNativeClassBucket -Record $_) -ceq 'edit' -and $null -ne $controlId -and [int]$controlId.Value -eq 1001 -and $null -ne $visible -and [bool]$visible.Value -and $null -ne $enabled -and [bool]$enabled.Value
+    })
+    if ($saveMatches.Count -gt 1 -or $cancelMatches.Count -gt 1 -or $editCandidates.Count -gt 1) { throw 'Native save roles were ambiguous.' }
+    if ($saveMatches.Count -ne 1 -or $cancelMatches.Count -ne 1 -or $editCandidates.Count -ne 1) { return $null }
+    $edit = $editCandidates[0]; $visited = [Collections.Generic.HashSet[long]]::new(); $chain = @(); $cursor = [long]$edit.HandleValue
+    for ($depth = 0; $depth -lt 6; $depth++) {
+        if (-not $visited.Add($cursor) -or -not $recordsByHandle.ContainsKey($cursor)) { throw 'Native save filename ancestry was cyclic or incomplete.' }
+        $chain += $recordsByHandle[$cursor]
+        if ($cursor -eq $RootHandleValue) { break }
+        $cursor = [long]$recordsByHandle[$cursor].ParentHandleValue
+        if ($cursor -eq 0) { break }
+    }
+    if ($chain.Count -ne 6 -or [long]$chain[5].HandleValue -ne $RootHandleValue) { return $null }
+    $expectedBuckets = @('edit','comboBox','other','directUiHwnd','other','dialog32770')
+    for ($index = 0; $index -lt $expectedBuckets.Count; $index++) {
+        if ((Get-SanitizedNativeClassBucket -Record $chain[$index]) -cne $expectedBuckets[$index]) { return $null }
+        if ($index -gt 0 -and $index -lt 5) {
+            $controlId = $chain[$index].PSObject.Properties['ControlId']
+            if ($null -eq $controlId -or [int]$controlId.Value -ne 0) { return $null }
+        }
+    }
+    return [pscustomobject][ordered]@{
+        cancel=('hwnd:' + ([long]$cancelMatches[0].HandleValue).ToString([Globalization.CultureInfo]::InvariantCulture) + '|native')
+        save=('hwnd:' + ([long]$saveMatches[0].HandleValue).ToString([Globalization.CultureInfo]::InvariantCulture) + '|native')
+        filenameEdit=('hwnd:' + ([long]$edit.HandleValue).ToString([Globalization.CultureInfo]::InvariantCulture) + '|native')
+    }
+}
+
 function Wait-NewProcessNativeWindowSurface {
     param(
         [Parameter(Mandatory = $true)][int]$ProcessId,
@@ -1344,6 +1498,19 @@ function Wait-NewProcessNativeWindowSurface {
             $rootHandleValue = [long]$visibleDialogRecords[0].HandleValue
             $surfaceRecords = @(Get-ProcessNativeWindowRecords -ProcessId $ProcessId -RootHandleValue $rootHandleValue -Deadline $Deadline -WindowProvider $WindowProvider -EnumerationStage ([ref]$rootedEnumerationStage))
             $structure = Get-SanitizedNativeWindowTopologyJson -TopLevelRecords $topLevelRecords -CandidateTopLevelRecords $candidateTopLevelRecords -SurfaceRecords $surfaceRecords -NativeEnumerationStage $rootedEnumerationStage
+            if ($Stage -ceq 'save-output-dialog') {
+                $nativeSaveRoles = Get-ExactNativeSaveDialogRoles -ProcessId $ProcessId -SurfaceRecords $surfaceRecords -RootHandleValue $rootHandleValue -Deadline $Deadline
+                if ($null -eq $nativeSaveRoles) { throw 'Native save dialog roles were incomplete.' }
+                $rootIdentity = 'hwnd:' + $rootHandleValue.ToString([Globalization.CultureInfo]::InvariantCulture) + '|native'
+                return [pscustomobject]@{
+                    surfaceRootIdentity=$rootIdentity
+                    surfaceElement=$null
+                    baselineIdentities=[string[]]@($baselineIdentities)
+                    trackedIdentities=[string[]]@($rootIdentity,[string]$nativeSaveRoles.cancel,[string]$nativeSaveRoles.save,[string]$nativeSaveRoles.filenameEdit)
+                    anchorElement=$null
+                    nativeRoles=$nativeSaveRoles
+                }
+            }
             $topLevel = @(Convert-ProcessNativeWindowRecordsToSnapshot -ProcessId $ProcessId -Deadline $Deadline -Records $topLevelRecords -TopLevelOnly -EnumerationStage ([ref]$topLevelEnumerationStage))
             $candidateTopLevelRecords = @(Get-NativeTopLevelCandidateDiagnosticRecords -TopLevelRecords $topLevelRecords -TopLevelSnapshot $topLevel -BaselineHandleValues $baselineHandleValues -Deadline $Deadline)
             $selectedRoots = @($topLevel | Where-Object { (Get-NativeSurfaceHandleValue -Identity ([string]$_.runtimeIdentity)) -eq $rootHandleValue })
@@ -1379,13 +1546,9 @@ function Wait-NewProcessNativeWindowSurface {
                 }
                 $structure = Get-SanitizedNativeWindowTopologyJson -TopLevelRecords $topLevelRecords -CandidateTopLevelRecords $candidateTopLevelRecords -SurfaceRecords $surfaceRecords -RoleCounts $roleCounts -NativeEnumerationStage $rootedEnumerationStage
             }
-            $nativeRoles = if ($Stage -cne 'save-output-dialog') { Get-ExactNativePrintDialogRoles -SurfaceRecords $surfaceRecords -Snapshot $current -RootHandleValue $rootHandleValue -Deadline $Deadline } else { $null }
-            $requiredTargetSet = if ($Stage -ceq 'save-output-dialog') {
-                $saveButtons -eq 1 -and $filenameEdits -eq 1
-            } else {
-                $null -ne $nativeRoles -or ($cancelButtons -eq 1 -and $printButtons -eq 1 -and $currentPageRadios -eq 1 -and
-                    $printerControls -le 1 -and $comboBoxes -le 8 -and $printerLists -le 1 -and ($printerControls -eq 1 -or $comboBoxes -ge 1 -or $printerLists -eq 1))
-            }
+            $nativeRoles = Get-ExactNativePrintDialogRoles -SurfaceRecords $surfaceRecords -Snapshot $current -RootHandleValue $rootHandleValue -Deadline $Deadline
+            $requiredTargetSet = $null -ne $nativeRoles -or ($cancelButtons -eq 1 -and $printButtons -eq 1 -and $currentPageRadios -eq 1 -and
+                $printerControls -le 1 -and $comboBoxes -le 8 -and $printerLists -le 1 -and ($printerControls -eq 1 -or $comboBoxes -ge 1 -or $printerLists -eq 1))
             if (($null -ne $nativeRoles -or $anchors.Count -eq 1) -and $requiredTargetSet) {
                 if ([datetime]::UtcNow -ge $Deadline) { break }
                 $anchorElement = if ($null -ne $nativeRoles) {
@@ -1687,11 +1850,15 @@ function Wait-NewProcessUiSurface {
 function Get-ValidatedBindingNativeRoles {
     param([Parameter(Mandatory = $true)]$Binding)
     if ($null -eq $Binding.nativeRoles) { return $null }
-    Assert-PrintExactProperties -Value $Binding.nativeRoles -Expected @('cancel','print','currentPage','printerList') -Kind 'Native print role binding'
+    $roleProperties = @($Binding.nativeRoles.PSObject.Properties.Name)
+    $expectedRoles = if ($roleProperties.Count -eq 3 -and $roleProperties -contains 'cancel' -and $roleProperties -contains 'save' -and $roleProperties -contains 'filenameEdit') {
+        @('cancel','save','filenameEdit')
+    } else { @('cancel','print','currentPage','printerList') }
+    Assert-PrintExactProperties -Value $Binding.nativeRoles -Expected $expectedRoles -Kind 'Native print role binding'
     $tracked = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($identity in @($Binding.trackedIdentities)) { $null = $tracked.Add([string]$identity) }
     $roles = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    foreach ($property in @('cancel','print','currentPage','printerList')) {
+    foreach ($property in $expectedRoles) {
         $identity = [string]$Binding.nativeRoles.$property
         if ([string]::IsNullOrWhiteSpace($identity) -or $identity -cnotmatch '^hwnd:' -or -not $tracked.Contains($identity) -or -not $roles.Add($identity)) { throw 'Native print role binding identity was invalid.' }
     }
@@ -1768,6 +1935,74 @@ function Get-BoundNativeRoleElement {
     Assert-ProcessUiElement -Element $roleMatches[0].element -ProcessId $ProcessId
     if ([datetime]::UtcNow -ge $Deadline) { throw 'Native print role action deadline expired.' }
     return $roleMatches[0].element
+}
+
+function Get-BoundNativeSaveRoleRecord {
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)]$Binding,
+        [Parameter(Mandatory = $true)][ValidateSet('save','filenameEdit')][string]$Role,
+        [Parameter(Mandatory = $true)][long]$DeadlineTickCount,
+        [scriptblock]$NativeWindowProvider
+    )
+    $remainingMilliseconds = $DeadlineTickCount - [Environment]::TickCount64
+    if ($remainingMilliseconds -le 0 -or $remainingMilliseconds -gt 120000) { throw 'Native save role deadline was invalid.' }
+    $roles = Get-ValidatedBindingNativeRoles -Binding $Binding
+    if ($null -eq $roles -or $null -eq $roles.PSObject.Properties['save'] -or $null -eq $roles.PSObject.Properties['filenameEdit']) { throw 'Native save role binding was invalid.' }
+    $rootHandleValue = Get-NativeSurfaceHandleValue -Identity ([string]$Binding.surfaceRootIdentity)
+    $deadline = [datetime]::UtcNow.AddMilliseconds($remainingMilliseconds)
+    $records = @(Get-ProcessNativeWindowRecords -ProcessId $ProcessId -RootHandleValue $rootHandleValue -Deadline $deadline -WindowProvider $NativeWindowProvider)
+    if ([Environment]::TickCount64 -ge $DeadlineTickCount) { throw 'Native save role revalidation exceeded its deadline.' }
+    $currentRoles = Get-ExactNativeSaveDialogRoles -ProcessId $ProcessId -SurfaceRecords $records -RootHandleValue $rootHandleValue -Deadline $deadline
+    if ($null -eq $currentRoles) { throw 'Native save roles were incomplete before their action.' }
+    foreach ($property in @('cancel','save','filenameEdit')) {
+        if ([string]$currentRoles.$property -cne [string]$roles.$property) { throw 'Native save role identity changed before its action.' }
+    }
+    $roleHandleValue = Get-NativeSurfaceHandleValue -Identity ([string]$roles.$Role)
+    $roleRecords = @($records | Where-Object { [long]$_.HandleValue -eq $roleHandleValue })
+    if ($roleRecords.Count -ne 1 -or [Environment]::TickCount64 -ge $DeadlineTickCount) { throw 'Native save role disappeared or became ambiguous before its action.' }
+    return $roleRecords[0]
+}
+
+function Set-BoundNativeSaveFileNameExact {
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)][long]$ProcessStartUtcTicks,
+        [Parameter(Mandatory = $true)]$Binding,
+        [Parameter(Mandatory = $true)][string]$Value,
+        [Parameter(Mandatory = $true)][long]$DeadlineTickCount,
+        [scriptblock]$NativeWindowProvider,
+        [scriptblock]$SetProvider
+    )
+    $record = Get-BoundNativeSaveRoleRecord -ProcessId $ProcessId -Binding $Binding -Role 'filenameEdit' -DeadlineTickCount $DeadlineTickCount -NativeWindowProvider $NativeWindowProvider
+    $rootHandleValue = Get-NativeSurfaceHandleValue -Identity ([string]$Binding.surfaceRootIdentity)
+    $editHandleValue = [long]$record.HandleValue
+    if ([Environment]::TickCount64 -ge $DeadlineTickCount) { throw 'Native save filename deadline expired.' }
+    if ($null -eq $SetProvider) { Initialize-PrintNativeWindowInterop }
+    $set = if ($SetProvider) { & $SetProvider $ProcessId $ProcessStartUtcTicks $rootHandleValue $editHandleValue $Value $DeadlineTickCount } else {
+        [Smacrobat.PrintVerification.NativeWindows]::SetSaveFileNameExact($ProcessId,$ProcessStartUtcTicks,$rootHandleValue,$editHandleValue,$Value,$DeadlineTickCount)
+    }
+    if ($set -isnot [bool] -or -not $set -or [Environment]::TickCount64 -ge $DeadlineTickCount) { throw 'Native save filename action was not exactly accepted before its deadline.' }
+}
+
+function Invoke-BoundNativeSaveButtonExact {
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)][long]$ProcessStartUtcTicks,
+        [Parameter(Mandatory = $true)]$Binding,
+        [Parameter(Mandatory = $true)][long]$DeadlineTickCount,
+        [scriptblock]$NativeWindowProvider,
+        [scriptblock]$ClickProvider
+    )
+    $record = Get-BoundNativeSaveRoleRecord -ProcessId $ProcessId -Binding $Binding -Role 'save' -DeadlineTickCount $DeadlineTickCount -NativeWindowProvider $NativeWindowProvider
+    $rootHandleValue = Get-NativeSurfaceHandleValue -Identity ([string]$Binding.surfaceRootIdentity)
+    $buttonHandleValue = [long]$record.HandleValue
+    if ([Environment]::TickCount64 -ge $DeadlineTickCount) { throw 'Native save button deadline expired.' }
+    if ($null -eq $ClickProvider) { Initialize-PrintNativeWindowInterop }
+    $clicked = if ($ClickProvider) { & $ClickProvider $ProcessId $ProcessStartUtcTicks $rootHandleValue $buttonHandleValue $DeadlineTickCount } else {
+        [Smacrobat.PrintVerification.NativeWindows]::ClickSaveButtonExact($ProcessId,$ProcessStartUtcTicks,$rootHandleValue,$buttonHandleValue,$DeadlineTickCount)
+    }
+    if ($clicked -isnot [bool] -or -not $clicked -or [Environment]::TickCount64 -ge $DeadlineTickCount) { throw 'Native save button action was not exactly accepted before its deadline.' }
 }
 
 function Invoke-BoundNativeButtonRole {
@@ -1889,17 +2124,52 @@ function Wait-BoundProcessUiSurfaceClosed {
     foreach ($identity in @($Binding.baselineIdentities)) { if ([string]::IsNullOrWhiteSpace([string]$identity) -or -not $baselineIdentities.Add([string]$identity)) { throw 'Native process UI close baseline identity set was invalid.' } }
     $structure = Get-SanitizedProcessUiStructureJson -ProcessId $ProcessId -DeadlineExpired
     if ([string]$Binding.surfaceRootIdentity -cmatch '^hwnd:') {
+        $boundIdentity = [string]$Binding.surfaceRootIdentity
+        $boundHandleValue = Get-NativeSurfaceHandleValue -Identity $boundIdentity
+        $boundIsExplicitNative = $boundIdentity -cmatch '\|native$'
+        $nativeAllowedIdentities = @($allowedSurfaces | Where-Object { [string]$_ -cmatch '\|native$' })
+        $uiaAllowedIdentities = @($allowedSurfaces | Where-Object { [string]$_ -cnotmatch '\|native$' })
         while ([datetime]::UtcNow -lt $Deadline) {
             try {
-                $current = @(Get-ProcessNativeWindowSnapshot -ProcessId $ProcessId -Deadline $Deadline -TopLevelOnly -WindowProvider $NativeWindowProvider)
+                $topLevelRecords = @()
+                $current = @(Get-ProcessNativeWindowSnapshot -ProcessId $ProcessId -Deadline $Deadline -TopLevelOnly -WindowProvider $NativeWindowProvider -ObservedRecords ([ref]$topLevelRecords))
                 $structure = Get-SanitizedObservedUiStructureJson -ProcessId $ProcessId -Elements @($current | ForEach-Object { $_.element }) -Scope 'top-level'
+                if ([datetime]::UtcNow -ge $Deadline) { break }
                 $byIdentity = @{}
                 foreach ($entry in $current) { $byIdentity.Add([string]$entry.runtimeIdentity,$entry) }
-                $boundSurfaceRemains = $byIdentity.ContainsKey([string]$Binding.surfaceRootIdentity)
+                $baselinePresent = $true
+                foreach ($identity in $baselineIdentities) {
+                    if (-not $byIdentity.ContainsKey($identity) -or -not [bool]$byIdentity[$identity].isSurface) { $baselinePresent = $false; break }
+                }
+                $boundSurfaceRemains = if ($boundIsExplicitNative) {
+                    @($current | Where-Object { (Get-NativeSurfaceHandleValue -Identity ([string]$_.runtimeIdentity)) -eq $boundHandleValue }).Count -gt 0
+                } else { $byIdentity.ContainsKey($boundIdentity) }
                 $allowedPresent = $true
-                foreach ($identity in $allowedSurfaces) { if (-not $byIdentity.ContainsKey($identity) -or -not [bool]$byIdentity[$identity].isSurface) { $allowedPresent = $false; break } }
-                $unexpectedSurface = @($current | Where-Object { -not $baselineIdentities.Contains([string]$_.runtimeIdentity) -and -not $allowedSurfaces.Contains([string]$_.runtimeIdentity) }).Count -gt 0
-                if (-not $boundSurfaceRemains -and $allowedPresent -and -not $unexpectedSurface) {
+                foreach ($identity in $uiaAllowedIdentities) {
+                    if (-not $byIdentity.ContainsKey($identity) -or -not [bool]$byIdentity[$identity].isSurface) { $allowedPresent = $false; break }
+                }
+                $validatedNativeAllowedHandles = [Collections.Generic.HashSet[long]]::new()
+                if ($allowedPresent) {
+                    foreach ($identity in $nativeAllowedIdentities) {
+                        if ([datetime]::UtcNow -ge $Deadline) { throw 'Native allowed Save surface validation deadline expired.' }
+                        $handleValue = Get-NativeSurfaceHandleValue -Identity ([string]$identity)
+                        $topLevelMatches = @($topLevelRecords | Where-Object { [long]$_.HandleValue -eq $handleValue })
+                        if ($topLevelMatches.Count -ne 1) { $allowedPresent = $false; break }
+                        $surfaceRecords = @(Get-ProcessNativeWindowRecords -ProcessId $ProcessId -RootHandleValue $handleValue -Deadline $Deadline -WindowProvider $NativeWindowProvider)
+                        if ([datetime]::UtcNow -ge $Deadline) { throw 'Native allowed Save surface validation deadline expired.' }
+                        $saveRoles = Get-ExactNativeSaveDialogRoles -ProcessId $ProcessId -SurfaceRecords $surfaceRecords -RootHandleValue $handleValue -Deadline $Deadline
+                        if ($null -eq $saveRoles) { $allowedPresent = $false; break }
+                        $null = $validatedNativeAllowedHandles.Add($handleValue)
+                    }
+                }
+                $unexpectedSurface = $false
+                foreach ($entry in @($current | Where-Object { [bool]$_.isSurface })) {
+                    $identity = [string]$entry.runtimeIdentity
+                    $handleValue = Get-NativeSurfaceHandleValue -Identity $identity
+                    if ($baselineIdentities.Contains($identity) -or $uiaAllowedIdentities -ccontains $identity -or $validatedNativeAllowedHandles.Contains($handleValue)) { continue }
+                    $unexpectedSurface = $true; break
+                }
+                if (-not $boundSurfaceRemains -and $baselinePresent -and $allowedPresent -and -not $unexpectedSurface) {
                     if ([datetime]::UtcNow -ge $Deadline) { break }
                     return
                 }
@@ -2482,16 +2752,24 @@ function Submit-NativePrintToPdf {
     }
     Wait-BoundProcessUiSurfaceClosed -ProcessId $ProcessId -Binding $surface -Stage 'second-print-dialog' -Deadline $Deadline -AllowedSurfaceIdentities @([string]$saveSurface.surfaceRootIdentity)
     Assert-NativePrintDeadline -Deadline $Deadline
-    try {
-        $filename = Find-BoundProcessUiElement -ProcessId $ProcessId -Binding $saveSurface -AutomationIds @('1001','FileNameControlHost') -ControlTypes @('ControlType.Edit') -Deadline $Deadline
-    } catch {
+    $saveRoles = Get-ValidatedBindingNativeRoles -Binding $saveSurface
+    if ($null -ne $saveRoles -and $null -ne $saveRoles.PSObject.Properties['save']) {
+        $remainingMilliseconds = [int][Math]::Min(120000,[Math]::Max(1,[Math]::Ceiling(($Deadline - [datetime]::UtcNow).TotalMilliseconds)))
+        $saveActionDeadlineTick = [Environment]::TickCount64 + $remainingMilliseconds
+        Set-BoundNativeSaveFileNameExact -ProcessId $ProcessId -ProcessStartUtcTicks $ProcessStartUtcTicks -Binding $saveSurface -Value $OutputPath -DeadlineTickCount $saveActionDeadlineTick
+        Invoke-BoundNativeSaveButtonExact -ProcessId $ProcessId -ProcessStartUtcTicks $ProcessStartUtcTicks -Binding $saveSurface -DeadlineTickCount $saveActionDeadlineTick
+    } else {
+        try {
+            $filename = Find-BoundProcessUiElement -ProcessId $ProcessId -Binding $saveSurface -AutomationIds @('1001','FileNameControlHost') -ControlTypes @('ControlType.Edit') -Deadline $Deadline
+        } catch {
+            Assert-NativePrintDeadline -Deadline $Deadline
+            $filename = Find-BoundProcessUiElement -ProcessId $ProcessId -Binding $saveSurface -Names @('File name:','File name') -ControlTypes @('ControlType.Edit') -Deadline $Deadline
+        }
+        Set-ProcessUiElementValue -Element $filename -ProcessId $ProcessId -Value $OutputPath -Deadline $Deadline
         Assert-NativePrintDeadline -Deadline $Deadline
-        $filename = Find-BoundProcessUiElement -ProcessId $ProcessId -Binding $saveSurface -Names @('File name:','File name') -ControlTypes @('ControlType.Edit') -Deadline $Deadline
+        $save = Find-BoundProcessUiElement -ProcessId $ProcessId -Binding $saveSurface -Names @('Save') -ControlTypes @('ControlType.Button') -Deadline $Deadline
+        Invoke-ProcessUiElement -Element $save -ProcessId $ProcessId -Deadline $Deadline
     }
-    Set-ProcessUiElementValue -Element $filename -ProcessId $ProcessId -Value $OutputPath -Deadline $Deadline
-    Assert-NativePrintDeadline -Deadline $Deadline
-    $save = Find-BoundProcessUiElement -ProcessId $ProcessId -Binding $saveSurface -Names @('Save') -ControlTypes @('ControlType.Button') -Deadline $Deadline
-    Invoke-ProcessUiElement -Element $save -ProcessId $ProcessId -Deadline $Deadline
     Wait-BoundProcessUiSurfaceClosed -ProcessId $ProcessId -Binding $saveSurface -Stage 'save-output-dialog' -Deadline $Deadline
 }
 

@@ -83,6 +83,128 @@ public sealed class NativeAccessibleListFixture : IDisposable {
     expect(result.status, result.stderr || result.stdout).toBe(0);
   });
 
+  it('binds and mutates only the exact evidenced native save dialog topology', () => {
+    const result = runPowerShell7(String.raw`
+      $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
+      Set-Location -LiteralPath '${process.cwd().replaceAll("'", "''")}'
+      . ./scripts/installed-print-dialog.ps1
+      Initialize-PrintNativeWindowInterop
+      Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+public sealed class NativeSaveDialogFixture : IDisposable {
+  delegate IntPtr WindowProcedure(IntPtr hwnd,uint message,IntPtr wParam,IntPtr lParam);
+  [StructLayout(LayoutKind.Sequential,CharSet=CharSet.Unicode)] struct WNDCLASS { public uint style; public IntPtr lpfnWndProc; public int cbClsExtra,cbWndExtra; public IntPtr hInstance,hIcon,hCursor,hbrBackground; public string lpszMenuName,lpszClassName; }
+  [StructLayout(LayoutKind.Sequential)] struct MSG { public IntPtr hwnd; public uint message; public UIntPtr wParam; public IntPtr lParam; public uint time; public int x,y; }
+  [DllImport("kernel32.dll")] static extern IntPtr GetModuleHandle(string name);
+  [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+  [DllImport("user32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern ushort RegisterClass(ref WNDCLASS value);
+  [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern IntPtr DefWindowProc(IntPtr hwnd,uint message,IntPtr wParam,IntPtr lParam);
+  [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern IntPtr CallWindowProc(IntPtr previous,IntPtr hwnd,uint message,IntPtr wParam,IntPtr lParam);
+  [DllImport("user32.dll",EntryPoint="SetWindowLongPtrW")] static extern IntPtr SetWindowLongPtr(IntPtr hwnd,int index,IntPtr value);
+  [DllImport("user32.dll")] static extern IntPtr SetParent(IntPtr child,IntPtr parent);
+  [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern IntPtr CreateWindowEx(uint ex,string cls,string title,uint style,int x,int y,int w,int h,IntPtr parent,IntPtr menu,IntPtr instance,IntPtr value);
+  [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern IntPtr FindWindowEx(IntPtr parent,IntPtr after,string cls,string title);
+  [DllImport("user32.dll")] static extern bool DestroyWindow(IntPtr hwnd);
+  [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr hwnd,int command);
+  [DllImport("user32.dll")] static extern bool UpdateWindow(IntPtr hwnd);
+  [DllImport("user32.dll")] static extern int GetMessage(out MSG message,IntPtr hwnd,uint minimum,uint maximum);
+  [DllImport("user32.dll")] static extern bool TranslateMessage(ref MSG message);
+  [DllImport("user32.dll")] static extern IntPtr DispatchMessage(ref MSG message);
+  [DllImport("user32.dll")] static extern bool PostThreadMessage(uint threadId,uint message,UIntPtr wParam,IntPtr lParam);
+  [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr hwnd,StringBuilder value,int maximum);
+  readonly ManualResetEventSlim ready=new ManualResetEventSlim(false); readonly WindowProcedure defaultProcedure; readonly WindowProcedure rootProcedure; readonly WindowProcedure editProcedure; readonly WindowProcedure saveProcedure; Thread thread; Exception failure; uint threadId; IntPtr previousRootProcedure; IntPtr previousEditProcedure; IntPtr previousSaveProcedure; IntPtr alternateSaveParent; volatile bool saveClicked; volatile bool saveClickMessage; volatile bool growOnLengthQuery; volatile bool reparentOnLabelLength;
+  public long RootHandle{get;private set;} public long EditHandle{get;private set;} public long SaveHandle{get;private set;} public bool SaveClicked{get{return saveClicked;}} public bool SaveClickMessage{get{return saveClickMessage;}}
+  public NativeSaveDialogFixture(){defaultProcedure=DefaultWindowProcedure;rootProcedure=RootWindowProcedure;editProcedure=EditWindowProcedure;saveProcedure=SaveWindowProcedure;}
+  IntPtr DefaultWindowProcedure(IntPtr hwnd,uint message,IntPtr wParam,IntPtr lParam){return DefWindowProc(hwnd,message,wParam,lParam);}
+  IntPtr RootWindowProcedure(IntPtr hwnd,uint message,IntPtr wParam,IntPtr lParam){if(message==0x0111&&(wParam.ToInt64()&0xffff)==1)saveClicked=true;return CallWindowProc(previousRootProcedure,hwnd,message,wParam,lParam);}
+  IntPtr EditWindowProcedure(IntPtr hwnd,uint message,IntPtr wParam,IntPtr lParam){
+    if(message==0x000E&&growOnLengthQuery){
+      IntPtr length=CallWindowProc(previousEditProcedure,hwnd,message,wParam,lParam);growOnLengthQuery=false;
+      var current=new StringBuilder(32768);GetWindowText(hwnd,current,current.Capacity);IntPtr changed=Marshal.StringToHGlobalUni(current.ToString()+".other");
+      try{CallWindowProc(previousEditProcedure,hwnd,0x000C,IntPtr.Zero,changed);}finally{Marshal.FreeHGlobal(changed);}return length;
+    }
+    return CallWindowProc(previousEditProcedure,hwnd,message,wParam,lParam);
+  }
+  IntPtr SaveWindowProcedure(IntPtr hwnd,uint message,IntPtr wParam,IntPtr lParam){
+    if(message==0x00F5)saveClickMessage=true;
+    if(message==0x000E&&reparentOnLabelLength){IntPtr length=CallWindowProc(previousSaveProcedure,hwnd,message,wParam,lParam);reparentOnLabelLength=false;SetParent(hwnd,alternateSaveParent);return length;}
+    return CallWindowProc(previousSaveProcedure,hwnd,message,wParam,lParam);
+  }
+  void Register(string name,IntPtr instance){var value=new WNDCLASS{lpfnWndProc=Marshal.GetFunctionPointerForDelegate(defaultProcedure),hInstance=instance,lpszClassName=name};ushort atom=RegisterClass(ref value);if(atom==0&&Marshal.GetLastWin32Error()!=1410)throw new InvalidOperationException("Class registration failed.");}
+  IntPtr Create(string cls,string text,uint style,IntPtr parent,int id,IntPtr instance){IntPtr hwnd=CreateWindowEx(0,cls,text,style,0,0,320,220,parent,new IntPtr(id),instance,IntPtr.Zero);if(hwnd==IntPtr.Zero)throw new InvalidOperationException("Window creation failed: "+cls);return hwnd;}
+  public void Start(){thread=new Thread(Run);thread.SetApartmentState(ApartmentState.STA);thread.IsBackground=true;thread.Start();if(!ready.Wait(5000))throw new TimeoutException();if(failure!=null)throw new InvalidOperationException("Native save fixture failed.",failure);}
+  void Run(){try{threadId=GetCurrentThreadId();IntPtr instance=GetModuleHandle(null);Register("SmacrobatSaveOuter",instance);Register("SmacrobatSaveInner",instance);Register("DirectUIHWND",instance);IntPtr root=Create("#32770","",0x10CF0000,IntPtr.Zero,0,instance);previousRootProcedure=SetWindowLongPtr(root,-4,Marshal.GetFunctionPointerForDelegate(rootProcedure));if(previousRootProcedure==IntPtr.Zero)throw new InvalidOperationException("Dialog subclass failed.");IntPtr outer=Create("SmacrobatSaveOuter","",0x50000000,root,0,instance);alternateSaveParent=outer;IntPtr direct=Create("DirectUIHWND","",0x50000000,outer,0,instance);IntPtr inner=Create("SmacrobatSaveInner","",0x50000000,direct,0,instance);IntPtr combo=Create("ComboBox","",0x50000002,inner,0,instance);IntPtr edit=FindWindowEx(combo,IntPtr.Zero,"Edit",null);if(edit==IntPtr.Zero)throw new InvalidOperationException("Combo edit was unavailable.");previousEditProcedure=SetWindowLongPtr(edit,-4,Marshal.GetFunctionPointerForDelegate(editProcedure));if(previousEditProcedure==IntPtr.Zero)throw new InvalidOperationException("Edit subclass failed.");Create("Edit","",0x40000080,combo,41477,instance);IntPtr save=Create("Button","&Save",0x50000001,root,1,instance);previousSaveProcedure=SetWindowLongPtr(save,-4,Marshal.GetFunctionPointerForDelegate(saveProcedure));if(previousSaveProcedure==IntPtr.Zero)throw new InvalidOperationException("Save subclass failed.");Create("Button","Cancel",0x50000000,root,2,instance);RootHandle=root.ToInt64();EditHandle=edit.ToInt64();SaveHandle=save.ToInt64();ShowWindow(root,5);UpdateWindow(root);ready.Set();MSG message;while(GetMessage(out message,IntPtr.Zero,0,0)>0){TranslateMessage(ref message);DispatchMessage(ref message);}DestroyWindow(root);}catch(Exception error){failure=error;ready.Set();}}
+  public void ArmGrowthRace(){saveClicked=false;growOnLengthQuery=true;}
+  public void ArmSaveReparentRace(){saveClicked=false;saveClickMessage=false;reparentOnLabelLength=true;}
+  public string ReadEdit(){var value=new StringBuilder(1024);GetWindowText(new IntPtr(EditHandle),value,value.Capacity);return value.ToString();}
+  public void Dispose(){if(thread!=null&&thread.IsAlive){PostThreadMessage(threadId,0x0012,UIntPtr.Zero,IntPtr.Zero);thread.Join(5000);}ready.Dispose();}
+}
+'@
+      $fixture=[NativeSaveDialogFixture]::new()
+      try{
+        $fixture.Start();$processIdentifier=[Environment]::ProcessId;$owned=[Diagnostics.Process]::GetProcessById($processIdentifier);try{$startTicks=$owned.StartTime.ToUniversalTime().Ticks}finally{$owned.Dispose()}
+        $records=@([Smacrobat.PrintVerification.NativeWindows]::Enumerate($processIdentifier,$fixture.RootHandle,$false))
+        $roles=Get-ExactNativeSaveDialogRoles -ProcessId $processIdentifier -SurfaceRecords $records -RootHandleValue $fixture.RootHandle -Deadline ([datetime]::UtcNow.AddSeconds(5))
+        if($null-eq$roles){throw 'The real native save topology was not bound.'}
+        $rootIdentity='hwnd:'+([long]$fixture.RootHandle).ToString([Globalization.CultureInfo]::InvariantCulture)+'|native'
+        $binding=[pscustomobject]@{surfaceRootIdentity=$rootIdentity;surfaceElement=$null;baselineIdentities=@('hwnd:10|baseline');trackedIdentities=@($rootIdentity,[string]$roles.cancel,[string]$roles.save,[string]$roles.filenameEdit);anchorElement=$null;nativeRoles=$roles}
+        $deadlineTick=[Environment]::TickCount64+5000;$value='C:\fixture\native-save-proof.pdf'
+        $fixture.ArmGrowthRace();$rejected=$false
+        try{Set-BoundNativeSaveFileNameExact -ProcessId $processIdentifier -ProcessStartUtcTicks $startTicks -Binding $binding -Value $value -DeadlineTickCount $deadlineTick}catch{$rejected=$true}
+        if(-not$rejected-or$fixture.SaveClicked){throw 'A native filename growth race reached the Save action.'}
+        Set-BoundNativeSaveFileNameExact -ProcessId $processIdentifier -ProcessStartUtcTicks $startTicks -Binding $binding -Value $value -DeadlineTickCount $deadlineTick
+        Invoke-BoundNativeSaveButtonExact -ProcessId $processIdentifier -ProcessStartUtcTicks $startTicks -Binding $binding -DeadlineTickCount $deadlineTick
+        if($fixture.ReadEdit()-cne$value-or-not$fixture.SaveClicked-or-not$fixture.SaveClickMessage){throw 'The real native save mutations were not observed.'}
+        $fixture.ArmSaveReparentRace();$rejected=$false
+        try{Invoke-BoundNativeSaveButtonExact -ProcessId $processIdentifier -ProcessStartUtcTicks $startTicks -Binding $binding -DeadlineTickCount $deadlineTick}catch{$rejected=$true}
+        if(-not$rejected-or$fixture.SaveClicked-or$fixture.SaveClickMessage){throw 'A Save button reparent race reached BM_CLICK.'}
+      }finally{$fixture.Dispose()}
+    `);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
+  it('rejects ambiguous foreign reparented cyclic and changed native save roles before mutation', () => {
+    const result = runPowerShell7(String.raw`
+      $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
+      Set-Location -LiteralPath '${process.cwd().replaceAll("'", "''")}'
+      . ./scripts/installed-print-dialog.ps1
+      function New-SaveRecord([long]$handle,[long]$parent,[string]$className,[int]$controlId,[int]$style,[bool]$visible,[bool]$enabled,[bool]$save=$false,[bool]$cancel=$false,[int]$owner=7319){[pscustomobject]@{HandleValue=$handle;ParentHandleValue=$parent;ProcessId=$owner;ClassName=$className;ControlId=$controlId;ButtonStyle=$style;IsVisible=$visible;IsEnabled=$enabled;IsLabelPrint=$false;IsLabelSave=$save;IsLabelCancel=$cancel;IsLabelFileName=$false;IsLabelCurrentPage=$false;IsLabelPrinterName=$false}}
+      function New-SaveRecords{
+        @(
+          (New-SaveRecord 500 0 '#32770' 0 -1 $true $true),
+          (New-SaveRecord 501 500 'SmacrobatSaveOuter' 0 -1 $true $true),
+          (New-SaveRecord 502 501 'DirectUIHWND' 0 -1 $true $true),
+          (New-SaveRecord 503 502 'SmacrobatSaveInner' 0 -1 $true $true),
+          (New-SaveRecord 504 503 'ComboBox' 0 -1 $true $true),
+          (New-SaveRecord 505 504 'Edit' 1001 -1 $true $true),
+          (New-SaveRecord 506 504 'Edit' 41477 -1 $false $true),
+          (New-SaveRecord 507 500 'Button' 1 1 $true $true $true),
+          (New-SaveRecord 508 500 'Button' 2 0 $true $true $false $true)
+        )
+      }
+      $records=@(New-SaveRecords);$roles=Get-ExactNativeSaveDialogRoles -ProcessId 7319 -SurfaceRecords $records -RootHandleValue 500 -Deadline ([datetime]::UtcNow.AddSeconds(2))
+      if($null-eq$roles){throw 'Exact native save fixture was not classified.'}
+      $binding=[pscustomobject]@{surfaceRootIdentity='hwnd:500|native';surfaceElement=$null;baselineIdentities=@('hwnd:10|baseline');trackedIdentities=@('hwnd:500|native',[string]$roles.cancel,[string]$roles.save,[string]$roles.filenameEdit);anchorElement=$null;nativeRoles=$roles}
+      $script:records=$records;$script:setCalls=0;$script:clickCalls=0;$deadlineTick=[Environment]::TickCount64+5000
+      $provider={param($requestedProcessId,[long]$rootHandle,[bool]$topLevelOnly)if($requestedProcessId-ne7319-or$rootHandle-ne500-or$topLevelOnly){throw 'Native save revalidation escaped its exact process or root.'};@($script:records)}
+      $setProvider={param($requestedProcessId,$startTicks,$rootHandle,$editHandle,$value,$observedDeadline)if($requestedProcessId-ne7319-or$startTicks-ne638500000000000000L-or$rootHandle-ne500-or$editHandle-ne505-or$value-cne'C:\fixture\proof.pdf'-or$observedDeadline-ne$deadlineTick){throw 'Native save filename mutation inputs changed.'};$script:setCalls++;$true}
+      $clickProvider={param($requestedProcessId,$startTicks,$rootHandle,$buttonHandle,$observedDeadline)if($requestedProcessId-ne7319-or$startTicks-ne638500000000000000L-or$rootHandle-ne500-or$buttonHandle-ne507-or$observedDeadline-ne$deadlineTick){throw 'Native save click inputs changed.'};$script:clickCalls++;$true}
+      Set-BoundNativeSaveFileNameExact -ProcessId 7319 -ProcessStartUtcTicks 638500000000000000L -Binding $binding -Value 'C:\fixture\proof.pdf' -DeadlineTickCount $deadlineTick -NativeWindowProvider $provider -SetProvider $setProvider
+      Invoke-BoundNativeSaveButtonExact -ProcessId 7319 -ProcessStartUtcTicks 638500000000000000L -Binding $binding -DeadlineTickCount $deadlineTick -NativeWindowProvider $provider -ClickProvider $clickProvider
+      if($script:setCalls-ne1-or$script:clickCalls-ne1){throw 'Exact native save mutations did not run once.'}
+      $duplicate=@(New-SaveRecords)+(New-SaveRecord 509 500 'Button' 1 1 $true $true $true);$rejected=$false;try{Get-ExactNativeSaveDialogRoles -ProcessId 7319 -SurfaceRecords $duplicate -RootHandleValue 500 -Deadline ([datetime]::UtcNow.AddSeconds(2))|Out-Null}catch{$rejected=$true};if(-not$rejected){throw 'Duplicate native Save was accepted.'}
+      $foreign=@(New-SaveRecords);$foreign[5].ProcessId=9999;$rejected=$false;try{Get-ExactNativeSaveDialogRoles -ProcessId 7319 -SurfaceRecords $foreign -RootHandleValue 500 -Deadline ([datetime]::UtcNow.AddSeconds(2))|Out-Null}catch{$rejected=$true};if(-not$rejected){throw 'Foreign native save control was accepted.'}
+      $reparented=@(New-SaveRecords);$reparented[5].ParentHandleValue=500;if($null-ne(Get-ExactNativeSaveDialogRoles -ProcessId 7319 -SurfaceRecords $reparented -RootHandleValue 500 -Deadline ([datetime]::UtcNow.AddSeconds(2)))){throw 'Reparented native filename edit was accepted.'}
+      $cyclic=@(New-SaveRecords);$cyclic[1].ParentHandleValue=503;$rejected=$false;try{Get-ExactNativeSaveDialogRoles -ProcessId 7319 -SurfaceRecords $cyclic -RootHandleValue 500 -Deadline ([datetime]::UtcNow.AddSeconds(2))|Out-Null}catch{$rejected=$true};if(-not$rejected){throw 'Cyclic native filename ancestry was accepted.'}
+      $missing=@(New-SaveRecords|Where-Object{[long]$_.HandleValue-ne508});if($null-ne(Get-ExactNativeSaveDialogRoles -ProcessId 7319 -SurfaceRecords $missing -RootHandleValue 500 -Deadline ([datetime]::UtcNow.AddSeconds(2)))){throw 'Missing native Cancel was accepted.'}
+      $script:records=$duplicate;$callsBefore=$script:setCalls;$rejected=$false;try{Set-BoundNativeSaveFileNameExact -ProcessId 7319 -ProcessStartUtcTicks 638500000000000000L -Binding $binding -Value 'C:\fixture\proof.pdf' -DeadlineTickCount ([Environment]::TickCount64+2000) -NativeWindowProvider $provider -SetProvider $setProvider}catch{$rejected=$true};if(-not$rejected-or$script:setCalls-ne$callsBefore){throw 'Changed native save roles reached filename mutation.'}
+    `);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
   it('binds cancel transport, reopen, conditional PDF output, parsing, correlation, and cleanup', () => {
     const source = readFileSync('scripts/installed-print-dialog.ps1', 'utf8');
     expect(source).toContain("-Prefix 'Printing canceled.'");
@@ -503,6 +625,10 @@ public sealed class NativeAccessibleListFixture : IDisposable {
       $printerCombo=New-NativeHostedElement 10 205 'ControlType.ComboBox' ''
       $printerItem=New-NativeHostedElement 8 0 'ControlType.ListItem' 'Microsoft Print to PDF'
       $replacement=New-NativeHostedElement 7 300 'ControlType.Window' ''
+      $changedMain=New-NativeHostedElement 91 100 'ControlType.Window' ''
+      $allowedSurface=New-NativeHostedElement 40 400 'ControlType.Window' ''
+      $allowedButtonReplacement=New-NativeHostedElement 41 400 'ControlType.Button' ''
+      $nativeSaveRoot=New-NativeHostedElement 50 500 'ControlType.Window' ''
       $hostedBaseline=@($main)
       foreach($index in 1..3){$hostedBaseline+=New-NativeHostedElement (10+$index) (110+$index) 'ControlType.Pane' ''}
       $hostedPost=@($hostedBaseline)+@($dialog)
@@ -515,6 +641,18 @@ public sealed class NativeAccessibleListFixture : IDisposable {
       function Get-ProcessUiTreeSnapshot {$script:uiaTreeCalls++;throw 'The hosted rooted UIA provider stalled.'}
       $provider={param($requestedProcessId,[long]$rootHandle,[bool]$topLevelOnly)
         if($rootHandle-ne0){
+          if($rootHandle-eq500){
+            return @(
+              [pscustomobject]@{HandleValue=500L;ParentHandleValue=0L;ProcessId=7319;ClassName='#32770';ControlId=0;ButtonStyle=-1;IsVisible=$true;IsEnabled=$true;IsLabelSave=$false;IsLabelCancel=$false;Element=$nativeSaveRoot},
+              [pscustomobject]@{HandleValue=501L;ParentHandleValue=500L;ProcessId=7319;ClassName='SmacrobatSaveOuter';ControlId=0;ButtonStyle=-1;IsVisible=$true;IsEnabled=$true;IsLabelSave=$false;IsLabelCancel=$false},
+              [pscustomobject]@{HandleValue=502L;ParentHandleValue=501L;ProcessId=7319;ClassName='DirectUIHWND';ControlId=0;ButtonStyle=-1;IsVisible=$true;IsEnabled=$true;IsLabelSave=$false;IsLabelCancel=$false},
+              [pscustomobject]@{HandleValue=503L;ParentHandleValue=502L;ProcessId=7319;ClassName='SmacrobatSaveInner';ControlId=0;ButtonStyle=-1;IsVisible=$true;IsEnabled=$true;IsLabelSave=$false;IsLabelCancel=$false},
+              [pscustomobject]@{HandleValue=504L;ParentHandleValue=503L;ProcessId=7319;ClassName='ComboBox';ControlId=0;ButtonStyle=-1;IsVisible=$true;IsEnabled=$true;IsLabelSave=$false;IsLabelCancel=$false},
+              [pscustomobject]@{HandleValue=505L;ParentHandleValue=504L;ProcessId=7319;ClassName='Edit';ControlId=1001;ButtonStyle=-1;IsVisible=$true;IsEnabled=$true;IsLabelSave=$false;IsLabelCancel=$false},
+              [pscustomobject]@{HandleValue=507L;ParentHandleValue=500L;ProcessId=7319;ClassName='Button';ControlId=1;ButtonStyle=1;IsVisible=$true;IsEnabled=$true;IsLabelSave=$true;IsLabelCancel=$false},
+              [pscustomobject]@{HandleValue=508L;ParentHandleValue=500L;ProcessId=7319;ClassName='Button';ControlId=2;ButtonStyle=0;IsVisible=$true;IsEnabled=$true;IsLabelSave=$false;IsLabelCancel=$true}
+            )
+          }
           if($rootHandle-ne200){throw 'Native enumeration escaped the exact dialog HWND.'}
           $rootRuntimePart=if($script:nativeState-ceq'mismatch'){9}else{2}
           return @(
@@ -527,6 +665,9 @@ public sealed class NativeAccessibleListFixture : IDisposable {
           )
         }
         if($script:nativeState-ceq'baseline'-or$script:nativeState-ceq'closed'){return @((New-NativeProviderRecord 100 0 $main 'Chrome_WidgetWin_1'))}
+        if($script:nativeState-ceq'changed-baseline'){return @((New-NativeProviderRecord 100 0 $changedMain 'Chrome_WidgetWin_1'))}
+        if($script:nativeState-ceq'allowed-nonsurface'){return @((New-NativeProviderRecord 100 0 $main 'Chrome_WidgetWin_1'),(New-NativeProviderRecord 400 0 $allowedButtonReplacement 'Button'))}
+        if($script:nativeState-ceq'native-save'){return @((New-NativeProviderRecord 100 0 $main 'Chrome_WidgetWin_1'),[pscustomobject]@{HandleValue=500L;ParentHandleValue=0L;ProcessId=7319;ClassName='#32770';ControlId=0;ButtonStyle=-1;IsVisible=$true;IsEnabled=$true;IsLabelSave=$false;IsLabelCancel=$false;Element=$nativeSaveRoot})}
         if($script:nativeState-ceq'replacement'){return @((New-NativeProviderRecord 100 0 $main 'Chrome_WidgetWin_1'),(New-NativeProviderRecord 300 0 $replacement '#32770'))}
         return @((New-NativeProviderRecord 100 0 $main 'Chrome_WidgetWin_1'),(New-NativeProviderRecord 200 0 (New-NativeHostedElement 2 200 'ControlType.Window' '') '#32770'))
       }
@@ -555,6 +696,14 @@ public sealed class NativeAccessibleListFixture : IDisposable {
       $successSelect={param($requestedProcessId,$handleValue,$value,$remainingMilliseconds)$script:comboSelectCalls++;$true}
       $selected=Select-BoundNativeComboItemExact -ProcessId 7319 -Binding $binding -Value 'Microsoft Print to PDF' -Deadline ([datetime]::UtcNow.AddSeconds(2)) -NativeWindowProvider $provider -ComboContainsProvider $uniqueContains -ComboSelectProvider $successSelect
       if(-not$selected-or$script:comboSelectCalls-ne2){throw 'An exact stable combo selection was not accepted.'}
+      $script:nativeState='changed-baseline';$rejected=$false
+      try{Wait-BoundProcessUiSurfaceClosed -ProcessId 7319 -Binding $binding -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(250)) -NativeWindowProvider $provider}catch{$rejected=$true}
+      if(-not$rejected){throw 'A changed baseline runtime identity with the same HWND was accepted.'}
+      $script:nativeState='allowed-nonsurface';$rejected=$false
+      try{Wait-BoundProcessUiSurfaceClosed -ProcessId 7319 -Binding $binding -Stage 'second-print-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(250)) -AllowedSurfaceIdentities @('hwnd:400|99:40') -NativeWindowProvider $provider}catch{$rejected=$true}
+      if(-not$rejected){throw 'A changed non-surface successor with the allowed HWND was accepted.'}
+      $script:nativeState='native-save'
+      Wait-BoundProcessUiSurfaceClosed -ProcessId 7319 -Binding $binding -Stage 'second-print-dialog' -Deadline ([datetime]::UtcNow.AddSeconds(2)) -AllowedSurfaceIdentities @('hwnd:500|native') -NativeWindowProvider $provider
       $script:nativeState='replacement';$rejected=$false
       try{Wait-BoundProcessUiSurfaceClosed -ProcessId 7319 -Binding $binding -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(250)) -NativeWindowProvider $provider}catch{$rejected=$true}
       if(-not$rejected){throw 'A replacement HWND surface was accepted as close.'}
@@ -866,7 +1015,7 @@ public sealed class NativeAccessibleListFixture : IDisposable {
       $binding=Wait-NewProcessNativeWindowSurface -ProcessId 7319 -Baseline $baseline -AnchorNames @('Cancel') -AnchorControlTypes @('ControlType.Button') -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddSeconds(3)) -WindowProvider $provider
       if([string]$binding.surfaceRootIdentity-cnotmatch'^hwnd:202\|'-or$script:hostedRootQueries-ne1){throw 'Hosted native topology did not bind only the unique visible enabled dialog HWND.'}
       $script:hostedChildless=$true;$childlessMessage='';try{Wait-NewProcessNativeWindowSurface -ProcessId 7319 -Baseline $baseline -AnchorNames @('Save') -AnchorControlTypes @('ControlType.Button') -Stage 'save-output-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(250)) -WindowProvider $provider|Out-Null}catch{$childlessMessage=$_.Exception.Message}
-      if($childlessMessage-cnotmatch'"nativeEnumerationStage":"uia-conversion-complete"'-or$childlessMessage-cnotmatch'"childCount":0'-or$childlessMessage-cmatch'Private|HandleValue|ParentHandleValue|202'){throw 'Childless hosted save dialog did not retain a bounded sanitized completed native-enumeration receipt.'}
+      if($childlessMessage-cnotmatch'"nativeEnumerationStage":"native-enumeration-complete"'-or$childlessMessage-cnotmatch'"childCount":0'-or$childlessMessage-cmatch'Private|HandleValue|ParentHandleValue|202'){throw 'Childless hosted save dialog did not retain a bounded sanitized completed native-enumeration receipt.'}
       $script:hostedChildless=$false
       $script:hostedRootDelayMilliseconds=400;$lateRootMessage='';try{Wait-NewProcessNativeWindowSurface -ProcessId 7319 -Baseline $baseline -AnchorNames @('Save') -AnchorControlTypes @('ControlType.Button') -Stage 'save-output-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(250)) -WindowProvider $provider|Out-Null}catch{$lateRootMessage=$_.Exception.Message};$script:hostedRootDelayMilliseconds=0
       if($lateRootMessage-cnotmatch'"nativeEnumerationStage":"native-enumeration-started"'-or$lateRootMessage-cnotmatch'"childCount":0'-or$lateRootMessage-cmatch'Private|HandleValue|ParentHandleValue|202'){throw 'Late rooted native enumeration did not preserve its bounded sanitized in-progress phase.'}
