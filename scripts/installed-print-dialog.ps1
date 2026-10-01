@@ -3034,16 +3034,42 @@ function Wait-StablePrintFile {
     param([Parameter(Mandatory = $true)][string]$Path,[Parameter(Mandatory = $true)][datetime]$Deadline)
     $last = -1L
     $stable = 0
-    do {
-        if (Test-Path -LiteralPath $Path -PathType Leaf) {
+    while ($true) {
+        if ([datetime]::UtcNow -ge $Deadline) { break }
+        $exists = Test-Path -LiteralPath $Path -PathType Leaf
+        if ([datetime]::UtcNow -ge $Deadline) { break }
+        if ($exists) {
             $item = Get-Item -LiteralPath $Path
-            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Printed PDF output is reparse-backed.' }
-            if ($item.Length -le 0 -or $item.Length -gt $script:PrintPins.OutputBytesMaximum) { throw 'Printed PDF output is empty or oversized.' }
-            if ($item.Length -eq $last) { $stable++ } else { $stable = 0; $last = $item.Length }
-            if ($stable -ge 2) { return $item }
+            if ([datetime]::UtcNow -ge $Deadline) { break }
+            $attributes = $item.Attributes
+            if ([datetime]::UtcNow -ge $Deadline) { break }
+            if ($attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Printed PDF output is reparse-backed.' }
+            $length = [long]$item.Length
+            if ([datetime]::UtcNow -ge $Deadline) { break }
+            if ($length -gt $script:PrintPins.OutputBytesMaximum) { throw 'Printed PDF output is oversized.' }
+            if ($length -eq 0) {
+                $last = -1L
+                $stable = 0
+            } elseif ($length -lt 0) {
+                throw 'Printed PDF output length is invalid.'
+            } elseif ($length -eq $last) {
+                $stable++
+            } else {
+                $stable = 0
+                $last = $length
+            }
+            if ($stable -ge 2) {
+                if ([datetime]::UtcNow -ge $Deadline) { break }
+                return $item
+            }
+        } else {
+            $last = -1L
+            $stable = 0
         }
-        Start-Sleep -Milliseconds 250
-    } while ([datetime]::UtcNow -lt $Deadline)
+        $remainingMilliseconds = ($Deadline - [datetime]::UtcNow).TotalMilliseconds
+        if ($remainingMilliseconds -le 0) { break }
+        Start-Sleep -Milliseconds ([int][Math]::Min(250.0,[Math]::Ceiling($remainingMilliseconds)))
+    }
     throw 'Printed PDF output did not become stable before its bounded deadline.'
 }
 

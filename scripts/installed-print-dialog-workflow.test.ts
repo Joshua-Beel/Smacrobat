@@ -306,6 +306,103 @@ public sealed class NativeSaveDialogFixture : IDisposable {
     expect(result.status, result.stderr || result.stdout).toBe(0);
   });
 
+  it('waits through a zero-length spool file and requires a stable positive output', () => {
+    const result = runPowerShell7(String.raw`
+      $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
+      Set-Location -LiteralPath '${process.cwd().replaceAll("'", "''")}'
+      . ./scripts/installed-print-dialog.ps1
+      Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Threading;
+public static class PrintSpoolWriterFixture {
+  public static Thread Start(string path,int firstDelay,int firstLength,int secondDelay,int secondLength) {
+    var thread=new Thread(()=>{
+      Thread.Sleep(firstDelay);File.WriteAllBytes(path,new byte[firstLength]);
+      if(secondLength>=0){Thread.Sleep(secondDelay);File.WriteAllBytes(path,new byte[secondLength]);}
+    });
+    thread.IsBackground=true;thread.Start();return thread;
+  }
+}
+'@
+      $root=Join-Path (Resolve-Path 'target') ('stable-print-'+[guid]::NewGuid().ToString('N'))
+      [IO.Directory]::CreateDirectory($root)|Out-Null
+      $originalMaximum=$script:PrintPins.OutputBytesMaximum
+      try {
+        $delayed=Join-Path $root 'delayed.pdf';[IO.File]::WriteAllBytes($delayed,[byte[]]@())
+        $writer=[PrintSpoolWriterFixture]::Start($delayed,350,9,0,-1);$timer=[Diagnostics.Stopwatch]::StartNew()
+        $item=Wait-StablePrintFile -Path $delayed -Deadline ([datetime]::UtcNow.AddSeconds(4));$timer.Stop();$null=$writer.Join(2000)
+        if($item.Length-ne9-or$timer.ElapsedMilliseconds-lt700){throw 'A zero-length spool file was accepted before positive bytes became stable.'}
+
+        $growing=Join-Path $root 'growing.pdf';[IO.File]::WriteAllBytes($growing,[byte[]]@())
+        $writer=[PrintSpoolWriterFixture]::Start($growing,100,3,350,8);$timer=[Diagnostics.Stopwatch]::StartNew()
+        $item=Wait-StablePrintFile -Path $growing -Deadline ([datetime]::UtcNow.AddSeconds(4));$timer.Stop();$null=$writer.Join(2000)
+        if($item.Length-ne8-or$timer.ElapsedMilliseconds-lt700){throw 'Output growth did not reset the positive-length stability observations.'}
+
+        $zero=Join-Path $root 'zero.pdf';[IO.File]::WriteAllBytes($zero,[byte[]]@());$rejected=$false
+        try{Wait-StablePrintFile -Path $zero -Deadline ([datetime]::UtcNow.AddMilliseconds(600))|Out-Null}catch{$rejected=$_.Exception.Message-ceq'Printed PDF output did not become stable before its bounded deadline.'}
+        if(-not$rejected){throw 'A permanently zero-length output did not reach the bounded timeout.'}
+
+        $global:PrintStabilitySleepCalls=0
+        function global:Start-Sleep { param([int]$Milliseconds)$global:PrintStabilitySleepCalls++ }
+        $script:PrintPins.OutputBytesMaximum=4L
+        $oversized=Join-Path $root 'oversized.pdf';[IO.File]::WriteAllBytes($oversized,[byte[]](1,2,3,4,5));$rejected=$false
+        try{Wait-StablePrintFile -Path $oversized -Deadline ([datetime]::UtcNow.AddSeconds(2))|Out-Null}catch{$rejected=$_.Exception.Message-ceq'Printed PDF output is oversized.'}
+        if(-not$rejected-or$global:PrintStabilitySleepCalls-ne0){throw 'An oversized output was not rejected immediately.'}
+        $script:PrintPins.OutputBytesMaximum=$originalMaximum
+
+        function global:Test-Path { param([string]$LiteralPath,[object]$PathType)$true }
+        function global:Get-Item { param([string]$LiteralPath)[pscustomobject]@{Attributes=[IO.FileAttributes]::ReparsePoint;Length=1L} }
+        $rejected=$false
+        try{Wait-StablePrintFile -Path 'private-reparse-fixture' -Deadline ([datetime]::UtcNow.AddSeconds(2))|Out-Null}catch{$rejected=$_.Exception.Message-ceq'Printed PDF output is reparse-backed.'}
+        if(-not$rejected-or$global:PrintStabilitySleepCalls-ne0){throw 'A reparse-backed output was not rejected immediately.'}
+
+        $global:PrintStabilityPathReads=0
+        function global:Test-Path { param([string]$LiteralPath,[object]$PathType)$global:PrintStabilityPathReads++;$true }
+        $rejected=$false
+        try{Wait-StablePrintFile -Path 'expired-before-probe' -Deadline ([datetime]::UtcNow.AddMilliseconds(-1))|Out-Null}catch{$rejected=$_.Exception.Message-ceq'Printed PDF output did not become stable before its bounded deadline.'}
+        if(-not$rejected-or$global:PrintStabilityPathReads-ne0){throw 'An expired output deadline still reached the first filesystem probe.'}
+
+        $global:PrintStabilityPathReads=0;$global:PrintStabilityItemReads=0
+        function global:Test-Path { param([string]$LiteralPath,[object]$PathType)$global:PrintStabilityPathReads++;[Threading.Thread]::Sleep(100);$true }
+        function global:Get-Item { param([string]$LiteralPath)$global:PrintStabilityItemReads++;[pscustomobject]@{Attributes=[IO.FileAttributes]::Normal;Length=7L} }
+        $rejected=$false
+        try{Wait-StablePrintFile -Path 'slow-path-probe' -Deadline ([datetime]::UtcNow.AddMilliseconds(70))|Out-Null}catch{$rejected=$_.Exception.Message-ceq'Printed PDF output did not become stable before its bounded deadline.'}
+        if(-not$rejected-or$global:PrintStabilityPathReads-ne1-or$global:PrintStabilityItemReads-ne0){throw 'A late path probe reached the item provider.'}
+
+        function global:Test-Path { param([string]$LiteralPath,[object]$PathType)$true }
+        $global:PrintStabilityItemReads=0
+        function global:Get-Item { param([string]$LiteralPath)$global:PrintStabilityItemReads++;if($global:PrintStabilityItemReads-eq3){[Threading.Thread]::Sleep(100)};[pscustomobject]@{Attributes=[IO.FileAttributes]::Normal;Length=7L} }
+        $rejected=$false
+        try{Wait-StablePrintFile -Path 'slow-third-item-read' -Deadline ([datetime]::UtcNow.AddMilliseconds(70))|Out-Null}catch{$rejected=$_.Exception.Message-ceq'Printed PDF output did not become stable before its bounded deadline.'}
+        if(-not$rejected-or$global:PrintStabilityItemReads-ne3){throw "A third stable item read that returned after the deadline was accepted: rejected=$rejected reads=$global:PrintStabilityItemReads"}
+
+        $global:PrintStabilityAttributeReads=0;$global:PrintStabilityLengthReads=0
+        $global:PrintStabilitySlowAttributeItem=[pscustomobject]@{Length=7L}
+        $global:PrintStabilitySlowAttributeItem|Add-Member -MemberType ScriptProperty -Name Attributes -Value {$global:PrintStabilityAttributeReads++;[Threading.Thread]::Sleep(100);[IO.FileAttributes]::Normal}
+        function global:Get-Item { param([string]$LiteralPath)$global:PrintStabilitySlowAttributeItem }
+        $rejected=$false
+        try{Wait-StablePrintFile -Path 'slow-attribute-read' -Deadline ([datetime]::UtcNow.AddMilliseconds(70))|Out-Null}catch{$rejected=$_.Exception.Message-ceq'Printed PDF output did not become stable before its bounded deadline.'}
+        if(-not$rejected-or$global:PrintStabilityAttributeReads-ne1-or$global:PrintStabilityLengthReads-ne0){throw 'A late attribute read reached the length read.'}
+
+        $global:PrintStabilityLengthReads=0
+        $global:PrintStabilitySlowLengthItem=[pscustomobject]@{Attributes=[IO.FileAttributes]::Normal}
+        $global:PrintStabilitySlowLengthItem|Add-Member -MemberType ScriptProperty -Name Length -Value {$global:PrintStabilityLengthReads++;[Threading.Thread]::Sleep(100);7L}
+        function global:Get-Item { param([string]$LiteralPath)$global:PrintStabilitySlowLengthItem }
+        $rejected=$false
+        try{Wait-StablePrintFile -Path 'slow-length-read' -Deadline ([datetime]::UtcNow.AddMilliseconds(70))|Out-Null}catch{$rejected=$_.Exception.Message-ceq'Printed PDF output did not become stable before its bounded deadline.'}
+        if(-not$rejected-or$global:PrintStabilityLengthReads-ne1){throw 'A length read that returned after the deadline was accepted.'}
+      } finally {
+        $script:PrintPins.OutputBytesMaximum=$originalMaximum
+        Microsoft.PowerShell.Management\Remove-Item -LiteralPath Function:\Start-Sleep -Force -ErrorAction SilentlyContinue
+        Microsoft.PowerShell.Management\Remove-Item -LiteralPath Function:\Test-Path -Force -ErrorAction SilentlyContinue
+        Microsoft.PowerShell.Management\Remove-Item -LiteralPath Function:\Get-Item -Force -ErrorAction SilentlyContinue
+        Microsoft.PowerShell.Management\Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+      }
+    `);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
   it('keeps PDF proof inputs bounded and compiles the pinned PDFium proof bridge', () => {
     const result = runPowerShell7(String.raw`
       $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
