@@ -20,8 +20,67 @@ describe('installed native print dialog verifier', () => {
     expect(source).toContain('[Windows.Automation.InvokePattern]::Pattern');
     expect(source).toContain('[Windows.Automation.SelectionItemPattern]::Pattern');
     expect(source).toContain('[Windows.Automation.ValuePattern]::Pattern');
+    expect(source).toContain('AccessibleObjectFromWindow(listHwnd, OBJID_CLIENT');
+    expect(source).toContain('AccessibleChildren(root, 0, childCount');
+    expect(source).toContain('WindowFromAccessibleObject(root, out rootWindow)');
+    expect(source).toContain('role != ROLE_SYSTEM_LISTITEM');
+    expect(source).toContain('new object[] { SELFLAG_TAKESELECTION, selected.ChildReference }');
+    expect(source).toContain('Type.GetType("Accessibility.IAccessible, Accessibility", true)');
+    expect(source).toContain('GetAccessibleIndexedProperty(AccessibleName, accessible, childReference)');
+    expect(source).toContain('AccessibleSelection.GetValue');
+    expect(source).toContain('workerProcess.Kill($true)');
     expect(source).not.toMatch(/SendKeys|mouse_event|SetCursorPos|ClickInput|pyautogui/i);
     expect(source).not.toMatch(/Enable-WindowsOptionalFeature|Add-WindowsCapability|dism(?:\.exe)?/i);
+  });
+
+  it('executes the official native accessibility property and selection contract on a real list view', () => {
+    const result = runPowerShell7(String.raw`
+      $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
+      Set-Location -LiteralPath '${process.cwd().replaceAll("'", "''")}'
+      . ./scripts/installed-print-dialog.ps1
+      Initialize-PrintNativeWindowInterop
+      Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Threading;
+public sealed class NativeAccessibleListFixture : IDisposable {
+  [StructLayout(LayoutKind.Sequential,CharSet=CharSet.Unicode)] struct LVITEM { public uint mask; public int iItem,iSubItem; public uint state,stateMask; public IntPtr pszText; public int cchTextMax,iImage; public IntPtr lParam; public int iIndent,iGroupId; public uint cColumns; public IntPtr puColumns,piColFmt; public int iGroup; }
+  [StructLayout(LayoutKind.Sequential,CharSet=CharSet.Unicode)] struct LVCOLUMN { public uint mask; public int fmt,cx; public IntPtr pszText; public int cchTextMax,iSubItem,iImage,iOrder,cxMin,cxDefault,cxIdeal; }
+  [StructLayout(LayoutKind.Sequential)] struct MSG { public IntPtr hwnd; public uint message; public UIntPtr wParam; public IntPtr lParam; public uint time; public int x,y; }
+  [DllImport("kernel32.dll")] static extern IntPtr GetModuleHandle(string name);
+  [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+  [DllImport("comctl32.dll")] static extern void InitCommonControls();
+  [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern IntPtr CreateWindowEx(uint ex,string cls,string title,uint style,int x,int y,int w,int h,IntPtr parent,IntPtr menu,IntPtr instance,IntPtr value);
+  [DllImport("user32.dll")] static extern bool DestroyWindow(IntPtr hwnd);
+  [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr hwnd,int command);
+  [DllImport("user32.dll")] static extern bool UpdateWindow(IntPtr hwnd);
+  [DllImport("user32.dll")] static extern int GetMessage(out MSG message,IntPtr hwnd,uint minimum,uint maximum);
+  [DllImport("user32.dll")] static extern bool TranslateMessage(ref MSG message);
+  [DllImport("user32.dll")] static extern IntPtr DispatchMessage(ref MSG message);
+  [DllImport("user32.dll")] static extern bool PostThreadMessage(uint threadId,uint message,UIntPtr wParam,IntPtr lParam);
+  [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern IntPtr SendMessage(IntPtr hwnd,uint message,IntPtr wParam,ref LVITEM item);
+  [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern IntPtr SendMessage(IntPtr hwnd,uint message,IntPtr wParam,ref LVCOLUMN column);
+  [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr hwnd,uint message,IntPtr wParam,IntPtr lParam);
+  readonly ManualResetEventSlim ready=new ManualResetEventSlim(false); Thread thread; Exception failure; uint threadId;
+  public long RootHandle {get;private set;} public long ListHandle {get;private set;}
+  public void Start(){thread=new Thread(Run);thread.SetApartmentState(ApartmentState.STA);thread.IsBackground=true;thread.Start();if(!ready.Wait(5000))throw new TimeoutException();if(failure!=null)throw new InvalidOperationException("Native fixture failed.",failure);}
+  void Run(){try{threadId=GetCurrentThreadId();InitCommonControls();IntPtr instance=GetModuleHandle(null);IntPtr root=CreateWindowEx(0,"#32770","",0x10CF0000,0,0,320,240,IntPtr.Zero,IntPtr.Zero,instance,IntPtr.Zero);if(root==IntPtr.Zero)throw new InvalidOperationException();IntPtr list=CreateWindowEx(0,"SysListView32","",0x50000005,0,0,300,200,root,new IntPtr(1),instance,IntPtr.Zero);if(list==IntPtr.Zero)throw new InvalidOperationException();RootHandle=root.ToInt64();ListHandle=list.ToInt64();IntPtr text=Marshal.StringToHGlobalUni("Microsoft Print to PDF");try{var column=new LVCOLUMN{mask=6,cx=280,pszText=text,cchTextMax=23};if(SendMessage(list,0x1061,IntPtr.Zero,ref column).ToInt64()<0)throw new InvalidOperationException();var item=new LVITEM{mask=1,iItem=0,pszText=text,cchTextMax=23};if(SendMessage(list,0x104D,IntPtr.Zero,ref item).ToInt64()<0)throw new InvalidOperationException();}finally{Marshal.FreeHGlobal(text);}ShowWindow(root,5);UpdateWindow(root);ready.Set();MSG message;while(GetMessage(out message,IntPtr.Zero,0,0)>0){TranslateMessage(ref message);DispatchMessage(ref message);}DestroyWindow(root);}catch(Exception error){failure=error;ready.Set();}}
+  public bool IsSelected(){return (SendMessage(new IntPtr(ListHandle),0x102C,IntPtr.Zero,new IntPtr(2)).ToInt64()&2)!=0;}
+  public void Dispose(){if(thread!=null&&thread.IsAlive){PostThreadMessage(threadId,0x0012,UIntPtr.Zero,IntPtr.Zero);thread.Join(5000);}ready.Dispose();}
+}
+'@
+      $fixture=[NativeAccessibleListFixture]::new()
+      try{
+        $fixture.Start();$processIdentifier=[Environment]::ProcessId;$ownedProcess=[Diagnostics.Process]::GetProcessById($processIdentifier)
+        try{$startTicks=$ownedProcess.StartTime.ToUniversalTime().Ticks}finally{$ownedProcess.Dispose()}
+        $expiredBeforeSelection=$false
+        try{Invoke-IsolatedNativeAccessiblePrinterSelection -ProcessId $processIdentifier -ProcessStartUtcTicks $startTicks -DialogRootHandleValue $fixture.RootHandle -ListHandleValue $fixture.ListHandle -ExpectedControlId 1 -ExactName 'Microsoft Print to PDF' -DeadlineTickCount ([Environment]::TickCount64+20)|Out-Null}catch{$expiredBeforeSelection=$true}
+        if(-not$expiredBeforeSelection-or$fixture.IsSelected()){throw 'A delayed helper selected after the shared monotonic deadline.'}
+        $selected=[Smacrobat.PrintVerification.NativeWindows]::SelectAccessibleChildExact($processIdentifier,$startTicks,$fixture.RootHandle,$fixture.ListHandle,1,'Microsoft Print to PDF',[Environment]::TickCount64+5000)
+        if(-not$selected-or-not$fixture.IsSelected()){throw 'The official native accessibility property/selection contract failed.'}
+      }finally{$fixture.Dispose()}
+    `);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
   });
 
   it('binds cancel transport, reopen, conditional PDF output, parsing, correlation, and cleanup', () => {
@@ -615,6 +674,32 @@ describe('installed native print dialog verifier', () => {
       $targetProvider={param($requestedProcessId,$rootElement)$script:printerRoots++;if(-not[object]::ReferenceEquals($rootElement,$printerList)){throw 'Printer lookup escaped the exact evidenced SysListView32 HWND.'};@($printerItem)}
       $found=Find-BoundNativePrinterElement -ProcessId 7319 -Binding $binding -Deadline ([datetime]::UtcNow.AddSeconds(2)) -NativeWindowProvider $provider -TargetProvider $targetProvider
       if(-not[object]::ReferenceEquals($found,$printerItem)-or$script:printerRoots-ne1){throw 'Exact native printer-list binding changed.'}
+      $script:expectedStartTicks=638500000000000000L
+      if(-not[Smacrobat.PrintVerification.NativeWindows]::AccessibleEnumerationStable(4,4,1,1,$true)-or
+        [Smacrobat.PrintVerification.NativeWindows]::AccessibleEnumerationStable(4,5,1,1,$true)-or
+        [Smacrobat.PrintVerification.NativeWindows]::AccessibleEnumerationStable(4,4,1,1,$false)-or
+        [Smacrobat.PrintVerification.NativeWindows]::AccessibleEnumerationStable(4,4,1,2,$true)){throw 'Accessible immediately-before-selection stability checks changed.'}
+      $script:accessibleCalls=0
+      $exactAccessible={param($requestedProcessId,$startTicks,$rootHandle,$listHandle,$controlId,$value,$deadlineTick)$script:accessibleCalls=$script:accessibleCalls+1;if($requestedProcessId-ne7319-or$startTicks-ne$script:expectedStartTicks-or$rootHandle-ne202-or$listHandle-ne302-or$controlId-ne1-or$value-cne'Microsoft Print to PDF'-or$deadlineTick-le[Environment]::TickCount64-or$deadlineTick-[Environment]::TickCount64-gt120000){throw 'Accessible selection escaped its exact process start, root, list, control ID, name, or deadline.'};$true}
+      $selected=Select-BoundNativeAccessiblePrinterExact -ProcessId 7319 -ProcessStartUtcTicks $script:expectedStartTicks -Binding $binding -Value 'Microsoft Print to PDF' -Deadline ([datetime]::UtcNow.AddSeconds(2)) -NativeWindowProvider $provider -AccessibleSelectProvider $exactAccessible
+      if(-not$selected-or$script:accessibleCalls-ne1){throw 'One exact accessible printer item was not selected.'}
+      $zeroAccessible={param($requestedProcessId,$startTicks,$rootHandle,$listHandle,$controlId,$value,$deadlineTick)$false}
+      if(Select-BoundNativeAccessiblePrinterExact -ProcessId 7319 -ProcessStartUtcTicks $script:expectedStartTicks -Binding $binding -Value 'Microsoft Print to PDF' -Deadline ([datetime]::UtcNow.AddSeconds(2)) -NativeWindowProvider $provider -AccessibleSelectProvider $zeroAccessible){throw 'Zero accessible printer matches were accepted.'}
+      foreach($failureMessage in @('duplicate exact accessible printer items','foreign accessible printer child','malformed accessible printer child')){
+        $failingAccessible={param($requestedProcessId,$startTicks,$rootHandle,$listHandle,$controlId,$value,$deadlineTick)throw $failureMessage}.GetNewClosure()
+        $rejected=$false;try{Select-BoundNativeAccessiblePrinterExact -ProcessId 7319 -ProcessStartUtcTicks $script:expectedStartTicks -Binding $binding -Value 'Microsoft Print to PDF' -Deadline ([datetime]::UtcNow.AddSeconds(2)) -NativeWindowProvider $provider -AccessibleSelectProvider $failingAccessible|Out-Null}catch{$rejected=$true}
+        if(-not$rejected){throw 'An ambiguous, foreign, or malformed accessible printer result was accepted.'}
+      }
+      $slowAccessible={param($requestedProcessId,$startTicks,$rootHandle,$listHandle,$controlId,$value,$deadlineTick)Start-Sleep -Milliseconds 40;$false}
+      $rejected=$false;try{Select-BoundNativeAccessiblePrinterExact -ProcessId 7319 -ProcessStartUtcTicks $script:expectedStartTicks -Binding $binding -Value 'Microsoft Print to PDF' -Deadline ([datetime]::UtcNow.AddMilliseconds(20)) -NativeWindowProvider $provider -AccessibleSelectProvider $slowAccessible|Out-Null}catch{$rejected=$true}
+      if(-not$rejected){throw 'An accessible printer provider completed after its deadline.'}
+      $script:comboFallbacks=0
+      $providerErrorSelector={param($requestedProcessId,$startTicks,$bindingValue,$value,$deadline)throw 'Accessible provider failed.'}
+      $comboFallback={param($requestedProcessId,$bindingValue,$value,$deadline)$script:comboFallbacks=$script:comboFallbacks+1;$true}
+      $rejected=$false;try{Select-BoundNativePrinterExact -ProcessId 7319 -ProcessStartUtcTicks $script:expectedStartTicks -Binding $binding -Value 'Microsoft Print to PDF' -Deadline ([datetime]::UtcNow.AddSeconds(2)) -AccessibleSelector $providerErrorSelector -ComboSelector $comboFallback|Out-Null}catch{$rejected=$true}
+      if(-not$rejected-or$script:comboFallbacks-ne0){throw 'An accessible provider error reached a fallback selector.'}
+      $zeroSelector={param($requestedProcessId,$startTicks,$bindingValue,$value,$deadline)$false}
+      if(-not(Select-BoundNativePrinterExact -ProcessId 7319 -ProcessStartUtcTicks $script:expectedStartTicks -Binding $binding -Value 'Microsoft Print to PDF' -Deadline ([datetime]::UtcNow.AddSeconds(2)) -AccessibleSelector $zeroSelector -ComboSelector $comboFallback)-or$script:comboFallbacks-ne1){throw 'A clean zero accessible result did not permit the exact combo fallback.'}
       $script:clicks=@()
       $clickProvider={param($requestedProcessId,$handleValue,$requireChecked,$remainingMilliseconds)$script:clicks+=([pscustomobject]@{Handle=[long]$handleValue;Checked=[bool]$requireChecked});$true}
       foreach($role in @('cancel','currentPage','print')){$null=Invoke-BoundNativeButtonRole -ProcessId 7319 -Binding $binding -Role $role -Deadline ([datetime]::UtcNow.AddSeconds(2)) -NativeWindowProvider $provider -ClickProvider $clickProvider}

@@ -7,12 +7,14 @@ $script:PrintPins = [ordered]@{
     UiElementMaximum = 2048
     NativeTopLevelDiagnosticMaximum = 32
     NativeChildDiagnosticMaximum = 64
+    NativePrinterListControlId = 1
     OutputBytesMaximum = 64MB
     PdfRenderSize = 384
     PdfFingerprintSize = 64
     CorrelationMinimum = 0.82
     MeanAbsoluteDifferenceMaximum = 38.0
 }
+$script:InstalledPrintDialogScriptPath = $PSCommandPath
 
 function Assert-PrintExactProperties {
     param($Value,[string[]]$Expected,[string]$Kind)
@@ -74,9 +76,13 @@ function Initialize-PrintUiAutomation {
 
 function Initialize-PrintNativeWindowInterop {
     if ('Smacrobat.PrintVerification.NativeWindows' -as [type]) { return }
+    Add-Type -AssemblyName Accessibility
     Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -111,6 +117,9 @@ namespace Smacrobat.PrintVerification {
         [DllImport("kernel32.dll")] private static extern void SetLastError(uint errorCode);
         [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint message, IntPtr wParam, string lParam, uint flags, uint timeout, out IntPtr result);
         [DllImport("user32.dll", SetLastError = true)] private static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam, uint flags, uint timeout, out IntPtr result);
+        [DllImport("oleacc.dll")] private static extern int AccessibleObjectFromWindow(IntPtr hwnd, uint objectId, ref Guid interfaceId, [MarshalAs(UnmanagedType.Interface)] out object accessible);
+        [DllImport("oleacc.dll")] private static extern int AccessibleChildren([MarshalAs(UnmanagedType.Interface)] object container, int childStart, int childCount, [Out, MarshalAs(UnmanagedType.LPArray, SizeParamIndex = 2)] object[] children, out int obtained);
+        [DllImport("oleacc.dll")] private static extern int WindowFromAccessibleObject([MarshalAs(UnmanagedType.Interface)] object accessible, out IntPtr hwnd);
         private const uint CB_GETCOUNT = 0x0146;
         private const uint CB_GETCURSEL = 0x0147;
         private const uint CB_SETCURSEL = 0x014E;
@@ -121,6 +130,37 @@ namespace Smacrobat.PrintVerification {
         private const int CBN_SELCHANGE = 1;
         private const int CB_ERR = -1;
         private const uint SMTO_ABORTIFHUNG = 0x0002;
+        private const uint OBJID_CLIENT = 0xFFFFFFFC;
+        private const int CHILDID_SELF = 0;
+        private const int ROLE_SYSTEM_LISTITEM = 0x22;
+        private const int STATE_SYSTEM_UNAVAILABLE = 0x00000001;
+        private const int STATE_SYSTEM_SELECTED = 0x00000002;
+        private const int STATE_SYSTEM_SELECTABLE = 0x00200000;
+        private const int SELFLAG_TAKESELECTION = 0x2;
+        private const int ACCESSIBLE_CHILD_MAXIMUM = 64;
+        private static readonly Type AccessibleInterface = Type.GetType("Accessibility.IAccessible, Accessibility", true);
+        private static readonly PropertyInfo AccessibleChildCount = AccessibleInterface.GetProperty("accChildCount");
+        private static readonly PropertyInfo AccessibleName = AccessibleInterface.GetProperty("accName");
+        private static readonly PropertyInfo AccessibleRole = AccessibleInterface.GetProperty("accRole");
+        private static readonly PropertyInfo AccessibleState = AccessibleInterface.GetProperty("accState");
+        private static readonly PropertyInfo AccessibleSelection = AccessibleInterface.GetProperty("accSelection");
+        private static readonly MethodInfo AccessibleSelect = AccessibleInterface.GetMethod("accSelect");
+
+        private sealed class AccessibleCandidate {
+            public object Accessible;
+            public object ChildReference;
+            public bool UsesChildId;
+            public int ChildId;
+            public int State;
+        }
+
+        private static int GetAccessibleChildCount(object accessible) {
+            return Convert.ToInt32(AccessibleChildCount.GetValue(accessible, null), CultureInfo.InvariantCulture);
+        }
+
+        private static object GetAccessibleIndexedProperty(PropertyInfo property, object accessible, object childReference) {
+            return property.GetValue(accessible, new object[] { childReference });
+        }
 
         private static bool IsOwned(IntPtr hwnd, int processId) {
             uint owner;
@@ -226,6 +266,183 @@ namespace Smacrobat.PrintVerification {
             long deadline = Environment.TickCount64 + timeoutMilliseconds;
             Call(hwnd, BM_CLICK, IntPtr.Zero, IntPtr.Zero, deadline);
             if (requireChecked && (!IsWindow(hwnd) || !IsOwned(hwnd, processId) || Call(hwnd, BM_GETCHECK, IntPtr.Zero, IntPtr.Zero, deadline).ToInt32() != 1)) return false;
+            return true;
+        }
+
+        private static void EnsureAccessibleDeadline(long deadline) {
+            if (Environment.TickCount64 >= deadline) throw new TimeoutException("Native accessible printer deadline expired.");
+        }
+
+        private static bool ExactClass(IntPtr hwnd, string expected) {
+            var className = new StringBuilder(64);
+            return GetClassName(hwnd, className, className.Capacity) > 0 && String.Equals(className.ToString(), expected, StringComparison.Ordinal);
+        }
+
+        private static void ValidateAccessibleTopology(int processId, long processStartUtcTicks, IntPtr dialogRoot, IntPtr listHwnd, int expectedControlId) {
+            using (var process = Process.GetProcessById(processId)) {
+                if (process.StartTime.ToUniversalTime().Ticks != processStartUtcTicks) throw new InvalidOperationException("Native accessible printer process identity changed.");
+            }
+            if (!IsWindow(dialogRoot) || !IsOwned(dialogRoot, processId) || !IsWindowVisible(dialogRoot) || !IsWindowEnabled(dialogRoot) || !ExactClass(dialogRoot, "#32770")) throw new InvalidOperationException("Native accessible printer dialog identity changed.");
+            if (!IsWindow(listHwnd) || !IsOwned(listHwnd, processId) || !IsWindowVisible(listHwnd) || !IsWindowEnabled(listHwnd) || !ExactClass(listHwnd, "SysListView32") || GetDlgCtrlID(listHwnd) != expectedControlId) throw new InvalidOperationException("Native accessible printer list identity changed.");
+            var visited = new HashSet<IntPtr>();
+            IntPtr current = listHwnd;
+            for (int depth = 0; depth < ACCESSIBLE_CHILD_MAXIMUM; depth++) {
+                if (!visited.Add(current) || !IsWindow(current) || !IsOwned(current, processId)) throw new InvalidOperationException("Native accessible printer ancestry was invalid.");
+                if (current == dialogRoot) return;
+                current = GetParent(current);
+                if (current == IntPtr.Zero) break;
+            }
+            throw new InvalidOperationException("Native accessible printer list did not reach its exact dialog root.");
+        }
+
+        private static bool SameComIdentity(object left, object right) {
+            if (left == null || right == null || !Marshal.IsComObject(left) || !Marshal.IsComObject(right)) return false;
+            IntPtr leftIdentity = IntPtr.Zero;
+            IntPtr rightIdentity = IntPtr.Zero;
+            try {
+                leftIdentity = Marshal.GetIUnknownForObject(left);
+                rightIdentity = Marshal.GetIUnknownForObject(right);
+                return leftIdentity == rightIdentity;
+            } finally {
+                if (leftIdentity != IntPtr.Zero) Marshal.Release(leftIdentity);
+                if (rightIdentity != IntPtr.Zero) Marshal.Release(rightIdentity);
+            }
+        }
+
+        private static bool SameAccessibleReference(AccessibleCandidate candidate, object value) {
+            if (candidate.UsesChildId) return value is int && (int)value == candidate.ChildId;
+            return value != null && AccessibleInterface.IsInstanceOfType(value) && SameComIdentity(candidate.Accessible, value);
+        }
+
+        public static bool AccessibleEnumerationStable(int initialChildCount, int recheckedChildCount, int initialMatchCount, int recheckedMatchCount, bool sameCandidateIdentity) {
+            return initialChildCount >= 0 && initialChildCount <= ACCESSIBLE_CHILD_MAXIMUM && initialChildCount == recheckedChildCount && initialMatchCount == 1 && recheckedMatchCount == 1 && sameCandidateIdentity;
+        }
+
+        private static bool SelectionValueMatches(object root, AccessibleCandidate candidate, object value, string exactName, long deadline) {
+            if (SameAccessibleReference(candidate, value)) return true;
+            object accessible;
+            object childReference;
+            if (value is int && (int)value > CHILDID_SELF) { accessible = root; childReference = value; }
+            else if (value != null && AccessibleInterface.IsInstanceOfType(value)) { accessible = value; childReference = CHILDID_SELF; }
+            else return false;
+            string name = Convert.ToString(GetAccessibleIndexedProperty(AccessibleName, accessible, childReference), CultureInfo.InvariantCulture) ?? String.Empty;
+            int role = Convert.ToInt32(GetAccessibleIndexedProperty(AccessibleRole, accessible, childReference), CultureInfo.InvariantCulture);
+            int state = Convert.ToInt32(GetAccessibleIndexedProperty(AccessibleState, accessible, childReference), CultureInfo.InvariantCulture);
+            EnsureAccessibleDeadline(deadline);
+            return name.Equals(exactName, StringComparison.OrdinalIgnoreCase) && role == ROLE_SYSTEM_LISTITEM && (state & STATE_SYSTEM_SELECTED) != 0 && (state & STATE_SYSTEM_SELECTABLE) != 0 && (state & STATE_SYSTEM_UNAVAILABLE) == 0;
+        }
+
+        private static bool ExactSingleSelection(object root, AccessibleCandidate candidate, string exactName, long deadline) {
+            object selection = AccessibleSelection.GetValue(root, null);
+            EnsureAccessibleDeadline(deadline);
+            if (SelectionValueMatches(root, candidate, selection, exactName, deadline)) return true;
+            var values = selection as object[];
+            if (values != null) return values.Length == 1 && SelectionValueMatches(root, candidate, values[0], exactName, deadline);
+            var variants = selection as System.Runtime.InteropServices.ComTypes.IEnumVARIANT;
+            if (variants == null) return false;
+            var enumerated = new object[2];
+            IntPtr fetchedPointer = Marshal.AllocCoTaskMem(sizeof(int));
+            try {
+                Marshal.WriteInt32(fetchedPointer, 0);
+                int result = variants.Next(2, enumerated, fetchedPointer);
+                EnsureAccessibleDeadline(deadline);
+                int fetched = Marshal.ReadInt32(fetchedPointer);
+                return result == 1 && fetched == 1 && SelectionValueMatches(root, candidate, enumerated[0], exactName, deadline);
+            } finally {
+                Marshal.FreeCoTaskMem(fetchedPointer);
+            }
+        }
+
+        private static AccessibleCandidate[] ReadAccessiblePrinterCandidates(object root, IntPtr boundList, string exactName, long deadline, out int stableChildCount) {
+            EnsureAccessibleDeadline(deadline);
+            int childCount = GetAccessibleChildCount(root);
+            EnsureAccessibleDeadline(deadline);
+            if (childCount < 0 || childCount > ACCESSIBLE_CHILD_MAXIMUM) throw new InvalidOperationException("Native accessible printer child count was unsupported.");
+            if (childCount == 0) {
+                if (GetAccessibleChildCount(root) != 0) throw new InvalidOperationException("Native accessible printer child count changed during enumeration.");
+                EnsureAccessibleDeadline(deadline);
+                stableChildCount = 0;
+                return new AccessibleCandidate[0];
+            }
+            var children = new object[childCount];
+            int obtained;
+            int childrenResult = AccessibleChildren(root, 0, childCount, children, out obtained);
+            EnsureAccessibleDeadline(deadline);
+            if (childrenResult < 0 || obtained != childCount) throw new InvalidOperationException("Native accessible printer children were incomplete.");
+            int recheckedCount = GetAccessibleChildCount(root);
+            EnsureAccessibleDeadline(deadline);
+            if (recheckedCount != childCount) throw new InvalidOperationException("Native accessible printer child count changed during enumeration.");
+            var matches = new List<AccessibleCandidate>();
+            foreach (object child in children) {
+                EnsureAccessibleDeadline(deadline);
+                object accessible;
+                object childReference;
+                bool usesChildId;
+                int childId;
+                if (child is int) {
+                    childId = (int)child;
+                    if (childId <= CHILDID_SELF) throw new InvalidOperationException("Native accessible printer child identifier was invalid.");
+                    accessible = root;
+                    childReference = childId;
+                    usesChildId = true;
+                } else {
+                    accessible = child;
+                    if (accessible == null || !AccessibleInterface.IsInstanceOfType(accessible)) throw new InvalidOperationException("Native accessible printer child type was unsupported.");
+                    childReference = CHILDID_SELF;
+                    usesChildId = false;
+                    childId = 0;
+                }
+                string name = Convert.ToString(GetAccessibleIndexedProperty(AccessibleName, accessible, childReference), CultureInfo.InvariantCulture) ?? String.Empty;
+                EnsureAccessibleDeadline(deadline);
+                if (name.Length > 260) throw new InvalidOperationException("Native accessible printer child name was oversized.");
+                int role = Convert.ToInt32(GetAccessibleIndexedProperty(AccessibleRole, accessible, childReference), CultureInfo.InvariantCulture);
+                EnsureAccessibleDeadline(deadline);
+                int state = Convert.ToInt32(GetAccessibleIndexedProperty(AccessibleState, accessible, childReference), CultureInfo.InvariantCulture);
+                EnsureAccessibleDeadline(deadline);
+                if (!name.Equals(exactName, StringComparison.OrdinalIgnoreCase)) continue;
+                if (role != ROLE_SYSTEM_LISTITEM || (state & STATE_SYSTEM_SELECTABLE) == 0 || (state & STATE_SYSTEM_UNAVAILABLE) != 0) throw new InvalidOperationException("Exact native accessible printer child was not an available selectable list item.");
+                matches.Add(new AccessibleCandidate { Accessible = accessible, ChildReference = childReference, UsesChildId = usesChildId, ChildId = childId, State = state });
+            }
+            stableChildCount = childCount;
+            return matches.ToArray();
+        }
+
+        public static bool SelectAccessibleChildExact(int processId, long processStartUtcTicks, long dialogRootHandleValue, long handleValue, int expectedControlId, string exactName, long deadlineTickCount) {
+            if (processId <= 0 || processStartUtcTicks <= 0 || dialogRootHandleValue == 0 || handleValue == 0 || expectedControlId <= 0 || String.IsNullOrEmpty(exactName) || exactName.Length > 260) throw new ArgumentOutOfRangeException();
+            long remaining = deadlineTickCount - Environment.TickCount64;
+            if (remaining <= 0 || remaining > 120000) throw new ArgumentOutOfRangeException(nameof(deadlineTickCount));
+            var dialogRoot = new IntPtr(dialogRootHandleValue);
+            var listHwnd = new IntPtr(handleValue);
+            long deadline = deadlineTickCount;
+            ValidateAccessibleTopology(processId, processStartUtcTicks, dialogRoot, listHwnd, expectedControlId);
+            EnsureAccessibleDeadline(deadline);
+            var accessibleId = AccessibleInterface.GUID;
+            object root;
+            if (AccessibleObjectFromWindow(listHwnd, OBJID_CLIENT, ref accessibleId, out root) < 0 || root == null) throw new InvalidOperationException("Native accessible printer root was unavailable.");
+            IntPtr rootWindow;
+            if (WindowFromAccessibleObject(root, out rootWindow) < 0 || rootWindow != listHwnd) throw new InvalidOperationException("Native accessible printer root identity changed.");
+            int initialChildCount;
+            AccessibleCandidate[] matches = ReadAccessiblePrinterCandidates(root, listHwnd, exactName, deadline, out initialChildCount);
+            if (matches.Length == 0) return false;
+            if (matches.Length != 1) throw new InvalidOperationException("Native accessible printer name was ambiguous.");
+            ValidateAccessibleTopology(processId, processStartUtcTicks, dialogRoot, listHwnd, expectedControlId);
+            EnsureAccessibleDeadline(deadline);
+            int preSelectChildCount;
+            AccessibleCandidate[] preSelectMatches = ReadAccessiblePrinterCandidates(root, listHwnd, exactName, deadline, out preSelectChildCount);
+            bool preSelectIdentityMatches = preSelectMatches.Length == 1 && SameAccessibleReference(matches[0], preSelectMatches[0].UsesChildId ? (object)preSelectMatches[0].ChildId : preSelectMatches[0].Accessible);
+            if (!AccessibleEnumerationStable(initialChildCount, preSelectChildCount, matches.Length, preSelectMatches.Length, preSelectIdentityMatches)) throw new InvalidOperationException("Native accessible printer identity changed immediately before selection.");
+            ValidateAccessibleTopology(processId, processStartUtcTicks, dialogRoot, listHwnd, expectedControlId);
+            EnsureAccessibleDeadline(deadline);
+            AccessibleCandidate selected = preSelectMatches[0];
+            AccessibleSelect.Invoke(selected.Accessible, new object[] { SELFLAG_TAKESELECTION, selected.ChildReference });
+            EnsureAccessibleDeadline(deadline);
+            int finalChildCount;
+            AccessibleCandidate[] rechecked = ReadAccessiblePrinterCandidates(root, listHwnd, exactName, deadline, out finalChildCount);
+            bool finalIdentityMatches = rechecked.Length == 1 && SameAccessibleReference(selected, rechecked[0].UsesChildId ? (object)rechecked[0].ChildId : rechecked[0].Accessible);
+            if (!AccessibleEnumerationStable(preSelectChildCount, finalChildCount, preSelectMatches.Length, rechecked.Length, finalIdentityMatches)) throw new InvalidOperationException("Native accessible printer identity changed after selection.");
+            if ((rechecked[0].State & STATE_SYSTEM_SELECTED) == 0 || !ExactSingleSelection(root, rechecked[0], exactName, deadline)) throw new InvalidOperationException("Native accessible printer selection was not exactly revalidated.");
+            ValidateAccessibleTopology(processId, processStartUtcTicks, dialogRoot, listHwnd, expectedControlId);
+            EnsureAccessibleDeadline(deadline);
             return true;
         }
 
@@ -2015,6 +2232,118 @@ function Find-BoundPdfPrinterElement {
     return $printer
 }
 
+function Invoke-IsolatedNativeAccessiblePrinterSelection {
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)][long]$ProcessStartUtcTicks,
+        [Parameter(Mandatory = $true)][long]$DialogRootHandleValue,
+        [Parameter(Mandatory = $true)][long]$ListHandleValue,
+        [Parameter(Mandatory = $true)][int]$ExpectedControlId,
+        [Parameter(Mandatory = $true)][string]$ExactName,
+        [Parameter(Mandatory = $true)][long]$DeadlineTickCount
+    )
+    $initialRemainingMilliseconds = $DeadlineTickCount - [Environment]::TickCount64
+    if ($initialRemainingMilliseconds -le 0 -or $initialRemainingMilliseconds -gt 120000 -or [string]::IsNullOrWhiteSpace($script:InstalledPrintDialogScriptPath)) { throw 'Native accessible printer worker inputs were invalid.' }
+    $workerSource = @'
+$ErrorActionPreference = 'Stop'
+. $env:SMACROBAT_PRINT_ACCESSIBLE_SCRIPT
+Initialize-PrintNativeWindowInterop
+$selected = [Smacrobat.PrintVerification.NativeWindows]::SelectAccessibleChildExact(
+    [int]$env:SMACROBAT_PRINT_ACCESSIBLE_PROCESS,
+    [long]$env:SMACROBAT_PRINT_ACCESSIBLE_START_TICKS,
+    [long]$env:SMACROBAT_PRINT_ACCESSIBLE_DIALOG_ROOT,
+    [long]$env:SMACROBAT_PRINT_ACCESSIBLE_HANDLE,
+    [int]$env:SMACROBAT_PRINT_ACCESSIBLE_CONTROL_ID,
+    [string]$env:SMACROBAT_PRINT_ACCESSIBLE_NAME,
+    [long]$env:SMACROBAT_PRINT_ACCESSIBLE_DEADLINE_TICK)
+if ($selected) { [Console]::Out.Write('selected') } else { [Console]::Out.Write('missing') }
+'@
+    $encodedWorker = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($workerSource))
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = [Environment]::ProcessPath
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.ArgumentList.Add('-NoProfile'); $startInfo.ArgumentList.Add('-NonInteractive'); $startInfo.ArgumentList.Add('-EncodedCommand'); $startInfo.ArgumentList.Add($encodedWorker)
+    $startInfo.Environment['SMACROBAT_PRINT_ACCESSIBLE_SCRIPT'] = $script:InstalledPrintDialogScriptPath
+    $startInfo.Environment['SMACROBAT_PRINT_ACCESSIBLE_PROCESS'] = $ProcessId.ToString([Globalization.CultureInfo]::InvariantCulture)
+    $startInfo.Environment['SMACROBAT_PRINT_ACCESSIBLE_START_TICKS'] = $ProcessStartUtcTicks.ToString([Globalization.CultureInfo]::InvariantCulture)
+    $startInfo.Environment['SMACROBAT_PRINT_ACCESSIBLE_DIALOG_ROOT'] = $DialogRootHandleValue.ToString([Globalization.CultureInfo]::InvariantCulture)
+    $startInfo.Environment['SMACROBAT_PRINT_ACCESSIBLE_HANDLE'] = $ListHandleValue.ToString([Globalization.CultureInfo]::InvariantCulture)
+    $startInfo.Environment['SMACROBAT_PRINT_ACCESSIBLE_CONTROL_ID'] = $ExpectedControlId.ToString([Globalization.CultureInfo]::InvariantCulture)
+    $startInfo.Environment['SMACROBAT_PRINT_ACCESSIBLE_NAME'] = $ExactName
+    $startInfo.Environment['SMACROBAT_PRINT_ACCESSIBLE_DEADLINE_TICK'] = $DeadlineTickCount.ToString([Globalization.CultureInfo]::InvariantCulture)
+    $workerProcess = [Diagnostics.Process]::new(); $workerProcess.StartInfo = $startInfo; $workerStarted = $false
+    try {
+        if (-not $workerProcess.Start()) { throw 'Native accessible printer worker did not start.' }
+        $workerStarted = $true
+        $waitMilliseconds = [long]$DeadlineTickCount - [Environment]::TickCount64
+        if ($waitMilliseconds -le 0 -or -not $workerProcess.WaitForExit([int][Math]::Min([int]::MaxValue,$waitMilliseconds))) {
+            try { $workerProcess.Kill($true) } catch { }
+            if (-not $workerProcess.WaitForExit(5000)) { throw 'Native accessible printer worker could not be stopped after its deadline.' }
+            throw 'Native accessible printer worker exceeded its deadline and was stopped.'
+        }
+        $output = $workerProcess.StandardOutput.ReadToEnd()
+        $null = $workerProcess.StandardError.ReadToEnd()
+        if ($workerProcess.ExitCode -ne 0 -or $output -notin @('selected','missing')) { throw 'Native accessible printer worker failed closed.' }
+        return $output -ceq 'selected'
+    } finally {
+        if ($workerStarted -and -not $workerProcess.HasExited) {
+            try { $workerProcess.Kill($true) } catch { }
+            $null = $workerProcess.WaitForExit(5000)
+        }
+        $workerProcess.Dispose()
+    }
+}
+
+function Select-BoundNativeAccessiblePrinterExact {
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)][long]$ProcessStartUtcTicks,
+        [Parameter(Mandatory = $true)]$Binding,
+        [Parameter(Mandatory = $true)][string]$Value,
+        [Parameter(Mandatory = $true)][datetime]$Deadline,
+        [scriptblock]$NativeWindowProvider,
+        [scriptblock]$AccessibleSelectProvider
+    )
+    $listElement = Get-BoundNativeRoleElement -ProcessId $ProcessId -Binding $Binding -Role 'printerList' -Deadline $Deadline -NativeWindowProvider $NativeWindowProvider
+    if ($null -eq $listElement) { return $false }
+    $roles = Get-ValidatedBindingNativeRoles -Binding $Binding
+    $dialogRootHandleValue = Get-NativeSurfaceHandleValue -Identity ([string]$Binding.surfaceRootIdentity)
+    $listHandleValue = Get-NativeSurfaceHandleValue -Identity ([string]$roles.printerList)
+    if ($ProcessStartUtcTicks -le 0) { throw 'Native accessible printer process start identity was invalid.' }
+    if ([datetime]::UtcNow -ge $Deadline) { throw 'Native accessible printer action deadline expired.' }
+    $remainingMilliseconds = [int][Math]::Min(120000,[Math]::Max(1,[Math]::Ceiling(($Deadline - [datetime]::UtcNow).TotalMilliseconds)))
+    $deadlineTickCount = [Environment]::TickCount64 + $remainingMilliseconds
+    $selected = if ($AccessibleSelectProvider) {
+        & $AccessibleSelectProvider $ProcessId $ProcessStartUtcTicks $dialogRootHandleValue $listHandleValue ([int]$script:PrintPins.NativePrinterListControlId) $Value $deadlineTickCount
+    } else {
+        Invoke-IsolatedNativeAccessiblePrinterSelection -ProcessId $ProcessId -ProcessStartUtcTicks $ProcessStartUtcTicks -DialogRootHandleValue $dialogRootHandleValue -ListHandleValue $listHandleValue -ExpectedControlId ([int]$script:PrintPins.NativePrinterListControlId) -ExactName $Value -DeadlineTickCount $deadlineTickCount
+    }
+    if ($selected -isnot [bool]) { throw 'Native accessible printer selection returned an invalid result.' }
+    if ([datetime]::UtcNow -ge $Deadline) { throw 'Native accessible printer action exceeded its deadline.' }
+    return $selected
+}
+
+function Select-BoundNativePrinterExact {
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)][long]$ProcessStartUtcTicks,
+        [Parameter(Mandatory = $true)]$Binding,
+        [Parameter(Mandatory = $true)][string]$Value,
+        [Parameter(Mandatory = $true)][datetime]$Deadline,
+        [scriptblock]$AccessibleSelector,
+        [scriptblock]$ComboSelector
+    )
+    $accessibleSelected = if ($AccessibleSelector) { & $AccessibleSelector $ProcessId $ProcessStartUtcTicks $Binding $Value $Deadline } else { Select-BoundNativeAccessiblePrinterExact -ProcessId $ProcessId -ProcessStartUtcTicks $ProcessStartUtcTicks -Binding $Binding -Value $Value -Deadline $Deadline }
+    if ($accessibleSelected -isnot [bool]) { throw 'Native accessible printer selector returned an invalid result.' }
+    if ($accessibleSelected) { return $true }
+    $comboSelected = if ($ComboSelector) { & $ComboSelector $ProcessId $Binding $Value $Deadline } else { Select-BoundNativeComboItemExact -ProcessId $ProcessId -Binding $Binding -Value $Value -Deadline $Deadline }
+    if ($comboSelected -isnot [bool]) { throw 'Native printer combo selector returned an invalid result.' }
+    return $comboSelected
+}
+
 function Select-BoundNativeComboItemExact {
     param([Parameter(Mandatory = $true)][int]$ProcessId,[Parameter(Mandatory = $true)]$Binding,[Parameter(Mandatory = $true)][string]$Value,[Parameter(Mandatory = $true)][datetime]$Deadline,[scriptblock]$ComboContainsProvider,[scriptblock]$ComboSelectProvider,[scriptblock]$NativeWindowProvider)
     if (($null -eq $ComboContainsProvider) -xor ($null -eq $ComboSelectProvider)) { throw 'Native printer combo test providers were incomplete.' }
@@ -2040,21 +2369,21 @@ function Select-BoundNativeComboItemExact {
 }
 
 function Select-PdfPrinterAndCurrentPage {
-    param([Parameter(Mandatory = $true)][int]$ProcessId,[Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Baseline,[AllowEmptyCollection()][object[]]$NativeBaseline = @(),[Parameter(Mandatory = $true)][datetime]$Deadline)
+    param([Parameter(Mandatory = $true)][int]$ProcessId,[Parameter(Mandatory = $true)][long]$ProcessStartUtcTicks,[Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Baseline,[AllowEmptyCollection()][object[]]$NativeBaseline = @(),[Parameter(Mandatory = $true)][datetime]$Deadline)
     $surface = if ($NativeBaseline.Count -gt 0) {
         Wait-NewProcessNativeWindowSurface -ProcessId $ProcessId -Baseline $NativeBaseline -AnchorNames @('Cancel') -AnchorControlTypes @('ControlType.Button') -Stage 'second-print-dialog' -Deadline $Deadline
     } else {
         Wait-NewProcessUiSurface -ProcessId $ProcessId -Baseline $Baseline -AnchorNames @('Cancel') -AnchorControlTypes @('ControlType.Button') -Stage 'second-print-dialog' -Deadline $Deadline
     }
     $printer = $null
-    $printerSelectedByNativeCombo = $false
+    $printerSelectedByNativeTransport = $false
     $printer = Find-BoundPdfPrinterElement -ProcessId $ProcessId -Binding $surface -Deadline $Deadline
     if ($null -eq $printer) {
         Assert-NativePrintDeadline -Deadline $Deadline
         if ([string]$surface.surfaceRootIdentity -cmatch '^hwnd:') {
-            $printerSelectedByNativeCombo = Select-BoundNativeComboItemExact -ProcessId $ProcessId -Binding $surface -Value $script:PrintPins.PrinterName -Deadline $Deadline
+            $printerSelectedByNativeTransport = Select-BoundNativePrinterExact -ProcessId $ProcessId -ProcessStartUtcTicks $ProcessStartUtcTicks -Binding $surface -Value $script:PrintPins.PrinterName -Deadline $Deadline
         }
-        if ($null -eq $printer -and -not $printerSelectedByNativeCombo) {
+        if ($null -eq $printer -and -not $printerSelectedByNativeTransport) {
             $combos = @(Get-BoundProcessUiElementsByControlType -ProcessId $ProcessId -Binding $surface -ControlType 'ControlType.ComboBox' -Deadline $Deadline)
             if ($combos.Count -gt 8) { throw 'Native print dialog exposed too many combo boxes.' }
             foreach ($combo in $combos) {
@@ -2072,7 +2401,7 @@ function Select-PdfPrinterAndCurrentPage {
             }
         }
     }
-    if ($null -eq $printer -and -not $printerSelectedByNativeCombo) {
+    if ($null -eq $printer -and -not $printerSelectedByNativeTransport) {
         $printerListUiStructure = if ([string]$surface.surfaceRootIdentity -cmatch '^hwnd:') {
             Get-BoundNativePrinterListDiagnosticJson -ProcessId $ProcessId -Binding $surface -Deadline $Deadline
         } else { '{"inventoryStatus":"unavailable","descendantCount":-1,"countCapped":false,"facts":[]}' }
@@ -2091,12 +2420,13 @@ function Select-PdfPrinterAndCurrentPage {
 function Submit-NativePrintToPdf {
     param(
         [Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)][long]$ProcessStartUtcTicks,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Baseline,
         [AllowEmptyCollection()][object[]]$NativeBaseline = @(),
         [Parameter(Mandatory = $true)][string]$OutputPath,
         [Parameter(Mandatory = $true)][datetime]$Deadline
     )
-    $surface = Select-PdfPrinterAndCurrentPage -ProcessId $ProcessId -Baseline $Baseline -NativeBaseline $NativeBaseline -Deadline $Deadline
+    $surface = Select-PdfPrinterAndCurrentPage -ProcessId $ProcessId -ProcessStartUtcTicks $ProcessStartUtcTicks -Baseline $Baseline -NativeBaseline $NativeBaseline -Deadline $Deadline
     Assert-NativePrintDeadline -Deadline $Deadline
     if ($null -ne $surface.nativeRoles) {
         $null = Invoke-BoundNativeButtonRole -ProcessId $ProcessId -Binding $surface -Role 'print' -Deadline $Deadline
@@ -2277,7 +2607,7 @@ function Wait-OwnedPrintApplication {
     do {
         $owned = @(Get-OwnedLaunchProcesses -RootProcessId $Driver.Id -StartedAfter $StartedAfter)
         $apps = @($owned | Where-Object { ([string]$_.Path).Equals($ApplicationPath,[StringComparison]::OrdinalIgnoreCase) })
-        if ($apps.Count -eq 1) { return [pscustomobject]@{ ProcessId = [int]$apps[0].ProcessId; Owned = $owned } }
+        if ($apps.Count -eq 1) { return [pscustomobject]@{ ProcessId = [int]$apps[0].ProcessId; ProcessStartUtcTicks = [long]$apps[0].StartTicks; Owned = $owned } }
         if ($apps.Count -gt 1) { throw 'The WebDriver process tree contains multiple installed application processes.' }
         Start-Sleep -Milliseconds 150
     } while ([datetime]::UtcNow -lt $Deadline)
@@ -2352,7 +2682,7 @@ function Invoke-RealInstalledPrintDialog {
         if ($null -ne $vendor -and ([string]$vendor.Value -split '\s+')[0] -cne $nativeVersion) { throw 'Print session EdgeDriver version disagrees with native status.' }
         $userData = $capabilities.PSObject.Properties['msedge.userDataDir']
         $ownedApp = Wait-OwnedPrintApplication -Driver $driver -StartedAfter $startedAfter -ApplicationPath $ApplicationPath -Deadline $deadline
-        $appProcessId = [int]$ownedApp.ProcessId; $captured += @($ownedApp.Owned)
+        $appProcessId = [int]$ownedApp.ProcessId; $appProcessStartUtcTicks = [long]$ownedApp.ProcessStartUtcTicks; $captured += @($ownedApp.Owned)
         $trustedConsoleHostCount = Assert-TrustedConsoleHostTopology -Owned $captured -RootProcessId $driver.Id
         if ([int]$trustedConsoleHostCount -lt 2) { throw 'The print verification console-host topology was incomplete before UI Automation.' }
         $homeOracle = Wait-WebDriverOracle -SessionId $sessionId -Script "return {ready:document.readyState==='complete',title:document.title,sample:[...document.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Explore a sample PDF').length};" -Deadline $deadline -Kind 'Installed print home UI' -Predicate { param($v) [bool]$v.ready -and [string]$v.title -ceq 'PDF Workstation' -and [int]$v.sample -eq 1 }
@@ -2385,7 +2715,7 @@ return document.querySelectorAll('dialog[aria-labelledby="print-title"]').length
         Open-NativePrintDialogFromWebView -SessionId $sessionId -Deadline $nativeDeadline
         $output = [ordered]@{ status='explicit-unavailable';bytes=$null;sha256=$null;pages=$null;widthPoints=$null;heightPoints=$null;sourceFingerprintSha256=$null;outputFingerprintSha256=$null;correlation=$null;meanAbsoluteDifference=$null }
         if ([bool]$PrinterFacts.microsoftPrintToPdfAvailable) {
-            Submit-NativePrintToPdf -ProcessId $appProcessId -Baseline @() -NativeBaseline $secondNativeWindowBaseline -OutputPath $OutputPdfPath -Deadline $nativeDeadline
+            Submit-NativePrintToPdf -ProcessId $appProcessId -ProcessStartUtcTicks $appProcessStartUtcTicks -Baseline @() -NativeBaseline $secondNativeWindowBaseline -OutputPath $OutputPdfPath -Deadline $nativeDeadline
             $item = Wait-StablePrintFile -Path $OutputPdfPath -Deadline (Get-PrintPhaseDeadline -TotalDeadline $deadline -MaximumMilliseconds $script:PrintPins.OutputTimeoutMilliseconds)
             $submitted = Wait-WebPrintStatus -SessionId $sessionId -Prefix '1 page submitted to the printer.' -Deadline $deadline
             $sourceProof = Get-PdfiumPrintProof -PdfiumPath $PdfiumPath -PdfPath $SamplePath
