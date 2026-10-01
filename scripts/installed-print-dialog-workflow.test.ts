@@ -561,8 +561,8 @@ public sealed class NativeAccessibleListFixture : IDisposable {
       $script:nativeState='closed'
       Wait-BoundProcessUiSurfaceClosed -ProcessId 7319 -Binding $binding -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddSeconds(2)) -NativeWindowProvider $provider
       $slowProvider={param($requestedProcessId,[long]$rootHandle,[bool]$topLevelOnly)Start-Sleep -Milliseconds 40;@((New-NativeProviderRecord 100 0 $main 'Chrome_WidgetWin_1'))}
-      $rejected=$false;try{Get-ProcessNativeWindowSnapshot -ProcessId 7319 -Deadline ([datetime]::UtcNow.AddMilliseconds(20)) -TopLevelOnly -WindowProvider $slowProvider|Out-Null}catch{$rejected=$true}
-      if(-not$rejected){throw 'A native HWND snapshot completed after its deadline.'}
+      $slowStage='not-started';$rejected=$false;try{Get-ProcessNativeWindowSnapshot -ProcessId 7319 -Deadline ([datetime]::UtcNow.AddMilliseconds(20)) -TopLevelOnly -WindowProvider $slowProvider -EnumerationStage ([ref]$slowStage)|Out-Null}catch{$rejected=$true}
+      if(-not$rejected-or$slowStage-cne'native-enumeration-started'){throw 'A native HWND snapshot completed after its deadline or entered UIA conversion before native enumeration completed.'}
     `);
     expect(result.status, result.stderr || result.stdout).toBe(0);
   });
@@ -588,33 +588,33 @@ public sealed class NativeAccessibleListFixture : IDisposable {
         $parentHandle=if($index-eq6){201L}else{200L}
         $surface+=[pscustomobject]@{
           HandleValue=[long](200+$index);ParentHandleValue=$parentHandle;ClassName=$class;ControlId=$controlId;IsVisible=$true;IsEnabled=$true;ButtonStyle=$buttonStyle
-          IsLabelPrint=($index-eq4);IsLabelCancel=($index-eq1);IsLabelCurrentPage=($index-eq5);IsLabelPrinterName=($index-eq6)
+          IsLabelPrint=($index-eq4);IsLabelSave=($index-eq2);IsLabelCancel=($index-eq1);IsLabelFileName=($index-eq3);IsLabelCurrentPage=($index-eq5);IsLabelPrinterName=($index-eq6)
           Text='Secret caption';Coordinates='10,20,30,40'
         }
       }
       $roles=[pscustomobject][ordered]@{cancelButton=1;printButton=0;saveButton=0;currentPageRadio=0;namedPrinter=0;printerCombo=1;printerList=1;filenameEdit=0}
-      $json=Get-SanitizedNativeWindowTopologyJson -TopLevelRecords $top -CandidateTopLevelRecords $candidate -SurfaceRecords $surface -RoleCounts $roles
+      $json=Get-SanitizedNativeWindowTopologyJson -TopLevelRecords $top -CandidateTopLevelRecords $candidate -SurfaceRecords $surface -RoleCounts $roles -NativeEnumerationStage 'uia-conversion-complete'
       if($json.Length-gt20000-or$json-cmatch'Private|Secret|file\.pdf|10,20|HandleValue|ParentHandleValue|Title|Path|Text|Coordinates'){throw 'HWND topology diagnostic leaked sensitive or raw window data.'}
       $receipt=$json|ConvertFrom-Json
-      Assert-PrintExactProperties -Value $receipt -Expected @('inventoryStatus','topLevelOwnedCount','topLevelOwnedVisibleCount','topLevelOwnedEnabledCount','topLevelCountCapped','candidateSurfaceCount','candidateSurfaceCountCapped','visibleDialogCandidateCount','visibleEnabledDialogCandidateCount','candidateTopLevels','childCount','childCountCapped','childDiagnosticsCapped','childDiagnostics','classHistogram','controlIdHistogram','requiredRoleMatchesAvailable','requiredRoleMatches') -Kind 'HWND topology receipt'
+      Assert-PrintExactProperties -Value $receipt -Expected @('inventoryStatus','nativeEnumerationStage','topLevelOwnedCount','topLevelOwnedVisibleCount','topLevelOwnedEnabledCount','topLevelCountCapped','candidateSurfaceCount','candidateSurfaceCountCapped','visibleDialogCandidateCount','visibleEnabledDialogCandidateCount','candidateTopLevels','childCount','childCountCapped','childDiagnosticsCapped','childDiagnostics','classHistogram','controlIdHistogram','requiredRoleMatchesAvailable','requiredRoleMatches') -Kind 'HWND topology receipt'
       Assert-PrintExactProperties -Value $receipt.candidateTopLevels[0] -Expected @('visible','enabled','classBucket','controlIdBucket','uiaControlTypeBucket','uiaNameMatchesAvailable','uiaNameMatches') -Kind 'HWND candidate receipt'
       Assert-PrintExactProperties -Value $receipt.candidateTopLevels[0].uiaNameMatches -Expected @('cancel','print','save','currentPage','printerName','fileName') -Kind 'HWND candidate name flags'
       Assert-PrintExactProperties -Value $receipt.classHistogram -Expected @('dialog32770','button','comboBox','comboBoxEx32','edit','sysListView32','directUiHwnd','static','sysTabControl32','other') -Kind 'HWND class histogram'
       Assert-PrintExactProperties -Value $receipt.controlIdHistogram -Expected @('idOk','idCancel','pushButtonRange','checkBoxRange','radioButtonRange','groupRange','staticRange','listRange','comboRange','editRange','scrollRange','otherPositive','none') -Kind 'HWND control-ID histogram'
       Assert-PrintExactProperties -Value $receipt.requiredRoleMatches -Expected @('cancelButton','printButton','saveButton','currentPageRadio','namedPrinter','printerCombo','printerList','filenameEdit') -Kind 'HWND role histogram'
       Assert-PrintExactProperties -Value $receipt.childDiagnostics[0] -Expected @('index','parentIndex','classBucket','controlId','visible','enabled','buttonStyleBucket','labelMatches') -Kind 'HWND child diagnostic'
-      Assert-PrintExactProperties -Value $receipt.childDiagnostics[0].labelMatches -Expected @('print','cancel','currentPage','printerName') -Kind 'HWND child exact label flags'
-      if($receipt.inventoryStatus-cne'native-window-observed'-or$receipt.topLevelOwnedCount-ne2-or$receipt.topLevelOwnedVisibleCount-ne2-or$receipt.topLevelOwnedEnabledCount-ne2-or$receipt.candidateSurfaceCount-ne1-or$receipt.visibleDialogCandidateCount-ne1-or$receipt.visibleEnabledDialogCandidateCount-ne1-or
+      Assert-PrintExactProperties -Value $receipt.childDiagnostics[0].labelMatches -Expected @('print','save','cancel','fileName','currentPage','printerName') -Kind 'HWND child exact label flags'
+      if($receipt.inventoryStatus-cne'native-window-observed'-or$receipt.nativeEnumerationStage-cne'uia-conversion-complete'-or$receipt.topLevelOwnedCount-ne2-or$receipt.topLevelOwnedVisibleCount-ne2-or$receipt.topLevelOwnedEnabledCount-ne2-or$receipt.candidateSurfaceCount-ne1-or$receipt.visibleDialogCandidateCount-ne1-or$receipt.visibleEnabledDialogCandidateCount-ne1-or
         $receipt.candidateTopLevels.Count-ne1-or$receipt.candidateTopLevels[0].classBucket-cne'dialog32770'-or$receipt.candidateTopLevels[0].uiaControlTypeBucket-cne'pane'-or-not$receipt.candidateTopLevels[0].uiaNameMatches.print-or-not$receipt.childCountCapped-or$receipt.childCount-gt2048-or
         -not$receipt.childDiagnosticsCapped-or$receipt.childDiagnostics.Count-ne64-or$receipt.childDiagnostics[0].index-ne0-or$receipt.childDiagnostics[0].parentIndex-ne-1-or$receipt.childDiagnostics[0].classBucket-cne'button'-or$receipt.childDiagnostics[0].controlId-ne2-or$receipt.childDiagnostics[0].buttonStyleBucket-cne'pushButton'-or-not$receipt.childDiagnostics[0].labelMatches.cancel-or
         $receipt.childDiagnostics[3].controlId-ne1-or$receipt.childDiagnostics[3].buttonStyleBucket-cne'defaultPushButton'-or-not$receipt.childDiagnostics[3].labelMatches.print-or
-        $receipt.childDiagnostics[4].buttonStyleBucket-cne'autoRadioButton'-or-not$receipt.childDiagnostics[4].labelMatches.currentPage-or$receipt.childDiagnostics[5].parentIndex-ne0-or-not$receipt.childDiagnostics[5].labelMatches.printerName-or$receipt.childDiagnostics[8].controlId-ne-1-or
+        -not$receipt.childDiagnostics[1].labelMatches.save-or-not$receipt.childDiagnostics[2].labelMatches.fileName-or$receipt.childDiagnostics[4].buttonStyleBucket-cne'autoRadioButton'-or-not$receipt.childDiagnostics[4].labelMatches.currentPage-or$receipt.childDiagnostics[5].parentIndex-ne0-or-not$receipt.childDiagnostics[5].labelMatches.printerName-or$receipt.childDiagnostics[8].controlId-ne-1-or
         $receipt.classHistogram.dialog32770-ne1-or$receipt.classHistogram.button-ne3-or$receipt.classHistogram.comboBox-ne1-or$receipt.classHistogram.sysListView32-ne1-or$receipt.classHistogram.static-ne1-or
         $receipt.controlIdHistogram.idOk-ne1-or$receipt.controlIdHistogram.idCancel-ne1-or$receipt.controlIdHistogram.radioButtonRange-ne1-or$receipt.controlIdHistogram.comboRange-ne1-or$receipt.controlIdHistogram.listRange-ne1-or$receipt.controlIdHistogram.scrollRange-ne1-or$receipt.controlIdHistogram.otherPositive-ne2041-or
         -not$receipt.requiredRoleMatchesAvailable-or$receipt.requiredRoleMatches.cancelButton-ne1-or$receipt.requiredRoleMatches.printerCombo-ne1-or$receipt.requiredRoleMatches.printerList-ne1){throw "HWND topology diagnostic counts changed: $json"}
       $unavailable=(Get-SanitizedNativeWindowTopologyJson -Unavailable)|ConvertFrom-Json
-      Assert-PrintExactProperties -Value $unavailable -Expected @('inventoryStatus','topLevelOwnedCount','topLevelOwnedVisibleCount','topLevelOwnedEnabledCount','topLevelCountCapped','candidateSurfaceCount','candidateSurfaceCountCapped','visibleDialogCandidateCount','visibleEnabledDialogCandidateCount','candidateTopLevels','childCount','childCountCapped','childDiagnosticsCapped','childDiagnostics','classHistogram','controlIdHistogram','requiredRoleMatchesAvailable','requiredRoleMatches') -Kind 'Unavailable HWND topology receipt'
-      if($unavailable.inventoryStatus-cne'unavailable'-or$unavailable.childCount-ne-1-or$unavailable.requiredRoleMatchesAvailable){throw 'Unavailable HWND topology diagnostic changed.'}
+      Assert-PrintExactProperties -Value $unavailable -Expected @('inventoryStatus','nativeEnumerationStage','topLevelOwnedCount','topLevelOwnedVisibleCount','topLevelOwnedEnabledCount','topLevelCountCapped','candidateSurfaceCount','candidateSurfaceCountCapped','visibleDialogCandidateCount','visibleEnabledDialogCandidateCount','candidateTopLevels','childCount','childCountCapped','childDiagnosticsCapped','childDiagnostics','classHistogram','controlIdHistogram','requiredRoleMatchesAvailable','requiredRoleMatches') -Kind 'Unavailable HWND topology receipt'
+      if($unavailable.inventoryStatus-cne'unavailable'-or$unavailable.nativeEnumerationStage-cne'unavailable'-or$unavailable.childCount-ne-1-or$unavailable.requiredRoleMatchesAvailable){throw 'Unavailable HWND topology diagnostic changed.'}
     `);
     expect(result.status, result.stderr || result.stdout).toBe(0);
   });
@@ -832,11 +832,13 @@ public sealed class NativeAccessibleListFixture : IDisposable {
       $print=New-HostedTopElement 31 302 'ControlType.Button' 'Print'
       $currentPage=New-HostedTopElement 32 303 'ControlType.RadioButton' 'Current Page'
       $printerCombo=New-HostedTopElement 33 304 'ControlType.ComboBox' ''
-      $script:hostedNativeState='baseline';$script:hostedRootQueries=0
+      $script:hostedNativeState='baseline';$script:hostedRootQueries=0;$script:hostedChildless=$false;$script:hostedRootDelayMilliseconds=0
       $provider={param($requestedProcessId,[long]$rootHandle,[bool]$topLevelOnly)
         if($rootHandle-ne0){
           $script:hostedRootQueries++
           if($rootHandle-ne202){throw 'Hosted topology selected a generic or invisible top-level HWND.'}
+          if($script:hostedRootDelayMilliseconds-gt0){Start-Sleep -Milliseconds $script:hostedRootDelayMilliseconds}
+          if($script:hostedChildless){return @([pscustomobject]@{HandleValue=202L;ParentHandleValue=0L;ClassName='#32770';ControlId=0;IsVisible=$true;IsEnabled=$true;Element=$candidateRecords[2].Element})}
           return @(
             [pscustomobject]@{HandleValue=202L;ParentHandleValue=0L;ClassName='#32770';ControlId=0;IsVisible=$true;IsEnabled=$true;Element=$candidateRecords[2].Element},
             [pscustomobject]@{HandleValue=301L;ParentHandleValue=202L;ClassName='Button';ControlId=2;IsVisible=$true;IsEnabled=$true;Element=$cancel},
@@ -863,6 +865,11 @@ public sealed class NativeAccessibleListFixture : IDisposable {
         $receipt.candidateTopLevels[2].uiaControlTypeBucket-cne'pane'-or-not$receipt.candidateTopLevels[2].uiaNameMatches.print){throw "Hosted native topology receipt changed: $json"}
       $binding=Wait-NewProcessNativeWindowSurface -ProcessId 7319 -Baseline $baseline -AnchorNames @('Cancel') -AnchorControlTypes @('ControlType.Button') -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddSeconds(3)) -WindowProvider $provider
       if([string]$binding.surfaceRootIdentity-cnotmatch'^hwnd:202\|'-or$script:hostedRootQueries-ne1){throw 'Hosted native topology did not bind only the unique visible enabled dialog HWND.'}
+      $script:hostedChildless=$true;$childlessMessage='';try{Wait-NewProcessNativeWindowSurface -ProcessId 7319 -Baseline $baseline -AnchorNames @('Save') -AnchorControlTypes @('ControlType.Button') -Stage 'save-output-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(250)) -WindowProvider $provider|Out-Null}catch{$childlessMessage=$_.Exception.Message}
+      if($childlessMessage-cnotmatch'"nativeEnumerationStage":"uia-conversion-complete"'-or$childlessMessage-cnotmatch'"childCount":0'-or$childlessMessage-cmatch'Private|HandleValue|ParentHandleValue|202'){throw 'Childless hosted save dialog did not retain a bounded sanitized completed native-enumeration receipt.'}
+      $script:hostedChildless=$false
+      $script:hostedRootDelayMilliseconds=400;$lateRootMessage='';try{Wait-NewProcessNativeWindowSurface -ProcessId 7319 -Baseline $baseline -AnchorNames @('Save') -AnchorControlTypes @('ControlType.Button') -Stage 'save-output-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(250)) -WindowProvider $provider|Out-Null}catch{$lateRootMessage=$_.Exception.Message};$script:hostedRootDelayMilliseconds=0
+      if($lateRootMessage-cnotmatch'"nativeEnumerationStage":"native-enumeration-started"'-or$lateRootMessage-cnotmatch'"childCount":0'-or$lateRootMessage-cmatch'Private|HandleValue|ParentHandleValue|202'){throw 'Late rooted native enumeration did not preserve its bounded sanitized in-progress phase.'}
       $candidateRecords[1].IsVisible=$true;$candidateRecords[1].IsEnabled=$false;$queriesBefore=$script:hostedRootQueries;$rejected=$false
       try{Wait-NewProcessNativeWindowSurface -ProcessId 7319 -Baseline $baseline -AnchorNames @('Cancel') -AnchorControlTypes @('ControlType.Button') -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(250)) -WindowProvider $provider|Out-Null}catch{$rejected=$true}
       if(-not$rejected-or$script:hostedRootQueries-ne$queriesBefore){throw 'Multiple visible dialog-class HWNDs reached a rooted UIA query.'}
