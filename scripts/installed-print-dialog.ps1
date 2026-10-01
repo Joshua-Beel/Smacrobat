@@ -2121,6 +2121,19 @@ function Get-BoundProcessUiElementsByControlType {
     return @(Get-BoundProcessUiEntries -ProcessId $ProcessId -Binding $Binding -Deadline $Deadline -ElementProvider $ElementProvider -ParentProvider $ParentProvider -NativeWindowProvider $NativeWindowProvider | Where-Object { [string]$_.controlType -ceq $ControlType } | ForEach-Object { $_.element })
 }
 
+function Get-SanitizedUnexpectedNativeClassBucket {
+    param([Parameter(Mandatory = $true)]$Record)
+    $property = $Record.PSObject.Properties['ClassName']
+    $value = if ($null -ne $property) { [string]$property.Value } else { '' }
+    if ($value.Equals('Chrome_WidgetWin_0',[StringComparison]::OrdinalIgnoreCase)) { return 'chromeWidgetWin0' }
+    if ($value.Equals('Chrome_WidgetWin_1',[StringComparison]::OrdinalIgnoreCase)) { return 'chromeWidgetWin1' }
+    if ($value.Equals('Chrome_SystemMessageWindow',[StringComparison]::OrdinalIgnoreCase)) { return 'chromeSystemMessageWindow' }
+    if ($value.Equals('Chrome_RenderWidgetHostHWND',[StringComparison]::OrdinalIgnoreCase)) { return 'chromeRenderWidgetHostHwnd' }
+    if ($value.Equals('Chrome_MessageWindow',[StringComparison]::OrdinalIgnoreCase)) { return 'chromeMessageWindow' }
+    if ($value.Equals('Intermediate D3D Window',[StringComparison]::OrdinalIgnoreCase)) { return 'intermediateD3DWindow' }
+    return Get-SanitizedNativeClassBucket -Record $Record
+}
+
 function Get-SanitizedUnexpectedNativeSurfaceDescriptors {
     param(
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$UnexpectedEntries,
@@ -2142,7 +2155,8 @@ function Get-SanitizedUnexpectedNativeSurfaceDescriptors {
         if (-not $recordsByHandle.ContainsKey($handleValue)) { throw 'Unexpected native surface diagnostic record was unavailable.' }
         $record = $recordsByHandle[$handleValue]
         $visibleProperty = $record.PSObject.Properties['IsVisible']; $enabledProperty = $record.PSObject.Properties['IsEnabled']
-        $classBucket = Get-SanitizedNativeClassBucket -Record $record
+        $classBucket = Get-SanitizedUnexpectedNativeClassBucket -Record $record
+        $controlIdBucket = Get-SanitizedNativeControlIdBucket -Record $record
         if ([datetime]::UtcNow -ge $Deadline) { throw 'Unexpected native surface diagnostic deadline expired.' }
         $controlTypeBucket = Get-SanitizedNativeUiControlTypeBucket -ControlType ([string]$entry.controlType)
         $visible = $null -ne $visibleProperty -and [bool]$visibleProperty.Value
@@ -2160,9 +2174,9 @@ function Get-SanitizedUnexpectedNativeSurfaceDescriptors {
             if ([datetime]::UtcNow -ge $Deadline) { throw 'Unexpected native surface diagnostic deadline expired.' }
         }
         $labelBits = @($labels.Values | ForEach-Object { [int][bool]$_ }) -join ''
-        $key = @($classBucket,$controlTypeBucket,[int]$visible,[int]$enabled,[int]$isSurface,$labelBits) -join '|'
+        $key = @($classBucket,$controlIdBucket,$controlTypeBucket,[int]$visible,[int]$enabled,[int]$isSurface,$labelBits) -join '|'
         if (-not $groups.ContainsKey($key)) {
-            $groups.Add($key,[pscustomobject][ordered]@{count=0;classBucket=$classBucket;controlTypeBucket=$controlTypeBucket;visible=$visible;enabled=$enabled;isSurface=$isSurface;fixedLabelMatches=[pscustomobject]$labels})
+            $groups.Add($key,[pscustomobject][ordered]@{count=0;classBucket=$classBucket;controlIdBucket=$controlIdBucket;controlTypeBucket=$controlTypeBucket;visible=$visible;enabled=$enabled;isSurface=$isSurface;fixedLabelMatches=[pscustomobject]$labels})
         }
         $groups[$key].count = [int]$groups[$key].count + 1
     }
@@ -2201,10 +2215,11 @@ function Get-SanitizedNativeCloseStateJson {
         if ($UnexpectedSurfaceCount -lt 0 -or $UnexpectedSurfaceDescriptors.Count -gt $script:PrintPins.UiElementMaximum) { throw 'Available unexpected surface descriptors were invalid.' }
         $descriptorTotal = 0
         foreach ($descriptor in $UnexpectedSurfaceDescriptors) {
-            Assert-PrintExactProperties -Value $descriptor -Expected @('count','classBucket','controlTypeBucket','visible','enabled','isSurface','fixedLabelMatches') -Kind 'Unexpected native surface descriptor'
+            Assert-PrintExactProperties -Value $descriptor -Expected @('count','classBucket','controlIdBucket','controlTypeBucket','visible','enabled','isSurface','fixedLabelMatches') -Kind 'Unexpected native surface descriptor'
             Assert-PrintExactProperties -Value $descriptor.fixedLabelMatches -Expected @('print','save','cancel','currentPage','printer','fileName','yes','no','ok','continue') -Kind 'Unexpected native surface fixed label descriptor'
             if ([int]$descriptor.count -lt 1 -or [int]$descriptor.count -gt $script:PrintPins.UiElementMaximum) { throw 'Unexpected native surface descriptor count was invalid.' }
-            if ([string]$descriptor.classBucket -notin @('dialog32770','button','comboBox','comboBoxEx32','edit','sysListView32','directUiHwnd','static','sysTabControl32','other')) { throw 'Unexpected native surface class bucket was invalid.' }
+            if ([string]$descriptor.classBucket -notin @('chromeWidgetWin0','chromeWidgetWin1','chromeSystemMessageWindow','chromeRenderWidgetHostHwnd','chromeMessageWindow','intermediateD3DWindow','dialog32770','button','comboBox','comboBoxEx32','edit','sysListView32','directUiHwnd','static','sysTabControl32','other')) { throw 'Unexpected native surface class bucket was invalid.' }
+            if ([string]$descriptor.controlIdBucket -notin @('idOk','idCancel','pushButtonRange','checkBoxRange','radioButtonRange','groupRange','staticRange','listRange','comboRange','editRange','scrollRange','otherPositive','none')) { throw 'Unexpected native surface control ID bucket was invalid.' }
             if ([string]$descriptor.controlTypeBucket -notin @('window','pane','button','radioButton','comboBox','list','edit','unavailable','other')) { throw 'Unexpected native surface control type bucket was invalid.' }
             $descriptorTotal += [int]$descriptor.count
         }
