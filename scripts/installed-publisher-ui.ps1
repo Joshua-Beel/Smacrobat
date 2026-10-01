@@ -7,9 +7,9 @@ Set-StrictMode -Version Latest
 $script:PublisherUiScriptPath = [IO.Path]::GetFullPath($MyInvocation.MyCommand.Path)
 $script:PublisherUiPins = [ordered]@{
     Culture = 'en-US'
-    DeadlineMilliseconds = 30000
-    InteractionMilliseconds = 25000
-    ChildDeadlineMilliseconds = 24000
+    DeadlineMilliseconds = 70000
+    InteractionMilliseconds = 65000
+    ChildDeadlineMilliseconds = 64000
     CleanupMilliseconds = 5000
     PollMilliseconds = 100
     ElementMaximum = 256
@@ -630,8 +630,11 @@ function ConvertFrom-PublisherUiHelperOutput {
     $actualResult = @($Result.PSObject.Properties.Name | Sort-Object -CaseSensitive)
     if ($actualResult.Count -ne $expectedResult.Count -or (Compare-Object $expectedResult $actualResult -CaseSensitive) -or
         $Result.TimedOut -isnot [bool] -or $Result.StdoutExceeded -isnot [bool] -or $Result.StderrExceeded -isnot [bool] -or
-        $Result.JobAssigned -isnot [bool] -or $Result.JobTerminated -isnot [bool] -or $Result.ProcessStopped -isnot [bool] -or
-        $Result.TimedOut -or $Result.StdoutExceeded -or $Result.StderrExceeded -or -not $Result.JobAssigned -or -not $Result.ProcessStopped -or
+        $Result.JobAssigned -isnot [bool] -or $Result.JobTerminated -isnot [bool] -or $Result.ProcessStopped -isnot [bool]) {
+        throw 'Windows publisher UI helper result is malformed.'
+    }
+    if ($Result.TimedOut) { throw 'Windows publisher UI helper exceeded its bounded deadline.' }
+    if ($Result.StdoutExceeded -or $Result.StderrExceeded -or -not $Result.JobAssigned -or -not $Result.ProcessStopped -or
         [int]$Result.ExitCode -ne 0 -or -not [string]::IsNullOrEmpty([string]$Result.Stderr)) {
         throw 'Windows publisher UI helper process did not complete safely.'
     }

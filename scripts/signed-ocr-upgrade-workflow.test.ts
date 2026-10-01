@@ -443,8 +443,9 @@ describe('manual signed OCR installer upgrade workflow', () => {
     expect(helper).toContain("-Root $details -Name 'Name:' -ControlType ([Windows.Automation.ControlType]::Edit)");
     expect(helper).toContain('$value.EndsWith("`r",[StringComparison]::Ordinal)');
     expect(helper).toContain('ElementMaximum = 256');
-    expect(helper).toContain('DeadlineMilliseconds = 30000');
-    expect(helper).toContain('InteractionMilliseconds = 25000');
+    expect(helper).toContain('DeadlineMilliseconds = 70000');
+    expect(helper).toContain('InteractionMilliseconds = 65000');
+    expect(helper).toContain('ChildDeadlineMilliseconds = 64000');
     expect(helper).toContain('CleanupMilliseconds = 5000');
     expect(helper).toContain('ExpectedOwner $propertiesHandle');
     expect(helper).toContain('$propertiesCleanupMatches');
