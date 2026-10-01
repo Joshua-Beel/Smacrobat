@@ -32,6 +32,62 @@ function extractFunctions(script: string, names: string[], body: string) {
 }
 
 describe('hosted installed signed application launch proof', () => {
+  it('bounds trickled response bodies by one deadline and rejects late oracle results', () => {
+    const source = extractFunctions('scripts/installed-app-launch.ps1', ['Get-LaunchRemainingMilliseconds', 'Read-BoundedLoopbackResponseText', 'Wait-WebDriverOracle'], String.raw`
+      $script:LaunchPins=[ordered]@{SessionCreationTimeoutMilliseconds=180000;RequestBytesMaximum=1024}
+      Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
+public sealed class TrickleResponseStream : MemoryStream {
+    public int Reads;
+    public bool Canceled;
+    public override async Task<int> ReadAsync(byte[] buffer,int offset,int count,CancellationToken token) {
+        Reads++;
+        using (token.Register(() => Canceled=true)) {
+            await Task.Delay(300,token);
+            buffer[offset]=32;
+            return 1;
+        }
+    }
+}
+public sealed class NonCooperativeResponseStream : MemoryStream {
+    public override Task<int> ReadAsync(byte[] buffer,int offset,int count,CancellationToken token) {
+        return new TaskCompletionSource<int>().Task;
+    }
+}
+'@
+      $stream=[TrickleResponseStream]::new();$rejected=$false;$watch=[Diagnostics.Stopwatch]::StartNew()
+      try{Read-BoundedLoopbackResponseText -Stream $stream -Deadline ([datetime]::UtcNow.AddMilliseconds(800))|Out-Null}catch{$rejected=$_.Exception.Message-match'deadline'}finally{$stream.Dispose()}
+      if(-not$rejected-or$stream.Reads-lt2-or$watch.ElapsedMilliseconds-gt3000){throw 'Trickled response reset or escaped its absolute deadline.'}
+      $stream=[NonCooperativeResponseStream]::new();$rejected=$false;$watch.Restart()
+      try{Read-BoundedLoopbackResponseText -Stream $stream -Deadline ([datetime]::UtcNow.AddMilliseconds(60))|Out-Null}catch{$rejected=$_.Exception.Message-match'deadline'}finally{$stream.Dispose()}
+      if(-not$rejected-or$watch.ElapsedMilliseconds-gt2000){throw 'A response ignoring cancellation blocked beyond the bounded wait.'}
+      $stream=[IO.MemoryStream]::new([Text.Encoding]::UTF8.GetBytes('{"value":true}'))
+      try{$text=Read-BoundedLoopbackResponseText -Stream $stream -Deadline ([datetime]::UtcNow.AddSeconds(2));if($text-cne'{"value":true}'){throw 'Timely response was changed.'}}finally{$stream.Dispose()}
+      $script:LaunchPins.RequestBytesMaximum=1;$stream=[IO.MemoryStream]::new([byte[]](32,32));$rejected=$false
+      try{Read-BoundedLoopbackResponseText -Stream $stream -Deadline ([datetime]::UtcNow.AddSeconds(2))|Out-Null}catch{$rejected=$_.Exception.Message-ceq'WebDriver response exceeded its live byte limit.'}finally{$stream.Dispose()}
+      if(-not$rejected){throw 'Response byte cap was bypassed.'}
+      $script:oracleCalls=0;$script:predicateCalls=0
+      function Invoke-WebDriverScript {param($SessionId,$Script,$Deadline)$script:oracleCalls++;Start-Sleep -Milliseconds 100;[pscustomobject]@{ready=$true}}
+      $rejected=$false
+      try{Wait-WebDriverOracle -SessionId test -Script test -Deadline ([datetime]::UtcNow.AddMilliseconds(30)) -Kind test -Predicate {param($value)$script:predicateCalls++;$value.ready}|Out-Null}catch{$rejected=$_.Exception.Message-like'test did not become true*'}
+      if(-not$rejected-or$oracleCalls-ne1-or$predicateCalls-ne0){throw 'Late response reached or passed the oracle predicate.'}
+      function Invoke-WebDriverScript {param($SessionId,$Script,$Deadline)[pscustomobject]@{ready=$true}}
+      $rejected=$false
+      try{Wait-WebDriverOracle -SessionId test -Script test -Deadline ([datetime]::UtcNow.AddMilliseconds(30)) -Kind test -Predicate {param($value)Start-Sleep -Milliseconds 100;$value.ready}|Out-Null}catch{$rejected=$_.Exception.Message-like'test did not become true*'}
+      if(-not$rejected){throw 'Late predicate returned successful proof.'}
+      $value=Wait-WebDriverOracle -SessionId test -Script test -Deadline ([datetime]::UtcNow.AddSeconds(2)) -Kind test -Predicate {param($value)$value.ready}
+      if(-not$value.ready){throw 'Timely oracle failed.'}
+    `);
+    const result = runPowerShell(source);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+    const production = readFileSync('scripts/installed-app-launch.ps1', 'utf8');
+    expect(production).toContain('Read-BoundedLoopbackResponseText -Stream $stream -Deadline $requestDeadline');
+    expect(production).toContain('$request.Abort()');
+  });
+
   it('keeps the workflow manual, runner-only, token-scoped, and clean after driver preparation', () => {
     const workflow = readFileSync('.github/workflows/ocr-installer-upgrade.yml', 'utf8');
     expect(workflow).toContain('workflow_dispatch:');

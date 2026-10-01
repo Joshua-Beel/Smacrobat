@@ -6,6 +6,7 @@ $script:PrintPins = [ordered]@{
     OutputTimeoutMilliseconds = 45000
     UiElementMaximum = 2048
     NativeTopLevelDiagnosticMaximum = 32
+    NativeChildDiagnosticMaximum = 64
     OutputBytesMaximum = 64MB
     PdfRenderSize = 384
     PdfFingerprintSize = 64
@@ -87,6 +88,11 @@ namespace Smacrobat.PrintVerification {
         public int ControlId { get; set; }
         public bool IsVisible { get; set; }
         public bool IsEnabled { get; set; }
+        public int ButtonStyle { get; set; }
+        public bool IsLabelPrint { get; set; }
+        public bool IsLabelCancel { get; set; }
+        public bool IsLabelCurrentPage { get; set; }
+        public bool IsLabelPrinterName { get; set; }
     }
 
     public static class NativeWindows {
@@ -99,7 +105,10 @@ namespace Smacrobat.PrintVerification {
         [DllImport("user32.dll")] private static extern bool IsWindowEnabled(IntPtr hwnd);
         [DllImport("user32.dll")] private static extern IntPtr GetParent(IntPtr hwnd);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr hwnd, StringBuilder value, int maximum);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetWindowText(IntPtr hwnd, StringBuilder value, int maximum);
         [DllImport("user32.dll")] private static extern int GetDlgCtrlID(IntPtr hwnd);
+        [DllImport("user32.dll", SetLastError = true)] private static extern int GetWindowLong(IntPtr hwnd, int index);
+        [DllImport("kernel32.dll")] private static extern void SetLastError(uint errorCode);
         [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint message, IntPtr wParam, string lParam, uint flags, uint timeout, out IntPtr result);
         [DllImport("user32.dll", SetLastError = true)] private static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam, uint flags, uint timeout, out IntPtr result);
         private const uint CB_GETCOUNT = 0x0146;
@@ -117,13 +126,29 @@ namespace Smacrobat.PrintVerification {
             return owner == (uint)processId;
         }
 
+        private static int GetButtonStyle(IntPtr hwnd, string className) {
+            if (!className.Equals("Button", StringComparison.OrdinalIgnoreCase)) return -1;
+            SetLastError(0);
+            int style = GetWindowLong(hwnd, -16);
+            if (style == 0 && Marshal.GetLastWin32Error() != 0) return -1;
+            return style & 0x0f;
+        }
+
         private static NativeWindowRecord Describe(IntPtr hwnd, IntPtr parent) {
             var className = new StringBuilder(128);
             int length = GetClassName(hwnd, className, className.Capacity);
+            string classValue = length > 0 ? className.ToString() : String.Empty;
+            var label = new StringBuilder(260);
+            int labelLength = GetWindowText(hwnd, label, label.Capacity);
+            string labelValue = labelLength > 0 ? label.ToString() : String.Empty;
             return new NativeWindowRecord {
                 HandleValue = hwnd.ToInt64(), ParentHandleValue = parent.ToInt64(),
-                ClassName = length > 0 ? className.ToString() : String.Empty,
-                ControlId = GetDlgCtrlID(hwnd), IsVisible = IsWindowVisible(hwnd), IsEnabled = IsWindowEnabled(hwnd)
+                ClassName = classValue, ControlId = GetDlgCtrlID(hwnd), IsVisible = IsWindowVisible(hwnd), IsEnabled = IsWindowEnabled(hwnd),
+                ButtonStyle = GetButtonStyle(hwnd, classValue),
+                IsLabelPrint = labelValue.Equals("Print", StringComparison.OrdinalIgnoreCase),
+                IsLabelCancel = labelValue.Equals("Cancel", StringComparison.OrdinalIgnoreCase),
+                IsLabelCurrentPage = labelValue.Equals("Current page", StringComparison.OrdinalIgnoreCase),
+                IsLabelPrinterName = labelValue.Equals("Microsoft Print to PDF", StringComparison.OrdinalIgnoreCase)
             };
         }
 
@@ -640,6 +665,32 @@ function Get-SanitizedNativeUiControlTypeBucket {
     }
 }
 
+function Get-SanitizedNativeButtonStyleBucket {
+    param([Parameter(Mandatory = $true)]$Record)
+    if ((Get-SanitizedNativeClassBucket -Record $Record) -cne 'button') { return 'notButton' }
+    $property = $Record.PSObject.Properties['ButtonStyle']
+    if ($null -eq $property) { return 'unavailable' }
+    switch ([int]$property.Value) {
+        0 { return 'pushButton' }
+        1 { return 'defaultPushButton' }
+        2 { return 'checkBox' }
+        3 { return 'autoCheckBox' }
+        4 { return 'radioButton' }
+        5 { return 'threeState' }
+        6 { return 'autoThreeState' }
+        7 { return 'groupBox' }
+        8 { return 'userButton' }
+        9 { return 'autoRadioButton' }
+        10 { return 'pushBox' }
+        11 { return 'ownerDraw' }
+        12 { return 'splitButton' }
+        13 { return 'defaultSplitButton' }
+        14 { return 'commandLink' }
+        15 { return 'defaultCommandLink' }
+        default { return 'unavailable' }
+    }
+}
+
 function Get-SanitizedNativeWindowTopologyJson {
     param(
         [AllowEmptyCollection()][object[]]$TopLevelRecords = @(),
@@ -654,7 +705,7 @@ function Get-SanitizedNativeWindowTopologyJson {
         $unavailableRoles = [ordered]@{ cancelButton=-1;printButton=-1;saveButton=-1;currentPageRadio=-1;namedPrinter=-1;printerCombo=-1;printerList=-1;filenameEdit=-1 }
         return ([pscustomobject][ordered]@{
             inventoryStatus='unavailable';topLevelOwnedCount=-1;topLevelOwnedVisibleCount=-1;topLevelOwnedEnabledCount=-1;topLevelCountCapped=$false
-            candidateSurfaceCount=-1;candidateSurfaceCountCapped=$false;visibleDialogCandidateCount=-1;visibleEnabledDialogCandidateCount=-1;candidateTopLevels=@();childCount=-1;childCountCapped=$false
+            candidateSurfaceCount=-1;candidateSurfaceCountCapped=$false;visibleDialogCandidateCount=-1;visibleEnabledDialogCandidateCount=-1;candidateTopLevels=@();childCount=-1;childCountCapped=$false;childDiagnosticsCapped=$false;childDiagnostics=@()
             classHistogram=[pscustomobject]$unavailableClasses;controlIdHistogram=[pscustomobject]$unavailableControlIds
             requiredRoleMatchesAvailable=$false;requiredRoleMatches=[pscustomobject]$unavailableRoles
         } | ConvertTo-Json -Compress -Depth 6)
@@ -665,6 +716,34 @@ function Get-SanitizedNativeWindowTopologyJson {
     $surfaceRecordCount = $SurfaceRecords.Count
     $boundedSurfaceRecords = @($SurfaceRecords | Select-Object -First $maximum)
     $childRecords = @($boundedSurfaceRecords | Where-Object { [long]$_.ParentHandleValue -ne 0 })
+    $childDiagnosticMaximum = [int]$script:PrintPins.NativeChildDiagnosticMaximum
+    $boundedChildRecords = @($childRecords | Select-Object -First $childDiagnosticMaximum)
+    $rootRecords = @($boundedSurfaceRecords | Where-Object { [long]$_.ParentHandleValue -eq 0 })
+    $rootHandleValue = if ($rootRecords.Count -eq 1) { [long]$rootRecords[0].HandleValue } else { 0L }
+    $childIndexesByHandle = @{}
+    for ($childIndex = 0; $childIndex -lt $boundedChildRecords.Count; $childIndex++) {
+        $childIndexesByHandle[[long]$boundedChildRecords[$childIndex].HandleValue] = $childIndex
+    }
+    $childDiagnostics = @()
+    for ($childIndex = 0; $childIndex -lt $boundedChildRecords.Count; $childIndex++) {
+        $record = $boundedChildRecords[$childIndex]
+        $parentHandleValue = [long]$record.ParentHandleValue
+        $parentIndex = if ($rootHandleValue -ne 0 -and $parentHandleValue -eq $rootHandleValue) { -1 } elseif ($childIndexesByHandle.ContainsKey($parentHandleValue)) { [int]$childIndexesByHandle[$parentHandleValue] } else { -2 }
+        $controlIdProperty = $record.PSObject.Properties['ControlId']; $controlIdValue = if ($null -ne $controlIdProperty) { [int]$controlIdProperty.Value } else { -1 }
+        if ($controlIdValue -lt 0 -or $controlIdValue -gt 65535) { $controlIdValue = -1 }
+        $visibleProperty = $record.PSObject.Properties['IsVisible']; $enabledProperty = $record.PSObject.Properties['IsEnabled']
+        $printProperty = $record.PSObject.Properties['IsLabelPrint']; $cancelProperty = $record.PSObject.Properties['IsLabelCancel']
+        $currentPageProperty = $record.PSObject.Properties['IsLabelCurrentPage']; $printerProperty = $record.PSObject.Properties['IsLabelPrinterName']
+        $childDiagnostics += [pscustomobject][ordered]@{
+            index=$childIndex;parentIndex=$parentIndex;classBucket=(Get-SanitizedNativeClassBucket -Record $record);controlId=$controlIdValue
+            visible=($null -ne $visibleProperty -and [bool]$visibleProperty.Value);enabled=($null -ne $enabledProperty -and [bool]$enabledProperty.Value)
+            buttonStyleBucket=(Get-SanitizedNativeButtonStyleBucket -Record $record)
+            labelMatches=[pscustomobject][ordered]@{
+                print=($null -ne $printProperty -and [bool]$printProperty.Value);cancel=($null -ne $cancelProperty -and [bool]$cancelProperty.Value)
+                currentPage=($null -ne $currentPageProperty -and [bool]$currentPageProperty.Value);printerName=($null -ne $printerProperty -and [bool]$printerProperty.Value)
+            }
+        }
+    }
     $visibleTopLevelCount = 0; $enabledTopLevelCount = 0
     foreach ($record in @($TopLevelRecords | Select-Object -First $maximum)) {
         $visibleProperty = $record.PSObject.Properties['IsVisible']
@@ -720,6 +799,8 @@ function Get-SanitizedNativeWindowTopologyJson {
         candidateTopLevels=$candidateTopLevels
         childCount=[int][Math]::Min($childRecords.Count,$maximum)
         childCountCapped=[bool]($surfaceRecordCount -gt $maximum)
+        childDiagnosticsCapped=[bool]($childRecords.Count -gt $childDiagnosticMaximum)
+        childDiagnostics=$childDiagnostics
         classHistogram=[pscustomobject]$classes
         controlIdHistogram=[pscustomobject]$controlIds
         requiredRoleMatchesAvailable=[bool]$rolesAvailable

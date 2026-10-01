@@ -103,6 +103,28 @@ function Get-LoopbackRequestTimeoutMilliseconds {
     return Get-LaunchRemainingMilliseconds -Deadline $Deadline -MaximumMilliseconds $maximum
 }
 
+function Read-BoundedLoopbackResponseText {
+    param([Parameter(Mandatory = $true)][IO.Stream]$Stream,[Parameter(Mandatory = $true)][datetime]$Deadline)
+    $memory = [IO.MemoryStream]::new()
+    try {
+        $buffer = [byte[]]::new(8192)
+        while ($true) {
+            $remaining = Get-LaunchRemainingMilliseconds -Deadline $Deadline -MaximumMilliseconds $script:LaunchPins.SessionCreationTimeoutMilliseconds
+            $cancellation = [Threading.CancellationTokenSource]::new()
+            try {
+                $pending = $Stream.ReadAsync($buffer,0,$buffer.Length,$cancellation.Token)
+                if (-not $pending.Wait($remaining)) { $cancellation.Cancel(); throw 'WebDriver response read exceeded its deadline.' }
+                $null = Get-LaunchRemainingMilliseconds -Deadline $Deadline -MaximumMilliseconds $script:LaunchPins.SessionCreationTimeoutMilliseconds
+                $read = $pending.GetAwaiter().GetResult()
+            } finally { $cancellation.Dispose() }
+            if ($read -eq 0) { break }
+            if ($memory.Length + $read -gt $script:LaunchPins.RequestBytesMaximum) { throw 'WebDriver response exceeded its live byte limit.' }
+            $memory.Write($buffer,0,$read)
+        }
+        return [Text.UTF8Encoding]::new($false,$true).GetString($memory.ToArray())
+    } finally { $memory.Dispose() }
+}
+
 function Invoke-BoundedLoopbackJson {
     param(
         [ValidateSet('GET','POST','DELETE')][string]$Method,
@@ -119,6 +141,8 @@ function Invoke-BoundedLoopbackJson {
     $uri = [Uri]::new("http://127.0.0.1:$Port$Path")
     if (-not $uri.IsLoopback -or $uri.Scheme -cne 'http') { throw 'WebDriver URI is not fixed loopback HTTP.' }
     $timeout = Get-LoopbackRequestTimeoutMilliseconds -Method $Method -Path $Path -Port $Port -Deadline $Deadline
+    $requestDeadline = [datetime]::UtcNow.AddMilliseconds($timeout)
+    if ($requestDeadline -gt $Deadline) { $requestDeadline = $Deadline }
     $request = [Net.HttpWebRequest]::CreateHttp($uri)
     $request.Method = $Method
     $request.AllowAutoRedirect = $false
@@ -135,26 +159,26 @@ function Invoke-BoundedLoopbackJson {
     }
     $response = $null
     try {
-        $response = [Net.HttpWebResponse]$request.GetResponse()
+        $remaining = Get-LaunchRemainingMilliseconds -Deadline $requestDeadline -MaximumMilliseconds $timeout
+        $pendingResponse = $request.GetResponseAsync()
+        if (-not $pendingResponse.Wait($remaining)) { throw 'WebDriver response headers exceeded their deadline.' }
+        $response = [Net.HttpWebResponse]$pendingResponse.GetAwaiter().GetResult()
+        $null = Get-LaunchRemainingMilliseconds -Deadline $requestDeadline -MaximumMilliseconds $timeout
         if ([int]$response.StatusCode -ne 200) { throw 'WebDriver returned an unexpected HTTP status.' }
         if ($response.ContentLength -gt $script:LaunchPins.RequestBytesMaximum) { throw 'WebDriver response exceeded its declared byte limit.' }
         $stream = $response.GetResponseStream()
-        $memory = [IO.MemoryStream]::new()
         try {
-            $buffer = [byte[]]::new(8192)
-            while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
-                if ($memory.Length + $read -gt $script:LaunchPins.RequestBytesMaximum) { throw 'WebDriver response exceeded its live byte limit.' }
-                $memory.Write($buffer, 0, $read)
-            }
-            $text = [Text.UTF8Encoding]::new($false, $true).GetString($memory.ToArray())
-        } finally { $memory.Dispose(); $stream.Dispose() }
+            $text = Read-BoundedLoopbackResponseText -Stream $stream -Deadline $requestDeadline
+        } finally { $request.Abort(); $stream.Dispose() }
     } finally {
+        $request.Abort()
         if ($null -ne $response) { $response.Dispose() }
     }
     if ([string]::IsNullOrWhiteSpace($text)) { throw 'WebDriver returned an empty JSON response.' }
     $value = $text | ConvertFrom-Json
     $nodes = 0
     Assert-BoundedJsonShape -Value $value -Nodes ([ref]$nodes)
+    $null = Get-LaunchRemainingMilliseconds -Deadline $requestDeadline -MaximumMilliseconds $timeout
     return $value
 }
 
@@ -356,8 +380,12 @@ function Invoke-WebDriverScript {
 function Wait-WebDriverOracle {
     param([string]$SessionId,[string]$Script,[datetime]$Deadline,[scriptblock]$Predicate,[string]$Kind)
     do {
+        if ([datetime]::UtcNow -ge $Deadline) { break }
         $value = Invoke-WebDriverScript -SessionId $SessionId -Script $Script -Deadline $Deadline
-        if (& $Predicate $value) { return $value }
+        if ([datetime]::UtcNow -ge $Deadline) { break }
+        $matched = & $Predicate $value
+        if ([datetime]::UtcNow -ge $Deadline) { break }
+        if ($matched) { return $value }
         Start-Sleep -Milliseconds 200
     } while ([datetime]::UtcNow -lt $Deadline)
     throw "$Kind did not become true before the shared launch deadline."

@@ -297,6 +297,41 @@ describe('installed signed reading-tools verifier', () => {
     expect(source.indexOf("$postOpen = Wait-ReadingPostOpenState")).toBeLessThan(source.indexOf('$null = Wait-ReadingDocument -SessionId $sessionId -Pages 6'));
   });
 
+  it('activates the unique signed text-selection mode after render and before waiting for its layer', () => {
+    const check = extractFunctions('scripts/installed-reading-tools.ps1', ['Enable-ReadingTextSelection'], String.raw`
+      $script:now=[datetime]::SpecifyKind([datetime]'2026-01-01T00:00:00',[DateTimeKind]::Utc);$clock={$script:now};$deadline=$script:now.AddSeconds(1);$script:actions=0
+      Enable-ReadingTextSelection -SessionId 'session' -Deadline $deadline -StateProvider {$script:actions++;[pscustomobject]@{count=[long]1;clicked=$true}} -UtcNowProvider $clock
+      if($actions-ne1){throw 'The unique text-selection action did not execute exactly once.'}
+      $ambiguous=$false;try{Enable-ReadingTextSelection -SessionId 'session' -Deadline $deadline -StateProvider {[pscustomobject]@{count=[long]2;clicked=$false}} -UtcNowProvider $clock}catch{$ambiguous=$_.Exception.Message-ceq'The exact installed text-selection mode control was unavailable.'}
+      if(-not$ambiguous){throw 'Ambiguous text-selection controls were accepted.'}
+      $script:now=$deadline;$script:actions=0;$expired=$false
+      try{Enable-ReadingTextSelection -SessionId 'session' -Deadline $deadline -StateProvider {$script:actions++;[pscustomobject]@{count=[long]1;clicked=$true}} -UtcNowProvider $clock}catch{$expired=$_.Exception.Message-ceq'The text-selection mode deadline expired before its exact action.'}
+      if(-not$expired-or$actions-ne0){throw 'An expired text-selection action was invoked.'}
+    `);
+    const result = runPowerShell(check);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+    const scriptResult = runPowerShell(extractFunctions('scripts/installed-reading-tools.ps1', ['Get-ReadingEnableTextSelectionScript'], String.raw`
+      (Get-ReadingEnableTextSelectionScript)|ConvertTo-Json -Compress
+    `));
+    expect(scriptResult.status, scriptResult.stderr || scriptResult.stdout).toBe(0);
+    const selectionScript = JSON.parse(scriptResult.stdout.trim()) as string;
+    expect(() => new Function('document', selectionScript)).not.toThrow();
+    let clicks = 0;
+    const button = { disabled: false, click: () => { clicks += 1; } };
+    const document = { querySelectorAll: (selector: string) => selector === 'button[aria-label="Select text on page"]' ? [button] : [] };
+    expect(new Function('document', selectionScript)(document)).toEqual({ count: 1, clicked: true });
+    expect(clicks).toBe(1);
+    const source = readFileSync('scripts/installed-reading-tools.ps1', 'utf8');
+    const render = source.indexOf('$null = Wait-ReadingDocument -SessionId $sessionId -Pages 6');
+    const activate = source.indexOf('Enable-ReadingTextSelection -SessionId $sessionId -Deadline $plainProductDeadline');
+    const layer = source.indexOf("$layer = Wait-WebDriverOracle -SessionId $sessionId -Deadline $plainProductDeadline -Kind 'embedded text layer'");
+    expect(render).toBeGreaterThan(-1);
+    expect(activate).toBeGreaterThan(render);
+    expect(layer).toBeGreaterThan(activate);
+    expect(readFileSync('src/preferences.ts', 'utf8')).toContain('hand: true');
+    expect(readFileSync('src/Viewer.tsx', 'utf8')).toContain('selectable={!hand && !commentMode && !highlightMode}');
+  });
+
   it('uses the signed Home marker and the unique global Open action when Home has two Open buttons', () => {
     const check = extractFunctions('scripts/installed-reading-tools.ps1', ['Get-ReadingHomeScript', 'Get-ReadingOpenFileScript'], String.raw`
       [ordered]@{home=Get-ReadingHomeScript;open=Get-ReadingOpenFileScript}|ConvertTo-Json -Compress
@@ -450,6 +485,7 @@ describe('installed signed reading-tools verifier', () => {
     expect(verify).toContain('clipboardSha256');
     expect(verify).toContain("method = 'programmatic-dom-range-plus-real-windows-clipboard'");
     expect(verify).toContain('programmaticDomSelectionVerified');
+    expect(verify).toContain('textSelectionModeActivated=[bool]$UiResult.textSelectionModeActivated');
     expect(verify).toContain('nativeFilenameControlCategory=[string]$UiResult.nativeFilenameControlCategory');
     expect(verify).toContain('activeFilenameMatched=[bool]$UiResult.postOpenActiveFilenameMatched');
     expect(verify).toContain('pageOneGlyphCount=[int]$UiResult.postOpenPageOneGlyphCount');

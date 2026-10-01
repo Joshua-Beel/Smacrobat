@@ -413,6 +413,13 @@ describe('installed native print dialog verifier', () => {
     expect(source).toContain('CB_FINDSTRINGEXACT');
     expect(source).toContain('CB_GETCURSEL');
     expect(source).not.toMatch(/CB_GETLBTEXT(?:LEN)?/);
+    expect(source).toContain('GetWindowLong(hwnd, -16)');
+    expect(source).toContain('GetWindowText(hwnd, label, label.Capacity)');
+    expect(source).toContain('labelValue.Equals("Print", StringComparison.OrdinalIgnoreCase)');
+    expect(source).toContain('labelValue.Equals("Cancel", StringComparison.OrdinalIgnoreCase)');
+    expect(source).toContain('labelValue.Equals("Current page", StringComparison.OrdinalIgnoreCase)');
+    expect(source).toContain('labelValue.Equals("Microsoft Print to PDF", StringComparison.OrdinalIgnoreCase)');
+    expect(source).not.toContain('labelValue.Contains');
     expect(source.match(/ExactComboIndex\(processId, handleValue, value, deadline\)/g)?.length).toBeGreaterThanOrEqual(4);
     const result = runPowerShell7(String.raw`
       $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
@@ -517,27 +524,38 @@ describe('installed native print dialog verifier', () => {
       })
       $surface=@([pscustomobject]@{HandleValue=200L;ParentHandleValue=0L;ClassName='#32770';ControlId=0;IsVisible=$true})
       foreach($index in 1..2050){
-        $class=if($index-eq1){'Button'}elseif($index-eq2){'ComboBox'}elseif($index-eq3){'SysListView32'}else{'SecretPrivateClass'}
-        $controlId=if($index-eq1){2}elseif($index-eq2){0x0470}elseif($index-eq3){0x0460}elseif($index-eq4){0x0497}elseif($index-eq5){0x0498}else{9000}
-        $surface+=[pscustomobject]@{HandleValue=[long](200+$index);ParentHandleValue=200L;ClassName=$class;ControlId=$controlId;IsVisible=$true;Text='Secret caption';Coordinates='10,20,30,40'}
+        $class=if($index-in@(1,4,5)){'Button'}elseif($index-eq2){'ComboBox'}elseif($index-eq3){'SysListView32'}elseif($index-eq6){'Static'}else{'SecretPrivateClass'}
+        $controlId=if($index-eq1){2}elseif($index-eq2){0x0470}elseif($index-eq3){0x0460}elseif($index-eq4){1}elseif($index-eq5){0x0420}elseif($index-eq7){0x0497}elseif($index-eq8){0x0498}elseif($index-eq9){70000}else{9000}
+        $buttonStyle=if($index-eq1){0}elseif($index-eq4){1}elseif($index-eq5){9}else{-1}
+        $parentHandle=if($index-eq6){201L}else{200L}
+        $surface+=[pscustomobject]@{
+          HandleValue=[long](200+$index);ParentHandleValue=$parentHandle;ClassName=$class;ControlId=$controlId;IsVisible=$true;IsEnabled=$true;ButtonStyle=$buttonStyle
+          IsLabelPrint=($index-eq4);IsLabelCancel=($index-eq1);IsLabelCurrentPage=($index-eq5);IsLabelPrinterName=($index-eq6)
+          Text='Secret caption';Coordinates='10,20,30,40'
+        }
       }
       $roles=[pscustomobject][ordered]@{cancelButton=1;printButton=0;saveButton=0;currentPageRadio=0;namedPrinter=0;printerCombo=1;printerList=1;filenameEdit=0}
       $json=Get-SanitizedNativeWindowTopologyJson -TopLevelRecords $top -CandidateTopLevelRecords $candidate -SurfaceRecords $surface -RoleCounts $roles
       if($json.Length-gt20000-or$json-cmatch'Private|Secret|file\.pdf|10,20|HandleValue|ParentHandleValue|Title|Path|Text|Coordinates'){throw 'HWND topology diagnostic leaked sensitive or raw window data.'}
       $receipt=$json|ConvertFrom-Json
-      Assert-PrintExactProperties -Value $receipt -Expected @('inventoryStatus','topLevelOwnedCount','topLevelOwnedVisibleCount','topLevelOwnedEnabledCount','topLevelCountCapped','candidateSurfaceCount','candidateSurfaceCountCapped','visibleDialogCandidateCount','visibleEnabledDialogCandidateCount','candidateTopLevels','childCount','childCountCapped','classHistogram','controlIdHistogram','requiredRoleMatchesAvailable','requiredRoleMatches') -Kind 'HWND topology receipt'
+      Assert-PrintExactProperties -Value $receipt -Expected @('inventoryStatus','topLevelOwnedCount','topLevelOwnedVisibleCount','topLevelOwnedEnabledCount','topLevelCountCapped','candidateSurfaceCount','candidateSurfaceCountCapped','visibleDialogCandidateCount','visibleEnabledDialogCandidateCount','candidateTopLevels','childCount','childCountCapped','childDiagnosticsCapped','childDiagnostics','classHistogram','controlIdHistogram','requiredRoleMatchesAvailable','requiredRoleMatches') -Kind 'HWND topology receipt'
       Assert-PrintExactProperties -Value $receipt.candidateTopLevels[0] -Expected @('visible','enabled','classBucket','controlIdBucket','uiaControlTypeBucket','uiaNameMatchesAvailable','uiaNameMatches') -Kind 'HWND candidate receipt'
       Assert-PrintExactProperties -Value $receipt.candidateTopLevels[0].uiaNameMatches -Expected @('cancel','print','save','currentPage','printerName','fileName') -Kind 'HWND candidate name flags'
       Assert-PrintExactProperties -Value $receipt.classHistogram -Expected @('dialog32770','button','comboBox','comboBoxEx32','edit','sysListView32','directUiHwnd','static','sysTabControl32','other') -Kind 'HWND class histogram'
       Assert-PrintExactProperties -Value $receipt.controlIdHistogram -Expected @('idOk','idCancel','pushButtonRange','checkBoxRange','radioButtonRange','groupRange','staticRange','listRange','comboRange','editRange','scrollRange','otherPositive','none') -Kind 'HWND control-ID histogram'
       Assert-PrintExactProperties -Value $receipt.requiredRoleMatches -Expected @('cancelButton','printButton','saveButton','currentPageRadio','namedPrinter','printerCombo','printerList','filenameEdit') -Kind 'HWND role histogram'
+      Assert-PrintExactProperties -Value $receipt.childDiagnostics[0] -Expected @('index','parentIndex','classBucket','controlId','visible','enabled','buttonStyleBucket','labelMatches') -Kind 'HWND child diagnostic'
+      Assert-PrintExactProperties -Value $receipt.childDiagnostics[0].labelMatches -Expected @('print','cancel','currentPage','printerName') -Kind 'HWND child exact label flags'
       if($receipt.inventoryStatus-cne'native-window-observed'-or$receipt.topLevelOwnedCount-ne2-or$receipt.topLevelOwnedVisibleCount-ne2-or$receipt.topLevelOwnedEnabledCount-ne2-or$receipt.candidateSurfaceCount-ne1-or$receipt.visibleDialogCandidateCount-ne1-or$receipt.visibleEnabledDialogCandidateCount-ne1-or
         $receipt.candidateTopLevels.Count-ne1-or$receipt.candidateTopLevels[0].classBucket-cne'dialog32770'-or$receipt.candidateTopLevels[0].uiaControlTypeBucket-cne'pane'-or-not$receipt.candidateTopLevels[0].uiaNameMatches.print-or-not$receipt.childCountCapped-or$receipt.childCount-gt2048-or
-        $receipt.classHistogram.dialog32770-ne1-or$receipt.classHistogram.button-ne1-or$receipt.classHistogram.comboBox-ne1-or$receipt.classHistogram.sysListView32-ne1-or
-        $receipt.controlIdHistogram.idCancel-ne1-or$receipt.controlIdHistogram.comboRange-ne1-or$receipt.controlIdHistogram.listRange-ne1-or$receipt.controlIdHistogram.scrollRange-ne1-or$receipt.controlIdHistogram.otherPositive-ne2043-or
+        -not$receipt.childDiagnosticsCapped-or$receipt.childDiagnostics.Count-ne64-or$receipt.childDiagnostics[0].index-ne0-or$receipt.childDiagnostics[0].parentIndex-ne-1-or$receipt.childDiagnostics[0].classBucket-cne'button'-or$receipt.childDiagnostics[0].controlId-ne2-or$receipt.childDiagnostics[0].buttonStyleBucket-cne'pushButton'-or-not$receipt.childDiagnostics[0].labelMatches.cancel-or
+        $receipt.childDiagnostics[3].controlId-ne1-or$receipt.childDiagnostics[3].buttonStyleBucket-cne'defaultPushButton'-or-not$receipt.childDiagnostics[3].labelMatches.print-or
+        $receipt.childDiagnostics[4].buttonStyleBucket-cne'autoRadioButton'-or-not$receipt.childDiagnostics[4].labelMatches.currentPage-or$receipt.childDiagnostics[5].parentIndex-ne0-or-not$receipt.childDiagnostics[5].labelMatches.printerName-or$receipt.childDiagnostics[8].controlId-ne-1-or
+        $receipt.classHistogram.dialog32770-ne1-or$receipt.classHistogram.button-ne3-or$receipt.classHistogram.comboBox-ne1-or$receipt.classHistogram.sysListView32-ne1-or$receipt.classHistogram.static-ne1-or
+        $receipt.controlIdHistogram.idOk-ne1-or$receipt.controlIdHistogram.idCancel-ne1-or$receipt.controlIdHistogram.radioButtonRange-ne1-or$receipt.controlIdHistogram.comboRange-ne1-or$receipt.controlIdHistogram.listRange-ne1-or$receipt.controlIdHistogram.scrollRange-ne1-or$receipt.controlIdHistogram.otherPositive-ne2041-or
         -not$receipt.requiredRoleMatchesAvailable-or$receipt.requiredRoleMatches.cancelButton-ne1-or$receipt.requiredRoleMatches.printerCombo-ne1-or$receipt.requiredRoleMatches.printerList-ne1){throw "HWND topology diagnostic counts changed: $json"}
       $unavailable=(Get-SanitizedNativeWindowTopologyJson -Unavailable)|ConvertFrom-Json
-      Assert-PrintExactProperties -Value $unavailable -Expected @('inventoryStatus','topLevelOwnedCount','topLevelOwnedVisibleCount','topLevelOwnedEnabledCount','topLevelCountCapped','candidateSurfaceCount','candidateSurfaceCountCapped','visibleDialogCandidateCount','visibleEnabledDialogCandidateCount','candidateTopLevels','childCount','childCountCapped','classHistogram','controlIdHistogram','requiredRoleMatchesAvailable','requiredRoleMatches') -Kind 'Unavailable HWND topology receipt'
+      Assert-PrintExactProperties -Value $unavailable -Expected @('inventoryStatus','topLevelOwnedCount','topLevelOwnedVisibleCount','topLevelOwnedEnabledCount','topLevelCountCapped','candidateSurfaceCount','candidateSurfaceCountCapped','visibleDialogCandidateCount','visibleEnabledDialogCandidateCount','candidateTopLevels','childCount','childCountCapped','childDiagnosticsCapped','childDiagnostics','classHistogram','controlIdHistogram','requiredRoleMatchesAvailable','requiredRoleMatches') -Kind 'Unavailable HWND topology receipt'
       if($unavailable.inventoryStatus-cne'unavailable'-or$unavailable.childCount-ne-1-or$unavailable.requiredRoleMatchesAvailable){throw 'Unavailable HWND topology diagnostic changed.'}
     `);
     expect(result.status, result.stderr || result.stdout).toBe(0);

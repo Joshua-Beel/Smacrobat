@@ -226,6 +226,7 @@ function Write-SanitizedReadingRecord {
                 pageTextStatusCount=[int]$UiResult.postOpenPageTextStatusCount
             }
             method = 'programmatic-dom-range-plus-real-windows-clipboard'
+            textSelectionModeActivated=[bool]$UiResult.textSelectionModeActivated
             programmaticDomSelectionVerified=[bool]$UiResult.programmaticDomSelectionVerified
             geometryInsidePage=[bool]$UiResult.selectionGeometryInsidePage
             clientRectCount=[int]$UiResult.selectionClientRectCount

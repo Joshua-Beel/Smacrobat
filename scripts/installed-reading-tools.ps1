@@ -650,6 +650,23 @@ function Wait-ReadingDocument {
     return Wait-WebDriverOracle -SessionId $SessionId -Script $script -Deadline $Deadline -Kind 'user PDF render' -Predicate { param($v) [int]$v.dialog -eq 0 -and [bool]$v.images -and [bool]$v.pages -and [string]$v.page -ceq '1' }
 }
 
+function Get-ReadingEnableTextSelectionScript {
+    return @'
+const b=[...document.querySelectorAll('button[aria-label="Select text on page"]')].filter(x=>!x.disabled);if(b.length===1)b[0].click();return {count:b.length,clicked:b.length===1};
+'@
+}
+
+function Enable-ReadingTextSelection {
+    param([Parameter(Mandatory = $true)][string]$SessionId,[Parameter(Mandatory = $true)][datetime]$Deadline,[scriptblock]$StateProvider,[scriptblock]$UtcNowProvider)
+    $now = if ($UtcNowProvider) { [datetime](& $UtcNowProvider) } else { [datetime]::UtcNow }
+    if ($now -ge $Deadline) { throw 'The text-selection mode deadline expired before its exact action.' }
+    $state = if ($StateProvider) { & $StateProvider } else { Invoke-WebDriverScript -SessionId $SessionId -Deadline $Deadline -Script (Get-ReadingEnableTextSelectionScript) }
+    $properties = @($state.PSObject.Properties.Name | Sort-Object -CaseSensitive)
+    if (($properties -join ',') -cne 'clicked,count' -or ($state.count -isnot [int] -and $state.count -isnot [long]) -or [int]$state.count -ne 1 -or $state.clicked -isnot [bool] -or -not [bool]$state.clicked) { throw 'The exact installed text-selection mode control was unavailable.' }
+    $now = if ($UtcNowProvider) { [datetime](& $UtcNowProvider) } else { [datetime]::UtcNow }
+    if ($now -ge $Deadline) { throw 'The text-selection mode action completed after its deadline.' }
+}
+
 function Close-ActiveReadingDocument {
     param([Parameter(Mandatory = $true)][string]$SessionId,[Parameter(Mandatory = $true)][datetime]$Deadline)
     $closed = Invoke-WebDriverScript -SessionId $SessionId -Deadline $Deadline -Script "const t=[...document.querySelectorAll('div')].filter(x=>x.querySelector(':scope>button>span')&&x.querySelector(':scope>button[aria-label^=`"Close `"]'));const a=t.filter(x=>x.className.includes('selectedTab'));const b=a.length===1?a[0].querySelector(':scope>button[aria-label^=`"Close `"]'):null;if(b)b.click();return !!b;"
@@ -731,6 +748,7 @@ function Invoke-RealInstalledReadingTools {
         $plainProductDeadline = New-ReadingPhaseDeadline -Phase product
         $postOpen = Wait-ReadingPostOpenState -SessionId $sessionId -ExpectedName 'reading-source.pdf' -ExpectedPages 6 -NativeControlCategory $plainPickerControlCategory -Deadline $plainProductDeadline
         $null = Wait-ReadingDocument -SessionId $sessionId -Pages 6 -Deadline $plainProductDeadline
+        Enable-ReadingTextSelection -SessionId $sessionId -Deadline $plainProductDeadline
         try {
             $layer = Wait-WebDriverOracle -SessionId $sessionId -Deadline $plainProductDeadline -Kind 'embedded text layer' -Script "const p=document.querySelector('[aria-label=`"Page 1`"]'),l=p?.querySelector('[data-testid=`"text-layer`"]'),i=p?.querySelector('img[alt=`"Page 1`"]');return {ready:!!l&&!!i&&i.complete,glyphs:l?.querySelectorAll('[data-geometry-index]').length||0};" -Predicate { param($v) [bool]$v.ready -and [int]$v.glyphs -gt 20 }
         } catch { throw "Embedded text layer verification failed after the sanitized post-open receipt; diagnostic=$($postOpen | ConvertTo-Json -Compress)" }
@@ -811,6 +829,7 @@ const a=document.querySelector('aside[aria-label="Find in document"]'),live=[...
             postOpenTextLayerCount = [int]$postOpen.textLayerCount
             postOpenPageOneGlyphCount = [int]$postOpen.pageOneGlyphCount
             postOpenPageTextStatusCount = [int]$postOpen.pageTextStatusCount
+            textSelectionModeActivated = $true
             programmaticDomSelectionVerified = $true
             selectionGeometryInsidePage = [bool]$selection.inside
             selectionClientRectCount = [int]$selection.rects
