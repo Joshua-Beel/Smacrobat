@@ -251,7 +251,7 @@ describe('installed native print dialog verifier', () => {
       $main=New-HostedTopLevel 7319 1 'ControlType.Window' 'PDF Workstation'
       $replacement=New-HostedTopLevel 7319 3 'ControlType.Pane' ''
       $baseline=@(Get-ProcessTopLevelUiSnapshot -ProcessId 7319 -Deadline ([datetime]::UtcNow.AddSeconds(1)) -ElementProvider {param($requestedProcessId,$windowsOnly)@($main)})
-      $message='';try{Wait-ProcessTopLevelUiBaselineRestored -ProcessId 7319 -Baseline $baseline -Stage 'first-native-cleanup' -Deadline ([datetime]::UtcNow.AddMilliseconds(50)) -ElementProvider {param($requestedProcessId,$windowsOnly)@($main,$replacement)}}catch{$message=$_.Exception.Message}
+      $message='';try{Wait-ProcessTopLevelUiBaselineRestored -ProcessId 7319 -Baseline $baseline -Stage 'first-native-cleanup' -Deadline ([datetime]::UtcNow.AddMilliseconds(250)) -ElementProvider {param($requestedProcessId,$windowsOnly)@($main,$replacement)}}catch{$message=$_.Exception.Message}
       if($message-cnotmatch'exact top-level baseline'-or$message-cnotmatch'"topLevelWindowCount":2'-or$message-cnotmatch'"paneCount":1'){throw 'An extra replacement surface was accepted after first cancellation.'}
       $absorbedBaseline=@(Get-ProcessTopLevelUiSnapshot -ProcessId 7319 -Deadline ([datetime]::UtcNow.AddSeconds(1)) -ElementProvider {param($requestedProcessId,$windowsOnly)@($main,$replacement)})
       $rejected=$false;try{Assert-ProcessTopLevelUiBaselineMatch -ProcessId 7319 -Expected $baseline -Actual $absorbedBaseline -Deadline ([datetime]::UtcNow.AddSeconds(1))}catch{$rejected=$true};if(-not$rejected){throw 'A replacement surface was absorbed into the second-attempt baseline.'}
@@ -345,6 +345,61 @@ describe('installed native print dialog verifier', () => {
     expect(source).toContain('-not $baselineIdentities.Contains($surfaceRootIdentity)');
     expect(source).toContain('$firstNativeControlBaseline = @(Get-ProcessUiTreeSnapshot');
     expect(source).toContain('$secondNativeControlBaseline = @(Get-ProcessUiTreeSnapshot');
+  });
+
+  it('uses an exact rooted target query after the hosted surface-only delta', () => {
+    const result = runPowerShell7(String.raw`
+      $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
+      Set-Location -LiteralPath '${process.cwd().replaceAll("'", "''")}'
+      . ./scripts/installed-print-dialog.ps1
+      function New-HostedElement([int]$runtimePart,[string]$type,[string]$name,$parent){
+        $element=[pscustomobject]@{RuntimePart=$runtimePart;Parent=$parent;Current=[pscustomobject]@{ProcessId=7319;ControlType=[pscustomobject]@{ProgrammaticName=$type};Name=$name;AutomationId=''}}
+        $element|Add-Member -MemberType ScriptMethod -Name GetRuntimeId -Value {[int[]]@(88,$this.RuntimePart)}
+        return $element
+      }
+      $desktop=[pscustomobject]@{Current=[pscustomobject]@{ProcessId=0}}
+      $main=New-HostedElement 1 'ControlType.Window' '' $desktop
+      $basePane1=New-HostedElement 2 'ControlType.Pane' '' $main
+      $basePane2=New-HostedElement 3 'ControlType.Pane' '' $basePane1
+      $basePane3=New-HostedElement 4 'ControlType.Pane' '' $basePane2
+      $dialog=New-HostedElement 5 'ControlType.Window' '' $desktop
+      $newPanes=@();$parent=$dialog
+      foreach($index in 1..30){$pane=New-HostedElement (100+$index) 'ControlType.Pane' '' $parent;$newPanes+=$pane;$parent=$pane}
+      $cancel=New-HostedElement 201 'ControlType.Button' 'Cancel' $parent
+      $print=New-HostedElement 202 'ControlType.Button' 'Print' $parent
+      $currentPage=New-HostedElement 203 'ControlType.RadioButton' 'Current Page' $parent
+      $combo=New-HostedElement 204 'ControlType.ComboBox' '' $parent
+      $script:hostedState='baseline';$script:rootedTargetQueries=0
+      $provider={param($requestedProcessId,$windowsOnly,$kind,$root)
+        if($windowsOnly){if($script:hostedState-ceq'baseline'){return @($main)};return @($main,$dialog)}
+        if($null-ne$root){
+          if(-not[object]::ReferenceEquals($root,$dialog)){throw 'Target query escaped the exact new hosted surface.'}
+          if($kind-ceq'targets'){$script:rootedTargetQueries++;return @($cancel,$print,$currentPage,$combo)}
+          return @($newPanes)
+        }
+        if($kind-ceq'targets'){return @()}
+        if($script:hostedState-ceq'baseline'){return @($main,$basePane1,$basePane2,$basePane3)}
+        return @($main,$basePane1,$basePane2,$basePane3,$dialog)+@($newPanes)
+      }
+      $parents={param($element)$element.Parent}
+      $baseline=@(Get-ProcessUiTreeSnapshot -ProcessId 7319 -Deadline ([datetime]::UtcNow.AddSeconds(2)) -ElementProvider $provider -ParentProvider $parents)
+      $baselineReceipt=Get-SanitizedObservedUiStructureJson -ProcessId 7319 -Elements @($baseline|ForEach-Object{$_.element}) -Scope 'process-descendants'
+      if($baselineReceipt-cnotmatch'"processElementCount":4'-or$baselineReceipt-cnotmatch'"windowCount":1'-or$baselineReceipt-cnotmatch'"paneCount":3'){throw 'Hosted baseline topology fixture changed.'}
+      $script:hostedState='post'
+      $post=@(Get-ProcessUiTreeSnapshot -ProcessId 7319 -Deadline ([datetime]::UtcNow.AddSeconds(2)) -ElementProvider $provider -ParentProvider $parents)
+      $postReceipt=Get-SanitizedObservedUiStructureJson -ProcessId 7319 -Elements @($post|ForEach-Object{$_.element}) -Scope 'process-descendants'
+      if($postReceipt-cnotmatch'"processElementCount":35'-or$postReceipt-cnotmatch'"windowCount":2'-or$postReceipt-cnotmatch'"paneCount":33'-or@($post|Where-Object{$_.isTarget}).Count-ne0){throw 'Hosted surface-only post topology fixture changed.'}
+      $baselineIds=Get-ProcessUiSnapshotIdentitySet -Snapshot $baseline -Kind 'Hosted baseline'
+      $postBy=@{};foreach($entry in $post){$postBy.Add([string]$entry.runtimeIdentity,$entry)}
+      $newSurfaces=@($post|Where-Object{$_.isSurface-and-not$baselineIds.Contains([string]$_.runtimeIdentity)})
+      $common=Get-ProcessUiSnapshotCommonAncestorIdentity -Entries $newSurfaces -EntriesByIdentity $postBy -Deadline ([datetime]::UtcNow.AddSeconds(2))
+      if($newSurfaces.Count-ne31-or[string]$common-cne'88:5'){throw 'Hosted surface-only ancestor fixture changed.'}
+      $rootedPreview=@(Get-ProcessUiTreeSnapshot -ProcessId 7319 -Deadline ([datetime]::UtcNow.AddSeconds(2)) -RootElement $dialog -ElementProvider $provider -ParentProvider $parents)
+      if(@($rootedPreview|Where-Object{$_.isTarget}).Count-ne4){throw 'Exact rooted hosted target fixture changed.'}
+      $binding=Wait-NewProcessUiSurface -ProcessId 7319 -Baseline $baseline -AnchorNames @('Cancel') -AnchorControlTypes @('ControlType.Button') -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddSeconds(5)) -ElementProvider $provider -ParentProvider $parents
+      if([string]$binding.surfaceRootIdentity-cne'88:5'-or$script:rootedTargetQueries-lt2-or@($binding.trackedIdentities).Count-ne35){throw 'Hosted surface delta did not trigger the exact rooted target proof.'}
+    `);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
   });
 
   it('maps every native wait callsite to its exact diagnostic stage', () => {

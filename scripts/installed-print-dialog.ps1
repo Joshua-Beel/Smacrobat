@@ -419,15 +419,17 @@ function Get-ProcessUiTreeSnapshot {
     param(
         [Parameter(Mandatory = $true)][int]$ProcessId,
         [Parameter(Mandatory = $true)][datetime]$Deadline,
+        $RootElement,
         [scriptblock]$ElementProvider,
         [scriptblock]$ParentProvider
     )
     if ([datetime]::UtcNow -ge $Deadline) { throw 'Native process UI snapshot deadline expired.' }
     $topLevel = @(if ($ElementProvider) { & $ElementProvider $ProcessId $true } else { Get-ProcessUiElements -ProcessId $ProcessId -WindowsOnly -Deadline $Deadline })
     if ([datetime]::UtcNow -ge $Deadline) { throw 'Native process UI snapshot exceeded its deadline.' }
-    $targetElements = @(if ($ElementProvider) { & $ElementProvider $ProcessId $false 'targets' } else { Get-ProcessUiElements -ProcessId $ProcessId -Deadline $Deadline })
+    $targetElements = @(if ($ElementProvider) { & $ElementProvider $ProcessId $false 'targets' $RootElement } elseif ($null -ne $RootElement) { Get-ProcessUiElements -ProcessId $ProcessId -RootElement $RootElement -Deadline $Deadline } else { Get-ProcessUiElements -ProcessId $ProcessId -Deadline $Deadline })
     if ([datetime]::UtcNow -ge $Deadline) { throw 'Native process UI snapshot exceeded its deadline.' }
-    $surfaceElements = @(if ($ElementProvider) { & $ElementProvider $ProcessId $false 'surfaces' } else { Get-ProcessUiElements -ProcessId $ProcessId -SurfaceContainersOnly -Deadline $Deadline })
+    $surfaceElements = @(if ($ElementProvider) { & $ElementProvider $ProcessId $false 'surfaces' $RootElement } elseif ($null -ne $RootElement) { Get-ProcessUiElements -ProcessId $ProcessId -SurfaceContainersOnly -RootElement $RootElement -Deadline $Deadline } else { Get-ProcessUiElements -ProcessId $ProcessId -SurfaceContainersOnly -Deadline $Deadline })
+    if ($null -ne $RootElement) { $surfaceElements = @($surfaceElements) + @($RootElement) }
     if ([datetime]::UtcNow -ge $Deadline) { throw 'Native process UI snapshot exceeded its deadline.' }
     if ($topLevel.Count -lt 1 -or $topLevel.Count -gt $script:PrintPins.UiElementMaximum -or $targetElements.Count -gt $script:PrintPins.UiElementMaximum -or $surfaceElements.Count -gt $script:PrintPins.UiElementMaximum) {
         throw 'Native process UI snapshot was missing or exceeded its bounded element count.'
@@ -589,6 +591,37 @@ function Wait-NewProcessUiSurface {
         $postStructure = Get-SanitizedObservedUiStructureJson -ProcessId $ProcessId -Elements @($current | ForEach-Object { $_.element }) -Scope 'process-descendants'
         if ([datetime]::UtcNow -ge $Deadline) { break }
         $newEntries = @($current | Where-Object { [bool]$_.isTarget -and -not $baselineTargetIdentities.Contains([string]$_.runtimeIdentity) })
+        $newSurfaceEntries = @()
+        $candidateSurfaceRootIdentity = $null
+        $byIdentity = @{}
+        foreach ($entry in $current) { $byIdentity.Add([string]$entry.runtimeIdentity,$entry) }
+        if ($newEntries.Count -eq 0) {
+            $newSurfaceEntries = @($current | Where-Object { [bool]$_.isSurface -and -not $baselineIdentities.Contains([string]$_.runtimeIdentity) })
+            if ($newSurfaceEntries.Count -gt 0) {
+                try { $commonSurfaceIdentity = Get-ProcessUiSnapshotCommonAncestorIdentity -Entries $newSurfaceEntries -EntriesByIdentity $byIdentity -Deadline $Deadline } catch { $commonSurfaceIdentity = $null }
+                $cursorIdentity = $commonSurfaceIdentity
+                while ($null -ne $cursorIdentity -and $byIdentity.ContainsKey($cursorIdentity) -and -not $baselineIdentities.Contains($cursorIdentity)) {
+                    if ([bool]$byIdentity[$cursorIdentity].isSurface) { $candidateSurfaceRootIdentity = $cursorIdentity }
+                    $parentIdentity = [string]$byIdentity[$cursorIdentity].parentRuntimeIdentity
+                    if ([string]::IsNullOrWhiteSpace($parentIdentity) -or $baselineIdentities.Contains($parentIdentity)) { break }
+                    if (-not $byIdentity.ContainsKey($parentIdentity)) { $candidateSurfaceRootIdentity = $null; break }
+                    $cursorIdentity = $parentIdentity
+                    if ([datetime]::UtcNow -ge $Deadline) { $candidateSurfaceRootIdentity = $null; break }
+                }
+                if ($null -ne $candidateSurfaceRootIdentity -and $byIdentity.ContainsKey($candidateSurfaceRootIdentity)) {
+                    try {
+                        $candidateSurfaceElement = $byIdentity[$candidateSurfaceRootIdentity].element
+                        Assert-ProcessUiElement -Element $candidateSurfaceElement -ProcessId $ProcessId
+                        if ([datetime]::UtcNow -ge $Deadline) { break }
+                        $rooted = @(Get-ProcessUiTreeSnapshot -ProcessId $ProcessId -Deadline $Deadline -RootElement $candidateSurfaceElement -ElementProvider $ElementProvider -ParentProvider $ParentProvider)
+                        $newEntries = @($rooted | Where-Object { [bool]$_.isTarget -and -not $baselineTargetIdentities.Contains([string]$_.runtimeIdentity) })
+                    } catch {
+                        if ([datetime]::UtcNow -ge $Deadline) { break }
+                        $newEntries = @()
+                    }
+                }
+            }
+        }
         $newStructure = Get-SanitizedObservedUiStructureJson -ProcessId $ProcessId -Elements @($newEntries | ForEach-Object { $_.element }) -Scope 'process-descendants'
         if ([datetime]::UtcNow -ge $Deadline) { break }
         $anchors = @()
@@ -615,26 +648,28 @@ function Wait-NewProcessUiSurface {
                 $printerControls -le 1 -and $comboBoxes -le 8 -and ($printerControls -eq 1 -or $comboBoxes -ge 1)
         }
         if ($anchors.Count -eq 1 -and $requiredTargetSet -and $newEntries.Count -gt 0) {
-            $byIdentity = @{}
-            foreach ($entry in $current) { $byIdentity.Add([string]$entry.runtimeIdentity,$entry) }
-            try { $commonAncestorIdentity = Get-ProcessUiSnapshotCommonAncestorIdentity -Entries $newEntries -EntriesByIdentity $byIdentity -Deadline $Deadline } catch { $commonAncestorIdentity = $null }
-            $surfaceRootIdentity = $null
-            $cursorIdentity = $commonAncestorIdentity
-            while ($null -ne $cursorIdentity -and $byIdentity.ContainsKey($cursorIdentity) -and -not $baselineIdentities.Contains($cursorIdentity)) {
-                if ([bool]$byIdentity[$cursorIdentity].isSurface) { $surfaceRootIdentity = $cursorIdentity }
-                $parentIdentity = [string]$byIdentity[$cursorIdentity].parentRuntimeIdentity
-                if ([string]::IsNullOrWhiteSpace($parentIdentity) -or $baselineIdentities.Contains($parentIdentity)) { break }
-                if (-not $byIdentity.ContainsKey($parentIdentity)) { $surfaceRootIdentity = $null; break }
-                $cursorIdentity = $parentIdentity
-                if ([datetime]::UtcNow -ge $Deadline) { $surfaceRootIdentity = $null; break }
+            $surfaceRootIdentity = $candidateSurfaceRootIdentity
+            if ($null -eq $surfaceRootIdentity) {
+                try { $commonAncestorIdentity = Get-ProcessUiSnapshotCommonAncestorIdentity -Entries $newEntries -EntriesByIdentity $byIdentity -Deadline $Deadline } catch { $commonAncestorIdentity = $null }
+                $cursorIdentity = $commonAncestorIdentity
+                while ($null -ne $cursorIdentity -and $byIdentity.ContainsKey($cursorIdentity) -and -not $baselineIdentities.Contains($cursorIdentity)) {
+                    if ([bool]$byIdentity[$cursorIdentity].isSurface) { $surfaceRootIdentity = $cursorIdentity }
+                    $parentIdentity = [string]$byIdentity[$cursorIdentity].parentRuntimeIdentity
+                    if ([string]::IsNullOrWhiteSpace($parentIdentity) -or $baselineIdentities.Contains($parentIdentity)) { break }
+                    if (-not $byIdentity.ContainsKey($parentIdentity)) { $surfaceRootIdentity = $null; break }
+                    $cursorIdentity = $parentIdentity
+                    if ([datetime]::UtcNow -ge $Deadline) { $surfaceRootIdentity = $null; break }
+                }
             }
             if ($null -ne $surfaceRootIdentity -and -not $baselineIdentities.Contains($surfaceRootIdentity) -and $byIdentity.ContainsKey($surfaceRootIdentity)) {
                 if ([datetime]::UtcNow -ge $Deadline) { break }
+                $tracked = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+                foreach ($entry in @($newSurfaceEntries) + @($newEntries)) { $null = $tracked.Add([string]$entry.runtimeIdentity) }
                 return [pscustomobject]@{
                     surfaceRootIdentity=$surfaceRootIdentity
                     surfaceElement=$byIdentity[$surfaceRootIdentity].element
                     baselineIdentities=[string[]]@($baselineIdentities)
-                    trackedIdentities=[string[]]@($newEntries | ForEach-Object { [string]$_.runtimeIdentity })
+                    trackedIdentities=[string[]]@($tracked)
                     anchorElement=$anchors[0].element
                 }
             }
@@ -659,7 +694,7 @@ function Get-BoundProcessUiEntries {
     }
     $baselineIdentities = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($identity in @($Binding.baselineIdentities)) { if ([string]::IsNullOrWhiteSpace([string]$identity) -or -not $baselineIdentities.Add([string]$identity)) { throw 'Native process UI surface baseline was invalid.' } }
-    $snapshot = @(Get-ProcessUiTreeSnapshot -ProcessId $ProcessId -Deadline $Deadline -ElementProvider $ElementProvider -ParentProvider $ParentProvider)
+    $snapshot = @(Get-ProcessUiTreeSnapshot -ProcessId $ProcessId -Deadline $Deadline -RootElement $Binding.surfaceElement -ElementProvider $ElementProvider -ParentProvider $ParentProvider)
     $byIdentity = @{}
     foreach ($entry in $snapshot) { $byIdentity.Add([string]$entry.runtimeIdentity,$entry) }
     if (-not $byIdentity.ContainsKey([string]$Binding.surfaceRootIdentity)) { throw 'Native process UI surface root disappeared before its action.' }
