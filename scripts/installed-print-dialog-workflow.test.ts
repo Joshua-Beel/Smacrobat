@@ -594,7 +594,7 @@ describe('installed native print dialog verifier', () => {
         (New-RoleRecord 300 202 '#32770' 0 -1 $true $true $printerDialog),
         (New-RoleRecord 301 300 'PrintHostContainer' 0 -1 $true $true $printerContainer),
         (New-RoleRecord 302 301 'SysListView32' 1 -1 $true $true $printerList),
-        (New-RoleRecord 317 202 '#32770' 0 -1 $true $true $pageDialog),
+        (New-RoleRecord 317 300 '#32770' 0 -1 $true $true $pageDialog),
         (New-RoleRecord 319 317 'Button' 1056 4 $true $true $radio1056),
         (New-RoleRecord 320 317 'Button' 1057 4 $true $false $radio1057),
         (New-RoleRecord 321 317 'Button' 1058 4 $true $true $currentPage $false $false $true),
@@ -628,6 +628,28 @@ describe('installed native print dialog verifier', () => {
       $duplicateObserved=@();$duplicateSnapshot=@(Get-ProcessNativeWindowSnapshot -ProcessId 7319 -RootHandleValue 202 -Deadline ([datetime]::UtcNow.AddSeconds(2)) -WindowProvider $duplicateProvider -ObservedRecords ([ref]$duplicateObserved))
       $rejected=$false;try{Get-ExactNativePrintDialogRoles -SurfaceRecords $duplicateObserved -Snapshot $duplicateSnapshot -RootHandleValue 202 -Deadline ([datetime]::UtcNow.AddSeconds(2))|Out-Null}catch{$rejected=$true}
       if(-not$rejected){throw 'Ambiguous exact native print buttons were accepted.'}
+      $records[4].ParentHandleValue=0
+      $wrongObserved=@();$wrongSnapshot=@(Get-ProcessNativeWindowSnapshot -ProcessId 7319 -RootHandleValue 202 -Deadline ([datetime]::UtcNow.AddSeconds(2)) -WindowProvider $provider -ObservedRecords ([ref]$wrongObserved))
+      if($null-ne(Get-ExactNativePrintDialogRoles -SurfaceRecords $wrongObserved -Snapshot $wrongSnapshot -RootHandleValue 202 -Deadline ([datetime]::UtcNow.AddSeconds(2)))){throw 'A radio group outside the bound root ancestry was accepted.'}
+      $records[4].ParentHandleValue=318
+      $cycleDialog=New-RoleRecord 318 317 '#32770' 0 -1 $true $true (New-RoleElement 15 318)
+      $cycleRecords=@($records)+@($cycleDialog);$cycleProvider={param($requestedProcessId,[long]$rootHandle,[bool]$topLevelOnly)$cycleRecords}
+      $cycleObserved=@();$cycleSnapshot=@(Get-ProcessNativeWindowSnapshot -ProcessId 7319 -RootHandleValue 202 -Deadline ([datetime]::UtcNow.AddSeconds(2)) -WindowProvider $cycleProvider -ObservedRecords ([ref]$cycleObserved))
+      $rejected=$false;try{Get-ExactNativePrintDialogRoles -SurfaceRecords $cycleObserved -Snapshot $cycleSnapshot -RootHandleValue 202 -Deadline ([datetime]::UtcNow.AddSeconds(2))|Out-Null}catch{$rejected=$true}
+      if(-not$rejected){throw 'Cyclic native print role ancestry was accepted.'}
+      $records[4].ParentHandleValue=300
+      $secondDialog=New-RoleElement 16 418
+      $ambiguousRecords=@($records)+@(
+        (New-RoleRecord 418 300 '#32770' 0 -1 $true $true $secondDialog),
+        (New-RoleRecord 419 418 'Button' 1056 4 $true $true (New-RoleElement 17 419)),
+        (New-RoleRecord 420 418 'Button' 1057 4 $true $false (New-RoleElement 18 420)),
+        (New-RoleRecord 421 418 'Button' 1058 4 $true $true (New-RoleElement 19 421) $false $false $true),
+        (New-RoleRecord 422 418 'Button' 1059 4 $true $true (New-RoleElement 20 422))
+      )
+      $ambiguousProvider={param($requestedProcessId,[long]$rootHandle,[bool]$topLevelOnly)$ambiguousRecords}
+      $ambiguousObserved=@();$ambiguousSnapshot=@(Get-ProcessNativeWindowSnapshot -ProcessId 7319 -RootHandleValue 202 -Deadline ([datetime]::UtcNow.AddSeconds(2)) -WindowProvider $ambiguousProvider -ObservedRecords ([ref]$ambiguousObserved))
+      $rejected=$false;try{Get-ExactNativePrintDialogRoles -SurfaceRecords $ambiguousObserved -Snapshot $ambiguousSnapshot -RootHandleValue 202 -Deadline ([datetime]::UtcNow.AddSeconds(2))|Out-Null}catch{$rejected=$true}
+      if(-not$rejected){throw 'Ambiguous complete descendant radio groups were accepted.'}
     `);
     expect(result.status, result.stderr || result.stdout).toBe(0);
   });

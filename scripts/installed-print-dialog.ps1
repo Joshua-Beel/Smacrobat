@@ -975,6 +975,23 @@ function Get-ExactNativePrintDialogRoles {
         $entriesByHandle.Add($handleValue,$entry)
     }
     if (-not $recordsByHandle.ContainsKey($RootHandleValue) -or -not $entriesByHandle.ContainsKey($RootHandleValue)) { throw 'Native print role root was missing.' }
+    $reachesBoundRoot = {
+        param([long]$StartHandleValue)
+        if ($StartHandleValue -eq $RootHandleValue) { return $false }
+        $visitedHandles = [Collections.Generic.HashSet[long]]::new()
+        $currentHandleValue = $StartHandleValue
+        for ($depth = 0; $depth -lt $SurfaceRecords.Count; $depth++) {
+            if (-not $visitedHandles.Add($currentHandleValue)) { throw 'Native print role ancestry contained a cycle.' }
+            if (-not $recordsByHandle.ContainsKey($currentHandleValue)) { throw 'Native print role ancestry referenced an unobserved handle.' }
+            $parentProperty = $recordsByHandle[$currentHandleValue].PSObject.Properties['ParentHandleValue']
+            if ($null -eq $parentProperty) { throw 'Native print role ancestry was missing its parent.' }
+            $parentHandleValue = [long]$parentProperty.Value
+            if ($parentHandleValue -eq $RootHandleValue) { return $true }
+            if ($parentHandleValue -eq 0) { return $false }
+            $currentHandleValue = $parentHandleValue
+        }
+        throw 'Native print role ancestry exceeded its bounded depth.'
+    }
     $matchesCommon = {
         param($Record,[string]$ClassName,[int]$ControlId,[int]$ButtonStyle,[long]$ParentHandle,[string]$LabelProperty)
         $classProperty = $Record.PSObject.Properties['ClassName']; $controlIdProperty = $Record.PSObject.Properties['ControlId']
@@ -992,7 +1009,9 @@ function Get-ExactNativePrintDialogRoles {
     }
     $cancelMatches = @($SurfaceRecords | Where-Object { & $matchesCommon $_ 'Button' 2 0 $RootHandleValue 'IsLabelCancel' })
     $printMatches = @($SurfaceRecords | Where-Object { & $matchesCommon $_ 'Button' 1 1 $RootHandleValue 'IsLabelPrint' })
-    $nestedDialogs = @($SurfaceRecords | Where-Object { & $matchesCommon $_ '#32770' 0 -1 $RootHandleValue '' })
+    $nestedDialogs = @($SurfaceRecords | Where-Object {
+        (& $matchesCommon $_ '#32770' 0 -1 ([long]$_.ParentHandleValue) '') -and (& $reachesBoundRoot ([long]$_.HandleValue))
+    })
     $currentMatches = @()
     foreach ($dialog in $nestedDialogs) {
         if ([datetime]::UtcNow -ge $Deadline) { throw 'Native print role classification deadline expired.' }
