@@ -415,11 +415,10 @@ describe('installed native print dialog verifier', () => {
     expect(source).not.toMatch(/CB_GETLBTEXT(?:LEN)?/);
     expect(source).toContain('GetWindowLong(hwnd, -16)');
     expect(source).toContain('GetWindowText(hwnd, label, label.Capacity)');
-    expect(source).toContain('labelValue.Equals("Print", StringComparison.OrdinalIgnoreCase)');
-    expect(source).toContain('labelValue.Equals("Cancel", StringComparison.OrdinalIgnoreCase)');
-    expect(source).toContain('labelValue.Equals("Current page", StringComparison.OrdinalIgnoreCase)');
-    expect(source).toContain('labelValue.Equals("Microsoft Print to PDF", StringComparison.OrdinalIgnoreCase)');
-    expect(source).not.toContain('labelValue.Contains');
+    expect(source).toContain('AccessKeyLabelEquals(labelValue, "Print")');
+    expect(source).toContain('AccessKeyLabelEquals(labelValue, "Cancel")');
+    expect(source).toContain('AccessKeyLabelEquals(labelValue, "Current page")');
+    expect(source).toContain('AccessKeyLabelEquals(labelValue, "Microsoft Print to PDF")');
     expect(source.match(/ExactComboIndex\(processId, handleValue, value, deadline\)/g)?.length).toBeGreaterThanOrEqual(4);
     const result = runPowerShell7(String.raw`
       $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
@@ -557,6 +556,78 @@ describe('installed native print dialog verifier', () => {
       $unavailable=(Get-SanitizedNativeWindowTopologyJson -Unavailable)|ConvertFrom-Json
       Assert-PrintExactProperties -Value $unavailable -Expected @('inventoryStatus','topLevelOwnedCount','topLevelOwnedVisibleCount','topLevelOwnedEnabledCount','topLevelCountCapped','candidateSurfaceCount','candidateSurfaceCountCapped','visibleDialogCandidateCount','visibleEnabledDialogCandidateCount','candidateTopLevels','childCount','childCountCapped','childDiagnosticsCapped','childDiagnostics','classHistogram','controlIdHistogram','requiredRoleMatchesAvailable','requiredRoleMatches') -Kind 'Unavailable HWND topology receipt'
       if($unavailable.inventoryStatus-cne'unavailable'-or$unavailable.childCount-ne-1-or$unavailable.requiredRoleMatchesAvailable){throw 'Unavailable HWND topology diagnostic changed.'}
+    `);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
+  it('binds the evidenced native print roles and revalidates them before exact actions', () => {
+    const result = runPowerShell7(String.raw`
+      $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
+      Set-Location -LiteralPath '${process.cwd().replaceAll("'", "''")}'
+      . ./scripts/installed-print-dialog.ps1
+      Initialize-PrintNativeWindowInterop
+      if(-not[Smacrobat.PrintVerification.NativeWindows]::AccessKeyLabelEquals('&Print','Print')-or
+        -not[Smacrobat.PrintVerification.NativeWindows]::AccessKeyLabelEquals('Current &page','Current page')-or
+        -not[Smacrobat.PrintVerification.NativeWindows]::AccessKeyLabelEquals('Microsoft Print to &PDF','Microsoft Print to PDF')-or
+        [Smacrobat.PrintVerification.NativeWindows]::AccessKeyLabelEquals('&&Print','Print')-or
+        [Smacrobat.PrintVerification.NativeWindows]::AccessKeyLabelEquals('Print&','Print')-or
+        [Smacrobat.PrintVerification.NativeWindows]::AccessKeyLabelEquals('Print ','Print')-or
+        [Smacrobat.PrintVerification.NativeWindows]::AccessKeyLabelEquals('X&Print','Print')){throw 'Access-key normalization was broader than fixed exact label equality.'}
+      function New-RoleElement([int]$runtimePart,[long]$handle,[string]$type='ControlType.Pane',[string]$name=''){
+        $element=[pscustomobject]@{RuntimePart=$runtimePart;Current=[pscustomobject]@{ProcessId=7319;NativeWindowHandle=[int]$handle;ControlType=[pscustomobject]@{ProgrammaticName=$type};Name=$name;AutomationId=''}}
+        $element|Add-Member -MemberType ScriptMethod -Name GetRuntimeId -Value {[int[]]@(129,$this.RuntimePart)}
+        return $element
+      }
+      function New-RoleRecord([long]$handle,[long]$parent,[string]$className,[int]$controlId,[int]$style,[bool]$visible,[bool]$enabled,$element,[bool]$print=$false,[bool]$cancel=$false,[bool]$currentPage=$false,[bool]$printerName=$false){
+        [pscustomobject]@{HandleValue=$handle;ParentHandleValue=$parent;ClassName=$className;ControlId=$controlId;ButtonStyle=$style;IsVisible=$visible;IsEnabled=$enabled;IsLabelPrint=$print;IsLabelCancel=$cancel;IsLabelCurrentPage=$currentPage;IsLabelPrinterName=$printerName;Element=$element}
+      }
+      $root=New-RoleElement 1 202
+      $printerDialog=New-RoleElement 2 300
+      $printerContainer=New-RoleElement 3 301
+      $printerList=New-RoleElement 4 302
+      $pageDialog=New-RoleElement 5 317
+      $radio1056=New-RoleElement 6 319;$radio1057=New-RoleElement 7 320;$currentPage=New-RoleElement 8 321;$radio1059=New-RoleElement 9 322
+      $print=New-RoleElement 10 333;$cancel=New-RoleElement 11 334
+      $outsidePrint=New-RoleElement 12 335;$outsideList=New-RoleElement 13 336
+      $records=@(
+        (New-RoleRecord 202 0 '#32770' 0 -1 $true $true $root),
+        (New-RoleRecord 300 202 '#32770' 0 -1 $true $true $printerDialog),
+        (New-RoleRecord 301 300 'PrintHostContainer' 0 -1 $true $true $printerContainer),
+        (New-RoleRecord 302 301 'SysListView32' 1 -1 $true $true $printerList),
+        (New-RoleRecord 317 202 '#32770' 0 -1 $true $true $pageDialog),
+        (New-RoleRecord 319 317 'Button' 1056 4 $true $true $radio1056),
+        (New-RoleRecord 320 317 'Button' 1057 4 $true $false $radio1057),
+        (New-RoleRecord 321 317 'Button' 1058 4 $true $true $currentPage $false $false $true),
+        (New-RoleRecord 322 317 'Button' 1059 4 $true $true $radio1059),
+        (New-RoleRecord 333 202 'Button' 1 1 $true $true $print $true),
+        (New-RoleRecord 334 202 'Button' 2 0 $true $true $cancel $false $true),
+        (New-RoleRecord 335 317 'Button' 1 1 $true $true $outsidePrint $true),
+        (New-RoleRecord 336 202 'SysListView32' 1 -1 $true $true $outsideList)
+      )
+      $provider={param($requestedProcessId,[long]$rootHandle,[bool]$topLevelOnly)if($rootHandle-ne202){throw 'Native role query escaped the bound root.'};$records}
+      $observed=@();$snapshot=@(Get-ProcessNativeWindowSnapshot -ProcessId 7319 -RootHandleValue 202 -Deadline ([datetime]::UtcNow.AddSeconds(2)) -WindowProvider $provider -ObservedRecords ([ref]$observed))
+      $roles=Get-ExactNativePrintDialogRoles -SurfaceRecords $observed -Snapshot $snapshot -RootHandleValue 202 -Deadline ([datetime]::UtcNow.AddSeconds(2))
+      if($null-eq$roles-or(Get-NativeSurfaceHandleValue $roles.cancel)-ne334-or(Get-NativeSurfaceHandleValue $roles.print)-ne333-or(Get-NativeSurfaceHandleValue $roles.currentPage)-ne321-or(Get-NativeSurfaceHandleValue $roles.printerList)-ne302){throw 'Evidenced native print roles were not bound exactly.'}
+      $rootEntries=@($snapshot|Where-Object{(Get-NativeSurfaceHandleValue -Identity ([string]$_.runtimeIdentity))-eq202});if($rootEntries.Count-ne1){throw 'Native role root fixture changed.'}
+      $binding=[pscustomobject][ordered]@{surfaceRootIdentity=[string]$rootEntries[0].runtimeIdentity;surfaceElement=$root;baselineIdentities=@('baseline:1');trackedIdentities=[string[]]@($snapshot|ForEach-Object{[string]$_.runtimeIdentity});anchorElement=$cancel;nativeRoles=$roles}
+      $printerItem=New-RoleElement 30 0 'ControlType.ListItem' 'Microsoft Print to PDF'
+      $script:printerRoots=0
+      $targetProvider={param($requestedProcessId,$rootElement)$script:printerRoots++;if(-not[object]::ReferenceEquals($rootElement,$printerList)){throw 'Printer lookup escaped the exact evidenced SysListView32 HWND.'};@($printerItem)}
+      $found=Find-BoundNativePrinterElement -ProcessId 7319 -Binding $binding -Deadline ([datetime]::UtcNow.AddSeconds(2)) -NativeWindowProvider $provider -TargetProvider $targetProvider
+      if(-not[object]::ReferenceEquals($found,$printerItem)-or$script:printerRoots-ne1){throw 'Exact native printer-list binding changed.'}
+      $script:clicks=@()
+      $clickProvider={param($requestedProcessId,$handleValue,$requireChecked,$remainingMilliseconds)$script:clicks+=([pscustomobject]@{Handle=[long]$handleValue;Checked=[bool]$requireChecked});$true}
+      foreach($role in @('cancel','currentPage','print')){$null=Invoke-BoundNativeButtonRole -ProcessId 7319 -Binding $binding -Role $role -Deadline ([datetime]::UtcNow.AddSeconds(2)) -NativeWindowProvider $provider -ClickProvider $clickProvider}
+      if($script:clicks.Count-ne3-or$script:clicks[0].Handle-ne334-or$script:clicks[0].Checked-or$script:clicks[1].Handle-ne321-or-not$script:clicks[1].Checked-or$script:clicks[2].Handle-ne333-or$script:clicks[2].Checked){throw 'Native role actions did not use the exact bound HWNDs and radio verification flag.'}
+      $records[9].IsLabelPrint=$false;$clickCount=$script:clicks.Count;$rejected=$false
+      try{Invoke-BoundNativeButtonRole -ProcessId 7319 -Binding $binding -Role print -Deadline ([datetime]::UtcNow.AddSeconds(1)) -NativeWindowProvider $provider -ClickProvider $clickProvider|Out-Null}catch{$rejected=$true}
+      if(-not$rejected-or$script:clicks.Count-ne$clickCount){throw 'A changed native role reached its action.'}
+      $records[9].IsLabelPrint=$true
+      $duplicatePrint=New-RoleRecord 337 202 'Button' 1 1 $true $true (New-RoleElement 14 337) $true
+      $duplicateRecords=@($records)+@($duplicatePrint);$duplicateProvider={param($requestedProcessId,[long]$rootHandle,[bool]$topLevelOnly)$duplicateRecords}
+      $duplicateObserved=@();$duplicateSnapshot=@(Get-ProcessNativeWindowSnapshot -ProcessId 7319 -RootHandleValue 202 -Deadline ([datetime]::UtcNow.AddSeconds(2)) -WindowProvider $duplicateProvider -ObservedRecords ([ref]$duplicateObserved))
+      $rejected=$false;try{Get-ExactNativePrintDialogRoles -SurfaceRecords $duplicateObserved -Snapshot $duplicateSnapshot -RootHandleValue 202 -Deadline ([datetime]::UtcNow.AddSeconds(2))|Out-Null}catch{$rejected=$true}
+      if(-not$rejected){throw 'Ambiguous exact native print buttons were accepted.'}
     `);
     expect(result.status, result.stderr || result.stdout).toBe(0);
   });

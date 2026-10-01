@@ -507,4 +507,30 @@ describe('installed signed reading-tools verifier', () => {
     expect(installed).toContain('-NotePropertyName relevantProcessesRemaining -NotePropertyValue 0');
     expect(verify).not.toMatch(/plainFixture\s*=\s*\[ordered\]@\{[^}]*path/);
   });
+
+  it('retries transient clipboard cleanup and accepts only the exact empty receipt before deadline', () => {
+    const check = extractFunctions('scripts/installed-reading-tools.ps1', ['Get-ReadingSha256', 'Get-ReadingTextReceipt', 'Clear-ReadingClipboardAndVerify'], String.raw`
+      $script:ReadingPins=[ordered]@{ClipboardPollMilliseconds=1}
+      $script:now=[datetime]'2026-01-01T00:00:00Z';$clock={$script:now};$sleep={param($milliseconds)$script:now=$script:now.AddMilliseconds($milliseconds)}
+      $script:clears=0;$script:receipts=0
+      $provider={param($operation)
+        if($operation-ceq'clear'){$script:clears++;if($script:clears-eq1){throw 'clipboard busy'};return}
+        $script:receipts++
+        if($script:receipts-eq1){return Get-ReadingTextReceipt -Text 'stale'}
+        return Get-ReadingTextReceipt -Text ''
+      }
+      $verified=Clear-ReadingClipboardAndVerify -Deadline $script:now.AddSeconds(1) -OperationProvider $provider -SleepProvider $sleep -UtcNowProvider $clock
+      if(-not$verified-or$script:clears-ne3-or$script:receipts-ne2){throw 'Transient clipboard cleanup was not retried to the exact empty receipt.'}
+
+      $script:expiredCalls=0;$expired=$false
+      try{Clear-ReadingClipboardAndVerify -Deadline $script:now -OperationProvider {$script:expiredCalls++} -SleepProvider $sleep -UtcNowProvider $clock}catch{$expired=$_.Exception.Message-ceq'The Windows clipboard did not clear to its exact empty receipt before the cleanup deadline.'}
+      if(-not$expired-or$script:expiredCalls-ne0){throw 'Expired clipboard cleanup performed an operation or did not fail closed.'}
+
+      $script:now=[datetime]'2026-01-01T00:00:00Z';$script:persistentCalls=0;$persistent=$false
+      try{Clear-ReadingClipboardAndVerify -Deadline $script:now.AddMilliseconds(2) -OperationProvider {param($operation)$script:persistentCalls++;if($operation-ceq'receipt'){Get-ReadingTextReceipt -Text 'stale'}} -SleepProvider $sleep -UtcNowProvider $clock}catch{$persistent=$_.Exception.Message-ceq'The Windows clipboard did not clear to its exact empty receipt before the cleanup deadline.'}
+      if(-not$persistent-or$script:persistentCalls-lt2){throw 'Persistent non-empty clipboard state did not fail closed after bounded retries.'}
+    `);
+    const result = runPowerShell(check);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
 });

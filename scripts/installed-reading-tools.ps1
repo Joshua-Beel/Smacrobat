@@ -50,13 +50,13 @@ function Assert-ReadingFileReceipt {
 }
 
 function Get-ReadingSha256 {
-    param([Parameter(Mandatory = $true)][byte[]]$Bytes)
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][byte[]]$Bytes)
     $sha = [Security.Cryptography.SHA256]::Create()
     try { return ([BitConverter]::ToString($sha.ComputeHash($Bytes))).Replace('-','') } finally { $sha.Dispose() }
 }
 
 function Get-ReadingTextReceipt {
-    param([Parameter(Mandatory = $true)][string]$Text)
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text)
     $bytes = [Text.UTF8Encoding]::new($false).GetBytes($Text)
     return [pscustomobject]@{ utf8Bytes = [int]$bytes.Length; sha256 = Get-ReadingSha256 -Bytes $bytes }
 }
@@ -164,6 +164,33 @@ function Wait-ReadingClipboardReceipt {
         Start-Sleep -Milliseconds $script:ReadingPins.ClipboardPollMilliseconds
     } while ([datetime]::UtcNow -lt $Deadline)
     throw 'The Windows clipboard did not receive the exact selected embedded text.'
+}
+
+function Clear-ReadingClipboardAndVerify {
+    param(
+        [Parameter(Mandatory = $true)][datetime]$Deadline,
+        [scriptblock]$OperationProvider,
+        [scriptblock]$SleepProvider,
+        [scriptblock]$UtcNowProvider
+    )
+    $emptyReceipt = Get-ReadingTextReceipt -Text ''
+    while ($true) {
+        $now = if ($UtcNowProvider) { [datetime](& $UtcNowProvider) } else { [datetime]::UtcNow }
+        if ($now -ge $Deadline) { break }
+        try {
+            if ($OperationProvider) { $null = & $OperationProvider 'clear' } else { Invoke-ReadingClipboardSta -Operation clear }
+            $now = if ($UtcNowProvider) { [datetime](& $UtcNowProvider) } else { [datetime]::UtcNow }
+            if ($now -ge $Deadline) { break }
+            $clipboard = if ($OperationProvider) { & $OperationProvider 'receipt' } else { Invoke-ReadingClipboardSta -Operation receipt }
+            $now = if ($UtcNowProvider) { [datetime](& $UtcNowProvider) } else { [datetime]::UtcNow }
+            if ($now -ge $Deadline) { break }
+            if ([int]$clipboard.utf8Bytes -eq 0 -and [string]$clipboard.sha256 -ceq [string]$emptyReceipt.sha256) { return $true }
+        } catch { }
+        $now = if ($UtcNowProvider) { [datetime](& $UtcNowProvider) } else { [datetime]::UtcNow }
+        if ($now -ge $Deadline) { break }
+        if ($SleepProvider) { & $SleepProvider $script:ReadingPins.ClipboardPollMilliseconds } else { Start-Sleep -Milliseconds $script:ReadingPins.ClipboardPollMilliseconds }
+    }
+    throw 'The Windows clipboard did not clear to its exact empty receipt before the cleanup deadline.'
 }
 
 function Initialize-ReadingNativePickerApi {
@@ -853,10 +880,7 @@ const a=document.querySelector('aside[aria-label="Find in document"]'),live=[...
         }
     } finally {
         try {
-            Invoke-ReadingClipboardSta -Operation clear
-            $emptyClipboard = Invoke-ReadingClipboardSta -Operation receipt
-            $emptyReceipt = Get-ReadingTextReceipt -Text ''
-            $clipboardCleared = [int]$emptyClipboard.utf8Bytes -eq 0 -and [string]$emptyClipboard.sha256 -ceq [string]$emptyReceipt.sha256
+            $clipboardCleared = Clear-ReadingClipboardAndVerify -Deadline ([datetime]::UtcNow.AddSeconds(10))
         } catch { $clipboardCleared = $false }
         $cleanupDeadline = [datetime]::UtcNow.AddSeconds(10)
         if ($sessionId) { $sessionDeleteOutcome = Invoke-SessionDeleteOutcome -SessionId $sessionId -Deadline $cleanupDeadline }

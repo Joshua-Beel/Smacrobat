@@ -115,6 +115,8 @@ namespace Smacrobat.PrintVerification {
         private const uint CB_GETCURSEL = 0x0147;
         private const uint CB_SETCURSEL = 0x014E;
         private const uint CB_FINDSTRINGEXACT = 0x0158;
+        private const uint BM_CLICK = 0x00F5;
+        private const uint BM_GETCHECK = 0x00F0;
         private const uint WM_COMMAND = 0x0111;
         private const int CBN_SELCHANGE = 1;
         private const int CB_ERR = -1;
@@ -134,6 +136,21 @@ namespace Smacrobat.PrintVerification {
             return style & 0x0f;
         }
 
+        private static string NormalizeAccessKeyMarkers(string value) {
+            if (String.IsNullOrEmpty(value) || value.IndexOf('&') < 0) return value ?? String.Empty;
+            var normalized = new StringBuilder(value.Length);
+            for (int index = 0; index < value.Length; index++) {
+                if (value[index] != '&') { normalized.Append(value[index]); continue; }
+                if (index + 1 >= value.Length) { normalized.Append('&'); continue; }
+                if (value[index + 1] == '&') { normalized.Append('&'); index++; }
+            }
+            return normalized.ToString();
+        }
+
+        public static bool AccessKeyLabelEquals(string observed, string expected) {
+            return !String.IsNullOrEmpty(expected) && NormalizeAccessKeyMarkers(observed).Equals(expected, StringComparison.OrdinalIgnoreCase);
+        }
+
         private static NativeWindowRecord Describe(IntPtr hwnd, IntPtr parent) {
             var className = new StringBuilder(128);
             int length = GetClassName(hwnd, className, className.Capacity);
@@ -145,10 +162,10 @@ namespace Smacrobat.PrintVerification {
                 HandleValue = hwnd.ToInt64(), ParentHandleValue = parent.ToInt64(),
                 ClassName = classValue, ControlId = GetDlgCtrlID(hwnd), IsVisible = IsWindowVisible(hwnd), IsEnabled = IsWindowEnabled(hwnd),
                 ButtonStyle = GetButtonStyle(hwnd, classValue),
-                IsLabelPrint = labelValue.Equals("Print", StringComparison.OrdinalIgnoreCase),
-                IsLabelCancel = labelValue.Equals("Cancel", StringComparison.OrdinalIgnoreCase),
-                IsLabelCurrentPage = labelValue.Equals("Current page", StringComparison.OrdinalIgnoreCase),
-                IsLabelPrinterName = labelValue.Equals("Microsoft Print to PDF", StringComparison.OrdinalIgnoreCase)
+                IsLabelPrint = AccessKeyLabelEquals(labelValue, "Print"),
+                IsLabelCancel = AccessKeyLabelEquals(labelValue, "Cancel"),
+                IsLabelCurrentPage = AccessKeyLabelEquals(labelValue, "Current page"),
+                IsLabelPrinterName = AccessKeyLabelEquals(labelValue, "Microsoft Print to PDF")
             };
         }
 
@@ -198,6 +215,18 @@ namespace Smacrobat.PrintVerification {
             IntPtr result;
             if (SendMessageTimeout(hwnd, message, wParam, lParam, SMTO_ABORTIFHUNG, Remaining(deadline), out result) == IntPtr.Zero) throw new TimeoutException("Native combo text message timed out.");
             return result;
+        }
+
+        public static bool ClickButton(int processId, long handleValue, bool requireChecked, int timeoutMilliseconds) {
+            if (timeoutMilliseconds <= 0 || timeoutMilliseconds > 120000) throw new ArgumentOutOfRangeException(nameof(timeoutMilliseconds));
+            var hwnd = new IntPtr(handleValue);
+            if (!IsWindow(hwnd) || !IsOwned(hwnd, processId) || !IsWindowVisible(hwnd) || !IsWindowEnabled(hwnd)) return false;
+            var className = new StringBuilder(64);
+            if (GetClassName(hwnd, className, className.Capacity) <= 0 || !String.Equals(className.ToString(), "Button", StringComparison.Ordinal)) return false;
+            long deadline = Environment.TickCount64 + timeoutMilliseconds;
+            Call(hwnd, BM_CLICK, IntPtr.Zero, IntPtr.Zero, deadline);
+            if (requireChecked && (!IsWindow(hwnd) || !IsOwned(hwnd, processId) || Call(hwnd, BM_GETCHECK, IntPtr.Zero, IntPtr.Zero, deadline).ToInt32() != 1)) return false;
+            return true;
         }
 
         public static bool IsUniqueExactIndex(int count, int first, int next) {
@@ -926,6 +955,94 @@ function Get-NativeTopLevelCandidateDiagnosticRecords {
     return $result
 }
 
+function Get-ExactNativePrintDialogRoles {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$SurfaceRecords,
+        [Parameter(Mandatory = $true)][object[]]$Snapshot,
+        [Parameter(Mandatory = $true)][long]$RootHandleValue,
+        [Parameter(Mandatory = $true)][datetime]$Deadline
+    )
+    $recordsByHandle = @{}
+    foreach ($record in $SurfaceRecords) {
+        $handleValue = [long]$record.HandleValue
+        if ($recordsByHandle.ContainsKey($handleValue)) { throw 'Native print role records duplicated a handle.' }
+        $recordsByHandle.Add($handleValue,$record)
+    }
+    $entriesByHandle = @{}
+    foreach ($entry in $Snapshot) {
+        $handleValue = Get-NativeSurfaceHandleValue -Identity ([string]$entry.runtimeIdentity)
+        if ($entriesByHandle.ContainsKey($handleValue)) { throw 'Native print role snapshot duplicated a handle.' }
+        $entriesByHandle.Add($handleValue,$entry)
+    }
+    if (-not $recordsByHandle.ContainsKey($RootHandleValue) -or -not $entriesByHandle.ContainsKey($RootHandleValue)) { throw 'Native print role root was missing.' }
+    $matchesCommon = {
+        param($Record,[string]$ClassName,[int]$ControlId,[int]$ButtonStyle,[long]$ParentHandle,[string]$LabelProperty)
+        $classProperty = $Record.PSObject.Properties['ClassName']; $controlIdProperty = $Record.PSObject.Properties['ControlId']
+        $styleProperty = $Record.PSObject.Properties['ButtonStyle']; $parentProperty = $Record.PSObject.Properties['ParentHandleValue']
+        $visibleProperty = $Record.PSObject.Properties['IsVisible']; $enabledProperty = $Record.PSObject.Properties['IsEnabled']
+        if ($null -eq $classProperty -or -not ([string]$classProperty.Value).Equals($ClassName,[StringComparison]::OrdinalIgnoreCase) -or
+            $null -eq $controlIdProperty -or [int]$controlIdProperty.Value -ne $ControlId -or $null -eq $parentProperty -or [long]$parentProperty.Value -ne $ParentHandle -or
+            $null -eq $visibleProperty -or -not [bool]$visibleProperty.Value -or $null -eq $enabledProperty -or -not [bool]$enabledProperty.Value) { return $false }
+        if ($ButtonStyle -ge 0 -and ($null -eq $styleProperty -or [int]$styleProperty.Value -ne $ButtonStyle)) { return $false }
+        if (-not [string]::IsNullOrEmpty($LabelProperty)) {
+            $label = $Record.PSObject.Properties[$LabelProperty]
+            if ($null -eq $label -or -not [bool]$label.Value) { return $false }
+        }
+        return $true
+    }
+    $cancelMatches = @($SurfaceRecords | Where-Object { & $matchesCommon $_ 'Button' 2 0 $RootHandleValue 'IsLabelCancel' })
+    $printMatches = @($SurfaceRecords | Where-Object { & $matchesCommon $_ 'Button' 1 1 $RootHandleValue 'IsLabelPrint' })
+    $nestedDialogs = @($SurfaceRecords | Where-Object { & $matchesCommon $_ '#32770' 0 -1 $RootHandleValue '' })
+    $currentMatches = @()
+    foreach ($dialog in $nestedDialogs) {
+        if ([datetime]::UtcNow -ge $Deadline) { throw 'Native print role classification deadline expired.' }
+        $dialogHandleValue = [long]$dialog.HandleValue
+        $radioGroup = @($SurfaceRecords | Where-Object {
+            $classProperty = $_.PSObject.Properties['ClassName']; $controlIdProperty = $_.PSObject.Properties['ControlId']; $styleProperty = $_.PSObject.Properties['ButtonStyle']
+            $parentProperty = $_.PSObject.Properties['ParentHandleValue']; $visibleProperty = $_.PSObject.Properties['IsVisible']
+            $null -ne $classProperty -and ([string]$classProperty.Value).Equals('Button',[StringComparison]::OrdinalIgnoreCase) -and
+                $null -ne $controlIdProperty -and [int]$controlIdProperty.Value -in @(1056,1057,1058,1059) -and
+                $null -ne $styleProperty -and [int]$styleProperty.Value -eq 4 -and $null -ne $parentProperty -and [long]$parentProperty.Value -eq $dialogHandleValue -and
+                $null -ne $visibleProperty -and [bool]$visibleProperty.Value
+        })
+        $radioIds = @($radioGroup | ForEach-Object { [int]$_.ControlId } | Sort-Object -Unique)
+        if ($radioGroup.Count -ne 4 -or $radioIds.Count -ne 4 -or (Compare-Object $radioIds @(1056,1057,1058,1059))) { continue }
+        $currentMatches += @($radioGroup | Where-Object {
+            $enabledProperty = $_.PSObject.Properties['IsEnabled']; $labelProperty = $_.PSObject.Properties['IsLabelCurrentPage']
+            $null -ne $enabledProperty -and [bool]$enabledProperty.Value -and $null -ne $labelProperty -and [bool]$labelProperty.Value
+        })
+    }
+    $printerListMatches = @()
+    foreach ($record in $SurfaceRecords) {
+        if ([datetime]::UtcNow -ge $Deadline) { throw 'Native print role classification deadline expired.' }
+        if (-not (& $matchesCommon $record 'SysListView32' 1 -1 ([long]$record.ParentHandleValue) '')) { continue }
+        $parentHandleValue = [long]$record.ParentHandleValue
+        if (-not $recordsByHandle.ContainsKey($parentHandleValue)) { continue }
+        $parent = $recordsByHandle[$parentHandleValue]
+        $parentControlId = $parent.PSObject.Properties['ControlId']; $parentVisible = $parent.PSObject.Properties['IsVisible']; $parentEnabled = $parent.PSObject.Properties['IsEnabled']
+        if ((Get-SanitizedNativeClassBucket -Record $parent) -cne 'other' -or $null -eq $parentControlId -or [int]$parentControlId.Value -ne 0 -or
+            $null -eq $parentVisible -or -not [bool]$parentVisible.Value -or $null -eq $parentEnabled -or -not [bool]$parentEnabled.Value) { continue }
+        $grandHandleValue = [long]$parent.ParentHandleValue
+        if (-not $recordsByHandle.ContainsKey($grandHandleValue)) { continue }
+        $grand = $recordsByHandle[$grandHandleValue]
+        if (-not (& $matchesCommon $grand '#32770' 0 -1 $RootHandleValue '')) { continue }
+        $printerListMatches += $record
+    }
+    if ($cancelMatches.Count -gt 1 -or $printMatches.Count -gt 1 -or $currentMatches.Count -gt 1 -or $printerListMatches.Count -gt 1) { throw 'Native print role mapping was ambiguous.' }
+    if ($cancelMatches.Count -ne 1 -or $printMatches.Count -ne 1 -or $currentMatches.Count -ne 1 -or $printerListMatches.Count -ne 1) { return $null }
+    $roleIdentities = [ordered]@{}
+    foreach ($role in @(
+        [pscustomobject]@{Name='cancel';Record=$cancelMatches[0]},[pscustomobject]@{Name='print';Record=$printMatches[0]},
+        [pscustomobject]@{Name='currentPage';Record=$currentMatches[0]},[pscustomobject]@{Name='printerList';Record=$printerListMatches[0]}
+    )) {
+        $handleValue = [long]$role.Record.HandleValue
+        if (-not $entriesByHandle.ContainsKey($handleValue)) { throw 'Native print role did not map to an owned snapshot entry.' }
+        $roleIdentities[$role.Name] = [string]$entriesByHandle[$handleValue].runtimeIdentity
+    }
+    if ([datetime]::UtcNow -ge $Deadline) { throw 'Native print role classification deadline expired.' }
+    return [pscustomobject]$roleIdentities
+}
+
 function Wait-NewProcessNativeWindowSurface {
     param(
         [Parameter(Mandatory = $true)][int]$ProcessId,
@@ -988,20 +1105,27 @@ function Wait-NewProcessNativeWindowSurface {
                 }
                 $structure = Get-SanitizedNativeWindowTopologyJson -TopLevelRecords $topLevelRecords -CandidateTopLevelRecords $candidateTopLevelRecords -SurfaceRecords $surfaceRecords -RoleCounts $roleCounts
             }
+            $nativeRoles = if ($Stage -cne 'save-output-dialog') { Get-ExactNativePrintDialogRoles -SurfaceRecords $surfaceRecords -Snapshot $current -RootHandleValue $rootHandleValue -Deadline $Deadline } else { $null }
             $requiredTargetSet = if ($Stage -ceq 'save-output-dialog') {
                 $saveButtons -eq 1 -and $filenameEdits -eq 1
             } else {
-                $cancelButtons -eq 1 -and $printButtons -eq 1 -and $currentPageRadios -eq 1 -and
-                    $printerControls -le 1 -and $comboBoxes -le 8 -and $printerLists -le 1 -and ($printerControls -eq 1 -or $comboBoxes -ge 1 -or $printerLists -eq 1)
+                $null -ne $nativeRoles -or ($cancelButtons -eq 1 -and $printButtons -eq 1 -and $currentPageRadios -eq 1 -and
+                    $printerControls -le 1 -and $comboBoxes -le 8 -and $printerLists -le 1 -and ($printerControls -eq 1 -or $comboBoxes -ge 1 -or $printerLists -eq 1))
             }
-            if ($anchors.Count -eq 1 -and $requiredTargetSet) {
+            if (($null -ne $nativeRoles -or $anchors.Count -eq 1) -and $requiredTargetSet) {
                 if ([datetime]::UtcNow -ge $Deadline) { break }
+                $anchorElement = if ($null -ne $nativeRoles) {
+                    $nativeAnchors = @($current | Where-Object { [string]$_.runtimeIdentity -ceq [string]$nativeRoles.cancel })
+                    if ($nativeAnchors.Count -ne 1) { throw 'Native cancel role did not map to one exact bound element.' }
+                    $nativeAnchors[0].element
+                } else { $anchors[0].element }
                 return [pscustomobject]@{
                     surfaceRootIdentity=[string]$selectedRoot.runtimeIdentity
                     surfaceElement=$currentRoots[0].element
                     baselineIdentities=[string[]]@($baselineIdentities)
                     trackedIdentities=[string[]]@($current | ForEach-Object { [string]$_.runtimeIdentity })
-                    anchorElement=$anchors[0].element
+                    anchorElement=$anchorElement
+                    nativeRoles=$nativeRoles
                 }
             }
         } catch {
@@ -1274,12 +1398,27 @@ function Wait-NewProcessUiSurface {
                     baselineIdentities=[string[]]@($baselineIdentities)
                     trackedIdentities=[string[]]@($tracked)
                     anchorElement=$anchors[0].element
+                    nativeRoles=$null
                 }
             }
         }
         if ([datetime]::UtcNow -lt $Deadline) { Start-Sleep -Milliseconds 150 }
     }
     throw "Native print UI stage '$Stage' did not expose one process-owned descendant surface; baselineUiStructure=$baselineStructure; postUiStructure=$postStructure; newUiStructure=$newStructure."
+}
+
+function Get-ValidatedBindingNativeRoles {
+    param([Parameter(Mandatory = $true)]$Binding)
+    if ($null -eq $Binding.nativeRoles) { return $null }
+    Assert-PrintExactProperties -Value $Binding.nativeRoles -Expected @('cancel','print','currentPage','printerList') -Kind 'Native print role binding'
+    $tracked = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($identity in @($Binding.trackedIdentities)) { $null = $tracked.Add([string]$identity) }
+    $roles = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($property in @('cancel','print','currentPage','printerList')) {
+        $identity = [string]$Binding.nativeRoles.$property
+        if ([string]::IsNullOrWhiteSpace($identity) -or $identity -cnotmatch '^hwnd:' -or -not $tracked.Contains($identity) -or -not $roles.Add($identity)) { throw 'Native print role binding identity was invalid.' }
+    }
+    return $Binding.nativeRoles
 }
 
 function Get-BoundProcessUiEntries {
@@ -1291,13 +1430,14 @@ function Get-BoundProcessUiEntries {
         [scriptblock]$ParentProvider,
         [scriptblock]$NativeWindowProvider
     )
-    Assert-PrintExactProperties -Value $Binding -Expected @('surfaceRootIdentity','surfaceElement','baselineIdentities','trackedIdentities','anchorElement') -Kind 'Native process UI surface binding'
+    Assert-PrintExactProperties -Value $Binding -Expected @('surfaceRootIdentity','surfaceElement','baselineIdentities','trackedIdentities','anchorElement','nativeRoles') -Kind 'Native process UI surface binding'
     if (@($Binding.baselineIdentities).Count -lt 1 -or @($Binding.baselineIdentities).Count -gt $script:PrintPins.UiElementMaximum -or
         @($Binding.trackedIdentities).Count -lt 1 -or @($Binding.trackedIdentities).Count -gt $script:PrintPins.UiElementMaximum) {
         throw 'Native process UI surface binding identity counts were invalid.'
     }
     $baselineIdentities = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($identity in @($Binding.baselineIdentities)) { if ([string]::IsNullOrWhiteSpace([string]$identity) -or -not $baselineIdentities.Add([string]$identity)) { throw 'Native process UI surface baseline was invalid.' } }
+    $null = Get-ValidatedBindingNativeRoles -Binding $Binding
     $isNativeWindowBinding = [string]$Binding.surfaceRootIdentity -cmatch '^hwnd:'
     $snapshot = @(if ($isNativeWindowBinding) {
         $rootHandleValue = Get-NativeSurfaceHandleValue -Identity ([string]$Binding.surfaceRootIdentity)
@@ -1323,6 +1463,56 @@ function Get-BoundProcessUiEntries {
     }
     if ([datetime]::UtcNow -ge $Deadline) { throw 'Native process UI surface action deadline expired.' }
     return $boundEntries
+}
+
+function Get-BoundNativeRoleElement {
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)]$Binding,
+        [Parameter(Mandatory = $true)][ValidateSet('cancel','print','currentPage','printerList')][string]$Role,
+        [Parameter(Mandatory = $true)][datetime]$Deadline,
+        [scriptblock]$NativeWindowProvider
+    )
+    $roles = Get-ValidatedBindingNativeRoles -Binding $Binding
+    if ($null -eq $roles) { return $null }
+    $rootHandleValue = Get-NativeSurfaceHandleValue -Identity ([string]$Binding.surfaceRootIdentity)
+    $observedRecords = @()
+    $snapshot = @(Get-ProcessNativeWindowSnapshot -ProcessId $ProcessId -RootHandleValue $rootHandleValue -Deadline $Deadline -WindowProvider $NativeWindowProvider -ObservedRecords ([ref]$observedRecords))
+    $rootMatches = @($snapshot | Where-Object { $null -eq $_.parentRuntimeIdentity -and [string]$_.runtimeIdentity -ceq [string]$Binding.surfaceRootIdentity })
+    if ($rootMatches.Count -ne 1) { throw 'Native print role root identity changed before its action.' }
+    $currentRoles = Get-ExactNativePrintDialogRoles -SurfaceRecords $observedRecords -Snapshot $snapshot -RootHandleValue $rootHandleValue -Deadline $Deadline
+    if ($null -eq $currentRoles) { throw 'Native print roles were incomplete before their action.' }
+    foreach ($property in @('cancel','print','currentPage','printerList')) {
+        if ([string]$currentRoles.$property -cne [string]$roles.$property) { throw 'Native print role identity changed before its action.' }
+    }
+    $identity = [string]$roles.$Role
+    $roleMatches = @($snapshot | Where-Object { [string]$_.runtimeIdentity -ceq $identity })
+    if ($roleMatches.Count -ne 1) { throw 'Native print role disappeared or became ambiguous before its action.' }
+    Assert-ProcessUiElement -Element $roleMatches[0].element -ProcessId $ProcessId
+    if ([datetime]::UtcNow -ge $Deadline) { throw 'Native print role action deadline expired.' }
+    return $roleMatches[0].element
+}
+
+function Invoke-BoundNativeButtonRole {
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)]$Binding,
+        [Parameter(Mandatory = $true)][ValidateSet('cancel','print','currentPage')][string]$Role,
+        [Parameter(Mandatory = $true)][datetime]$Deadline,
+        [scriptblock]$NativeWindowProvider,
+        [scriptblock]$ClickProvider
+    )
+    $element = Get-BoundNativeRoleElement -ProcessId $ProcessId -Binding $Binding -Role $Role -Deadline $Deadline -NativeWindowProvider $NativeWindowProvider
+    if ($null -eq $element) { return $false }
+    $roles = Get-ValidatedBindingNativeRoles -Binding $Binding
+    $handleValue = Get-NativeSurfaceHandleValue -Identity ([string]$roles.$Role)
+    if ([datetime]::UtcNow -ge $Deadline) { throw 'Native print role action deadline expired.' }
+    $remainingMilliseconds = [int][Math]::Min(120000,[Math]::Max(1,[Math]::Ceiling(($Deadline - [datetime]::UtcNow).TotalMilliseconds)))
+    if ($null -eq $ClickProvider) { Initialize-PrintNativeWindowInterop }
+    $clicked = if ($ClickProvider) { & $ClickProvider $ProcessId $handleValue ($Role -ceq 'currentPage') $remainingMilliseconds } else { [Smacrobat.PrintVerification.NativeWindows]::ClickButton($ProcessId,$handleValue,($Role -ceq 'currentPage'),$remainingMilliseconds) }
+    if ($clicked -isnot [bool] -or -not $clicked) { throw 'Native print role action was not accepted.' }
+    if ([datetime]::UtcNow -ge $Deadline) { throw 'Native print role action exceeded its deadline.' }
+    return $true
 }
 
 function Find-BoundProcessUiElement {
@@ -1410,7 +1600,7 @@ function Wait-BoundProcessUiSurfaceClosed {
         [scriptblock]$ParentProvider,
         [scriptblock]$NativeWindowProvider
     )
-    Assert-PrintExactProperties -Value $Binding -Expected @('surfaceRootIdentity','surfaceElement','baselineIdentities','trackedIdentities','anchorElement') -Kind 'Native process UI surface binding'
+    Assert-PrintExactProperties -Value $Binding -Expected @('surfaceRootIdentity','surfaceElement','baselineIdentities','trackedIdentities','anchorElement','nativeRoles') -Kind 'Native process UI surface binding'
     if (@($Binding.trackedIdentities).Count -lt 1 -or @($Binding.trackedIdentities).Count -gt $script:PrintPins.UiElementMaximum) { throw 'Native process UI tracked identity count was invalid.' }
     $tracked = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($identity in @($Binding.trackedIdentities)) { if ([string]::IsNullOrWhiteSpace([string]$identity) -or -not $tracked.Add([string]$identity)) { throw 'Native process UI tracked identity set was invalid.' } }
@@ -1664,16 +1854,23 @@ function Cancel-NativePrintDialog {
         Wait-NewProcessUiSurface -ProcessId $ProcessId -Baseline $Baseline -AnchorNames @('Cancel') -AnchorControlTypes @('ControlType.Button') -Stage $Stage -Deadline $Deadline
     }
     Assert-NativePrintDeadline -Deadline $Deadline
-    $cancel = Find-BoundProcessUiElement -ProcessId $ProcessId -Binding $surface -Names @('Cancel') -ControlTypes @('ControlType.Button') -Deadline $Deadline
-    Invoke-ProcessUiElement -Element $cancel -ProcessId $ProcessId -Deadline $Deadline
+    if ($null -ne $surface.nativeRoles) {
+        $null = Invoke-BoundNativeButtonRole -ProcessId $ProcessId -Binding $surface -Role 'cancel' -Deadline $Deadline
+    } else {
+        $cancel = Find-BoundProcessUiElement -ProcessId $ProcessId -Binding $surface -Names @('Cancel') -ControlTypes @('ControlType.Button') -Deadline $Deadline
+        Invoke-ProcessUiElement -Element $cancel -ProcessId $ProcessId -Deadline $Deadline
+    }
     Wait-BoundProcessUiSurfaceClosed -ProcessId $ProcessId -Binding $surface -Stage $Stage -Deadline $Deadline
     return $surface
 }
 
 function Find-BoundNativePrinterElement {
     param([Parameter(Mandatory = $true)][int]$ProcessId,[Parameter(Mandatory = $true)]$Binding,[Parameter(Mandatory = $true)][datetime]$Deadline,[scriptblock]$NativeWindowProvider,[scriptblock]$TargetProvider)
-    $entries = @(Get-BoundProcessUiEntries -ProcessId $ProcessId -Binding $Binding -Deadline $Deadline -NativeWindowProvider $NativeWindowProvider)
-    $lists = @($entries | Where-Object { [string]$_.controlType -ceq 'ControlType.List' })
+    $boundNativeList = Get-BoundNativeRoleElement -ProcessId $ProcessId -Binding $Binding -Role 'printerList' -Deadline $Deadline -NativeWindowProvider $NativeWindowProvider
+    $lists = if ($null -ne $boundNativeList) { @([pscustomobject]@{element=$boundNativeList}) } else {
+        $entries = @(Get-BoundProcessUiEntries -ProcessId $ProcessId -Binding $Binding -Deadline $Deadline -NativeWindowProvider $NativeWindowProvider)
+        @($entries | Where-Object { [string]$_.controlType -ceq 'ControlType.List' })
+    }
     if ($lists.Count -gt 1) { throw 'Native print dialog exposed an ambiguous printer list.' }
     $printerMatches = @()
     foreach ($list in $lists) {
@@ -1753,8 +1950,12 @@ function Select-PdfPrinterAndCurrentPage {
     }
     if ($null -eq $printer -and -not $printerSelectedByNativeCombo) { throw 'Microsoft Print to PDF was not exposed by the process-bound native dialog.' }
     if ($null -ne $printer) { Select-ProcessUiElement -Element $printer -ProcessId $ProcessId -Deadline $Deadline }
-    $current = Wait-BoundProcessUiElement -ProcessId $ProcessId -Binding $surface -Names @('Current Page','Current page') -ControlTypes @('ControlType.RadioButton') -Stage 'current-page-control' -Deadline $Deadline
-    Select-ProcessUiElement -Element $current -ProcessId $ProcessId -Deadline $Deadline
+    if ($null -ne $surface.nativeRoles) {
+        $null = Invoke-BoundNativeButtonRole -ProcessId $ProcessId -Binding $surface -Role 'currentPage' -Deadline $Deadline
+    } else {
+        $current = Wait-BoundProcessUiElement -ProcessId $ProcessId -Binding $surface -Names @('Current Page','Current page') -ControlTypes @('ControlType.RadioButton') -Stage 'current-page-control' -Deadline $Deadline
+        Select-ProcessUiElement -Element $current -ProcessId $ProcessId -Deadline $Deadline
+    }
     return $surface
 }
 
@@ -1768,8 +1969,12 @@ function Submit-NativePrintToPdf {
     )
     $surface = Select-PdfPrinterAndCurrentPage -ProcessId $ProcessId -Baseline $Baseline -NativeBaseline $NativeBaseline -Deadline $Deadline
     Assert-NativePrintDeadline -Deadline $Deadline
-    $print = Find-BoundProcessUiElement -ProcessId $ProcessId -Binding $surface -Names @('Print') -ControlTypes @('ControlType.Button') -Deadline $Deadline
-    Invoke-ProcessUiElement -Element $print -ProcessId $ProcessId -Deadline $Deadline
+    if ($null -ne $surface.nativeRoles) {
+        $null = Invoke-BoundNativeButtonRole -ProcessId $ProcessId -Binding $surface -Role 'print' -Deadline $Deadline
+    } else {
+        $print = Find-BoundProcessUiElement -ProcessId $ProcessId -Binding $surface -Names @('Print') -ControlTypes @('ControlType.Button') -Deadline $Deadline
+        Invoke-ProcessUiElement -Element $print -ProcessId $ProcessId -Deadline $Deadline
+    }
     $saveSurface = if ($NativeBaseline.Count -gt 0) {
         Wait-NewProcessNativeWindowSurface -ProcessId $ProcessId -Baseline $NativeBaseline -AnchorNames @('Save') -AnchorControlTypes @('ControlType.Button') -Stage 'save-output-dialog' -Deadline $Deadline
     } else {
