@@ -49,6 +49,7 @@ function functionHarness(names: string[], body: string) {
     Set-Location -LiteralPath '${process.cwd().replaceAll("'", "''")}'
     . ./scripts/ocr/installer-package.ps1
     . ./scripts/ocr/windows-signing.ps1
+    . ./scripts/installed-publisher-ui.ps1
     $scriptPath = (Resolve-Path ./scripts/verify-signed-ocr-upgrade.ps1).Path
     $tokens = $null; $errors = $null
     $ast = [Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$errors)
@@ -174,6 +175,11 @@ describe('manual signed OCR installer upgrade workflow', () => {
     expect(script).toContain('applicationLaunchVerified = $true');
     expect(script).toContain('webViewDomVerified = $true');
     expect(script).toContain('nativeWindowVisualVerified = $false');
+    expect(script).toContain('installerShellPublisherUiVerified = $true');
+    expect(script).toContain('installedApplicationShellPublisherUiVerified = $true');
+    expect(script).toContain('publisherUiScreenshotsUsed = $false');
+    expect(script).toContain('uacPublisherPromptVerified = $false');
+    expect(script).toContain('smartScreenPublisherPromptVerified = $false');
     expect(script).toContain('realPreferencesVerified = $false');
     expect(script).toContain('installedEngineOcrSmokeVerified = $true');
     expect(script).toContain('applicationOcrIntegrationVerified = $true');
@@ -392,6 +398,77 @@ describe('manual signed OCR installer upgrade workflow', () => {
     expect(result.status, result.stderr || result.stdout).toBe(0);
   }, 15_000);
 
+  it('isolates Explorer publisher UI behind a hard process deadline and accepts only one sanitized JSON object', () => {
+    const helper = readFileSync('scripts/installed-publisher-ui.ps1', 'utf8');
+    expect(helper).toContain('SEE_MASK_INVOKEIDLIST | SEE_MASK_NOASYNC');
+    expect(helper).toContain('info.lpVerb = "properties"');
+    expect(helper).toContain("SignatureTab = 'Digital Signatures'");
+    expect(helper).toContain("DetailsTitle = 'Digital Signature Details'");
+    expect(helper).toContain("ValidStatus = 'This digital signature is OK.'");
+    expect(helper).toContain('[Windows.Automation.SelectionItemPattern]::Pattern');
+    expect(helper).toContain('[Windows.Automation.InvokePattern]::Pattern');
+    expect(helper).toContain('ElementMaximum = 256');
+    expect(helper).toContain('DeadlineMilliseconds = 30000');
+    expect(helper).toContain('InteractionMilliseconds = 25000');
+    expect(helper).toContain('CleanupMilliseconds = 5000');
+    expect(helper).toContain('ExpectedOwner $propertiesHandle');
+    expect(helper).toContain('$propertiesCleanupMatches');
+    expect(helper).toContain('$detailsCleanupMatches');
+    expect(helper).toContain('Close-PublisherUiWindow');
+    expect(helper).toContain('JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE');
+    expect(helper).toContain('TerminateJobObject(job, 125)');
+    expect(helper).toContain('start.Environment.Clear()');
+    expect(helper).toContain('StdoutMaximum = 4096');
+    expect(helper).toContain('StderrMaximum = 2048');
+    expect(helper).toContain("[Console]::Error.Write('publisher-ui-child-failed')");
+    expect(helper).not.toContain('[scriptblock]$SurfaceProvider');
+    expect(helper.match(/Assert-PublisherUiFileReceipt -Path \$canonical/g)).toHaveLength(2);
+    expect(helper.match(/Assert-TrustedWindowsSignature -Path \$canonical/g)).toHaveLength(2);
+    expect(helper).not.toMatch(/AZURE_|TAURI_SIGNING|CopyFromScreen|Bitmap|Save\(/i);
+
+    const parentStart = helper.indexOf('function Invoke-PublisherUiHelperProcess');
+    const parentEnd = helper.indexOf('function Get-PublisherUiSha256', parentStart);
+    const parentBoundary = helper.slice(parentStart, parentEnd);
+    expect(parentBoundary).toContain('BoundedProcess]::Run');
+    expect(parentBoundary).not.toMatch(/Windows\.Automation|ShellExecuteEx|FindAll\(|TryGetCurrentPattern|\.Select\(\)|\.Invoke\(\)/);
+
+    const check = String.raw`
+      $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
+      Set-Location -LiteralPath '${process.cwd().replaceAll("'", "''")}'
+      . ./scripts/installed-publisher-ui.ps1
+      $null=Get-PublisherUiCultureFacts -CultureProvider {[pscustomobject]@{Culture='en-US';UICulture='en-US'}}
+      $rejected=$false;try{Get-PublisherUiCultureFacts -CultureProvider {[pscustomobject]@{Culture='fr-FR';UICulture='fr-FR'}}|Out-Null}catch{$rejected=$true};if(-not$rejected){throw 'Non-en-US publisher UI culture was accepted.'}
+      $fixture=Join-Path (Resolve-Path target) ('publisher-ui-'+[Guid]::NewGuid().ToString('N')+'.exe')
+      [IO.File]::WriteAllText($fixture,'signed fixture',[Text.UTF8Encoding]::new($false))
+      $item=Get-Item -LiteralPath $fixture
+      $receipt=[pscustomobject]@{bytes=[uint64]$item.Length;sha256=Get-PublisherUiSha256 -Path $fixture}
+      Assert-PublisherUiFileReceipt -Path $fixture -Receipt $receipt
+      $rejected=$false;try{Assert-PublisherUiFileReceipt -Path $fixture -Receipt ([pscustomobject]@{bytes=$receipt.bytes;sha256=('A'*64)})}catch{$rejected=$true};if(-not$rejected){throw 'Wrong publisher UI receipt was accepted.'}
+      Initialize-PublisherUiIsolation
+      $encoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes('[Console]::Out.Write($PID);[Console]::Out.Flush();Start-Sleep -Seconds 30'))
+      $arguments=@('-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',$encoded)
+      $result=[Smacrobat.PublisherUiIsolation.BoundedProcess]::Run((Join-Path $PSHOME 'pwsh.exe'),$arguments,(Get-Location).Path,(Get-PublisherUiMinimalEnvironment),300,4096,2048)
+      if(-not$result.TimedOut-or-not$result.JobAssigned-or-not$result.JobTerminated-or-not$result.ProcessStopped-or$result.ElapsedMilliseconds-gt2500){throw 'Hung publisher UI helper was not killed inside its hard deadline.'}
+      $sameProcess=$false
+      try{$process=Get-Process -Id $result.ProcessId -ErrorAction Stop;$sameProcess=$process.StartTime.ToUniversalTime().Ticks-eq$result.ProcessStartTimeUtcTicks}catch{}
+      if($sameProcess){throw 'Timed-out publisher UI helper identity is still running.'}
+
+      $overflow=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes('[Console]::Out.Write((''X''*8192));[Console]::Out.Flush();Start-Sleep -Seconds 30'))
+      $overflowResult=[Smacrobat.PublisherUiIsolation.BoundedProcess]::Run((Join-Path $PSHOME 'pwsh.exe'),@('-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',$overflow),(Get-Location).Path,(Get-PublisherUiMinimalEnvironment),5000,128,128)
+      if(-not$overflowResult.StdoutExceeded-or-not$overflowResult.ProcessStopped-or$overflowResult.Stdout.Length-ne128){throw 'Publisher UI helper stdout cap was not enforced.'}
+
+      $json=([pscustomobject][ordered]@{uiCulture='en-US';shellPropertiesDialog=$true;digitalSignaturesTab=$true;signerRowMatched=$true;detailsDialog=$true;statusTextMatched=$true;cleanupVerified=$true;screenshotsUsed=$false}|ConvertTo-Json -Compress)
+      function New-HelperResult([string]$stdout){[pscustomobject][ordered]@{Stdout=$stdout;Stderr='';ExitCode=[int]0;ElapsedMilliseconds=[int]10;TimedOut=$false;StdoutExceeded=$false;StderrExceeded=$false;JobAssigned=$true;JobTerminated=$false;ProcessStopped=$true;ProcessId=[int]1;ProcessStartTimeUtcTicks=[long]1}}
+      $surface=ConvertFrom-PublisherUiHelperOutput -Result (New-HelperResult $json)
+      if(-not$surface.cleanupVerified-or$surface.screenshotsUsed){throw 'Exact sanitized publisher UI JSON was rejected.'}
+      foreach($bad in @('{"uiCulture":',($json+$json),($json+[Environment]::NewLine))){$rejected=$false;try{ConvertFrom-PublisherUiHelperOutput -Result (New-HelperResult $bad)|Out-Null}catch{$rejected=$true};if(-not$rejected){throw 'Partial or extra publisher UI output was accepted.'}}
+      $screenshot=$json.Replace('"screenshotsUsed":false','"screenshotsUsed":true')
+      $rejected=$false;try{ConvertFrom-PublisherUiHelperOutput -Result (New-HelperResult $screenshot)|Out-Null}catch{$rejected=$true};if(-not$rejected){throw 'Screenshot-backed publisher UI output was accepted.'}
+    `;
+    const result = runPowerShell7(check);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  }, 15_000);
+
   it('enforces bounded process and installed-registry facts and writes one sanitized record', () => {
     const check = functionHarness(
       ['Assert-ExactProperties', 'Invoke-BoundedSilentInstaller', 'Assert-InstallFacts', 'Write-SanitizedUpgradeRecord'],
@@ -413,15 +490,17 @@ describe('manual signed OCR installer upgrade workflow', () => {
         $receipt=[pscustomobject]@{packagedApplication=$app}
         $smoke=[ordered]@{generator=[ordered]@{target='scripts/ocr/generate-smoke.ps1';bytes=[uint64]1;sha256=('B'*64)};input=[ordered]@{format='P6';width=1200;height=240;bytes=[uint64]1;sha256=('C'*64)};engine=[ordered]@{bytes=[uint64]1;sha256=('D'*64)};model=[ordered]@{bytes=[uint64]1;sha256=('E'*64)};profile=[ordered]@{language='eng';engineMode=1;pageSegmentationMode=6;dpi=150;logLevel='ERROR'};limits=[ordered]@{inputBytesMaximum=16777216;stdoutCharactersMaximum=1048576;stderrCharactersMaximum=65536;timeoutMilliseconds=30000};expectedTextSha256=('F'*64);actualTextSha256=('F'*64);exitCode=0;stderrEmpty=$true;matched=$true}
         $launch=[ordered]@{drivers=[ordered]@{tauriDriver=[ordered]@{version='2.0.6';bytes=[uint64]1;sha256=('1'*64);sourceSha256=('2'*64)};webView2RuntimeVersion='151.0.1.2';edgeDriver=[ordered]@{version='151.0.1.3';bytes=[uint64]1;sha256=('3'*64);publisher='Microsoft Corporation';trustedTimestamp=$true}};profile=[ordered]@{state='controlled-runner-owned';binding='owned-webview-tauri-app-settings-ebwebview';prelaunchSettingsEntries=1;sentinelPreserved=$true};title='PDF Workstation';homeButton='Explore a sample PDF';ocrCapabilityStatus='Available';sample=[ordered]@{name='welcome.pdf';pages=6;firstPageDecoded=$true;naturalWidth=100;naturalHeight=100;source='blob:'};currentPageOcr=[ordered]@{sampleName='welcome.pdf';physicalPage=1;dialogTitle='Recognize text on page 1';status='recognized';language='eng';textUtf8Bytes=12;textSha256=('4'*64);sourceUiPreserved=$true;sourceFileReceiptPreserved=$true;accuracyVerified=$false};cleanup=[ordered]@{sessionDeleted=$true;ownedProcessTreeStopped=$true;relevantProcessesRemaining=0}}
-        $path=Write-SanitizedUpgradeRecord -OutputRoot $output -WorkflowSourceRevision ('b'*40) -Receipt $receipt -InstalledEngineSmoke $smoke -InstalledAppLaunch $launch
+        $publisherUi=[pscustomobject][ordered]@{kind='installer';fileName=$script:Pins.SignedInstallerName;bytes=$script:Pins.SignedInstallerBytes;sha256=$script:Pins.SignedInstallerSha256;publisher='Joshua Beel';uiCulture='en-US';shellPropertiesDialog=$true;digitalSignaturesTab=$true;signerRowMatched=$true;detailsDialog=$true;statusTextMatched=$true;trustedTimestampVerified=$true;cleanupVerified=$true;screenshotsUsed=$false}
+        $applicationPublisherUi=$publisherUi.PSObject.Copy();$applicationPublisherUi.kind='installed-application';$applicationPublisherUi.fileName='pdf-workstation.exe';$applicationPublisherUi.bytes=$app.bytes;$applicationPublisherUi.sha256=$app.sha256
+        $path=Write-SanitizedUpgradeRecord -OutputRoot $output -WorkflowSourceRevision ('b'*40) -Receipt $receipt -InstalledEngineSmoke $smoke -InstalledAppLaunch $launch -InstallerPublisherUi $publisherUi -ApplicationPublisherUi $applicationPublisherUi
         $json=Get-Content -LiteralPath $path -Raw -Encoding UTF8
         $value=$json|ConvertFrom-Json
-        $verificationProperties=@('applicationCurrentPageOcrCompleted','applicationLaunchVerified','applicationOcrAccuracyVerified','applicationOcrIntegrationVerified','applicationOcrRecognitionVerified','applicationProcessStarted','baselineSilentInstall','documentSentinelPreserved','ephemeral','inAppUpdaterVerified','installedEngineOcrSmokeVerified','installedReceiptsMatched','launchProcessCleanupVerified','nativeDragDropVerified','nativeFilePickerVerified','nativeOcrCapabilityVerified','nativeWindowVisualVerified','printingVerified','realPreferencesVerified','registryVersionUpdated','runner','samplePdfiumRenderVerified','samplePdfOpened','settingsSentinelPreserved','signedSilentManualUpgrade','updaterArtifacts','userPdfVerified','webViewDomVerified')
+        $verificationProperties=@('applicationCurrentPageOcrCompleted','applicationLaunchVerified','applicationOcrAccuracyVerified','applicationOcrIntegrationVerified','applicationOcrRecognitionVerified','applicationProcessStarted','baselineSilentInstall','documentSentinelPreserved','ephemeral','inAppUpdaterVerified','installedApplicationShellPublisherUiVerified','installedEngineOcrSmokeVerified','installedReceiptsMatched','installerShellPublisherUiVerified','launchProcessCleanupVerified','nativeDragDropVerified','nativeFilePickerVerified','nativeOcrCapabilityVerified','nativeWindowVisualVerified','printingVerified','publisherUiScreenshotsUsed','realPreferencesVerified','registryVersionUpdated','runner','samplePdfiumRenderVerified','samplePdfOpened','settingsSentinelPreserved','signedSilentManualUpgrade','smartScreenPublisherPromptVerified','uacPublisherPromptVerified','updaterArtifacts','userPdfVerified','webViewDomVerified')
         $actualVerification=@($value.verification.PSObject.Properties.Name|Sort-Object -CaseSensitive);$expectedVerification=@($verificationProperties|Sort-Object -CaseSensitive);if($actualVerification.Count-ne$expectedVerification.Count-or(Compare-Object $expectedVerification $actualVerification -CaseSensitive)){throw 'Sanitized verification claim set changed.'}
         $ocrProperties=@('accuracyVerified','dialogTitle','language','physicalPage','sampleName','sourceFileReceiptPreserved','sourceUiPreserved','status','textSha256','textUtf8Bytes');$actualOcr=@($value.upgrade.installedApplicationLaunch.currentPageOcr.PSObject.Properties.Name|Sort-Object -CaseSensitive);$expectedOcr=@($ocrProperties|Sort-Object -CaseSensitive);if($actualOcr.Count-ne$expectedOcr.Count-or(Compare-Object $expectedOcr $actualOcr -CaseSensitive)){throw 'Sanitized current-page OCR receipt set changed.'}
-        if($value.schemaVersion-ne4-or@(Get-ChildItem -LiteralPath $output -File -Force).Count -ne 1 -or-not$value.verification.installedEngineOcrSmokeVerified -or-not$value.verification.applicationLaunchVerified -or-not$value.verification.webViewDomVerified -or-not$value.verification.nativeOcrCapabilityVerified -or-not$value.verification.applicationOcrIntegrationVerified -or-not$value.verification.applicationCurrentPageOcrCompleted -or-not$value.verification.applicationOcrRecognitionVerified -or$value.verification.applicationOcrAccuracyVerified -ne $false -or$value.verification.nativeWindowVisualVerified -ne $false -or$value.verification.nativeFilePickerVerified -ne $false -or$value.verification.userPdfVerified -ne $false -or$value.verification.printingVerified -ne $false -or$value.verification.nativeDragDropVerified -ne $false -or$value.verification.realPreferencesVerified -ne $false -or$value.verification.inAppUpdaterVerified -ne $false -or-not$value.upgrade.installedEngineOcrSmoke.matched -or$value.upgrade.installedApplicationLaunch.sample.pages-ne6-or$value.upgrade.installedApplicationLaunch.currentPageOcr.physicalPage-ne1-or$value.upgrade.installedApplicationLaunch.currentPageOcr.accuracyVerified-ne$false){throw 'Sanitized output contract failed.'}
+        if($value.schemaVersion-ne5-or@(Get-ChildItem -LiteralPath $output -File -Force).Count -ne 1 -or-not$value.verification.installedEngineOcrSmokeVerified -or-not$value.verification.applicationLaunchVerified -or-not$value.verification.webViewDomVerified -or-not$value.verification.nativeOcrCapabilityVerified -or-not$value.verification.applicationOcrIntegrationVerified -or-not$value.verification.applicationCurrentPageOcrCompleted -or-not$value.verification.applicationOcrRecognitionVerified -or$value.verification.applicationOcrAccuracyVerified -ne $false -or-not$value.verification.installerShellPublisherUiVerified -or-not$value.verification.installedApplicationShellPublisherUiVerified -or$value.verification.publisherUiScreenshotsUsed -ne $false -or$value.verification.uacPublisherPromptVerified -ne $false -or$value.verification.smartScreenPublisherPromptVerified -ne $false -or$value.verification.nativeWindowVisualVerified -ne $false -or$value.verification.nativeFilePickerVerified -ne $false -or$value.verification.userPdfVerified -ne $false -or$value.verification.printingVerified -ne $false -or$value.verification.nativeDragDropVerified -ne $false -or$value.verification.realPreferencesVerified -ne $false -or$value.verification.inAppUpdaterVerified -ne $false -or-not$value.upgrade.installedEngineOcrSmoke.matched -or$value.upgrade.publisherUi.installer.kind-cne'installer'-or$value.upgrade.publisherUi.installedApplication.kind-cne'installed-application'-or$value.upgrade.publisherUi.installer.screenshotsUsed -ne $false -or$value.upgrade.installedApplicationLaunch.sample.pages-ne6-or$value.upgrade.installedApplicationLaunch.currentPageOcr.physicalPage-ne1-or$value.upgrade.installedApplicationLaunch.currentPageOcr.accuracyVerified-ne$false){throw 'Sanitized output contract failed.'}
         if($json -match 'fixed private OCR output|recognized text sample'){throw 'Sanitized output included raw OCR text.'}
-        if($json -match '(?i)([A-Z]:\\|\\Users\\|11005152678|36499724415|569181842|GITHUB_TOKEN|AZURE_)'){throw 'Sanitized output leaked restricted evidence.'}
+        if($json -match '(?i)([A-Z]:\\|\\Users\\|11005152678|36499724415|569181842|GITHUB_TOKEN|AZURE_|codesigning\.azure\.net|signingAccount|signingProfile|tenantId|clientId)'){throw 'Sanitized output leaked restricted evidence.'}
       `,
     );
     const result = runPowerShell(check);

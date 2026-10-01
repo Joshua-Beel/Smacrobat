@@ -1,0 +1,178 @@
+name: Manual published in-app update verification
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_version:
+        description: Stable published version, without v
+        required: true
+        type: string
+      target_tag:
+        description: Exact published release tag
+        required: true
+        type: string
+      target_source_revision:
+        description: Exact lowercase 40-character commit for the tag
+        required: true
+        type: string
+      target_release_id:
+        description: Exact public GitHub release id
+        required: true
+        type: string
+      target_installer_receipt:
+        description: JSON with exact installer id, name, bytes, and uppercase sha256
+        required: true
+        type: string
+      target_signature_receipt:
+        description: JSON with exact detached-signature id, bytes, and uppercase sha256
+        required: true
+        type: string
+      target_manifest_receipt:
+        description: JSON with exact latest.json id, bytes, and uppercase sha256
+        required: true
+        type: string
+      expected_publisher:
+        description: Exact publisher already established by trusted signature evidence
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: published-in-app-update-${{ inputs.target_tag }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: windows-2022
+    timeout-minutes: 35
+    steps:
+      - name: Require an exact manual master dispatch
+        shell: pwsh
+        env:
+          TARGET_VERSION: ${{ inputs.target_version }}
+          TARGET_TAG: ${{ inputs.target_tag }}
+          TARGET_SOURCE_REVISION: ${{ inputs.target_source_revision }}
+        run: |
+          if ($env:GITHUB_REPOSITORY -cne 'Joshua-Beel/Smacrobat' -or
+              $env:GITHUB_EVENT_NAME -cne 'workflow_dispatch' -or
+              $env:GITHUB_REF -cne 'refs/heads/master') {
+            throw 'Dispatch this published in-app update verification only from master.'
+          }
+          if ($env:TARGET_VERSION -cnotmatch '^\d+\.\d+\.\d+$' -or
+              $env:TARGET_TAG -cne "v$env:TARGET_VERSION" -or
+              $env:TARGET_SOURCE_REVISION -cnotmatch '^[a-f0-9]{40}$') {
+            throw 'Target version, tag, or source revision is malformed.'
+          }
+
+      - name: Initialize fresh runner paths
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP) -or [string]::IsNullOrWhiteSpace($env:GITHUB_ENV)) {
+            throw 'GitHub-hosted runner path variables are unavailable.'
+          }
+          $root = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\')
+          $values = @(
+            "UPDATE_WORK_ROOT=$root\pdf-workstation-in-app-update-work"
+            "UPDATE_OUTPUT_ROOT=$root\pdf-workstation-in-app-update-output"
+            "WEBDRIVER_ROOT=$root\pdf-workstation-in-app-update-webdriver"
+            "WEBVIEW_PROFILE_ROOT=$root\pdf-workstation-in-app-update-profile"
+          )
+          $writer = [IO.StreamWriter]::new($env:GITHUB_ENV, $true, [Text.UTF8Encoding]::new($false))
+          try { foreach ($value in $values) { $writer.WriteLine([string]$value) } } finally { $writer.Dispose() }
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Bind clean workflow source to the exact target tag
+        shell: pwsh
+        env:
+          TARGET_VERSION: ${{ inputs.target_version }}
+          TARGET_TAG: ${{ inputs.target_tag }}
+          TARGET_SOURCE_REVISION: ${{ inputs.target_source_revision }}
+        run: |
+          $headRevision = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $headRevision -cne $env:GITHUB_SHA) { throw 'Checked-out HEAD does not match github.sha.' }
+          git diff --quiet --
+          if ($LASTEXITCODE -ne 0) { throw 'Tracked working-tree files changed after checkout.' }
+          git diff --cached --quiet --
+          if ($LASTEXITCODE -ne 0) { throw 'The tracked index changed after checkout.' }
+          $tagRevision = (git rev-list -n 1 $env:TARGET_TAG).Trim()
+          if ($LASTEXITCODE -ne 0 -or $tagRevision -cne $env:TARGET_SOURCE_REVISION) { throw 'Target tag does not resolve to the exact expected source revision.' }
+          $configVersion = [string](Get-Content src-tauri/tauri.conf.json -Raw -Encoding UTF8 | ConvertFrom-Json).version
+          $packageVersion = [string](Get-Content package.json -Raw -Encoding UTF8 | ConvertFrom-Json).version
+          $cargoVersion = [regex]::Match((Get-Content src-tauri/Cargo.toml -Raw -Encoding UTF8), '(?m)^version = "([^"]+)"').Groups[1].Value
+          if ($configVersion -cne $env:TARGET_VERSION -or $packageVersion -cne $env:TARGET_VERSION -or $cargoVersion -cne $env:TARGET_VERSION) {
+            throw 'Dispatched target version does not match the three release source versions.'
+          }
+
+      - name: Prepare exact hosted WebDriver inputs
+        shell: pwsh
+        run: |
+          ./scripts/setup-installed-app-webdriver.ps1 -OutputRoot $env:WEBDRIVER_ROOT
+
+      - name: Recheck clean source after driver preparation
+        shell: pwsh
+        run: |
+          $headRevision = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $headRevision -cne $env:GITHUB_SHA) { throw 'Checked-out HEAD changed during WebDriver preparation.' }
+          git diff --quiet --
+          if ($LASTEXITCODE -ne 0) { throw 'Tracked working-tree files changed during WebDriver preparation.' }
+          git diff --cached --quiet --
+          if ($LASTEXITCODE -ne 0) { throw 'The tracked index changed during WebDriver preparation.' }
+
+      - name: Exercise the exact published in-app update
+        shell: pwsh
+        env:
+          TARGET_VERSION: ${{ inputs.target_version }}
+          TARGET_TAG: ${{ inputs.target_tag }}
+          TARGET_SOURCE_REVISION: ${{ inputs.target_source_revision }}
+          TARGET_RELEASE_ID: ${{ inputs.target_release_id }}
+          TARGET_INSTALLER_RECEIPT: ${{ inputs.target_installer_receipt }}
+          TARGET_SIGNATURE_RECEIPT: ${{ inputs.target_signature_receipt }}
+          TARGET_MANIFEST_RECEIPT: ${{ inputs.target_manifest_receipt }}
+          EXPECTED_PUBLISHER: ${{ inputs.expected_publisher }}
+        run: |
+          $installer = $env:TARGET_INSTALLER_RECEIPT | ConvertFrom-Json
+          $signature = $env:TARGET_SIGNATURE_RECEIPT | ConvertFrom-Json
+          $manifest = $env:TARGET_MANIFEST_RECEIPT | ConvertFrom-Json
+          function Assert-ReceiptProperties($value, [string[]]$expected, [string]$kind) {
+            $actual = @($value.PSObject.Properties.Name | Sort-Object -CaseSensitive)
+            $sorted = @($expected | Sort-Object -CaseSensitive)
+            if ($actual.Count -ne $sorted.Count -or (Compare-Object $sorted $actual -CaseSensitive)) { throw "$kind receipt properties are malformed." }
+          }
+          Assert-ReceiptProperties $installer @('id','name','bytes','sha256') 'Installer'
+          Assert-ReceiptProperties $signature @('id','bytes','sha256') 'Signature'
+          Assert-ReceiptProperties $manifest @('id','bytes','sha256') 'Manifest'
+          ./scripts/verify-in-app-update.ps1 `
+            -WorkRoot $env:UPDATE_WORK_ROOT `
+            -OutputRoot $env:UPDATE_OUTPUT_ROOT `
+            -WebDriverRoot $env:WEBDRIVER_ROOT `
+            -WebViewProfileRoot $env:WEBVIEW_PROFILE_ROOT `
+            -WorkflowSourceRevision $env:GITHUB_SHA `
+            -TargetVersion $env:TARGET_VERSION `
+            -TargetTag $env:TARGET_TAG `
+            -TargetSourceRevision $env:TARGET_SOURCE_REVISION `
+            -TargetReleaseId $env:TARGET_RELEASE_ID `
+            -TargetInstallerAssetId ([string]$installer.id) `
+            -TargetInstallerName ([string]$installer.name) `
+            -TargetInstallerBytes ([string]$installer.bytes) `
+            -TargetInstallerSha256 ([string]$installer.sha256) `
+            -TargetSignatureAssetId ([string]$signature.id) `
+            -TargetSignatureBytes ([string]$signature.bytes) `
+            -TargetSignatureSha256 ([string]$signature.sha256) `
+            -TargetManifestAssetId ([string]$manifest.id) `
+            -TargetManifestBytes ([string]$manifest.bytes) `
+            -TargetManifestSha256 ([string]$manifest.sha256) `
+            -ExpectedPublisher $env:EXPECTED_PUBLISHER
+
+      - name: Upload only the sanitized in-app update verification
+        uses: actions/upload-artifact@v4
+        with:
+          name: published-in-app-update-verification-${{ inputs.target_tag }}-${{ github.sha }}
+          path: ${{ env.UPDATE_OUTPUT_ROOT }}/in-app-update-verification.json
+          if-no-files-found: error

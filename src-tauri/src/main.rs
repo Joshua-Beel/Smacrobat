@@ -12,6 +12,7 @@ mod forms;
 mod page_labels;
 mod image_pdf;
 mod page_image;
+mod update_attempt;
 #[cfg(windows)]
 mod notices;
 #[cfg(windows)]
@@ -24,6 +25,25 @@ mod ocr;
 mod ocr_commands;
 use service::{DocumentInfo, PdfService};
 use tauri::{Manager, State};
+
+fn update_attempt_root(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    app.path().app_data_dir().map_err(|error| format!("The update recovery folder is unavailable: {error}"))
+}
+
+#[tauri::command]
+fn read_update_attempt(app: tauri::AppHandle) -> Result<Option<update_attempt::UpdateAttempt>, String> {
+    update_attempt::read(&update_attempt_root(&app)?)
+}
+
+#[tauri::command]
+fn write_update_attempt(app: tauri::AppHandle, attempt: update_attempt::UpdateAttempt) -> Result<(), String> {
+    update_attempt::write(&update_attempt_root(&app)?, &attempt)
+}
+
+#[tauri::command]
+fn clear_update_attempt(app: tauri::AppHandle) -> Result<(), String> {
+    update_attempt::clear(&update_attempt_root(&app)?)
+}
 
 #[tauri::command]
 async fn open_document(app: tauri::AppHandle, service: State<'_, PdfService>) -> Result<Option<service::OpenResult>, String> {
@@ -211,6 +231,6 @@ fn main() {
         app.manage(service);
         app.manage(print_commands::PrintJobs::default());
         Ok(())
-    }).invoke_handler(tauri::generate_handler![document_form_fields, fill_form_copy, open_document, reopen_document, open_example, render_page, export_page_image, close_document, edit_pages, crop_page, crop_pages, reset_crops, create_pdf_from_image, create_comment, update_comment, delete_comment, document_comments, document_annotations, create_highlight, create_text_highlight, update_highlight, delete_highlight, save_copy, split_document, combine_documents, insert_pages_copy, replace_pages_copy, page_text, page_text_geometry, document_bookmarks, document_page_labels, document_properties, dependency_notices, unlock_document, cancel_password_request, ocr_capability, recognize_page_ocr, cancel_page_ocr, print_commands::print_document, print_commands::cancel_print])
+    }).invoke_handler(tauri::generate_handler![read_update_attempt, write_update_attempt, clear_update_attempt, document_form_fields, fill_form_copy, open_document, reopen_document, open_example, render_page, export_page_image, close_document, edit_pages, crop_page, crop_pages, reset_crops, create_pdf_from_image, create_comment, update_comment, delete_comment, document_comments, document_annotations, create_highlight, create_text_highlight, update_highlight, delete_highlight, save_copy, split_document, combine_documents, insert_pages_copy, replace_pages_copy, page_text, page_text_geometry, document_bookmarks, document_page_labels, document_properties, dependency_notices, unlock_document, cancel_password_request, ocr_capability, recognize_page_ocr, cancel_page_ocr, print_commands::print_document, print_commands::cancel_print])
       .run(tauri::generate_context!()).expect("Desktop application failed");
 }

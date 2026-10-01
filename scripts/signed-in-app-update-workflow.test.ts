@@ -1,0 +1,149 @@
+import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+
+const workflowPath = '.github/workflows/in-app-update-verification.yml';
+const scriptPath = 'scripts/verify-in-app-update.ps1';
+
+function verifierHarness(names: string[], body: string) {
+  return String.raw`
+    $ErrorActionPreference='Stop'
+    Set-StrictMode -Version Latest
+    Set-Location -LiteralPath '${process.cwd().replaceAll("'", "''")}'
+    $tokens=$null;$errors=$null
+    $ast=[Management.Automation.Language.Parser]::ParseFile((Resolve-Path '${scriptPath}'),[ref]$tokens,[ref]$errors)
+    if($errors.Count){throw 'In-app updater verifier did not parse.'}
+    foreach($name in @(${names.map(name => "'" + name + "'").join(',')})){
+      $function=$ast.Find({param($node)$node-is[Management.Automation.Language.FunctionDefinitionAst]-and$node.Name-ceq$name},$true)
+      if(-not$function){throw('Missing verifier function: '+$name)}
+      Invoke-Expression $function.Extent.Text
+    }
+    ${body}
+  `;
+}
+
+describe('published in-app update verification infrastructure', () => {
+  it('is manual, read-only, exact-input driven, and carries no release or signing credential', () => {
+    const workflow = readFileSync(workflowPath, 'utf8');
+    const requiredInputs = [
+      'target_version', 'target_tag', 'target_source_revision', 'target_release_id',
+      'target_installer_receipt', 'target_signature_receipt', 'target_manifest_receipt', 'expected_publisher',
+    ];
+    expect(workflow).toContain('workflow_dispatch:');
+    expect(workflow).not.toMatch(/^\s*(push|pull_request|schedule):/m);
+    for (const input of requiredInputs) expect(workflow).toContain('      ' + input + ':');
+    expect(requiredInputs).toHaveLength(8);
+    expect(workflow).toContain("Assert-ReceiptProperties $installer @('id','name','bytes','sha256') 'Installer'");
+    expect(workflow).toContain("Assert-ReceiptProperties $signature @('id','bytes','sha256') 'Signature'");
+    expect(workflow).toContain("Assert-ReceiptProperties $manifest @('id','bytes','sha256') 'Manifest'");
+    expect(workflow).toContain('permissions:\n  contents: read');
+    expect(workflow).not.toMatch(/contents:\s*write|actions:\s*write|id-token:\s*write/);
+    expect(workflow).not.toMatch(/secrets\.|github\.token|GITHUB_TOKEN|GH_TOKEN|AZURE_|TAURI_SIGNING/);
+    expect(workflow).toContain('runs-on: windows-2022');
+    expect(workflow).toContain('TARGET_TAG -cne "v$env:TARGET_VERSION"');
+    expect(workflow).toContain('git rev-list -n 1 $env:TARGET_TAG');
+    expect(workflow).toContain('$tagRevision -cne $env:TARGET_SOURCE_REVISION');
+    expect(workflow).toContain('persist-credentials: false');
+    expect(workflow).toContain('./scripts/verify-in-app-update.ps1');
+    expect(workflow).toContain('in-app-update-verification.json');
+    expect(workflow).not.toMatch(/gh release|release create|release edit|--draft=false|--latest/);
+  });
+
+  it('pins public artifacts and fails closed on release, asset, manifest, and signature identity', () => {
+    const script = readFileSync(scriptPath, 'utf8');
+    expect(script).toContain("BaselineVersion = '0.2.0'");
+    expect(script).toContain('BaselineBytes = [uint64]6418229');
+    expect(script).toContain("BaselineSha256 = '17788CB82BB42DEAC35EA197A385A9BAFC8CD331422446A2B834E115A90C4D2E'");
+    expect(script).toContain('releases/latest/download/latest.json');
+    expect(script).toContain('/releases/tags/$TargetTag');
+    expect(script).toContain('[uint64]$latestRelease.id -ne $targetReleaseIdValue');
+    expect(script).toContain('[bool]$release.draft');
+    expect(script).toContain('[bool]$release.prerelease');
+    expect(script.match(/Assert-ExactAsset -Release \$release/g)).toHaveLength(3);
+    expect(script).toContain("$manifest.platforms.'windows-x86_64'");
+    expect(script).toContain('[string]$platform.signature -cne $signatureText');
+    expect(script).toContain('[string]$platform.url -cne [string]$installerAsset.browser_download_url');
+    expect(script).toContain('Assert-TrustedWindowsSignature -Path $targetInstallerPath');
+    expect(script).toContain('Assert-TrustedWindowsSignature -Path $extractedApp.FullName');
+    expect(script).toContain('^PDF(?:\\.| )Workstation_');
+    expect(script).not.toMatch(/Authorization|Bearer|api[_-]?key|client[_-]?secret/i);
+    expect(script).not.toMatch(/dangerousInsecureTransportProtocol|dangerousAcceptInvalid|allowDowngrades|\.endpoints\(/);
+  });
+
+  it('uses the real updater UI with deterministic blocked-download recovery and verifies relaunch', () => {
+    const script = readFileSync(scriptPath, 'utf8');
+    expect(script).toContain("textContent.trim()==='Check for updates…'");
+    expect(script).toContain("textContent.trim()==='Install update and restart'");
+    expect(script).toContain("'Installed version: 0.2.0'");
+    expect(script).toContain('New-NetFirewallRule');
+    expect(script).toContain('-Direction Outbound -Action Block -Program ([string]$baselineFacts.appPath)');
+    expect(script).toContain("'Your installed version is unchanged. You can retry.'");
+    expect(script).toContain('Remove-NetFirewallRule -DisplayName $firewallName -ErrorAction Stop');
+    expect(script).toContain("Get-NetFirewallRule -DisplayName $firewallName -ErrorAction SilentlyContinue");
+    expect(script).toMatch(/finally \{[\s\S]*Remove-NetFirewallRule -DisplayName \$firewallName -ErrorAction SilentlyContinue/);
+    expect(script.match(/Invoke-InstallButton -SessionId \$session\.SessionId/g)).toHaveLength(2);
+    expect(script).toContain("if (-not $sawDownloadState)");
+    expect(script).toContain("if (-not $sessionClosedForInstall)");
+    expect(script).toContain('exact baseline application process did not exit');
+    expect(script).toContain('Assert-InstallFacts -Facts $unchanged');
+    expect(script).toContain('Assert-InstallFacts -Facts $upgraded');
+    expect(script).toContain('automatically relaunch');
+    expect(script).toContain('Wait-CurrentVersionUi');
+    expect(script).toContain("'You have the latest released version.'");
+    expect(script).toContain('Invoke-InstalledPublisherUiProof');
+    expect(script).toContain('settingsSentinelPreserved = $true');
+    expect(script).toContain('documentSentinelPreserved = $true');
+  });
+
+  it('rechecks PID identity and limits interruption claims to observed evidence', () => {
+    const script = readFileSync(scriptPath, 'utf8');
+    expect(script).toContain('$samePath = [IO.Path]::GetFullPath([string]$process.MainModule.FileName)');
+    expect(script).toContain('$sameStart = [long]$process.StartTime.ToUniversalTime().Ticks -eq [long]$entry.StartTicks');
+    expect(script).toContain('standaloneSignedInstallerRepairVerified = $true');
+    expect(script).toContain('partialByteDownloadInterruptionVerified = $false');
+    expect(script).toContain('appKillMidDownloadVerified = $false');
+    expect(script).toContain('installerStageInterruptionVerified = $false');
+    expect(script).toContain('installerTransactionalityVerified = $false');
+    expect(script).toContain("[IO.File]::Move([string]$upgraded.appPath,$quarantineApp,$false)");
+    expect(script).toContain('Controlled damage did not remove the installed application executable.');
+    expect(script).toContain("damageKind = 'missing-application-executable'");
+    expect(script).toContain('Assert-FileReceipt -Path $quarantineApp');
+    expect(script).toContain('Repair changed the isolated quarantine inventory.');
+    expect(script).not.toMatch(/appKillMidDownloadVerified\s*=\s*\$true|installerTransactionalityVerified\s*=\s*\$true/);
+  });
+
+  it('writes exactly one sanitized receipt-only JSON record', () => {
+    const script = readFileSync(scriptPath, 'utf8');
+    expect(script).toContain("Join-Path $output 'in-app-update-verification.json'");
+    expect(script).toContain('$outputFiles.Count -ne 1');
+    expect(script).toContain('notes = $manifestNotesReceipt');
+    expect(script).not.toContain('notes = [string]$manifest.notes');
+    expect(script).toContain('GITHUB_TOKEN|GH_TOKEN|AZURE_|TAURI_SIGNING');
+    expect(script).toContain('release-assets\\.githubusercontent\\.com');
+    expect(script).not.toMatch(/Write-Host\s+\$json|Write-Output\s+\$json/);
+  });
+
+  it('parses and rejects ambiguous numeric and installed-file receipts', () => {
+    const source = verifierHarness(
+      ['ConvertTo-ExactUInt64', 'Get-TextReceipt', 'Assert-InstallFacts'],
+      String.raw`
+        if((ConvertTo-ExactUInt64 -Value '42' -Kind id)-ne[uint64]42){throw 'Exact integer failed.'}
+        foreach($bad in @('0','-1',' 1','1.0','1e2','18446744073709551616')){
+          $rejected=$false;try{$null=ConvertTo-ExactUInt64 -Value $bad -Kind id}catch{$rejected=$true}
+          if(-not$rejected){throw 'Ambiguous integer passed.'}
+        }
+        $text=Get-TextReceipt -Value 'é'
+        if($text.bytes-ne2-or$text.sha256-cnotmatch'^[A-F0-9]{64}$'){throw 'UTF-8 text receipt failed.'}
+        $root=[IO.Path]::GetFullPath('target/mock-installed')
+        $receipt=[pscustomobject]@{bytes=[uint64]10;sha256=('A'*64)}
+        $facts=[pscustomobject]@{displayName='PDF Workstation';displayVersion='1.2.3';installLocation=$root;appBytes=[uint64]10;appSha256=('A'*64);fileVersion='1.2.3';productVersion='1.2.3';signatureStatus='Valid';publisher='Joshua Beel';hasTimestamp=$true}
+        Assert-InstallFacts -Facts $facts -Version '1.2.3' -InstallRoot $root -ApplicationReceipt $receipt -Publisher 'Joshua Beel' -SignatureStatus 'Valid'
+        $wrong=$facts.PSObject.Copy();$wrong.appSha256=('B'*64)
+        $rejected=$false;try{Assert-InstallFacts -Facts $wrong -Version '1.2.3' -InstallRoot $root -ApplicationReceipt $receipt -Publisher 'Joshua Beel' -SignatureStatus 'Valid'}catch{$rejected=$true}
+        if(-not$rejected){throw 'Wrong installed receipt passed.'}
+      `,
+    );
+    const result = spawnSync('pwsh.exe', ['-NoProfile', '-NonInteractive', '-Command', source], { encoding: 'utf8', timeout: 20_000 });
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+});

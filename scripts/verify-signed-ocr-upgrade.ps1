@@ -13,6 +13,7 @@ Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'ocr/installer-package.ps1')
 . (Join-Path $PSScriptRoot 'ocr/windows-signing.ps1')
 . (Join-Path $PSScriptRoot 'installed-app-launch.ps1')
+. (Join-Path $PSScriptRoot 'installed-publisher-ui.ps1')
 
 $script:Pins = [ordered]@{
     Repository = 'Joshua-Beel/Smacrobat'
@@ -673,14 +674,43 @@ function Write-SanitizedUpgradeRecord {
         [Parameter(Mandatory = $true)][string]$WorkflowSourceRevision,
         [Parameter(Mandatory = $true)]$Receipt,
         [Parameter(Mandatory = $true)]$InstalledEngineSmoke,
-        [Parameter(Mandatory = $true)]$InstalledAppLaunch
+        [Parameter(Mandatory = $true)]$InstalledAppLaunch,
+        [Parameter(Mandatory = $true)]$InstallerPublisherUi,
+        [Parameter(Mandatory = $true)]$ApplicationPublisherUi
     )
+    $publisherUiContracts = @(
+        [pscustomobject]@{ Value = $InstallerPublisherUi; Kind = 'installer'; FileName = $script:Pins.SignedInstallerName; Bytes = [uint64]$script:Pins.SignedInstallerBytes; Sha256 = [string]$script:Pins.SignedInstallerSha256 },
+        [pscustomobject]@{ Value = $ApplicationPublisherUi; Kind = 'installed-application'; FileName = 'pdf-workstation.exe'; Bytes = [uint64]$Receipt.packagedApplication.bytes; Sha256 = [string]$Receipt.packagedApplication.sha256 }
+    )
+    foreach ($contract in $publisherUiContracts) {
+        $value = $contract.Value
+        Assert-ExactProperties -Value $value -Expected @(
+            'kind','fileName','bytes','sha256','publisher','uiCulture','shellPropertiesDialog','digitalSignaturesTab',
+            'signerRowMatched','detailsDialog','statusTextMatched','trustedTimestampVerified','cleanupVerified','screenshotsUsed'
+        ) -Kind 'Windows publisher UI receipt'
+        if ([string]$value.kind -cne [string]$contract.Kind -or
+            [string]$value.fileName -cne [string]$contract.FileName -or
+            [uint64]$value.bytes -ne [uint64]$contract.Bytes -or
+            [string]$value.sha256 -cne [string]$contract.Sha256 -or
+            [string]$value.publisher -cne $script:Pins.ExpectedPublisher -or
+            [string]$value.uiCulture -cne 'en-US' -or
+            $value.shellPropertiesDialog -isnot [bool] -or -not $value.shellPropertiesDialog -or
+            $value.digitalSignaturesTab -isnot [bool] -or -not $value.digitalSignaturesTab -or
+            $value.signerRowMatched -isnot [bool] -or -not $value.signerRowMatched -or
+            $value.detailsDialog -isnot [bool] -or -not $value.detailsDialog -or
+            $value.statusTextMatched -isnot [bool] -or -not $value.statusTextMatched -or
+            $value.trustedTimestampVerified -isnot [bool] -or -not $value.trustedTimestampVerified -or
+            $value.cleanupVerified -isnot [bool] -or -not $value.cleanupVerified -or
+            $value.screenshotsUsed -isnot [bool] -or $value.screenshotsUsed) {
+            throw 'Windows publisher UI receipt is incomplete or malformed.'
+        }
+    }
     if (Test-Path -LiteralPath $OutputRoot) { throw 'Sanitized output root must be fresh.' }
     [IO.Directory]::CreateDirectory($OutputRoot) | Out-Null
     Assert-NoReparseAncestors -Path $OutputRoot
     $record = [ordered]@{
-        schemaVersion = 4
-        scope = 'Ephemeral GitHub-hosted silent NSIS installation, manual upgrade, direct installed-engine OCR smoke, and installed signed application WebView launch/native IPC/sample-render/current-page OCR completion verification; OCR accuracy, native dialogs, user documents, printing, preferences, drag-and-drop, and updater behavior are not established.'
+        schemaVersion = 5
+        scope = 'Ephemeral GitHub-hosted silent NSIS installation, manual upgrade, Windows Explorer Digital Signatures publisher UI, direct installed-engine OCR smoke, and installed signed application WebView launch/native IPC/sample-render/current-page OCR completion verification; OCR accuracy, other native dialogs, native visuals, UAC and SmartScreen prompts, user documents, printing, preferences, drag-and-drop, and updater behavior are not established.'
         mode = 'ephemeral-current-user-silent-manual-upgrade'
         workflowSourceRevision = $WorkflowSourceRevision
         signedArtifactSourceRevision = $script:Pins.SignedSourceRevision
@@ -694,6 +724,7 @@ function Write-SanitizedUpgradeRecord {
             installedApplication = [ordered]@{ bytes = [uint64]$Receipt.packagedApplication.bytes; sha256 = [string]$Receipt.packagedApplication.sha256 }
             installedEngineOcrSmoke = $InstalledEngineSmoke
             installedApplicationLaunch = $InstalledAppLaunch
+            publisherUi = [ordered]@{ installer = $InstallerPublisherUi; installedApplication = $ApplicationPublisherUi }
             publisher = $script:Pins.ExpectedPublisher
             signatures = [ordered]@{ installer = 'Valid'; application = 'Valid'; pdfium = 'Valid'; engine = 'Valid'; trustedTimestampsRequired = $true }
         }
@@ -713,6 +744,11 @@ function Write-SanitizedUpgradeRecord {
             samplePdfOpened = $true
             samplePdfiumRenderVerified = $true
             launchProcessCleanupVerified = $true
+            installerShellPublisherUiVerified = $true
+            installedApplicationShellPublisherUiVerified = $true
+            publisherUiScreenshotsUsed = $false
+            uacPublisherPromptVerified = $false
+            smartScreenPublisherPromptVerified = $false
             nativeWindowVisualVerified = $false
             realPreferencesVerified = $false
             installedEngineOcrSmokeVerified = $true
@@ -729,7 +765,7 @@ function Write-SanitizedUpgradeRecord {
         }
     }
     $json = $record | ConvertTo-Json -Depth 12
-    if ($json -match '(?i)([A-Z]:\\|\\Users\\|runneradmin|GITHUB_TOKEN|GH_TOKEN|AZURE_|TAURI_SIGNING|11005152678|36499724415|569181842|raw\.log)') {
+    if ($json -match '(?i)([A-Z]:\\|\\Users\\|runneradmin|GITHUB_TOKEN|GH_TOKEN|AZURE_|TAURI_SIGNING|codesigning\.azure\.net|signingAccount|signingProfile|tenantId|clientId|11005152678|36499724415|569181842|raw\.log)') {
         throw 'Sanitized upgrade record contains a host path, token, credential identifier, artifact identifier, or raw log reference.'
     }
     $path = Join-Path $OutputRoot 'upgrade-verification.json'
@@ -780,6 +816,11 @@ $receiptSets = Assert-SignedArtifactReceipt -Receipt $receipt
 
 $freshFacts = Get-FreshInstallFacts -InstallRoot $installRoot -SettingsRoot $settingsRoot -RegistryPath $registryPath -InstallerPaths @($baselinePath,$signedInstaller)
 Assert-FreshInstallFacts -Facts $freshFacts
+$installerPublisherUi = Invoke-InstalledPublisherUiProof `
+    -Path $signedInstaller `
+    -Receipt ([pscustomobject]@{ bytes = $script:Pins.SignedInstallerBytes; sha256 = $script:Pins.SignedInstallerSha256 }) `
+    -Kind 'installer' `
+    -ExpectedPublisher $script:Pins.ExpectedPublisher
 
 [IO.Directory]::CreateDirectory($work) | Out-Null
 Assert-NoReparseAncestors -Path $work
@@ -817,6 +858,11 @@ if ($processFacts.applicationProcessPresent -or $processFacts.installerProcessPr
 $upgraded = Get-InstallFacts -RegistryPath $registryPath -ExpectedInstallRoot $installRoot
 Assert-InstallFacts -Facts $upgraded -ExpectedVersion '0.2.6' -ExpectedInstallRoot $installRoot -ExpectedApplication $receipt.packagedApplication -ExpectedSignatureStatus 'Valid' -ExpectedPublisher $script:Pins.ExpectedPublisher -ExpectedTimestamp $true
 $installedResources = Assert-InstalledSignedResources -InstallRoot $installRoot -Receipt $receipt -ReceiptSets $receiptSets
+$applicationPublisherUi = Invoke-InstalledPublisherUiProof `
+    -Path $installedResources.Application.FullName `
+    -Receipt $receipt.packagedApplication `
+    -Kind 'installed-application' `
+    -ExpectedPublisher $script:Pins.ExpectedPublisher
 $smokeRoot = Join-Path $work 'installed-engine-ocr-smoke'
 [IO.Directory]::CreateDirectory($smokeRoot) | Out-Null
 Assert-NoReparseAncestors -Path $smokeRoot
@@ -859,6 +905,13 @@ $installedAppLaunch = Invoke-InstalledAppLaunchSmoke `
     -ExpectedPublisher $script:Pins.ExpectedPublisher
 Assert-SentinelReceipts -SettingsPath $settingsSentinel -SettingsSha256 $settingsSentinelSha256 -DocumentPath $documentSentinel -DocumentSha256 $documentSentinelSha256
 
-$record = Write-SanitizedUpgradeRecord -OutputRoot $output -WorkflowSourceRevision ([string]$runnerFacts.githubSha) -Receipt $receipt -InstalledEngineSmoke $installedEngineSmoke -InstalledAppLaunch $installedAppLaunch
+$record = Write-SanitizedUpgradeRecord `
+    -OutputRoot $output `
+    -WorkflowSourceRevision ([string]$runnerFacts.githubSha) `
+    -Receipt $receipt `
+    -InstalledEngineSmoke $installedEngineSmoke `
+    -InstalledAppLaunch $installedAppLaunch `
+    -InstallerPublisherUi $installerPublisherUi `
+    -ApplicationPublisherUi $applicationPublisherUi
 Write-Output 'Ephemeral silent installer upgrade verification succeeded.'
 Write-Output ('Sanitized record SHA-256: ' + (Get-ExactSha256 -Path $record))
