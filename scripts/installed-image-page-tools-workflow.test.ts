@@ -72,17 +72,42 @@ describe('installed image page-tools verifier', () => {
       try{Invoke-ImagePageCreateNativeFlow -SessionId 'session' -ProcessId 42 -ProcessStartUtcTicks 10 -SourceImagePath 'C:\proof\source.png' -CreatedPdfPath 'C:\proof\created.pdf' -Deadline ([datetime]::UtcNow.AddSeconds(5))}catch{}
       try{Invoke-ImagePageExportNativeFlow -SessionId 'session' -ProcessId 42 -ProcessStartUtcTicks 10 -ExportedPngPath 'C:\proof\exported.png' -Deadline ([datetime]::UtcNow.AddSeconds(5))}catch{}
       $expectedCreate=@'
-const d=document.querySelector('dialog[aria-labelledby="create-pdf-title"]');const b=d?[...d.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Create PDF'):[];if(b.length===1)b[0].click();return b.length===1;
+const d=document.querySelector('dialog[aria-labelledby="create-pdf-title"]');const b=d?[...d.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Create PDF'&&!x.disabled):[];if(b.length===1)setTimeout(()=>b[0].click(),0);return b.length===1;
 '@
       $expectedExport=@'
-const d=document.querySelector('dialog[aria-labelledby="export-image-title"]');const b=d?[...d.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Export PNG'):[];if(b.length===1)b[0].click();return b.length===1;
+const d=document.querySelector('dialog[aria-labelledby="export-image-title"]');const b=d?[...d.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Export PNG'&&!x.disabled):[];if(b.length===1)setTimeout(()=>b[0].click(),0);return b.length===1;
 '@
       if($script:captured.Count-ne2-or$script:captured[0]-cne$expectedCreate-or$script:captured[1]-cne$expectedExport){throw ('WebDriver selector scripts were truncated or changed: '+($script:captured|ConvertTo-Json -Compress))}
       $tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile((Resolve-Path './scripts/installed-image-page-tools.ps1'),[ref]$tokens,[ref]$errors)
       $dialogScripts=@($ast.FindAll({param($node)$node-is[Management.Automation.Language.StringConstantExpressionAst]-and$node.Value-like'*aria-labelledby*'},$true)|ForEach-Object Value)
       $createDefaults=@($dialogScripts|Where-Object{$_-like'*Page size*'});$exportDefaults=@($dialogScripts|Where-Object{$_-like'*Image resolution*'})
       if($errors.Count-or$dialogScripts.Count-ne6-or$createDefaults.Count-ne1-or-not$createDefaults[0].Contains('dialog[aria-labelledby="create-pdf-title"]')-or-not$createDefaults[0].Contains('select[aria-label="Page size"]')-or$exportDefaults.Count-ne1-or-not$exportDefaults[0].Contains('dialog[aria-labelledby="export-image-title"]')-or-not$exportDefaults[0].Contains('select[aria-label="Image resolution"]')){throw 'One or more evaluated image WebDriver dialog scripts are truncated or changed.'}
+      $script:captured|ConvertTo-Json -Compress
     `);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+    const scripts = JSON.parse(result.stdout.trim()) as string[];
+    for (const [index, buttonText] of ['Create PDF', 'Export PNG'].entries()) {
+      const timers: Array<() => void> = [], events: string[] = [];
+      const button = { textContent: buttonText, disabled: false, click: () => events.push('click') };
+      const document = { querySelector: () => ({ querySelectorAll: () => [button] }) };
+      const receipt = new Function('document', 'setTimeout', scripts[index])(document, (callback: () => void) => timers.push(callback));
+      expect(receipt).toBe(true);
+      expect(events).toEqual([]);
+      expect(timers).toHaveLength(1);
+      timers[0]();
+      expect(events).toEqual(['click']);
+    }
+  });
+
+  it('reports only fixed WebDriver stage and failure categories', () => {
+    const result = runPowerShell(extractFunctions(['Get-ImagePageWebDriverFailureCategory', 'Invoke-ImagePageWebDriverScript', 'Wait-ImagePageWebDriverOracle'], String.raw`
+      function Invoke-WebDriverScript{throw 'WebDriver response headers exceeded their deadline. ambient-secret'}
+      $invokeMessage='';try{Invoke-ImagePageWebDriverScript -SessionId session -Script 'return true' -Deadline ([datetime]::UtcNow.AddSeconds(1)) -Stage submit-create}catch{$invokeMessage=$_.Exception.Message}
+      if($invokeMessage-cne'Installed image page-tools WebDriver stage failed: submit-create/response-headers-timeout.'-or$invokeMessage-like'*ambient-secret*'){throw 'Invoke stage diagnostic was missing or disclosed the source exception.'}
+      function Wait-WebDriverOracle{throw 'The remote server returned an HTTP 500 response containing ambient-secret'}
+      $waitMessage='';try{Wait-ImagePageWebDriverOracle -SessionId session -Script 'return true' -Deadline ([datetime]::UtcNow.AddSeconds(1)) -Predicate {$true} -Stage export-defaults}catch{$waitMessage=$_.Exception.Message}
+      if($waitMessage-cne'Installed image page-tools WebDriver stage failed: export-defaults/http-failure.'-or$waitMessage-like'*ambient-secret*'){throw 'Oracle stage diagnostic was missing or disclosed the source exception.'}
+    `));
     expect(result.status, result.stderr || result.stdout).toBe(0);
   });
 
