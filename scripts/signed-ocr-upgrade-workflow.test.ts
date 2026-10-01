@@ -4,6 +4,22 @@ import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 
+const approvedActionUses = [
+  'actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683',
+  'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093',
+  'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02',
+];
+
+function assertApprovedImmutableActionUses(workflow: string) {
+  const actionUses = [...workflow.matchAll(/^\s*-?\s*uses:\s*([^\s#]+)(?:\s+#.*)?$/gm)].map((match) => match[1]);
+  for (const actionUse of actionUses) {
+    if (!/@[0-9a-f]{40}$/.test(actionUse)) throw new Error(`Action does not use an immutable full SHA: ${actionUse}`);
+    if (!approvedActionUses.includes(actionUse)) throw new Error(`Action is not approved: ${actionUse}`);
+  }
+  if (actionUses.length !== approvedActionUses.length) throw new Error('Workflow action count changed.');
+  return actionUses;
+}
+
 function runPowerShell(source: string) {
   const root = `target/ocr-upgrade-test-script-${randomUUID()}`;
   mkdirSync(root, { recursive: true });
@@ -97,7 +113,8 @@ describe('manual signed OCR installer upgrade workflow', () => {
     expect(workflow).toContain('- name: Initialize fresh runner paths');
     expect(workflow).toContain('$env:RUNNER_TEMP');
     expect(workflow).toContain('[IO.StreamWriter]::new($env:GITHUB_ENV, $true, [Text.UTF8Encoding]::new($false))');
-    const initStep = workflow.slice(workflow.indexOf('- name: Initialize fresh runner paths'), workflow.indexOf('- uses: actions/checkout@v4'));
+    expect(assertApprovedImmutableActionUses(workflow)).toEqual(approvedActionUses);
+    const initStep = workflow.slice(workflow.indexOf('- name: Initialize fresh runner paths'), workflow.indexOf(`- uses: ${approvedActionUses[0]}`));
     expect(initStep).toContain('IsNullOrWhiteSpace($env:RUNNER_TEMP)');
     expect(initStep).toContain('IsNullOrWhiteSpace($env:GITHUB_ENV)');
     expect(initStep.match(/^[ ]{12}"(BASELINE_ROOT|SIGNED_ARTIFACT_ROOT|UPGRADE_WORK_ROOT|UPGRADE_OUTPUT_ROOT|WEBDRIVER_ROOT|WEBVIEW_PROFILE_ROOT)=/gm)).toHaveLength(6);
@@ -131,6 +148,15 @@ describe('manual signed OCR installer upgrade workflow', () => {
     const uploadStep = workflow.slice(workflow.indexOf('- name: Upload only'));
     expect(uploadStep).toContain('/upgrade-verification.json');
     expect(uploadStep).not.toMatch(/\.exe|SIGNED_ARTIFACT_ROOT|BASELINE_ROOT|UPGRADE_WORK_ROOT/);
+  });
+
+  it('rejects mutable action refs and unapproved external actions', () => {
+    const workflow = readFileSync('.github/workflows/ocr-installer-upgrade.yml', 'utf8');
+    const mutable = workflow.replace(approvedActionUses[0], 'actions/checkout@v4');
+    const unapproved = workflow.replace(approvedActionUses[0], `third-party/checkout@${'a'.repeat(40)}`);
+
+    expect(() => assertApprovedImmutableActionUses(mutable)).toThrow('Action does not use an immutable full SHA');
+    expect(() => assertApprovedImmutableActionUses(unapproved)).toThrow('Action is not approved');
   });
 
   it('executes the exact path initialization block under PowerShell 7', () => {
@@ -344,7 +370,7 @@ describe('manual signed OCR installer upgrade workflow', () => {
     );
     const result = runPowerShell7(check);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('binds direct installed-engine smoke to exact trusted assets, oracle, profile, and caps', () => {
     const check = functionHarness(
@@ -407,6 +433,15 @@ describe('manual signed OCR installer upgrade workflow', () => {
     expect(helper).toContain("ValidStatus = 'This digital signature is OK.'");
     expect(helper).toContain('[Windows.Automation.SelectionItemPattern]::Pattern');
     expect(helper).toContain('[Windows.Automation.InvokePattern]::Pattern');
+    expect(helper).toContain('[Windows.Automation.ValuePattern]::Pattern');
+    expect(helper).toContain("-Name 'Embedded Signatures' -ControlType ([Windows.Automation.ControlType]::DataGrid)");
+    expect(helper).toContain('-Root $signatureGrids[0] -Name $ExpectedPublisher -ControlType ([Windows.Automation.ControlType]::DataItem)');
+    expect(helper).toContain('Where-Object { [bool]$_.Current.IsEnabled }');
+    expect(helper).toContain('$buttons[0].SetFocus()');
+    expect(helper).toContain('NativeShell]::OwnedBy($ExpectedOwner)');
+    expect(helper).toContain('Wait-PublisherUiExactOwnedWindow');
+    expect(helper).toContain("-Root $details -Name 'Name:' -ControlType ([Windows.Automation.ControlType]::Edit)");
+    expect(helper).toContain('$value.EndsWith("`r",[StringComparison]::Ordinal)');
     expect(helper).toContain('ElementMaximum = 256');
     expect(helper).toContain('DeadlineMilliseconds = 30000');
     expect(helper).toContain('InteractionMilliseconds = 25000');
@@ -418,6 +453,7 @@ describe('manual signed OCR installer upgrade workflow', () => {
     expect(helper).toContain('JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE');
     expect(helper).toContain('TerminateJobObject(job, 125)');
     expect(helper).toContain('start.Environment.Clear()');
+    expect(helper).toContain("'SystemRoot','SystemDrive','WINDIR','ProgramData'");
     expect(helper).toContain('StdoutMaximum = 4096');
     expect(helper).toContain('StderrMaximum = 2048');
     expect(helper).toContain("[Console]::Error.Write('publisher-ui-child-failed')");

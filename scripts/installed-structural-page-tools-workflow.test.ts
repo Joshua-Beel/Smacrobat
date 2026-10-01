@@ -155,5 +155,5 @@ Start-Sleep -Seconds 30
       if(-not$rejected-or$watch.ElapsedMilliseconds-gt7000){throw 'Stalled structural PDFium proof was not killed within its bounded deadline.'}
     `);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 });

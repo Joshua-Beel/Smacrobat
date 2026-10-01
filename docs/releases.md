@@ -12,6 +12,8 @@ The manual `in-app-update-verification.yml` workflow is a read-only post-publica
 
 The signed-upgrade verifier also checks the Windows Explorer **Digital Signatures** property sheet for the exact installer and installed application. Shell and UI Automation execute only in a killable child process with a minimal environment, bounded output, and an enforced deadline. The evidence records the public publisher and fixed verification booleans without screenshots, raw UI trees, certificate metadata, paths, or Azure identifiers. GitHub-hosted Windows cannot prove a UAC publisher prompt, and SmartScreen remains dependent on reputation and final download origin; both claims stay false.
 
+[Hosted run 36924870408](https://github.com/Joshua-Beel/Smacrobat/actions/runs/36924870408) failed closed at the new publisher surface check. Windows exposed the signer as both a data row and child text, exposed embedded and catalog Details buttons, and omitted the owned modal details dialog from the root UI Automation tree. The verifier now selects one signer row inside the exact embedded-signature grid, invokes the one enabled Details action, resolves the exact owned modal through its Win32 owner, and reads the signer from the exact value field before accepting the fixed valid-signature text. The isolated helper passes locally against the retained signed installer. Hosted evidence remains pending a rerun.
+
 ## Signing key
 
 Store the private updater signing key outside Git and preserve a secure backup. Replacing or losing it prevents existing installations from accepting future updates. Never commit it or print it in logs. The public key lives in `src-tauri/tauri.conf.json`.

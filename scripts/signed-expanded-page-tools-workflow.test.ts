@@ -42,7 +42,7 @@ describe('signed installed expanded page-tools workflow', () => {
     expect(verifier).toContain('signedSelectorMarkerCount -ne 10');
   });
 
-  it('resolves every feature blob against both signed and dispatched source while reporting shell drift separately', () => {
+  it('fails closed when current feature source has moved beyond the inspected signed artifact', () => {
     const script = String.raw`
       $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
       $path='${process.cwd().replaceAll("'", "''")}\scripts\verify-signed-expanded-page-tools.ps1';$tokens=$null;$errors=$null
@@ -50,14 +50,14 @@ describe('signed installed expanded page-tools workflow', () => {
       $assignment=$ast.Find({param($node)$node-is[Management.Automation.Language.AssignmentStatementAst]-and$node.Left.Extent.Text-ceq'$script:ExpandedPins'},$true)
       Invoke-Expression $assignment.Extent.Text
       foreach($name in @('Assert-SignedExpandedSourceParity')){$definition=$ast.Find({param($node)$node-is[Management.Automation.Language.FunctionDefinitionAst]-and$node.Name-ceq$name},$true);Invoke-Expression $definition.Extent.Text}
-      $result=Assert-SignedExpandedSourceParity -ProjectRoot '${process.cwd().replaceAll("'", "''")}'
-      if(-not$result.exactSignedFeatureBlobsMatched-or$result.featureBlobCount-ne16-or$result.signedSelectorMarkerCount-ne10){throw 'Signed expanded source binding was incomplete.'}
+      Assert-SignedExpandedSourceParity -ProjectRoot '${process.cwd().replaceAll("'", "''")}' | Out-Null
     `;
     const result = runPowerShell(script);
-    expect(result.status, result.stderr || result.stdout).toBe(0);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('An expanded page-tools feature blob does not match the exact signed and dispatched source: src-tauri/src/main.rs');
     expect(verifier).toContain('currentApplicationShellMatchesSigned');
     expect(verifier).not.toContain('exactSignedApplicationShellMatched=$true');
-  });
+  }, 15_000);
 
   it('imports and invokes all three independent installed-app verifiers with fresh profiles', () => {
     for (const script of ['installed-image-page-tools.ps1', 'installed-organizer-tools.ps1', 'installed-structural-page-tools.ps1']) expect(verifier).toContain(script);

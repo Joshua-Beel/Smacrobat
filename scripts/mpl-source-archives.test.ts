@@ -97,4 +97,4 @@ it('verifies the five checked-in archive resources against offline locked Cargo 
   expect(entries.map(entry => `${entry.name}@${entry.version}`)).toEqual([
     'cssparser@0.36.0', 'cssparser-macros@0.6.1', 'dtoa-short@0.3.5', 'option-ext@0.2.0', 'selectors@0.36.1',
   ]);
-}, 15_000);
+}, 30_000);

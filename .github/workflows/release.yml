@@ -12,12 +12,15 @@ jobs:
   installer:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: '22'
           cache: npm
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
       - name: Validate release version and signing setup
         shell: pwsh
         env:
@@ -41,8 +44,37 @@ jobs:
           foreach ($name in @('AZURE_TENANT_ID', 'AZURE_CLIENT_ID', 'AZURE_CLIENT_SECRET')) {
             if (-not [Environment]::GetEnvironmentVariable($name)) { throw "Add repository Actions secret: $name" }
           }
-          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
-          if ($env:GITHUB_REF_TYPE -ne 'tag' -or $env:GITHUB_REF_NAME -ne "v$version") { throw 'Run this workflow on the matching version tag.' }
+          if ($env:GITHUB_REF_TYPE -cne 'tag' -or $env:GITHUB_REF_NAME -cnotmatch '^v(?<version>\d+\.\d+\.\d+)$') {
+            throw 'Run this workflow on an exact stable vMAJOR.MINOR.PATCH tag.'
+          }
+          $version = $Matches.version
+          $package = Get-Content package.json -Raw -Encoding UTF8 | ConvertFrom-Json
+          $packageLock = Get-Content package-lock.json -Raw -Encoding UTF8 | ConvertFrom-Json
+          $lockRoot = $packageLock.packages.PSObject.Properties[''].Value
+          $tauri = Get-Content src-tauri/tauri.conf.json -Raw -Encoding UTF8 | ConvertFrom-Json
+          $cargo = Get-Content src-tauri/Cargo.toml -Raw -Encoding UTF8
+          $cargoVersionMatch = [regex]::Match($cargo, '(?m)^version = "([^"]+)"$')
+          $cargoLock = Get-Content src-tauri/Cargo.lock -Raw -Encoding UTF8
+          $cargoLockMatches = [regex]::Matches($cargoLock, '(?m)^name = "pdf-workstation"\r?\nversion = "([^"]+)"$')
+          if (-not $lockRoot -or -not $cargoVersionMatch.Success -or $cargoLockMatches.Count -ne 1) {
+            throw 'Could not resolve every release version source exactly once.'
+          }
+          $versions = @($package.version, $packageLock.version, $lockRoot.version, $tauri.version, $cargoVersionMatch.Groups[1].Value, $cargoLockMatches[0].Groups[1].Value)
+          if (@($versions | Where-Object { $_ -cne $version }).Count -ne 0) {
+            throw 'Tag, npm, Cargo, lockfile, and Tauri versions must agree exactly.'
+          }
+          $head = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Could not resolve checked-out HEAD.' }
+          $tagCommit = (git rev-parse "$($env:GITHUB_REF_NAME)^{commit}").Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the release tag commit.' }
+          if ($head -cne $env:GITHUB_SHA -or $tagCommit -cne $env:GITHUB_SHA) {
+            throw 'Checked-out source, workflow source SHA, and release tag commit must be identical.'
+          }
+          git diff --quiet
+          if ($LASTEXITCODE -ne 0) { throw 'Release source has tracked working-tree changes.' }
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) { throw 'Release source has staged changes.' }
+          [IO.File]::AppendAllText($env:GITHUB_ENV, "RELEASE_VERSION=$version`n", [Text.UTF8Encoding]::new($false))
       - run: npm ci
       - run: npm run fixtures
       - run: ./scripts/setup-pdfium.ps1
@@ -51,7 +83,7 @@ jobs:
         run: cargo fetch --locked --target x86_64-pc-windows-msvc --manifest-path src-tauri/Cargo.toml
       - run: npm test
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
         with:
           dotnet-version: '8.0.x'
       - name: Install Azure Artifact Signing CLI
@@ -68,16 +100,56 @@ jobs:
           AZURE_SIGNING_ENDPOINT: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
           AZURE_SIGNING_ACCOUNT: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
           AZURE_SIGNING_PROFILE: ${{ secrets.AZURE_SIGNING_PROFILE }}
-      - uses: actions/upload-artifact@v4
+      - name: Verify exact release asset inventory
+        shell: pwsh
+        run: |
+          $bundle = 'src-tauri/target/release/bundle/nsis'
+          $installerName = "PDF Workstation_$($env:RELEASE_VERSION)_x64-setup.exe"
+          $expected = @($installerName, "$installerName.sig", 'latest.json') | Sort-Object
+          $actual = @(Get-ChildItem -LiteralPath $bundle -File | ForEach-Object Name | Sort-Object)
+          if ($actual.Count -ne 3 -or (Compare-Object -ReferenceObject $expected -DifferenceObject $actual -CaseSensitive)) {
+            throw 'Release bundle must contain exactly the installer, its detached updater signature, and latest.json.'
+          }
+          foreach ($name in $expected) {
+            $path = Join-Path $bundle $name
+            if ((Get-Item -LiteralPath $path).Length -le 0) { throw "Release asset is empty: $name" }
+          }
+          $manifest = Get-Content (Join-Path $bundle 'latest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+          $platform = $manifest.platforms.'windows-x86_64'
+          $signature = (Get-Content (Join-Path $bundle "$installerName.sig") -Raw -Encoding UTF8).Trim()
+          $assetName = $installerName.Replace(' ', '.')
+          $expectedUrl = "https://github.com/Joshua-Beel/Smacrobat/releases/download/v$($env:RELEASE_VERSION)/$assetName"
+          $notes = Get-Content docs/release-notes.md -Raw -Encoding UTF8
+          if ($manifest.version -cne $env:RELEASE_VERSION -or $platform.url -cne $expectedUrl -or $platform.signature -cne $signature -or $manifest.notes -cne $notes) {
+            throw 'Updater manifest is not bound to the exact version, installer, detached signature, and release notes.'
+          }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: windows-installer
-          path: src-tauri/target/release/bundle/nsis/*
+          path: |
+            src-tauri/target/release/bundle/nsis/PDF Workstation_${{ env.RELEASE_VERSION }}_x64-setup.exe
+            src-tauri/target/release/bundle/nsis/PDF Workstation_${{ env.RELEASE_VERSION }}_x64-setup.exe.sig
+            src-tauri/target/release/bundle/nsis/latest.json
           if-no-files-found: error
       - name: Create draft release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $assets = Get-ChildItem src-tauri/target/release/bundle/nsis -File | Where-Object { $_.Name -match '\.(exe|sig|json)$' } | ForEach-Object FullName
-          gh release create $env:GITHUB_REF_NAME @assets --verify-tag --draft --title "PDF Workstation $env:GITHUB_REF_NAME" --notes-file docs/release-notes.md
+          $bundle = 'src-tauri/target/release/bundle/nsis'
+          $installerName = "PDF Workstation_$($env:RELEASE_VERSION)_x64-setup.exe"
+          $assets = @(
+            (Join-Path $bundle $installerName),
+            (Join-Path $bundle "$installerName.sig"),
+            (Join-Path $bundle 'latest.json')
+          )
+          gh release create $env:GITHUB_REF_NAME @assets --repo $env:GITHUB_REPOSITORY --verify-tag --draft --target $env:GITHUB_SHA --title "PDF Workstation $env:GITHUB_REF_NAME" --notes-file docs/release-notes.md
           if ($LASTEXITCODE -ne 0) { throw 'Release creation failed. Existing releases are never overwritten.' }
+          $releaseJson = gh release view $env:GITHUB_REF_NAME --repo $env:GITHUB_REPOSITORY --json tagName,isDraft,isPrerelease,targetCommitish,assets
+          if ($LASTEXITCODE -ne 0) { throw 'Could not verify the created draft release.' }
+          $release = $releaseJson | ConvertFrom-Json
+          $expectedNames = @($installerName.Replace(' ', '.'), ($installerName.Replace(' ', '.') + '.sig'), 'latest.json') | Sort-Object
+          $actualNames = @($release.assets | ForEach-Object name | Sort-Object)
+          if ($release.tagName -cne $env:GITHUB_REF_NAME -or -not $release.isDraft -or $release.isPrerelease -or $release.targetCommitish -cne $env:GITHUB_SHA -or $actualNames.Count -ne 3 -or (Compare-Object -ReferenceObject $expectedNames -DifferenceObject $actualNames -CaseSensitive)) {
+            throw 'Created release is not the exact source-bound draft with the required three assets.'
+          }

@@ -31,6 +31,7 @@ function Initialize-PublisherUiInterop {
     if ('Smacrobat.PublisherUi.NativeShell' -as [type]) { return }
     Add-Type -TypeDefinition @'
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
 
@@ -59,6 +60,8 @@ namespace Smacrobat.PublisherUi {
         private static extern bool ShellExecuteEx(ref SHELLEXECUTEINFO info);
         [DllImport("user32.dll")] private static extern bool IsWindow(IntPtr hwnd);
         [DllImport("user32.dll")] private static extern IntPtr GetWindow(IntPtr hwnd, uint command);
+        private delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr state);
+        [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr state);
         [DllImport("user32.dll", SetLastError = true)] private static extern bool PostMessage(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);
 
         private const uint SEE_MASK_INVOKEIDLIST = 0x0000000C;
@@ -78,6 +81,15 @@ namespace Smacrobat.PublisherUi {
 
         public static bool WindowExists(long handleValue) { return IsWindow(new IntPtr(handleValue)); }
         public static long OwnerOf(long handleValue) { return GetWindow(new IntPtr(handleValue), GW_OWNER).ToInt64(); }
+        public static long[] OwnedBy(long handleValue) {
+            IntPtr owner = new IntPtr(handleValue);
+            List<long> matches = new List<long>();
+            EnumWindows((hwnd, state) => {
+                if (GetWindow(hwnd, GW_OWNER) == owner) matches.Add(hwnd.ToInt64());
+                return true;
+            }, IntPtr.Zero);
+            return matches.ToArray();
+        }
         public static void CloseWindow(long handleValue) {
             IntPtr handle = new IntPtr(handleValue);
             if (IsWindow(handle) && !PostMessage(handle, WM_CLOSE, IntPtr.Zero, IntPtr.Zero)) {
@@ -380,6 +392,45 @@ function Wait-PublisherUiExactWindow {
     throw 'Windows publisher UI expected window did not appear before the deadline.'
 }
 
+function Get-PublisherUiExactOwnedWindows {
+    param(
+        [Parameter(Mandatory = $true)][string]$Title,
+        [Parameter(Mandatory = $true)][long]$ExpectedOwner,
+        [Parameter(Mandatory = $true)][datetime]$Deadline
+    )
+    Assert-PublisherUiDeadline -Deadline $Deadline
+    $ownedHandles = @([Smacrobat.PublisherUi.NativeShell]::OwnedBy($ExpectedOwner))
+    if ($ownedHandles.Count -gt $script:PublisherUiPins.ElementMaximum) { throw 'Windows publisher UI owned-window result exceeded its bound.' }
+    return @($ownedHandles | ForEach-Object {
+        $element = [Windows.Automation.AutomationElement]::FromHandle([IntPtr]$_)
+        if ($null -ne $element -and
+            [string]$element.Current.Name -ceq $Title -and
+            [string]$element.Current.ClassName -ceq $script:PublisherUiPins.PropertyClass -and
+            $element.Current.ControlType -eq [Windows.Automation.ControlType]::Window -and
+            [long]$element.Current.NativeWindowHandle -ne 0 -and
+            [bool]$element.Current.IsEnabled -and
+            -not [bool]$element.Current.IsOffscreen) {
+            $element
+        }
+    })
+}
+
+function Wait-PublisherUiExactOwnedWindow {
+    param(
+        [Parameter(Mandatory = $true)][string]$Title,
+        [Parameter(Mandatory = $true)][long]$ExpectedOwner,
+        [Parameter(Mandatory = $true)][datetime]$Deadline
+    )
+    do {
+        Assert-PublisherUiDeadline -Deadline $Deadline
+        $matches = @(Get-PublisherUiExactOwnedWindows -Title $Title -ExpectedOwner $ExpectedOwner -Deadline $Deadline)
+        if ($matches.Count -eq 1) { return $matches[0] }
+        if ($matches.Count -gt 1) { throw 'Windows publisher UI owned-window identity was ambiguous.' }
+        Start-Sleep -Milliseconds $script:PublisherUiPins.PollMilliseconds
+    } while ([datetime]::UtcNow -lt $Deadline)
+    throw 'Windows publisher UI expected owned window did not appear before the deadline.'
+}
+
 function Invoke-PublisherUiSelection {
     param([Parameter(Mandatory = $true)]$Element,[Parameter(Mandatory = $true)][datetime]$Deadline)
     Assert-PublisherUiDeadline -Deadline $Deadline
@@ -400,6 +451,21 @@ function Invoke-PublisherUiButton {
     }
     ([Windows.Automation.InvokePattern]$pattern).Invoke()
     Assert-PublisherUiDeadline -Deadline $Deadline
+}
+
+function Get-PublisherUiValue {
+    param([Parameter(Mandatory = $true)]$Element,[Parameter(Mandatory = $true)][datetime]$Deadline)
+    Assert-PublisherUiDeadline -Deadline $Deadline
+    $pattern = $null
+    if (-not $Element.TryGetCurrentPattern([Windows.Automation.ValuePattern]::Pattern,[ref]$pattern)) {
+        throw 'Windows publisher UI value field did not expose ValuePattern.'
+    }
+    $value = [string]([Windows.Automation.ValuePattern]$pattern).Current.Value
+    if ($value.Length -gt $script:PublisherUiPins.StringLengthMaximum) { throw 'Windows publisher UI value exceeded its bound.' }
+    if ($value.EndsWith("`r",[StringComparison]::Ordinal)) { $value = $value.Substring(0,$value.Length - 1) }
+    if ($value.Contains("`r") -or $value.Contains("`n")) { throw 'Windows publisher UI value was not one normalized line.' }
+    Assert-PublisherUiDeadline -Deadline $Deadline
+    return $value
 }
 
 function Close-PublisherUiWindow {
@@ -447,30 +513,29 @@ function Invoke-WindowsShellPublisherSurface {
         if ($tabs.Count -ne 1) { throw 'Windows publisher UI did not expose one exact Digital Signatures tab.' }
         Invoke-PublisherUiSelection -Element $tabs[0] -Deadline $interactionDeadline
 
-        $signers = @()
-        foreach ($type in @([Windows.Automation.ControlType]::DataItem,[Windows.Automation.ControlType]::ListItem,[Windows.Automation.ControlType]::Text)) {
-            $signers += @(Get-PublisherUiExactElements -Root $properties -Name $ExpectedPublisher -ControlType $type -Deadline $interactionDeadline)
-        }
-        $signerHandles = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-        $uniqueSigners = @($signers | Where-Object { $signerHandles.Add((($_.GetRuntimeId() | ForEach-Object { [string]$_ }) -join '.')) })
-        if ($uniqueSigners.Count -ne 1) { throw 'Windows publisher UI did not expose one exact expected signer row.' }
+        $signatureGrids = @(Get-PublisherUiExactElements -Root $properties -Name 'Embedded Signatures' -ControlType ([Windows.Automation.ControlType]::DataGrid) -Deadline $interactionDeadline)
+        if ($signatureGrids.Count -ne 1) { throw 'Windows publisher UI did not expose one exact embedded-signatures grid.' }
+        $signers = @(Get-PublisherUiExactElements -Root $signatureGrids[0] -Name $ExpectedPublisher -ControlType ([Windows.Automation.ControlType]::DataItem) -Deadline $interactionDeadline)
+        if ($signers.Count -ne 1) { throw 'Windows publisher UI did not expose one exact expected embedded signer row.' }
+        Invoke-PublisherUiSelection -Element $signers[0] -Deadline $interactionDeadline
 
-        $buttons = @(Get-PublisherUiExactElements -Root $properties -Name $script:PublisherUiPins.DetailsButton -ControlType ([Windows.Automation.ControlType]::Button) -Deadline $interactionDeadline)
-        if ($buttons.Count -ne 1) { throw 'Windows publisher UI did not expose one exact Details action.' }
+        $buttons = @(Get-PublisherUiExactElements -Root $properties -Name $script:PublisherUiPins.DetailsButton -ControlType ([Windows.Automation.ControlType]::Button) -Deadline $interactionDeadline | Where-Object { [bool]$_.Current.IsEnabled })
+        if ($buttons.Count -ne 1) { throw 'Windows publisher UI did not expose one enabled embedded-signature Details action.' }
+        $buttons[0].SetFocus()
+        Assert-PublisherUiDeadline -Deadline $interactionDeadline
         Invoke-PublisherUiButton -Element $buttons[0] -Deadline $interactionDeadline
         $detailsInvoked = $true
 
-        $details = Wait-PublisherUiExactWindow -Title $script:PublisherUiPins.DetailsTitle -ExpectedOwner $propertiesHandle -Deadline $interactionDeadline
+        $details = Wait-PublisherUiExactOwnedWindow -Title $script:PublisherUiPins.DetailsTitle -ExpectedOwner $propertiesHandle -Deadline $interactionDeadline
         $detailsHandle = [long]$details.Current.NativeWindowHandle
         $status = @(Get-PublisherUiExactElements -Root $details -Name $script:PublisherUiPins.ValidStatus -ControlType ([Windows.Automation.ControlType]::Text) -Deadline $interactionDeadline)
         if ($status.Count -ne 1) { throw 'Windows publisher UI did not expose the exact valid-signature status.' }
-        $publisherLabels = @()
-        foreach ($name in @($ExpectedPublisher,"Name: $ExpectedPublisher")) {
-            $publisherLabels += @(Get-PublisherUiExactElements -Root $details -Name $name -ControlType ([Windows.Automation.ControlType]::Text) -Deadline $interactionDeadline)
+        $signerGroups = @(Get-PublisherUiExactElements -Root $details -Name 'Signer information' -ControlType ([Windows.Automation.ControlType]::Group) -Deadline $interactionDeadline)
+        if ($signerGroups.Count -ne 1) { throw 'Windows publisher UI details did not expose one exact signer-information group.' }
+        $publisherFields = @(Get-PublisherUiExactElements -Root $details -Name 'Name:' -ControlType ([Windows.Automation.ControlType]::Edit) -Deadline $interactionDeadline)
+        if ($publisherFields.Count -ne 1 -or (Get-PublisherUiValue -Element $publisherFields[0] -Deadline $interactionDeadline) -cne $ExpectedPublisher) {
+            throw 'Windows publisher UI details did not expose the exact expected signer value.'
         }
-        $publisherIdentities = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-        $uniquePublisherLabels = @($publisherLabels | Where-Object { $publisherIdentities.Add((($_.GetRuntimeId() | ForEach-Object { [string]$_ }) -join '.')) })
-        if ($uniquePublisherLabels.Count -ne 1) { throw 'Windows publisher UI details did not expose the exact expected signer.' }
 
         return [pscustomobject]@{
             uiCulture = $script:PublisherUiPins.Culture
@@ -489,9 +554,7 @@ function Invoke-WindowsShellPublisherSurface {
             if ($propertiesCleanupMatches.Count -eq 1) { $propertiesHandle = [long]$propertiesCleanupMatches[0].Current.NativeWindowHandle }
         }
         if ($detailsHandle -eq 0 -and $detailsInvoked -and $propertiesHandle -ne 0) {
-            $detailsCleanupMatches = @(Get-PublisherUiExactWindows -Title $script:PublisherUiPins.DetailsTitle -Deadline $totalDeadline | Where-Object {
-                [Smacrobat.PublisherUi.NativeShell]::OwnerOf([long]$_.Current.NativeWindowHandle) -eq $propertiesHandle
-            })
+            $detailsCleanupMatches = @(Get-PublisherUiExactOwnedWindows -Title $script:PublisherUiPins.DetailsTitle -ExpectedOwner $propertiesHandle -Deadline $totalDeadline)
             if ($detailsCleanupMatches.Count -gt 1) { throw 'Windows publisher UI cleanup found ambiguous signature-details surfaces.' }
             if ($detailsCleanupMatches.Count -eq 1) { $detailsHandle = [long]$detailsCleanupMatches[0].Current.NativeWindowHandle }
         }
@@ -501,7 +564,7 @@ function Invoke-WindowsShellPublisherSurface {
 }
 
 function Get-PublisherUiMinimalEnvironment {
-    $required = @('SystemRoot','WINDIR','TEMP','TMP','USERPROFILE','LOCALAPPDATA','APPDATA','COMSPEC')
+    $required = @('SystemRoot','SystemDrive','WINDIR','ProgramData','TEMP','TMP','USERPROFILE','LOCALAPPDATA','APPDATA','COMSPEC')
     $pairs = [Collections.Generic.List[string]]::new()
     foreach ($name in $required) {
         $value = [Environment]::GetEnvironmentVariable($name)
