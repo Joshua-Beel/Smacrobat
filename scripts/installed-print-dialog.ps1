@@ -2121,6 +2121,55 @@ function Get-BoundProcessUiElementsByControlType {
     return @(Get-BoundProcessUiEntries -ProcessId $ProcessId -Binding $Binding -Deadline $Deadline -ElementProvider $ElementProvider -ParentProvider $ParentProvider -NativeWindowProvider $NativeWindowProvider | Where-Object { [string]$_.controlType -ceq $ControlType } | ForEach-Object { $_.element })
 }
 
+function Get-SanitizedUnexpectedNativeSurfaceDescriptors {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$UnexpectedEntries,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$TopLevelRecords,
+        [Parameter(Mandatory = $true)][datetime]$Deadline
+    )
+    if ($UnexpectedEntries.Count -gt $script:PrintPins.UiElementMaximum -or $TopLevelRecords.Count -gt $script:PrintPins.UiElementMaximum) { throw 'Unexpected native surface diagnostic exceeded its bounded inventory.' }
+    $recordsByHandle = @{}
+    foreach ($record in $TopLevelRecords) {
+        if ([datetime]::UtcNow -ge $Deadline) { throw 'Unexpected native surface diagnostic deadline expired.' }
+        $handleValue = [long]$record.HandleValue
+        if ($handleValue -eq 0 -or $recordsByHandle.ContainsKey($handleValue)) { throw 'Unexpected native surface diagnostic records were invalid.' }
+        $recordsByHandle.Add($handleValue,$record)
+    }
+    $groups = @{}
+    foreach ($entry in $UnexpectedEntries) {
+        if ([datetime]::UtcNow -ge $Deadline) { throw 'Unexpected native surface diagnostic deadline expired.' }
+        $handleValue = Get-NativeSurfaceHandleValue -Identity ([string]$entry.runtimeIdentity)
+        if (-not $recordsByHandle.ContainsKey($handleValue)) { throw 'Unexpected native surface diagnostic record was unavailable.' }
+        $record = $recordsByHandle[$handleValue]
+        $visibleProperty = $record.PSObject.Properties['IsVisible']; $enabledProperty = $record.PSObject.Properties['IsEnabled']
+        $classBucket = Get-SanitizedNativeClassBucket -Record $record
+        if ([datetime]::UtcNow -ge $Deadline) { throw 'Unexpected native surface diagnostic deadline expired.' }
+        $controlTypeBucket = Get-SanitizedNativeUiControlTypeBucket -ControlType ([string]$entry.controlType)
+        $visible = $null -ne $visibleProperty -and [bool]$visibleProperty.Value
+        $enabled = $null -ne $enabledProperty -and [bool]$enabledProperty.Value
+        $isSurface = [bool]$entry.isSurface
+        if ([datetime]::UtcNow -ge $Deadline) { throw 'Unexpected native surface diagnostic deadline expired.' }
+        $labels = [ordered]@{}
+        foreach ($label in @(
+            [pscustomobject]@{key='print';property='IsLabelPrint'},[pscustomobject]@{key='save';property='IsLabelSave'},[pscustomobject]@{key='cancel';property='IsLabelCancel'},
+            [pscustomobject]@{key='currentPage';property='IsLabelCurrentPage'},[pscustomobject]@{key='printer';property='IsLabelPrinterName'},[pscustomobject]@{key='fileName';property='IsLabelFileName'},
+            [pscustomobject]@{key='yes';property='IsLabelYes'},[pscustomobject]@{key='no';property='IsLabelNo'},[pscustomobject]@{key='ok';property='IsLabelOk'},[pscustomobject]@{key='continue';property='IsLabelContinue'}
+        )) {
+            $property = $record.PSObject.Properties[[string]$label.property]
+            $labels[[string]$label.key] = $null -ne $property -and [bool]$property.Value
+            if ([datetime]::UtcNow -ge $Deadline) { throw 'Unexpected native surface diagnostic deadline expired.' }
+        }
+        $labelBits = @($labels.Values | ForEach-Object { [int][bool]$_ }) -join ''
+        $key = @($classBucket,$controlTypeBucket,[int]$visible,[int]$enabled,[int]$isSurface,$labelBits) -join '|'
+        if (-not $groups.ContainsKey($key)) {
+            $groups.Add($key,[pscustomobject][ordered]@{count=0;classBucket=$classBucket;controlTypeBucket=$controlTypeBucket;visible=$visible;enabled=$enabled;isSurface=$isSurface;fixedLabelMatches=[pscustomobject]$labels})
+        }
+        $groups[$key].count = [int]$groups[$key].count + 1
+    }
+    if ([datetime]::UtcNow -ge $Deadline) { throw 'Unexpected native surface diagnostic deadline expired.' }
+    return @($groups.GetEnumerator() | Sort-Object Key | ForEach-Object { $_.Value })
+}
+
 function Get-SanitizedNativeCloseStateJson {
     param(
         [Parameter(Mandatory = $true)][ValidateSet('first-print-dialog','second-print-dialog','save-output-dialog')][string]$Stage,
@@ -2132,6 +2181,8 @@ function Get-SanitizedNativeCloseStateJson {
         [Parameter(Mandatory = $true)][ValidateSet('not-applicable','unavailable','absent','incomplete','complete')][string]$BoundSaveRoleStatus,
         [Parameter(Mandatory = $true)][ValidateSet('not-applicable','unavailable','exact','changed')][string]$FilenameStatus,
         [Parameter(Mandatory = $true)][int]$UnexpectedSurfaceCount,
+        [Parameter(Mandatory = $true)][ValidateSet('unavailable','available')][string]$UnexpectedSurfaceDescriptorsStatus,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$UnexpectedSurfaceDescriptors,
         [Parameter(Mandatory = $true)][int]$SuccessorDialogCount,
         [Parameter(Mandatory = $true)][ValidateSet('not-observed','available','unavailable')][string]$SuccessorRoleStatus,
         [Parameter(Mandatory = $true)][int]$SuccessorYesCount,
@@ -2144,12 +2195,27 @@ function Get-SanitizedNativeCloseStateJson {
     foreach ($count in @($BaselineExpectedCount,$BaselineExactSurfaceCount,$UnexpectedSurfaceCount,$SuccessorDialogCount,$SuccessorYesCount,$SuccessorNoCount,$SuccessorOkCount,$SuccessorContinueCount,$SuccessorCancelCount,$SuccessorSaveCount)) {
         if ($count -lt -1 -or $count -gt $script:PrintPins.UiElementMaximum) { throw 'Native close diagnostic count was invalid.' }
     }
+    if ($UnexpectedSurfaceDescriptorsStatus -ceq 'unavailable') {
+        if ($UnexpectedSurfaceDescriptors.Count -ne 0) { throw 'Unavailable unexpected surface descriptors were not empty.' }
+    } else {
+        if ($UnexpectedSurfaceCount -lt 0 -or $UnexpectedSurfaceDescriptors.Count -gt $script:PrintPins.UiElementMaximum) { throw 'Available unexpected surface descriptors were invalid.' }
+        $descriptorTotal = 0
+        foreach ($descriptor in $UnexpectedSurfaceDescriptors) {
+            Assert-PrintExactProperties -Value $descriptor -Expected @('count','classBucket','controlTypeBucket','visible','enabled','isSurface','fixedLabelMatches') -Kind 'Unexpected native surface descriptor'
+            Assert-PrintExactProperties -Value $descriptor.fixedLabelMatches -Expected @('print','save','cancel','currentPage','printer','fileName','yes','no','ok','continue') -Kind 'Unexpected native surface fixed label descriptor'
+            if ([int]$descriptor.count -lt 1 -or [int]$descriptor.count -gt $script:PrintPins.UiElementMaximum) { throw 'Unexpected native surface descriptor count was invalid.' }
+            if ([string]$descriptor.classBucket -notin @('dialog32770','button','comboBox','comboBoxEx32','edit','sysListView32','directUiHwnd','static','sysTabControl32','other')) { throw 'Unexpected native surface class bucket was invalid.' }
+            if ([string]$descriptor.controlTypeBucket -notin @('window','pane','button','radioButton','comboBox','list','edit','unavailable','other')) { throw 'Unexpected native surface control type bucket was invalid.' }
+            $descriptorTotal += [int]$descriptor.count
+        }
+        if ($descriptorTotal -ne $UnexpectedSurfaceCount) { throw 'Unexpected native surface descriptor total did not match its inventory.' }
+    }
     return ([ordered]@{
         inventoryStatus=$InventoryStatus;stage=$Stage;actionTransport=$ActionTransport
         baselineExpectedCount=$BaselineExpectedCount;baselineExactSurfaceCount=$BaselineExactSurfaceCount;boundSurfaceStatus=$BoundSurfaceStatus
-        boundSaveRoleStatus=$BoundSaveRoleStatus;filenameStatus=$FilenameStatus;unexpectedSurfaceCount=$UnexpectedSurfaceCount;successorDialogCount=$SuccessorDialogCount
+        boundSaveRoleStatus=$BoundSaveRoleStatus;filenameStatus=$FilenameStatus;unexpectedSurfaceCount=$UnexpectedSurfaceCount;unexpectedSurfaceDescriptorsStatus=$UnexpectedSurfaceDescriptorsStatus;unexpectedSurfaceDescriptors=$UnexpectedSurfaceDescriptors;successorDialogCount=$SuccessorDialogCount
         successorRoleStatus=$SuccessorRoleStatus;successorRoleCounts=[ordered]@{yes=$SuccessorYesCount;no=$SuccessorNoCount;ok=$SuccessorOkCount;continue=$SuccessorContinueCount;cancel=$SuccessorCancelCount;save=$SuccessorSaveCount}
-    } | ConvertTo-Json -Compress -Depth 4)
+    } | ConvertTo-Json -Compress -Depth 6)
 }
 
 function Wait-BoundProcessUiSurfaceClosed {
@@ -2178,7 +2244,7 @@ function Wait-BoundProcessUiSurfaceClosed {
     $baselineIdentities = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($identity in @($Binding.baselineIdentities)) { if ([string]::IsNullOrWhiteSpace([string]$identity) -or -not $baselineIdentities.Add([string]$identity)) { throw 'Native process UI close baseline identity set was invalid.' } }
     $structure = Get-SanitizedProcessUiStructureJson -ProcessId $ProcessId -DeadlineExpired
-    $closeState = Get-SanitizedNativeCloseStateJson -Stage $Stage -InventoryStatus 'unavailable' -ActionTransport $ActionTransport -BaselineExpectedCount $baselineIdentities.Count -BaselineExactSurfaceCount -1 -BoundSurfaceStatus 'unknown' -BoundSaveRoleStatus 'unavailable' -FilenameStatus 'unavailable' -UnexpectedSurfaceCount -1 -SuccessorDialogCount -1 -SuccessorRoleStatus 'unavailable' -SuccessorYesCount -1 -SuccessorNoCount -1 -SuccessorOkCount -1 -SuccessorContinueCount -1 -SuccessorCancelCount -1 -SuccessorSaveCount -1
+    $closeState = Get-SanitizedNativeCloseStateJson -Stage $Stage -InventoryStatus 'unavailable' -ActionTransport $ActionTransport -BaselineExpectedCount $baselineIdentities.Count -BaselineExactSurfaceCount -1 -BoundSurfaceStatus 'unknown' -BoundSaveRoleStatus 'unavailable' -FilenameStatus 'unavailable' -UnexpectedSurfaceCount -1 -UnexpectedSurfaceDescriptorsStatus 'unavailable' -UnexpectedSurfaceDescriptors @() -SuccessorDialogCount -1 -SuccessorRoleStatus 'unavailable' -SuccessorYesCount -1 -SuccessorNoCount -1 -SuccessorOkCount -1 -SuccessorContinueCount -1 -SuccessorCancelCount -1 -SuccessorSaveCount -1
     $deferUnexpectedSurfaceCheck = $Stage -ceq 'save-output-dialog'
     if ([string]$Binding.surfaceRootIdentity -cmatch '^hwnd:') {
         $boundIdentity = [string]$Binding.surfaceRootIdentity
@@ -2223,14 +2289,17 @@ function Wait-BoundProcessUiSurfaceClosed {
                         $null = $validatedNativeAllowedHandles.Add($handleValue)
                     }
                 }
-                $unexpectedSurface = $false; $unexpectedSurfaceCount = 0
+                $unexpectedSurface = $false; $unexpectedSurfaceCount = 0; $unexpectedEntries = @()
                 foreach ($entry in @($current | Where-Object { [bool]$_.isSurface })) {
                     $identity = [string]$entry.runtimeIdentity
                     $handleValue = Get-NativeSurfaceHandleValue -Identity $identity
                     if ($baselineIdentities.Contains($identity) -or $uiaAllowedIdentities -ccontains $identity -or $validatedNativeAllowedHandles.Contains($handleValue)) { continue }
-                    $unexpectedSurface = $true; $unexpectedSurfaceCount++
+                    $unexpectedSurface = $true; $unexpectedSurfaceCount++; $unexpectedEntries += $entry
                 }
                 if ([datetime]::UtcNow -ge $nextDetailedDiagnostic) {
+                    $unexpectedSurfaceDescriptorsStatus = 'available'; $unexpectedSurfaceDescriptors = @()
+                    try { $unexpectedSurfaceDescriptors = @(Get-SanitizedUnexpectedNativeSurfaceDescriptors -UnexpectedEntries $unexpectedEntries -TopLevelRecords $topLevelRecords -Deadline $Deadline) }
+                    catch { if ([datetime]::UtcNow -ge $Deadline) { throw }; $unexpectedSurfaceDescriptorsStatus = 'unavailable'; $unexpectedSurfaceDescriptors = @() }
                     $boundSaveRoleStatus = if ($Stage -ceq 'save-output-dialog' -and $boundIsExplicitNative) { if ($boundSurfaceRemains) { 'unavailable' } else { 'absent' } } else { 'not-applicable' }
                     $filenameStatus = if ($Stage -ceq 'save-output-dialog' -and $boundIsExplicitNative) { if ($boundSurfaceRemains) { 'unavailable' } else { 'not-applicable' } } else { 'not-applicable' }
                     if ($Stage -ceq 'save-output-dialog' -and $boundIsExplicitNative -and $boundSurfaceRemains -and [datetime]::UtcNow -lt $Deadline) {
@@ -2275,7 +2344,7 @@ function Wait-BoundProcessUiSurfaceClosed {
                         } catch { if ([datetime]::UtcNow -ge $Deadline) { throw }; $successorRoleStatus = 'unavailable'; foreach ($key in @($successorCounts.Keys)) { $successorCounts[$key] = -1 } }
                     }
                     $boundSurfaceStatus = if ($boundSurfaceRemains) { 'present' } else { 'absent' }
-                    $closeState = Get-SanitizedNativeCloseStateJson -Stage $Stage -InventoryStatus 'native-close-observed' -ActionTransport $ActionTransport -BaselineExpectedCount $baselineIdentities.Count -BaselineExactSurfaceCount $baselineExactSurfaceCount -BoundSurfaceStatus $boundSurfaceStatus -BoundSaveRoleStatus $boundSaveRoleStatus -FilenameStatus $filenameStatus -UnexpectedSurfaceCount $unexpectedSurfaceCount -SuccessorDialogCount $successorDialogs.Count -SuccessorRoleStatus $successorRoleStatus -SuccessorYesCount $successorCounts.yes -SuccessorNoCount $successorCounts.no -SuccessorOkCount $successorCounts.ok -SuccessorContinueCount $successorCounts.continue -SuccessorCancelCount $successorCounts.cancel -SuccessorSaveCount $successorCounts.save
+                    $closeState = Get-SanitizedNativeCloseStateJson -Stage $Stage -InventoryStatus 'native-close-observed' -ActionTransport $ActionTransport -BaselineExpectedCount $baselineIdentities.Count -BaselineExactSurfaceCount $baselineExactSurfaceCount -BoundSurfaceStatus $boundSurfaceStatus -BoundSaveRoleStatus $boundSaveRoleStatus -FilenameStatus $filenameStatus -UnexpectedSurfaceCount $unexpectedSurfaceCount -UnexpectedSurfaceDescriptorsStatus $unexpectedSurfaceDescriptorsStatus -UnexpectedSurfaceDescriptors $unexpectedSurfaceDescriptors -SuccessorDialogCount $successorDialogs.Count -SuccessorRoleStatus $successorRoleStatus -SuccessorYesCount $successorCounts.yes -SuccessorNoCount $successorCounts.no -SuccessorOkCount $successorCounts.ok -SuccessorContinueCount $successorCounts.continue -SuccessorCancelCount $successorCounts.cancel -SuccessorSaveCount $successorCounts.save
                     $nextDetailedDiagnostic = [datetime]::UtcNow.AddSeconds(1)
                 }
                 if (-not $boundSurfaceRemains -and $baselinePresent -and $allowedPresent -and ($deferUnexpectedSurfaceCheck -or -not $unexpectedSurface)) {
