@@ -463,9 +463,10 @@ describe('installed native print dialog verifier', () => {
         return @([pscustomobject]@{HandleValue=100L;ParentHandleValue=0L;Element=$main},[pscustomobject]@{HandleValue=200L;ParentHandleValue=0L;Element=(New-NativeHostedElement 2 200 'ControlType.Window' '')})
       }
       $baseline=@(Get-ProcessNativeWindowSnapshot -ProcessId 7319 -Deadline ([datetime]::UtcNow.AddSeconds(2)) -TopLevelOnly -WindowProvider $provider)
-      $script:nativeState='mismatch';$rejected=$false
-      try{Wait-NewProcessNativeWindowSurface -ProcessId 7319 -Baseline $baseline -AnchorNames @('Cancel') -AnchorControlTypes @('ControlType.Button') -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(250)) -WindowProvider $provider|Out-Null}catch{$rejected=$true}
+      $script:nativeState='mismatch';$rejected=$false;$mismatchMessage=''
+      try{Wait-NewProcessNativeWindowSurface -ProcessId 7319 -Baseline $baseline -AnchorNames @('Cancel') -AnchorControlTypes @('ControlType.Button') -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(250)) -WindowProvider $provider|Out-Null}catch{$rejected=$true;$mismatchMessage=$_.Exception.Message}
       if(-not$rejected){throw 'A replaced HWND runtime identity was accepted during binding.'}
+      if($mismatchMessage-cnotmatch'"inventoryStatus":"native-window-observed"'-or$mismatchMessage-cnotmatch'"candidateSurfaceCount":1'-or$mismatchMessage-cmatch'hwnd:|Private|Secret|HandleValue|ParentHandleValue'){throw 'The HWND binding failure did not preserve only the sanitized observed topology.'}
       $script:nativeState='open'
       $binding=Wait-NewProcessNativeWindowSurface -ProcessId 7319 -Baseline $baseline -AnchorNames @('Cancel') -AnchorControlTypes @('ControlType.Button') -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddSeconds(2)) -WindowProvider $provider
       if([string]$binding.surfaceRootIdentity-cnotmatch'^hwnd:200\|'-or@($binding.trackedIdentities).Count-ne6-or$script:uiaTreeCalls-ne0){throw 'Exact HWND binding did not bypass the stalled UIA tree provider.'}
@@ -494,6 +495,40 @@ describe('installed native print dialog verifier', () => {
       $slowProvider={param($requestedProcessId,[long]$rootHandle,[bool]$topLevelOnly)Start-Sleep -Milliseconds 40;@([pscustomobject]@{HandleValue=100L;ParentHandleValue=0L;Element=$main})}
       $rejected=$false;try{Get-ProcessNativeWindowSnapshot -ProcessId 7319 -Deadline ([datetime]::UtcNow.AddMilliseconds(20)) -TopLevelOnly -WindowProvider $slowProvider|Out-Null}catch{$rejected=$true}
       if(-not$rejected){throw 'A native HWND snapshot completed after its deadline.'}
+    `);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
+  it('emits deterministic bounded privacy-safe HWND topology diagnostics', () => {
+    const result = runPowerShell7(String.raw`
+      $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
+      Set-Location -LiteralPath '${process.cwd().replaceAll("'", "''")}'
+      . ./scripts/installed-print-dialog.ps1
+      $top=@(
+        [pscustomobject]@{HandleValue=100L;ParentHandleValue=0L;ClassName='SecretPrivateClass';ControlId=0;IsVisible=$true;Title='Private document title'},
+        [pscustomobject]@{HandleValue=200L;ParentHandleValue=0L;ClassName='#32770';ControlId=0;IsVisible=$true;Path='C:\private\file.pdf'}
+      )
+      $surface=@([pscustomobject]@{HandleValue=200L;ParentHandleValue=0L;ClassName='#32770';ControlId=0;IsVisible=$true})
+      foreach($index in 1..2050){
+        $class=if($index-eq1){'Button'}elseif($index-eq2){'ComboBox'}elseif($index-eq3){'SysListView32'}else{'SecretPrivateClass'}
+        $controlId=if($index-eq1){2}elseif($index-eq2){0x0470}elseif($index-eq3){0x0460}elseif($index-eq4){0x0497}elseif($index-eq5){0x0498}else{9000}
+        $surface+=[pscustomobject]@{HandleValue=[long](200+$index);ParentHandleValue=200L;ClassName=$class;ControlId=$controlId;IsVisible=$true;Text='Secret caption';Coordinates='10,20,30,40'}
+      }
+      $roles=[pscustomobject][ordered]@{cancelButton=1;printButton=0;saveButton=0;currentPageRadio=0;namedPrinter=0;printerCombo=1;printerList=1;filenameEdit=0}
+      $json=Get-SanitizedNativeWindowTopologyJson -TopLevelRecords $top -SurfaceRecords $surface -CandidateSurfaceCount 1 -RoleCounts $roles
+      if($json.Length-gt20000-or$json-cmatch'Private|Secret|file\.pdf|10,20|HandleValue|ParentHandleValue|Title|Path|Text|Coordinates'){throw 'HWND topology diagnostic leaked sensitive or raw window data.'}
+      $receipt=$json|ConvertFrom-Json
+      Assert-PrintExactProperties -Value $receipt -Expected @('inventoryStatus','topLevelOwnedCount','topLevelOwnedVisibleCount','topLevelCountCapped','candidateSurfaceCount','candidateSurfaceCountCapped','childCount','childCountCapped','classHistogram','controlIdHistogram','requiredRoleMatchesAvailable','requiredRoleMatches') -Kind 'HWND topology receipt'
+      Assert-PrintExactProperties -Value $receipt.classHistogram -Expected @('dialog32770','button','comboBox','comboBoxEx32','edit','sysListView32','directUiHwnd','static','sysTabControl32','other') -Kind 'HWND class histogram'
+      Assert-PrintExactProperties -Value $receipt.controlIdHistogram -Expected @('idOk','idCancel','pushButtonRange','checkBoxRange','radioButtonRange','groupRange','staticRange','listRange','comboRange','editRange','scrollRange','otherPositive','none') -Kind 'HWND control-ID histogram'
+      Assert-PrintExactProperties -Value $receipt.requiredRoleMatches -Expected @('cancelButton','printButton','saveButton','currentPageRadio','namedPrinter','printerCombo','printerList','filenameEdit') -Kind 'HWND role histogram'
+      if($receipt.inventoryStatus-cne'native-window-observed'-or$receipt.topLevelOwnedCount-ne2-or$receipt.topLevelOwnedVisibleCount-ne2-or$receipt.candidateSurfaceCount-ne1-or-not$receipt.childCountCapped-or$receipt.childCount-gt2048-or
+        $receipt.classHistogram.dialog32770-ne1-or$receipt.classHistogram.button-ne1-or$receipt.classHistogram.comboBox-ne1-or$receipt.classHistogram.sysListView32-ne1-or
+        $receipt.controlIdHistogram.idCancel-ne1-or$receipt.controlIdHistogram.comboRange-ne1-or$receipt.controlIdHistogram.listRange-ne1-or$receipt.controlIdHistogram.scrollRange-ne1-or$receipt.controlIdHistogram.otherPositive-ne2043-or
+        -not$receipt.requiredRoleMatchesAvailable-or$receipt.requiredRoleMatches.cancelButton-ne1-or$receipt.requiredRoleMatches.printerCombo-ne1-or$receipt.requiredRoleMatches.printerList-ne1){throw "HWND topology diagnostic counts changed: $json"}
+      $unavailable=(Get-SanitizedNativeWindowTopologyJson -Unavailable)|ConvertFrom-Json
+      Assert-PrintExactProperties -Value $unavailable -Expected @('inventoryStatus','topLevelOwnedCount','topLevelOwnedVisibleCount','topLevelCountCapped','candidateSurfaceCount','candidateSurfaceCountCapped','childCount','childCountCapped','classHistogram','controlIdHistogram','requiredRoleMatchesAvailable','requiredRoleMatches') -Kind 'Unavailable HWND topology receipt'
+      if($unavailable.inventoryStatus-cne'unavailable'-or$unavailable.childCount-ne-1-or$unavailable.requiredRoleMatchesAvailable){throw 'Unavailable HWND topology diagnostic changed.'}
     `);
     expect(result.status, result.stderr || result.stdout).toBe(0);
   });

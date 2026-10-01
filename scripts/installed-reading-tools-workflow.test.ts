@@ -216,12 +216,52 @@ describe('installed signed reading-tools verifier', () => {
     expect(source).toContain("type = 'keyDown'");
     expect(source).toContain("type = 'keyUp'");
     expect(source).toContain('RequestBytesMaximum = 1MB');
-    expect(source).toContain('TotalTimeoutMilliseconds = 180000');
+    expect(source).toContain('LaunchTimeoutMilliseconds = 180000');
+    expect(source).toContain('NativePickerTimeoutMilliseconds = 180000');
+    expect(source).toContain('ProductTimeoutMilliseconds = 180000');
     expect(source).toContain('PortReleaseTimeoutMilliseconds = 180000');
     expect(source).toContain('$null = Wait-FixedWebDriverPortsFree -Deadline');
     expect(source).not.toContain('function Wait-ReadingWebDriverPortsFree');
-    expect(source.indexOf('Wait-FixedWebDriverPortsFree -Deadline')).toBeLessThan(source.indexOf('$deadline = [datetime]::UtcNow.AddMilliseconds($script:ReadingPins.TotalTimeoutMilliseconds)'));
+    expect(source.indexOf('Wait-FixedWebDriverPortsFree -Deadline')).toBeLessThan(source.indexOf('$launchDeadline = New-ReadingPhaseDeadline -Phase launch'));
     expect(source).toContain('Assert-BoundedJsonShape');
+  });
+
+  it('starts a fresh capped product phase after native open when the launch deadline is exhausted', () => {
+    const check = extractFunctions('scripts/installed-reading-tools.ps1', ['New-ReadingPhaseDeadline', 'Assert-ReadingPhaseTransition'], String.raw`
+      $script:ReadingPins=[ordered]@{LaunchTimeoutMilliseconds=180000;NativePickerTimeoutMilliseconds=180000;ProductTimeoutMilliseconds=180000}
+      $script:now=[datetime]::SpecifyKind([datetime]'2026-01-01T00:00:00',[DateTimeKind]::Utc);$clock={$script:now}
+      $launchDeadline=New-ReadingPhaseDeadline -Phase launch -UtcNowProvider $clock
+      $script:ownedValidated=$false;$script:profileValidated=$false
+      function Assert-MockedReadingOwnership{$script:ownedValidated=$true;$script:now=$launchDeadline}
+      function Assert-MockedReadingProfile{$script:profileValidated=$true}
+      $script:pickerStarts=0;$transitionRejected=$false
+      try{Assert-MockedReadingOwnership;Assert-MockedReadingProfile;Assert-ReadingPhaseTransition -Deadline $launchDeadline -Phase launch -UtcNowProvider $clock;$script:pickerStarts++;$null=New-ReadingPhaseDeadline -Phase native-picker -UtcNowProvider $clock}catch{$transitionRejected=$_.Exception.Message-ceq'The reading-tools launch phase expired before its next phase.'}
+      if(-not$ownedValidated-or-not$profileValidated-or-not$transitionRejected-or$pickerStarts-ne0){throw 'Delayed ownership or profile validation started a picker after the launch deadline.'}
+      $script:now=$launchDeadline.AddMilliseconds(-1)
+      Assert-ReadingPhaseTransition -Deadline $launchDeadline -Phase launch -UtcNowProvider $clock
+      $pickerDeadline=New-ReadingPhaseDeadline -Phase native-picker -UtcNowProvider $clock
+      $productDeadline=New-ReadingPhaseDeadline -Phase product -UtcNowProvider $clock
+      if(($pickerDeadline-$script:now).TotalMilliseconds-ne180000-or($productDeadline-$script:now).TotalMilliseconds-ne180000){throw 'A timely transition did not receive its exact fresh bounded phase.'}
+      $script:ReadingPins.ProductTimeoutMilliseconds=180001;$capRejected=$false
+      try{New-ReadingPhaseDeadline -Phase product -UtcNowProvider $clock}catch{$capRejected=$_.Exception.Message-ceq'A reading-tools phase timeout was outside its exact cap.'}
+      if(-not$capRejected){throw 'A reading phase exceeded its explicit timeout cap.'}
+    `);
+    const result = runPowerShell(check);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+    const source = readFileSync('scripts/installed-reading-tools.ps1', 'utf8');
+    const open = source.indexOf('Open-ReadingUserFile -SessionId $sessionId -ApplicationProcessId $applicationProcessId -Path $PlainFixture -Deadline $plainPickerDeadline');
+    const product = source.indexOf('$plainProductDeadline = New-ReadingPhaseDeadline -Phase product');
+    const layer = source.indexOf("$layer = Wait-WebDriverOracle -SessionId $sessionId -Deadline $plainProductDeadline -Kind 'embedded text layer'");
+    expect(open).toBeGreaterThan(-1);
+    expect(product).toBeGreaterThan(open);
+    expect(layer).toBeGreaterThan(product);
+    expect(source).not.toContain("-Deadline $launchDeadline -Kind 'embedded text layer'");
+    const functionStart = source.indexOf('function Invoke-RealInstalledReadingTools');
+    const functionEnd = source.indexOf('function Invoke-InstalledReadingTools', functionStart);
+    const invokeSource = source.slice(functionStart, functionEnd);
+    expect((invokeSource.match(/New-ReadingPhaseDeadline -Phase /g) || []).length).toBe(9);
+    expect((invokeSource.match(/Assert-ReadingPhaseTransition -Deadline /g) || []).length).toBe(8);
+    expect(invokeSource).toContain('Assert-ReadingProfileScope -ProfileRoot $ProfileRoot -SettingsRoot $SettingsRoot -Binding $profileBinding\n\n        Assert-ReadingPhaseTransition -Deadline $launchDeadline -Phase launch\n        $plainPickerDeadline = New-ReadingPhaseDeadline -Phase native-picker');
   });
 
   it('uses the signed Home marker and the unique global Open action when Home has two Open buttons', () => {

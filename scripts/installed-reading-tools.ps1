@@ -8,7 +8,9 @@ Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'installed-app-launch.ps1')
 
 $script:ReadingPins = [ordered]@{
-    TotalTimeoutMilliseconds = 180000
+    LaunchTimeoutMilliseconds = 180000
+    NativePickerTimeoutMilliseconds = 180000
+    ProductTimeoutMilliseconds = 180000
     PortReleaseTimeoutMilliseconds = 180000
     UiAutomationPollMilliseconds = 100
     ClipboardPollMilliseconds = 100
@@ -18,6 +20,24 @@ $script:ReadingPins = [ordered]@{
     SelectionText = 'A place for your PDFs.'
     SearchText = 'Sample document'
     Password = 'test password'
+}
+
+function New-ReadingPhaseDeadline {
+    param([Parameter(Mandatory = $true)][ValidateSet('launch','native-picker','product')][string]$Phase,[scriptblock]$UtcNowProvider)
+    $now = if ($UtcNowProvider) { [datetime](& $UtcNowProvider) } else { [datetime]::UtcNow }
+    $timeout = switch ($Phase) {
+        'launch' { [int]$script:ReadingPins.LaunchTimeoutMilliseconds }
+        'native-picker' { [int]$script:ReadingPins.NativePickerTimeoutMilliseconds }
+        'product' { [int]$script:ReadingPins.ProductTimeoutMilliseconds }
+    }
+    if ($timeout -lt 1 -or $timeout -gt 180000) { throw 'A reading-tools phase timeout was outside its exact cap.' }
+    return $now.AddMilliseconds($timeout)
+}
+
+function Assert-ReadingPhaseTransition {
+    param([Parameter(Mandatory = $true)][datetime]$Deadline,[Parameter(Mandatory = $true)][ValidateSet('launch','native-picker','product')][string]$Phase,[scriptblock]$UtcNowProvider)
+    $now = if ($UtcNowProvider) { [datetime](& $UtcNowProvider) } else { [datetime]::UtcNow }
+    if ($now -ge $Deadline) { throw "The reading-tools $Phase phase expired before its next phase." }
 }
 
 function Assert-ReadingFileReceipt {
@@ -605,7 +625,7 @@ function Cancel-ReadingPassword {
 function Invoke-RealInstalledReadingTools {
     param([string]$ApplicationPath,[string]$TauriDriverPath,[string]$EdgeDriverPath,[string]$ProfileRoot,[string]$SettingsRoot,[string]$PlainFixture,[string]$ProtectedFixture,[string]$ExpectedEdgeDriverVersion,[string]$ExpectedRuntimeVersion)
     $null = Wait-FixedWebDriverPortsFree -Deadline ([datetime]::UtcNow.AddMilliseconds($script:ReadingPins.PortReleaseTimeoutMilliseconds))
-    $deadline = [datetime]::UtcNow.AddMilliseconds($script:ReadingPins.TotalTimeoutMilliseconds)
+    $launchDeadline = New-ReadingPhaseDeadline -Phase launch
     $driverCapture = $null; $driver = $null; $sessionId = $null; $captured = @(); $result = $null
     $startedAfter = [datetime]::UtcNow; $sessionDeleteOutcome = 'requestfailed'; $driverExited = $false
     $driverStopOutcome = 'not-invoked'; $processesQuiescent = $false; $remaining = -1; $residualCategory = 'multiple'; $clipboardCleared = $false
@@ -615,14 +635,14 @@ function Invoke-RealInstalledReadingTools {
         $driverCapture = Start-BoundedDiscardProcess -Path $TauriDriverPath -Arguments @("--port=$($script:LaunchPins.WebDriverPort)","--native-port=$($script:LaunchPins.NativeDriverPort)","--native-driver=$EdgeDriverPath")
         $driverCapture.Start(); $driver = $driverCapture.Process
         do {
-            try { $status = Invoke-BoundedLoopbackJson -Method GET -Path '/status' -Deadline $deadline; if ($status.value.ready) { break } } catch { }
+            try { $status = Invoke-BoundedLoopbackJson -Method GET -Path '/status' -Deadline $launchDeadline; if ($status.value.ready) { break } } catch { }
             if ($driver.HasExited) { throw 'Pinned tauri-driver exited before reading-tools readiness.' }
             Start-Sleep -Milliseconds 200
-        } while ([datetime]::UtcNow -lt $deadline)
+        } while ([datetime]::UtcNow -lt $launchDeadline)
         if ($null -eq $status -or -not [bool]$status.value.ready) { throw 'Pinned tauri-driver did not become ready for reading tools.' }
-        $nativeDriverVersion = Wait-NativeDriverStatus -ExpectedVersion $ExpectedEdgeDriverVersion -Deadline $deadline -TauriDriver $driver
+        $nativeDriverVersion = Wait-NativeDriverStatus -ExpectedVersion $ExpectedEdgeDriverVersion -Deadline $launchDeadline -TauriDriver $driver
         $sessionBody = [ordered]@{ capabilities=[ordered]@{ alwaysMatch=[ordered]@{ browserName='wry';'tauri:options'=[ordered]@{ application=$ApplicationPath;args=@();webviewOptions=[ordered]@{userDataFolder=$ProfileRoot} } } } }
-        $session = Invoke-BoundedLoopbackJson -Method POST -Path '/session' -Body $sessionBody -Deadline $deadline
+        $session = Invoke-BoundedLoopbackJson -Method POST -Path '/session' -Body $sessionBody -Deadline $launchDeadline
         if ($null -eq $session.value -or [string]$session.value.sessionId -cnotmatch '^[A-Za-z0-9-]+$') { throw 'Reading-tools WebDriver session identifier was invalid.' }
         $sessionId = [string]$session.value.sessionId
         $capabilities = $session.value.capabilities
@@ -634,67 +654,83 @@ function Invoke-RealInstalledReadingTools {
         $runtimeParts = $returnedRuntimeVersion.Split('.'); $expectedRuntimeParts = $ExpectedRuntimeVersion.Split('.')
         if ($returnedRuntimeVersion -cnotmatch '^\d+\.\d+\.\d+\.\d+$' -or $runtimeParts.Count -ne 4 -or ($runtimeParts[0..2] -join '.') -cne ($expectedRuntimeParts[0..2] -join '.')) { throw 'Reading-tools WebView2 runtime capability disagrees with its trusted receipt.' }
         $returnedUserData = if ($null -ne $capabilities.PSObject.Properties['msedge.userDataDir']) { [string]$capabilities.'msedge.userDataDir' } else { '' }
-        $homeOracle = Wait-WebDriverOracle -SessionId $sessionId -Deadline $deadline -Kind 'reading-tools home' -Script (Get-ReadingHomeScript) -Predicate { param($v) [bool]$v.ready -and [string]$v.title -ceq 'PDF Workstation' -and [int]$v.sample -eq 1 }
+        $homeOracle = Wait-WebDriverOracle -SessionId $sessionId -Deadline $launchDeadline -Kind 'reading-tools home' -Script (Get-ReadingHomeScript) -Predicate { param($v) [bool]$v.ready -and [string]$v.title -ceq 'PDF Workstation' -and [int]$v.sample -eq 1 }
         do {
             $captured += @(Get-OwnedLaunchProcesses -RootProcessId $driver.Id -StartedAfter $startedAfter); $captured = @(Get-UniqueOwnedLaunchProcesses -Processes $captured)
             $apps = @($captured | Where-Object { [string]$_.Path -and [IO.Path]::GetFullPath([string]$_.Path).Equals([IO.Path]::GetFullPath($ApplicationPath),[StringComparison]::OrdinalIgnoreCase) })
             if ($apps.Count -eq 1) { break }
             if ($apps.Count -gt 1) { throw 'More than one owned installed application process was found.' }
             Start-Sleep -Milliseconds 100
-        } while ([datetime]::UtcNow -lt $deadline)
+        } while ([datetime]::UtcNow -lt $launchDeadline)
         if ($apps.Count -ne 1) { throw 'The owned installed application process was unavailable for process-bound UI Automation.' }
         $applicationProcessId = [int]$apps[0].ProcessId
         Assert-ReadingOwnedExecutables -Owned $captured -ApplicationPath $ApplicationPath -EdgeDriverPath $EdgeDriverPath -RootProcessId $driver.Id
         $profileBinding = if ($returnedUserData) { 'session-capability-' + (Get-ExactProfileBinding -Candidate $returnedUserData -RequestedProfile $ProfileRoot -SettingsRoot $SettingsRoot) } else { Get-OwnedProfileBinding -Owned $captured -RequestedProfile $ProfileRoot -SettingsRoot $SettingsRoot }
         Assert-ReadingProfileScope -ProfileRoot $ProfileRoot -SettingsRoot $SettingsRoot -Binding $profileBinding
 
-        Open-ReadingUserFile -SessionId $sessionId -ApplicationProcessId $applicationProcessId -Path $PlainFixture -Deadline $deadline
-        $null = Wait-ReadingDocument -SessionId $sessionId -Pages 6 -Deadline $deadline
-        $layer = Wait-WebDriverOracle -SessionId $sessionId -Deadline $deadline -Kind 'embedded text layer' -Script "const p=document.querySelector('[aria-label=`"Page 1`"]'),l=p?.querySelector('[data-testid=`"text-layer`"]'),i=p?.querySelector('img[alt=`"Page 1`"]');return {ready:!!l&&!!i&&i.complete,glyphs:l?.querySelectorAll('[data-geometry-index]').length||0};" -Predicate { param($v) [bool]$v.ready -and [int]$v.glyphs -gt 20 }
+        Assert-ReadingPhaseTransition -Deadline $launchDeadline -Phase launch
+        $plainPickerDeadline = New-ReadingPhaseDeadline -Phase native-picker
+        Open-ReadingUserFile -SessionId $sessionId -ApplicationProcessId $applicationProcessId -Path $PlainFixture -Deadline $plainPickerDeadline
+        Assert-ReadingPhaseTransition -Deadline $plainPickerDeadline -Phase native-picker
+        $plainProductDeadline = New-ReadingPhaseDeadline -Phase product
+        $null = Wait-ReadingDocument -SessionId $sessionId -Pages 6 -Deadline $plainProductDeadline
+        $layer = Wait-WebDriverOracle -SessionId $sessionId -Deadline $plainProductDeadline -Kind 'embedded text layer' -Script "const p=document.querySelector('[aria-label=`"Page 1`"]'),l=p?.querySelector('[data-testid=`"text-layer`"]'),i=p?.querySelector('img[alt=`"Page 1`"]');return {ready:!!l&&!!i&&i.complete,glyphs:l?.querySelectorAll('[data-geometry-index]').length||0};" -Predicate { param($v) [bool]$v.ready -and [int]$v.glyphs -gt 20 }
         $selectionScript = @'
 const target='A place for your PDFs.',p=document.querySelector('[aria-label="Page 1"]'),l=p?.querySelector('[data-testid="text-layer"]'),i=p?.querySelector('img[alt="Page 1"]');if(!l||!i)return {ready:false,exact:false,utf16:0,rects:0,inside:false};const s=[...l.querySelectorAll('[data-geometry-index]')],joined=s.map(x=>x.textContent||'').join(''),start=joined.indexOf(target);if(start<0)return {ready:true,exact:false,utf16:0,rects:0,inside:false};let offset=0,first=null,last=null,firstOffset=0,lastOffset=0;for(const x of s){const text=x.textContent||'',next=offset+text.length;if(first===null&&start>=offset&&start<next){first=x;firstOffset=start-offset}if(start+target.length>offset&&start+target.length<=next){last=x;lastOffset=start+target.length-offset;break}offset=next}if(!first||!last)return {ready:true,exact:false,utf16:0,rects:0,inside:false};const r=document.createRange();r.setStart(first.firstChild,firstOffset);r.setEnd(last.firstChild,lastOffset);const sel=getSelection();sel.removeAllRanges();sel.addRange(r);const rects=[...r.getClientRects()],page=i.getBoundingClientRect(),inside=rects.length>0&&rects.every(x=>x.width>0&&x.height>0&&x.left>=page.left-2&&x.top>=page.top-2&&x.right<=page.right+2&&x.bottom<=page.bottom+2);return {ready:true,exact:sel.toString()===target,utf16:sel.toString().length,rects:rects.length,inside};
 '@
-        $selection = Invoke-WebDriverScript -SessionId $sessionId -Script $selectionScript -Deadline $deadline
+        $selection = Invoke-WebDriverScript -SessionId $sessionId -Script $selectionScript -Deadline $plainProductDeadline
         if (-not [bool]$selection.ready -or -not [bool]$selection.exact -or [int]$selection.utf16 -ne $script:ReadingPins.SelectionText.Length -or [int]$selection.rects -lt 1 -or -not [bool]$selection.inside) { throw 'Installed embedded-text selection or its on-page geometry was not exact.' }
         $expectedClipboard = Get-ReadingTextReceipt -Text $script:ReadingPins.SelectionText
         Invoke-ReadingClipboardSta -Operation set-sentinel
         $sentinelReceipt = Invoke-ReadingClipboardSta -Operation receipt
         $expectedSentinel = Get-ReadingTextReceipt -Text 'reading-verifier-sentinel'
         if ([int]$sentinelReceipt.utf8Bytes -ne [int]$expectedSentinel.utf8Bytes -or [string]$sentinelReceipt.sha256 -cne [string]$expectedSentinel.sha256) { throw 'The Windows clipboard sentinel was not established before the real copy action.' }
-        Send-ReadingKeyChord -SessionId $sessionId -Key c -Deadline $deadline
-        $clipboard = Wait-ReadingClipboardReceipt -Expected $expectedClipboard -Deadline $deadline
+        Send-ReadingKeyChord -SessionId $sessionId -Key c -Deadline $plainProductDeadline
+        $clipboard = Wait-ReadingClipboardReceipt -Expected $expectedClipboard -Deadline $plainProductDeadline
 
-        Send-ReadingKeyChord -SessionId $sessionId -Key f -Deadline $deadline
-        $null = Wait-WebDriverOracle -SessionId $sessionId -Deadline $deadline -Kind 'Find panel' -Script "return document.querySelectorAll('aside[aria-label=`"Find in document`"] input[aria-label=`"Find in document`"]').length===1;" -Predicate { param($v) $v -is [bool] -and $v }
+        Send-ReadingKeyChord -SessionId $sessionId -Key f -Deadline $plainProductDeadline
+        $null = Wait-WebDriverOracle -SessionId $sessionId -Deadline $plainProductDeadline -Kind 'Find panel' -Script "return document.querySelectorAll('aside[aria-label=`"Find in document`"] input[aria-label=`"Find in document`"]').length===1;" -Predicate { param($v) $v -is [bool] -and $v }
         $searchScript = @'
 const i=document.querySelector('aside[aria-label="Find in document"] input[aria-label="Find in document"]');if(!i)return false;const s=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;s.call(i,'Sample document');i.dispatchEvent(new Event('input',{bubbles:true}));i.closest('form').requestSubmit();return true;
 '@
-        if (-not (Invoke-WebDriverScript -SessionId $sessionId -Script $searchScript -Deadline $deadline)) { throw 'The installed Find form was unavailable.' }
-        $search = Wait-WebDriverOracle -SessionId $sessionId -Deadline $deadline -Kind 'Find results' -Script "const a=document.querySelector('aside[aria-label=`"Find in document`"]');return {status:[...a.querySelectorAll('[role=`"status`"]')].map(x=>x.textContent.trim()).includes('6 matching pages.'),results:[...a.querySelectorAll('button')].filter(x=>/^Go to page [1-6]$/.test(x.textContent.trim())).length,next:[...a.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Next matching page'&&!x.disabled).length};" -Predicate { param($v) [bool]$v.status -and [int]$v.results -eq 6 -and [int]$v.next -eq 1 }
+        if (-not (Invoke-WebDriverScript -SessionId $sessionId -Script $searchScript -Deadline $plainProductDeadline)) { throw 'The installed Find form was unavailable.' }
+        $search = Wait-WebDriverOracle -SessionId $sessionId -Deadline $plainProductDeadline -Kind 'Find results' -Script "const a=document.querySelector('aside[aria-label=`"Find in document`"]');return {status:[...a.querySelectorAll('[role=`"status`"]')].map(x=>x.textContent.trim()).includes('6 matching pages.'),results:[...a.querySelectorAll('button')].filter(x=>/^Go to page [1-6]$/.test(x.textContent.trim())).length,next:[...a.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Next matching page'&&!x.disabled).length};" -Predicate { param($v) [bool]$v.status -and [int]$v.results -eq 6 -and [int]$v.next -eq 1 }
         for ($step = 0; $step -lt 2; $step++) {
-            $next = Invoke-WebDriverScript -SessionId $sessionId -Deadline $deadline -Script "const a=document.querySelector('aside[aria-label=`"Find in document`"]'),b=a?[...a.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Next matching page'&&!x.disabled):[];if(b.length===1)b[0].click();return b.length===1;"
+            $next = Invoke-WebDriverScript -SessionId $sessionId -Deadline $plainProductDeadline -Script "const a=document.querySelector('aside[aria-label=`"Find in document`"]'),b=a?[...a.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Next matching page'&&!x.disabled):[];if(b.length===1)b[0].click();return b.length===1;"
             if ($next -isnot [bool] -or -not $next) { throw 'Find next-page navigation control was unavailable.' }
         }
         $geometryScript = @'
 const a=document.querySelector('aside[aria-label="Find in document"]'),live=[...a.querySelectorAll('[aria-live="polite"]')].map(x=>x.textContent.trim()),p=document.querySelector('[aria-label="Page 2"]'),i=p?.querySelector('img[alt="Page 2"]'),l=p?.querySelector('[data-testid="text-layer"]'),h=p?[...p.querySelectorAll('[data-testid="search-highlight"]')]:[];if(!i||!l)return {ready:false,nav:false,count:0,inside:false,paired:false};const page=i.getBoundingClientRect(),glyphs=[...l.querySelectorAll('[data-geometry-index]')],target='Sample document',joined=glyphs.map(x=>x.textContent||'').join(''),start=joined.indexOf(target),indexes=[];let offset=0;for(let n=0;n<glyphs.length;n++){const text=glyphs[n].textContent||'',next=offset+text.length;if(start>=0&&next>start&&offset<start+target.length&&glyphs[n].hasAttribute('data-angle'))indexes.push(n);offset=next}const inside=h.length>0&&h.every(x=>{const r=x.getBoundingClientRect();return r.width>0&&r.height>0&&r.left>=page.left-2&&r.top>=page.top-2&&r.right<=page.right+2&&r.bottom<=page.bottom+2}),paired=h.length===indexes.length&&h.every((x,n)=>{const r=x.getBoundingClientRect(),g=glyphs[indexes[n]].getBoundingClientRect();return Math.abs(r.left-g.left)<=2&&Math.abs(r.top-g.top)<=2&&Math.abs(r.width-g.width)<=2&&Math.abs(r.height-g.height)<=2});return {ready:i.complete&&i.naturalWidth>0,nav:live.includes('Matching page 2 of 6'),count:h.length,inside,paired};
 '@
-        $geometry = Wait-WebDriverOracle -SessionId $sessionId -Script $geometryScript -Deadline $deadline -Kind 'search highlight geometry' -Predicate { param($v) [bool]$v.ready -and [bool]$v.nav -and [int]$v.count -gt 5 -and [bool]$v.inside -and [bool]$v.paired }
-        Close-ActiveReadingDocument -SessionId $sessionId -Deadline $deadline
+        $geometry = Wait-WebDriverOracle -SessionId $sessionId -Script $geometryScript -Deadline $plainProductDeadline -Kind 'search highlight geometry' -Predicate { param($v) [bool]$v.ready -and [bool]$v.nav -and [int]$v.count -gt 5 -and [bool]$v.inside -and [bool]$v.paired }
+        Close-ActiveReadingDocument -SessionId $sessionId -Deadline $plainProductDeadline
 
-        Open-ReadingUserFile -SessionId $sessionId -ApplicationProcessId $applicationProcessId -Path $ProtectedFixture -Deadline $deadline
-        $prompt = Wait-WebDriverOracle -SessionId $sessionId -Deadline $deadline -Kind 'password prompt' -Script "const d=document.querySelector('dialog[aria-labelledby=`"password-title`"]'),i=d?.querySelector('input[type=`"password`"]');return {one:!!d&&!!i&&i.value==='',message:[...d?.querySelectorAll('p')||[]].some(x=>x.textContent.trim()==='Your password is used only to open this document.')};" -Predicate { param($v) [bool]$v.one -and [bool]$v.message }
-        Set-ReadingPasswordInput -SessionId $sessionId -Password 'wrong password' -Deadline $deadline; Submit-ReadingPassword -SessionId $sessionId -Deadline $deadline
-        $wrong = Wait-WebDriverOracle -SessionId $sessionId -Deadline $deadline -Kind 'wrong password retry' -Script "const d=document.querySelector('dialog[aria-labelledby=`"password-title`"]'),i=d?.querySelector('input[type=`"password`"]');return {prompt:!!d,cleared:i?.value==='',alert:[...d?.querySelectorAll('[role=`"alert`"]')||[]].some(x=>x.textContent.trim()==='Incorrect password. Try again.')};" -Predicate { param($v) [bool]$v.prompt -and [bool]$v.cleared -and [bool]$v.alert }
-        Set-ReadingPasswordInput -SessionId $sessionId -Password $script:ReadingPins.Password -Deadline $deadline; Submit-ReadingPassword -SessionId $sessionId -Deadline $deadline
-        $null = Wait-ReadingDocument -SessionId $sessionId -Pages 1 -Deadline $deadline
-        Close-ActiveReadingDocument -SessionId $sessionId -Deadline $deadline
-        Open-ReadingUserFile -SessionId $sessionId -ApplicationProcessId $applicationProcessId -Path $ProtectedFixture -Deadline $deadline
-        $reopened = Wait-WebDriverOracle -SessionId $sessionId -Deadline $deadline -Kind 'transient password reopen' -Script "const d=document.querySelector('dialog[aria-labelledby=`"password-title`"]'),i=d?.querySelector('input[type=`"password`"]');return {prompt:!!d,empty:i?.value===''};" -Predicate { param($v) [bool]$v.prompt -and [bool]$v.empty }
-        Cancel-ReadingPassword -SessionId $sessionId -Deadline $deadline
+        Assert-ReadingPhaseTransition -Deadline $plainProductDeadline -Phase product
+        $passwordPickerDeadline = New-ReadingPhaseDeadline -Phase native-picker
+        Open-ReadingUserFile -SessionId $sessionId -ApplicationProcessId $applicationProcessId -Path $ProtectedFixture -Deadline $passwordPickerDeadline
+        Assert-ReadingPhaseTransition -Deadline $passwordPickerDeadline -Phase native-picker
+        $passwordProductDeadline = New-ReadingPhaseDeadline -Phase product
+        $prompt = Wait-WebDriverOracle -SessionId $sessionId -Deadline $passwordProductDeadline -Kind 'password prompt' -Script "const d=document.querySelector('dialog[aria-labelledby=`"password-title`"]'),i=d?.querySelector('input[type=`"password`"]');return {one:!!d&&!!i&&i.value==='',message:[...d?.querySelectorAll('p')||[]].some(x=>x.textContent.trim()==='Your password is used only to open this document.')};" -Predicate { param($v) [bool]$v.one -and [bool]$v.message }
+        Set-ReadingPasswordInput -SessionId $sessionId -Password 'wrong password' -Deadline $passwordProductDeadline; Submit-ReadingPassword -SessionId $sessionId -Deadline $passwordProductDeadline
+        $wrong = Wait-WebDriverOracle -SessionId $sessionId -Deadline $passwordProductDeadline -Kind 'wrong password retry' -Script "const d=document.querySelector('dialog[aria-labelledby=`"password-title`"]'),i=d?.querySelector('input[type=`"password`"]');return {prompt:!!d,cleared:i?.value==='',alert:[...d?.querySelectorAll('[role=`"alert`"]')||[]].some(x=>x.textContent.trim()==='Incorrect password. Try again.')};" -Predicate { param($v) [bool]$v.prompt -and [bool]$v.cleared -and [bool]$v.alert }
+        Set-ReadingPasswordInput -SessionId $sessionId -Password $script:ReadingPins.Password -Deadline $passwordProductDeadline; Submit-ReadingPassword -SessionId $sessionId -Deadline $passwordProductDeadline
+        $null = Wait-ReadingDocument -SessionId $sessionId -Pages 1 -Deadline $passwordProductDeadline
+        Close-ActiveReadingDocument -SessionId $sessionId -Deadline $passwordProductDeadline
+        Assert-ReadingPhaseTransition -Deadline $passwordProductDeadline -Phase product
+        $reopenPickerDeadline = New-ReadingPhaseDeadline -Phase native-picker
+        Open-ReadingUserFile -SessionId $sessionId -ApplicationProcessId $applicationProcessId -Path $ProtectedFixture -Deadline $reopenPickerDeadline
+        Assert-ReadingPhaseTransition -Deadline $reopenPickerDeadline -Phase native-picker
+        $reopenProductDeadline = New-ReadingPhaseDeadline -Phase product
+        $reopened = Wait-WebDriverOracle -SessionId $sessionId -Deadline $reopenProductDeadline -Kind 'transient password reopen' -Script "const d=document.querySelector('dialog[aria-labelledby=`"password-title`"]'),i=d?.querySelector('input[type=`"password`"]');return {prompt:!!d,empty:i?.value===''};" -Predicate { param($v) [bool]$v.prompt -and [bool]$v.empty }
+        Cancel-ReadingPassword -SessionId $sessionId -Deadline $reopenProductDeadline
         Start-Sleep -Milliseconds 250
-        Open-ReadingUserFile -SessionId $sessionId -ApplicationProcessId $applicationProcessId -Path $ProtectedFixture -Deadline $deadline
-        $afterCancel = Wait-WebDriverOracle -SessionId $sessionId -Deadline $deadline -Kind 'post-cancel password reopen' -Script "const d=document.querySelector('dialog[aria-labelledby=`"password-title`"]'),i=d?.querySelector('input[type=`"password`"]');return {prompt:!!d,empty:i?.value===''};" -Predicate { param($v) [bool]$v.prompt -and [bool]$v.empty }
-        Cancel-ReadingPassword -SessionId $sessionId -Deadline $deadline
+        Assert-ReadingPhaseTransition -Deadline $reopenProductDeadline -Phase product
+        $postCancelPickerDeadline = New-ReadingPhaseDeadline -Phase native-picker
+        Open-ReadingUserFile -SessionId $sessionId -ApplicationProcessId $applicationProcessId -Path $ProtectedFixture -Deadline $postCancelPickerDeadline
+        Assert-ReadingPhaseTransition -Deadline $postCancelPickerDeadline -Phase native-picker
+        $postCancelProductDeadline = New-ReadingPhaseDeadline -Phase product
+        $afterCancel = Wait-WebDriverOracle -SessionId $sessionId -Deadline $postCancelProductDeadline -Kind 'post-cancel password reopen' -Script "const d=document.querySelector('dialog[aria-labelledby=`"password-title`"]'),i=d?.querySelector('input[type=`"password`"]');return {prompt:!!d,empty:i?.value===''};" -Predicate { param($v) [bool]$v.prompt -and [bool]$v.empty }
+        Cancel-ReadingPassword -SessionId $sessionId -Deadline $postCancelProductDeadline
 
         $captured += @(Get-OwnedLaunchProcesses -RootProcessId $driver.Id -StartedAfter $startedAfter); $captured = @(Get-UniqueOwnedLaunchProcesses -Processes $captured)
         Assert-ReadingOwnedExecutables -Owned $captured -ApplicationPath $ApplicationPath -EdgeDriverPath $EdgeDriverPath -RootProcessId $driver.Id

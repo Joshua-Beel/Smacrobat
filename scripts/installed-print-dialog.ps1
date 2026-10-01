@@ -82,6 +82,9 @@ namespace Smacrobat.PrintVerification {
     public sealed class NativeWindowRecord {
         public long HandleValue { get; set; }
         public long ParentHandleValue { get; set; }
+        public string ClassName { get; set; }
+        public int ControlId { get; set; }
+        public bool IsVisible { get; set; }
     }
 
     public static class NativeWindows {
@@ -90,6 +93,7 @@ namespace Smacrobat.PrintVerification {
         [DllImport("user32.dll")] private static extern bool EnumChildWindows(IntPtr parent, EnumWindowProc callback, IntPtr state);
         [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
         [DllImport("user32.dll")] private static extern bool IsWindow(IntPtr hwnd);
+        [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr hwnd);
         [DllImport("user32.dll")] private static extern IntPtr GetParent(IntPtr hwnd);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr hwnd, StringBuilder value, int maximum);
         [DllImport("user32.dll")] private static extern int GetDlgCtrlID(IntPtr hwnd);
@@ -110,19 +114,29 @@ namespace Smacrobat.PrintVerification {
             return owner == (uint)processId;
         }
 
+        private static NativeWindowRecord Describe(IntPtr hwnd, IntPtr parent) {
+            var className = new StringBuilder(128);
+            int length = GetClassName(hwnd, className, className.Capacity);
+            return new NativeWindowRecord {
+                HandleValue = hwnd.ToInt64(), ParentHandleValue = parent.ToInt64(),
+                ClassName = length > 0 ? className.ToString() : String.Empty,
+                ControlId = GetDlgCtrlID(hwnd), IsVisible = IsWindowVisible(hwnd)
+            };
+        }
+
         public static NativeWindowRecord[] Enumerate(int processId, long rootHandleValue, bool topLevelOnly) {
             if (processId <= 0) throw new ArgumentOutOfRangeException(nameof(processId));
             var result = new List<NativeWindowRecord>();
             if (rootHandleValue == 0) {
                 EnumWindows((hwnd, state) => {
-                    if (IsOwned(hwnd, processId)) result.Add(new NativeWindowRecord { HandleValue = hwnd.ToInt64(), ParentHandleValue = 0 });
+                    if (IsOwned(hwnd, processId)) result.Add(Describe(hwnd, IntPtr.Zero));
                     return true;
                 }, IntPtr.Zero);
                 if (topLevelOnly) return result.ToArray();
                 var roots = result.ToArray();
                 foreach (var root in roots) {
                     EnumChildWindows(new IntPtr(root.HandleValue), (hwnd, state) => {
-                        if (IsOwned(hwnd, processId)) result.Add(new NativeWindowRecord { HandleValue = hwnd.ToInt64(), ParentHandleValue = GetParent(hwnd).ToInt64() });
+                        if (IsOwned(hwnd, processId)) result.Add(Describe(hwnd, GetParent(hwnd)));
                         return true;
                     }, IntPtr.Zero);
                 }
@@ -130,10 +144,10 @@ namespace Smacrobat.PrintVerification {
             }
             var rootHandle = new IntPtr(rootHandleValue);
             if (!IsWindow(rootHandle) || !IsOwned(rootHandle, processId)) throw new InvalidOperationException("Native print surface was not owned by the application process.");
-            result.Add(new NativeWindowRecord { HandleValue = rootHandleValue, ParentHandleValue = 0 });
+            result.Add(Describe(rootHandle, IntPtr.Zero));
             if (!topLevelOnly) {
                 EnumChildWindows(rootHandle, (hwnd, state) => {
-                    if (IsOwned(hwnd, processId)) result.Add(new NativeWindowRecord { HandleValue = hwnd.ToInt64(), ParentHandleValue = GetParent(hwnd).ToInt64() });
+                    if (IsOwned(hwnd, processId)) result.Add(Describe(hwnd, GetParent(hwnd)));
                     return true;
                 }, IntPtr.Zero);
             }
@@ -573,13 +587,101 @@ function Test-PrintTargetUiElement {
     )
 }
 
+function Get-SanitizedNativeWindowTopologyJson {
+    param(
+        [AllowEmptyCollection()][object[]]$TopLevelRecords = @(),
+        [AllowEmptyCollection()][object[]]$SurfaceRecords = @(),
+        [int]$CandidateSurfaceCount = 0,
+        $RoleCounts,
+        [switch]$Unavailable
+    )
+    if ($Unavailable) {
+        $unavailableClasses = [ordered]@{ dialog32770=-1;button=-1;comboBox=-1;comboBoxEx32=-1;edit=-1;sysListView32=-1;directUiHwnd=-1;static=-1;sysTabControl32=-1;other=-1 }
+        $unavailableControlIds = [ordered]@{ idOk=-1;idCancel=-1;pushButtonRange=-1;checkBoxRange=-1;radioButtonRange=-1;groupRange=-1;staticRange=-1;listRange=-1;comboRange=-1;editRange=-1;scrollRange=-1;otherPositive=-1;none=-1 }
+        $unavailableRoles = [ordered]@{ cancelButton=-1;printButton=-1;saveButton=-1;currentPageRadio=-1;namedPrinter=-1;printerCombo=-1;printerList=-1;filenameEdit=-1 }
+        return ([pscustomobject][ordered]@{
+            inventoryStatus='unavailable';topLevelOwnedCount=-1;topLevelOwnedVisibleCount=-1;topLevelCountCapped=$false
+            candidateSurfaceCount=-1;candidateSurfaceCountCapped=$false;childCount=-1;childCountCapped=$false
+            classHistogram=[pscustomobject]$unavailableClasses;controlIdHistogram=[pscustomobject]$unavailableControlIds
+            requiredRoleMatchesAvailable=$false;requiredRoleMatches=[pscustomobject]$unavailableRoles
+        } | ConvertTo-Json -Compress -Depth 4)
+    }
+    $maximum = [int]$script:PrintPins.UiElementMaximum
+    $topLevelCount = [Math]::Min($TopLevelRecords.Count,$maximum)
+    $surfaceRecordCount = $SurfaceRecords.Count
+    $boundedSurfaceRecords = @($SurfaceRecords | Select-Object -First $maximum)
+    $childRecords = @($boundedSurfaceRecords | Where-Object { [long]$_.ParentHandleValue -ne 0 })
+    $visibleTopLevelCount = 0
+    foreach ($record in @($TopLevelRecords | Select-Object -First $maximum)) {
+        $visibleProperty = $record.PSObject.Properties['IsVisible']
+        if ($null -ne $visibleProperty -and [bool]$visibleProperty.Value) { $visibleTopLevelCount++ }
+    }
+    $classes = [ordered]@{ dialog32770=0;button=0;comboBox=0;comboBoxEx32=0;edit=0;sysListView32=0;directUiHwnd=0;static=0;sysTabControl32=0;other=0 }
+    $controlIds = [ordered]@{ idOk=0;idCancel=0;pushButtonRange=0;checkBoxRange=0;radioButtonRange=0;groupRange=0;staticRange=0;listRange=0;comboRange=0;editRange=0;scrollRange=0;otherPositive=0;none=0 }
+    foreach ($record in $boundedSurfaceRecords) {
+        $classProperty = $record.PSObject.Properties['ClassName']
+        $className = if ($null -ne $classProperty) { [string]$classProperty.Value } else { '' }
+        if ($className.Equals('#32770',[StringComparison]::OrdinalIgnoreCase)) { $classes.dialog32770++ }
+        elseif ($className.Equals('Button',[StringComparison]::OrdinalIgnoreCase)) { $classes.button++ }
+        elseif ($className.Equals('ComboBox',[StringComparison]::OrdinalIgnoreCase)) { $classes.comboBox++ }
+        elseif ($className.Equals('ComboBoxEx32',[StringComparison]::OrdinalIgnoreCase)) { $classes.comboBoxEx32++ }
+        elseif ($className.Equals('Edit',[StringComparison]::OrdinalIgnoreCase)) { $classes.edit++ }
+        elseif ($className.Equals('SysListView32',[StringComparison]::OrdinalIgnoreCase)) { $classes.sysListView32++ }
+        elseif ($className.Equals('DirectUIHWND',[StringComparison]::OrdinalIgnoreCase)) { $classes.directUiHwnd++ }
+        elseif ($className.Equals('Static',[StringComparison]::OrdinalIgnoreCase)) { $classes.static++ }
+        elseif ($className.Equals('SysTabControl32',[StringComparison]::OrdinalIgnoreCase)) { $classes.sysTabControl32++ }
+        else { $classes.other++ }
+        $controlIdProperty = $record.PSObject.Properties['ControlId']
+        $controlId = if ($null -ne $controlIdProperty) { [int]$controlIdProperty.Value } else { 0 }
+        if ($controlId -eq 1) { $controlIds.idOk++ }
+        elseif ($controlId -eq 2) { $controlIds.idCancel++ }
+        elseif ($controlId -ge 0x0400 -and $controlId -le 0x040f) { $controlIds.pushButtonRange++ }
+        elseif ($controlId -ge 0x0410 -and $controlId -le 0x041f) { $controlIds.checkBoxRange++ }
+        elseif ($controlId -ge 0x0420 -and $controlId -le 0x042f) { $controlIds.radioButtonRange++ }
+        elseif ($controlId -ge 0x0430 -and $controlId -le 0x043f) { $controlIds.groupRange++ }
+        elseif ($controlId -ge 0x0440 -and $controlId -le 0x045f) { $controlIds.staticRange++ }
+        elseif ($controlId -ge 0x0460 -and $controlId -le 0x046f) { $controlIds.listRange++ }
+        elseif ($controlId -ge 0x0470 -and $controlId -le 0x047f) { $controlIds.comboRange++ }
+        elseif ($controlId -ge 0x0480 -and $controlId -le 0x048f) { $controlIds.editRange++ }
+        elseif ($controlId -ge 0x0490 -and $controlId -le 0x0497) { $controlIds.scrollRange++ }
+        elseif ($controlId -gt 0) { $controlIds.otherPositive++ }
+        else { $controlIds.none++ }
+    }
+    $roles = [ordered]@{ cancelButton=-1;printButton=-1;saveButton=-1;currentPageRadio=-1;namedPrinter=-1;printerCombo=-1;printerList=-1;filenameEdit=-1 }
+    $rolesAvailable = $null -ne $RoleCounts
+    if ($rolesAvailable) {
+        Assert-PrintExactProperties -Value $RoleCounts -Expected @('cancelButton','printButton','saveButton','currentPageRadio','namedPrinter','printerCombo','printerList','filenameEdit') -Kind 'Native window role counts'
+        foreach ($property in @('cancelButton','printButton','saveButton','currentPageRadio','namedPrinter','printerCombo','printerList','filenameEdit')) {
+            $value = [int]$RoleCounts.$property
+            if ($value -lt 0 -or $value -gt $maximum) { throw 'Native window role count was invalid.' }
+            $roles[$property] = $value
+        }
+    }
+    $receipt = [ordered]@{
+        inventoryStatus='native-window-observed'
+        topLevelOwnedCount=[int]$topLevelCount
+        topLevelOwnedVisibleCount=[int]$visibleTopLevelCount
+        topLevelCountCapped=[bool]($TopLevelRecords.Count -gt $maximum)
+        candidateSurfaceCount=[int][Math]::Min([Math]::Max(0,$CandidateSurfaceCount),$maximum)
+        candidateSurfaceCountCapped=[bool]($CandidateSurfaceCount -gt $maximum)
+        childCount=[int][Math]::Min($childRecords.Count,$maximum)
+        childCountCapped=[bool]($surfaceRecordCount -gt $maximum)
+        classHistogram=[pscustomobject]$classes
+        controlIdHistogram=[pscustomobject]$controlIds
+        requiredRoleMatchesAvailable=[bool]$rolesAvailable
+        requiredRoleMatches=[pscustomobject]$roles
+    }
+    return ([pscustomobject]$receipt | ConvertTo-Json -Compress -Depth 4)
+}
+
 function Get-ProcessNativeWindowSnapshot {
     param(
         [Parameter(Mandatory = $true)][int]$ProcessId,
         [Parameter(Mandatory = $true)][datetime]$Deadline,
         [long]$RootHandleValue = 0,
         [switch]$TopLevelOnly,
-        [scriptblock]$WindowProvider
+        [scriptblock]$WindowProvider,
+        [ref]$ObservedRecords
     )
     if ([datetime]::UtcNow -ge $Deadline) { throw 'Native window snapshot deadline expired.' }
     Initialize-PrintUiAutomation
@@ -587,6 +689,7 @@ function Get-ProcessNativeWindowSnapshot {
         Initialize-PrintNativeWindowInterop
         [Smacrobat.PrintVerification.NativeWindows]::Enumerate($ProcessId,$RootHandleValue,[bool]$TopLevelOnly)
     })
+    if ($null -ne $ObservedRecords) { $ObservedRecords.Value = $records }
     if ([datetime]::UtcNow -ge $Deadline) { throw 'Native window enumeration exceeded its deadline.' }
     if ($records.Count -lt 1 -or $records.Count -gt $script:PrintPins.UiElementMaximum) { throw 'Native window enumeration was missing or oversized.' }
     $byHandle = @{}
@@ -646,17 +749,22 @@ function Wait-NewProcessNativeWindowSurface {
         [scriptblock]$WindowProvider
     )
     $baselineIdentities = Get-ProcessUiSnapshotIdentitySet -Snapshot $Baseline -Kind 'Native window baseline'
-    $structure = Get-SanitizedProcessUiStructureJson -ProcessId $ProcessId -DeadlineExpired
+    $baselineHandleValues = [Collections.Generic.HashSet[long]]::new()
+    foreach ($identity in @($baselineIdentities)) { $null = $baselineHandleValues.Add((Get-NativeSurfaceHandleValue -Identity ([string]$identity))) }
+    $structure = Get-SanitizedNativeWindowTopologyJson -Unavailable
     while ([datetime]::UtcNow -lt $Deadline) {
+        $topLevelRecords = @(); $surfaceRecords = @(); $candidateSurfaceCount = 0
         try {
-            $topLevel = @(Get-ProcessNativeWindowSnapshot -ProcessId $ProcessId -Deadline $Deadline -TopLevelOnly -WindowProvider $WindowProvider)
+            $topLevel = @(Get-ProcessNativeWindowSnapshot -ProcessId $ProcessId -Deadline $Deadline -TopLevelOnly -WindowProvider $WindowProvider -ObservedRecords ([ref]$topLevelRecords))
             $newRoots = @($topLevel | Where-Object { -not $baselineIdentities.Contains([string]$_.runtimeIdentity) })
+            $candidateSurfaceCount = $newRoots.Count
+            if ([datetime]::UtcNow -lt $Deadline) { $structure = Get-SanitizedNativeWindowTopologyJson -TopLevelRecords $topLevelRecords -SurfaceRecords @() -CandidateSurfaceCount $candidateSurfaceCount }
             if ($newRoots.Count -ne 1 -or -not [bool]$newRoots[0].isSurface) { throw 'Native window delta did not expose exactly one owned surface.' }
             $rootHandleValue = Get-NativeSurfaceHandleValue -Identity ([string]$newRoots[0].runtimeIdentity)
-            $current = @(Get-ProcessNativeWindowSnapshot -ProcessId $ProcessId -RootHandleValue $rootHandleValue -Deadline $Deadline -WindowProvider $WindowProvider)
+            $current = @(Get-ProcessNativeWindowSnapshot -ProcessId $ProcessId -RootHandleValue $rootHandleValue -Deadline $Deadline -WindowProvider $WindowProvider -ObservedRecords ([ref]$surfaceRecords))
             $currentRoots = @($current | Where-Object { $null -eq $_.parentRuntimeIdentity -and [string]$_.runtimeIdentity -ceq [string]$newRoots[0].runtimeIdentity -and [bool]$_.isSurface })
             if ($currentRoots.Count -ne 1) { throw 'Native window root identity changed during exact descendant enumeration.' }
-            $structure = Get-SanitizedObservedUiStructureJson -ProcessId $ProcessId -Elements @($current | ForEach-Object { $_.element }) -Scope 'process-descendants'
+            $structure = Get-SanitizedNativeWindowTopologyJson -TopLevelRecords $topLevelRecords -SurfaceRecords $surfaceRecords -CandidateSurfaceCount $candidateSurfaceCount
             if ([datetime]::UtcNow -ge $Deadline) { break }
             $targets = @($current | Where-Object { [bool]$_.isTarget })
             $anchors = @(); $cancelButtons = 0; $printButtons = 0; $saveButtons = 0; $currentPageRadios = 0; $printerControls = 0; $comboBoxes = 0; $printerLists = 0; $filenameEdits = 0
@@ -676,6 +784,13 @@ function Wait-NewProcessNativeWindowSurface {
                 if ([string]$entry.controlType -ceq 'ControlType.Edit' -and ($automationId -in @('1001','FileNameControlHost') -or $name -in @('File name:','File name'))) { $filenameEdits++ }
                 if ($AnchorControlTypes.Contains([string]$entry.controlType) -and @($AnchorNames | Where-Object { $name.Equals($_,[StringComparison]::OrdinalIgnoreCase) }).Count -eq 1) { $anchors += $entry }
             }
+            if ([datetime]::UtcNow -lt $Deadline) {
+                $roleCounts = [pscustomobject][ordered]@{
+                    cancelButton=$cancelButtons;printButton=$printButtons;saveButton=$saveButtons;currentPageRadio=$currentPageRadios
+                    namedPrinter=$printerControls;printerCombo=$comboBoxes;printerList=$printerLists;filenameEdit=$filenameEdits
+                }
+                $structure = Get-SanitizedNativeWindowTopologyJson -TopLevelRecords $topLevelRecords -SurfaceRecords $surfaceRecords -CandidateSurfaceCount $candidateSurfaceCount -RoleCounts $roleCounts
+            }
             $requiredTargetSet = if ($Stage -ceq 'save-output-dialog') {
                 $saveButtons -eq 1 -and $filenameEdits -eq 1
             } else {
@@ -694,6 +809,10 @@ function Wait-NewProcessNativeWindowSurface {
             }
         } catch {
             if ([datetime]::UtcNow -ge $Deadline) { break }
+            if ($topLevelRecords.Count -gt 0) {
+                $candidateSurfaceCount = @($topLevelRecords | Where-Object { -not $baselineHandleValues.Contains([long]$_.HandleValue) }).Count
+                $structure = Get-SanitizedNativeWindowTopologyJson -TopLevelRecords $topLevelRecords -SurfaceRecords $surfaceRecords -CandidateSurfaceCount $candidateSurfaceCount
+            }
         }
         if ([datetime]::UtcNow -lt $Deadline) { Start-Sleep -Milliseconds 150 }
     }
