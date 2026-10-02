@@ -5,6 +5,10 @@ import { spawnSync } from 'node:child_process';
 const workflowPath = '.github/workflows/in-app-update-verification.yml';
 const scriptPath = 'scripts/verify-in-app-update.ps1';
 
+function normalizeNewlines(value: string) {
+  return value.replace(/\r\n?/g, '\n');
+}
+
 function verifierHarness(names: string[], body: string) {
   return String.raw`
     $ErrorActionPreference='Stop'
@@ -23,8 +27,13 @@ function verifierHarness(names: string[], body: string) {
 }
 
 describe('published in-app update verification infrastructure', () => {
+  it('normalizes LF and Windows CRLF before exact workflow block assertions', () => {
+    expect(normalizeNewlines('permissions:\n  contents: read')).toBe('permissions:\n  contents: read');
+    expect(normalizeNewlines('permissions:\r\n  contents: read\r\n')).toBe('permissions:\n  contents: read\n');
+  });
+
   it('is manual, read-only, exact-input driven, and carries no release or signing credential', () => {
-    const workflow = readFileSync(workflowPath, 'utf8');
+    const workflow = normalizeNewlines(readFileSync(workflowPath, 'utf8'));
     const requiredInputs = [
       'target_version', 'target_tag', 'target_source_revision', 'target_release_id',
       'target_installer_receipt', 'target_signature_receipt', 'target_manifest_receipt', 'expected_publisher',

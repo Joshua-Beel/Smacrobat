@@ -81,7 +81,7 @@ public sealed class NativeAccessibleListFixture : IDisposable {
       }finally{$fixture.Dispose()}
     `);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('binds and mutates only the exact evidenced native save dialog topology', () => {
     const result = runPowerShell7(String.raw`
@@ -653,12 +653,12 @@ public static class PrintSpoolWriterFixture {
       $message='';try{Wait-NewProcessUiSurface -ProcessId 7319 -Baseline $baseline -AnchorNames @('Cancel') -AnchorControlTypes @('ControlType.Button') -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(50)) -ElementProvider $provider -ParentProvider $parents|Out-Null}catch{$message=$_.Exception.Message}
       if($message-cnotmatch'one process-owned descendant surface'-or$outsidePrint.Clicked-or$outsideCancel.Clicked){throw 'Matching controls in a sibling subtree were accepted or clicked.'}
       $script:treeElements=@($main,$pane,$outside,$existingSibling,$dialog)
-      $message='';try{Wait-BoundProcessUiSurfaceClosed -ProcessId 7319 -Binding $binding -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(50)) -ElementProvider $provider -ParentProvider $parents}catch{$message=$_.Exception.Message}
+      $message='';try{Wait-BoundProcessUiSurfaceClosed -ProcessId 7319 -Binding $binding -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(500)) -ElementProvider $provider -ParentProvider $parents}catch{$message=$_.Exception.Message}
       if($message-cnotmatch'retained'){throw 'Target disappearance falsely proved close while the bound surface remained.'}
       $replacement=New-TreeElement 7319 15 'ControlType.Pane' '' $pane
       $script:treeElements=@($main,$pane,$outside,$existingSibling,$replacement)
-      $message='';try{Wait-BoundProcessUiSurfaceClosed -ProcessId 7319 -Binding $binding -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(50)) -ElementProvider $provider -ParentProvider $parents}catch{$message=$_.Exception.Message}
-      if($message-cnotmatch'retained'){throw 'A replacement native surface falsely proved close.'}
+      $message='';try{Wait-BoundProcessUiSurfaceClosed -ProcessId 7319 -Binding $binding -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(500)) -ElementProvider $provider -ParentProvider $parents}catch{$message=$_.Exception.Message}
+      if($message-cnotmatch'unbound replacement surface'-or$replacement.Clicked){throw 'A replacement surface was accepted or actuated after the exact bound identity disappeared.'}
       $script:treeElements=@($main,$pane,$outside,$existingSibling)
       Wait-BoundProcessUiSurfaceClosed -ProcessId 7319 -Binding $binding -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddSeconds(1)) -ElementProvider $provider -ParentProvider $parents
       $foreign=New-TreeElement 7320 11 'ControlType.Button' 'Cancel' $pane

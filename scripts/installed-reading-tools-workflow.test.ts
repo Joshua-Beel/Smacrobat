@@ -5,6 +5,10 @@ import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
+function normalizeNewlines(value: string) {
+  return value.replace(/\r\n?/g, '\n');
+}
+
 function runPowerShell(source: string) {
   const root = mkdtempSync(join(tmpdir(), 'smacrobat-reading-tools-'));
   const path = join(root, 'run.ps1');
@@ -36,6 +40,11 @@ function extractFunctions(path: string, names: string[], body: string) {
 }
 
 describe('installed signed reading-tools verifier', () => {
+  it('normalizes LF and Windows CRLF before exact multiline source assertions', () => {
+    expect(normalizeNewlines('first\nsecond')).toBe('first\nsecond');
+    expect(normalizeNewlines('first\r\nsecond\r\n')).toBe('first\nsecond\n');
+  });
+
   it('parses and keeps all native interaction process-bound without coordinates or global SendKeys', () => {
     const source = readFileSync('scripts/installed-reading-tools.ps1', 'utf8');
     const parsed = spawnSync('pwsh.exe', ['-NoProfile', '-NonInteractive', '-Command',
@@ -288,7 +297,7 @@ public static class ReadingNativePickerApi {
     const postOpenScript = JSON.parse(scriptResult.stdout.trim()) as string;
     expect(() => new Function('document', postOpenScript)).not.toThrow();
     expect(postOpenScript).not.toMatch(/\.path|textContent\s*[,}]/);
-    const source = readFileSync('scripts/installed-reading-tools.ps1', 'utf8');
+    const source = normalizeNewlines(readFileSync('scripts/installed-reading-tools.ps1', 'utf8'));
     const open = source.indexOf('Open-ReadingUserFile -SessionId $sessionId -ApplicationProcessId $applicationProcessId -ApplicationProcessStartUtcTicks $applicationProcessStartUtcTicks -Path $PlainFixture -Deadline $plainPickerDeadline');
     const product = source.indexOf('$plainProductDeadline = New-ReadingPhaseDeadline -Phase product');
     const layer = source.indexOf("$layer = Wait-WebDriverOracle -SessionId $sessionId -Deadline $plainProductDeadline -Kind 'embedded text layer'");

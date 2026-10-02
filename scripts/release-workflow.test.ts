@@ -19,7 +19,7 @@ function versionFixture(lineEnding: '\n' | '\r\n') {
 }
 
 function validateFixture(root: string) {
-  return spawnSync('pwsh', ['-NoProfile', '-NonInteractive', '-File', 'scripts/assert-release-version.ps1', '-ProjectRoot', root, '-Version', '0.2.9'], {
+  return spawnSync('pwsh', ['-NoProfile', '-NonInteractive', '-File', 'scripts/assert-release-version.ps1', '-ProjectRoot', root, '-Version', '0.2.10'], {
     cwd: process.cwd(), encoding: 'utf8', timeout: 10_000,
   });
 }
@@ -68,10 +68,10 @@ describe('release workflow contract', () => {
         (root: string) => { const value = JSON.parse(readFileSync(join(root, 'package-lock.json'), 'utf8')); value.version = '9.9.9'; writeFileSync(join(root, 'package-lock.json'), JSON.stringify(value), 'utf8'); },
         (root: string) => { const value = JSON.parse(readFileSync(join(root, 'package-lock.json'), 'utf8')); value.packages[''].version = '9.9.9'; writeFileSync(join(root, 'package-lock.json'), JSON.stringify(value), 'utf8'); },
         (root: string) => { const value = JSON.parse(readFileSync(join(root, 'src-tauri/tauri.conf.json'), 'utf8')); value.version = '9.9.9'; writeFileSync(join(root, 'src-tauri/tauri.conf.json'), JSON.stringify(value), 'utf8'); },
-        (root: string) => writeFileSync(join(root, 'src-tauri/Cargo.toml'), readFileSync(join(root, 'src-tauri/Cargo.toml'), 'utf8').replace('version = "0.2.9"', 'version = "9.9.9"'), 'utf8'),
-        (root: string) => writeFileSync(join(root, 'src-tauri/Cargo.lock'), readFileSync(join(root, 'src-tauri/Cargo.lock'), 'utf8').replace('name = "pdf-workstation"\nversion = "0.2.9"', 'name = "pdf-workstation"\nversion = "9.9.9"'), 'utf8'),
+        (root: string) => writeFileSync(join(root, 'src-tauri/Cargo.toml'), readFileSync(join(root, 'src-tauri/Cargo.toml'), 'utf8').replace('version = "0.2.10"', 'version = "9.9.9"'), 'utf8'),
+        (root: string) => writeFileSync(join(root, 'src-tauri/Cargo.lock'), readFileSync(join(root, 'src-tauri/Cargo.lock'), 'utf8').replace('name = "pdf-workstation"\nversion = "0.2.10"', 'name = "pdf-workstation"\nversion = "9.9.9"'), 'utf8'),
         (root: string) => { const value = JSON.parse(readFileSync(join(root, 'package-lock.json'), 'utf8')); delete value.packages['']; writeFileSync(join(root, 'package-lock.json'), JSON.stringify(value), 'utf8'); },
-        (root: string) => writeFileSync(join(root, 'src-tauri/Cargo.lock'), `${readFileSync(join(root, 'src-tauri/Cargo.lock'), 'utf8')}\n[[package]]\nname = "pdf-workstation"\nversion = "0.2.9"\n`, 'utf8'),
+        (root: string) => writeFileSync(join(root, 'src-tauri/Cargo.lock'), `${readFileSync(join(root, 'src-tauri/Cargo.lock'), 'utf8')}\n[[package]]\nname = "pdf-workstation"\nversion = "0.2.10"\n`, 'utf8'),
       ]) {
         const root = versionFixture('\n'); roots.push(root); mutate(root);
         expect(validateFixture(root).status).not.toBe(0);
@@ -82,6 +82,7 @@ describe('release workflow contract', () => {
   }, 30_000);
 
   it('fails closed on signing and publishes only the explicit three-asset draft inventory', () => {
+    expect(workflow).toContain('- run: npm test -- --maxWorkers=2');
     for (const secret of [
       'TAURI_SIGNING_PRIVATE_KEY',
       'AZURE_TENANT_ID',
@@ -109,14 +110,14 @@ describe('release workflow contract', () => {
     const tauri = JSON.parse(readFileSync('src-tauri/tauri.conf.json', 'utf8'));
     const cargo = readFileSync('src-tauri/Cargo.toml', 'utf8').match(/^version = "([^"]+)"$/m)?.[1];
     const cargoLock = readFileSync('src-tauri/Cargo.lock', 'utf8').match(/\[\[package\]\]\r?\nname = "pdf-workstation"\r?\nversion = "([^"]+)"/)?.[1];
-    expect([pkg.version, npmLock.version, npmLock.packages[''].version, tauri.version, cargo, cargoLock]).toEqual(Array(6).fill('0.2.9'));
+    expect([pkg.version, npmLock.version, npmLock.packages[''].version, tauri.version, cargo, cargoLock]).toEqual(Array(6).fill('0.2.10'));
     expect(tauri.plugins.updater).toEqual({
       pubkey: 'dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDg1OTcwQzM0QUVBQkQ3NzUKUldSMTE2dXVOQXlYaFdZN0k1Mk1CcSt2NS81bzNRTERRbU16ejYxTDNiS3V6b1RTZ0tuTlRjZVEK',
       endpoints: ['https://github.com/Joshua-Beel/Smacrobat/releases/latest/download/latest.json'],
       windows: { installMode: 'passive' },
     });
     const notes = readFileSync('docs/release-notes.md', 'utf8');
-    expect(notes).toMatch(/^## 0\.2\.9 \(draft candidate\)/);
+    expect(notes).toMatch(/^## 0\.2\.10 \(draft candidate\)/);
     expect(notes).toContain('Hardens update recovery.');
     expect(notes).toContain('does not bundle OCR');
     expect(notes).toContain('does not create searchable/document OCR');

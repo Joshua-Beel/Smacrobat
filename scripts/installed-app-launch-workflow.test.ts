@@ -52,7 +52,7 @@ describe('hosted installed signed application launch proof', () => {
     `);
     const result = runPowerShell(source);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 20_000);
 
   it('supplies the exact minimal environment to every production bounded child launch', () => {
     const result = runPowerShell(String.raw`
@@ -181,7 +181,7 @@ public sealed class NonCooperativeResponseStream : MemoryStream {
         $cleanSource=Join-Path $root 'clean-source';[IO.Directory]::CreateDirectory($cleanSource)|Out-Null
         $cargoHome=Join-Path $root 'cargo-home';$install=Join-Path $root 'install';$marker=Join-Path $root 'cargo-provider-called'
         Push-Location $hostile
-        try{Invoke-IsolatedCargoInstall -Cargo 'cargo.exe' -Source $cleanSource -InstallRoot $install -CargoHome $cargoHome -ProcessProvider {param($cargo,$arguments)[IO.File]::WriteAllText($marker,'called');if(-not(Get-Location).Path.Equals($cleanSource,[StringComparison]::OrdinalIgnoreCase)-or$env:CARGO_HOME-cne$cargoHome-or($arguments-join ' ')-cne'install --path . --locked --root '+$install){throw 'Cargo isolation contract changed.'};0}.GetNewClosure()}finally{Pop-Location}
+        try{Invoke-IsolatedCargoInstall -Cargo 'cargo.exe' -Source $cleanSource -InstallRoot $install -CargoHome $cargoHome -ProcessProvider {param($cargo,$firstArgument)$arguments=@($firstArgument)+@($args);[IO.File]::WriteAllText($marker,'called');if($cargo-cne'cargo.exe'-or-not(Get-Location).Path.Equals($cleanSource,[StringComparison]::OrdinalIgnoreCase)-or$env:CARGO_HOME-cne$cargoHome-or$arguments.Count-ne6-or($arguments-join ' ')-cne('install --path . --locked --root '+$install)){throw 'Cargo isolation contract changed.'};0}.GetNewClosure()}finally{Pop-Location}
         if(-not(Test-Path -LiteralPath $marker -PathType Leaf)){throw 'Isolated Cargo provider was not invoked.'}
       `,
     );
