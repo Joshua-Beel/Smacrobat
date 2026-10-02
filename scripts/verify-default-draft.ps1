@@ -83,16 +83,20 @@ function Invoke-GitHubJson {
 }
 
 function Get-ExactReleaseAsset {
-    param($Release,[uint64]$Id,[string]$Name,[uint64]$Bytes,[string]$Sha256)
+    param($Release,[uint64]$Id,[string]$Name,[uint64]$Bytes,[string]$Sha256,[string]$ExpectedDownloadSegment)
     $matches=@($Release.assets|Where-Object{[uint64]$_.id -eq $Id})
     if($matches.Count -ne 1){throw 'Draft asset id is absent or ambiguous.'}
     $asset=$matches[0]
     $uri=[Uri][string]$asset.browser_download_url
-    $expectedPath="/$script:Repository/releases/download/$TargetTag/$Name"
+    $prefix="/$script:Repository/releases/download/";$suffix='/'+[Uri]::EscapeDataString($Name);$path=$uri.AbsolutePath
+    if(-not $path.StartsWith($prefix,[StringComparison]::Ordinal)-or-not $path.EndsWith($suffix,[StringComparison]::Ordinal)){throw 'Draft asset metadata does not match its exact receipt.'}
+    $downloadSegment=$path.Substring($prefix.Length,$path.Length-$prefix.Length-$suffix.Length)
+    if(($downloadSegment -cne $TargetTag-and $downloadSegment -cnotmatch '^untagged-[a-f0-9]{20}$')-or($ExpectedDownloadSegment-and $downloadSegment -cne $ExpectedDownloadSegment)){throw 'Draft asset metadata does not match its exact receipt.'}
+    $expectedPath=$prefix+$downloadSegment+$suffix
     if([string]$asset.name -cne $Name -or [uint64]$asset.size -ne $Bytes -or [string]$asset.state -cne 'uploaded' -or
        [string]$asset.digest -cne ('sha256:'+$Sha256.ToLowerInvariant()) -or $uri.Scheme -cne 'https' -or $uri.DnsSafeHost -cne 'github.com' -or
-       $uri.UserInfo -or $uri.Query -or $uri.Fragment -or [Uri]::UnescapeDataString($uri.AbsolutePath) -cne $expectedPath){throw 'Draft asset metadata does not match its exact receipt.'}
-    return $asset
+       $uri.UserInfo -or $uri.Query -or $uri.Fragment -or $path -cne $expectedPath){throw 'Draft asset metadata does not match its exact receipt.'}
+    return $downloadSegment
 }
 
 function Save-ExactReleaseAsset {
@@ -251,9 +255,9 @@ $release=Invoke-GitHubJson "https://api.github.com/repos/$script:Repository/rele
 $expectedNames=@($InstallerName,"$InstallerName.sig",'latest.json')|Sort-Object
 $actualNames=@($release.assets|ForEach-Object{[string]$_.name}|Sort-Object)
 if([uint64]$release.id -ne $releaseId-or [string]$release.tag_name -cne $TargetTag-or -not [bool]$release.draft-or [bool]$release.prerelease-or [string]$release.target_commitish -cne $TargetSourceRevision-or $actualNames.Count -ne 3-or (Compare-Object $expectedNames $actualNames -CaseSensitive)){throw 'Release is not the exact source-bound three-asset draft.'}
-$null=Get-ExactReleaseAsset $release $installerId $InstallerName $installerLength $InstallerSha256
-$null=Get-ExactReleaseAsset $release $signatureId "$InstallerName.sig" $signatureLength $SignatureSha256
-$null=Get-ExactReleaseAsset $release $manifestId 'latest.json' $manifestLength $ManifestSha256
+$downloadSegment=Get-ExactReleaseAsset $release $installerId $InstallerName $installerLength $InstallerSha256
+$null=Get-ExactReleaseAsset $release $signatureId "$InstallerName.sig" $signatureLength $SignatureSha256 $downloadSegment
+$null=Get-ExactReleaseAsset $release $manifestId 'latest.json' $manifestLength $ManifestSha256 $downloadSegment
 $installerPath=Join-Path $assetRoot $InstallerName;$signaturePath=Join-Path $assetRoot "$InstallerName.sig";$manifestPath=Join-Path $assetRoot 'latest.json'
 Save-ExactReleaseAsset $installerId $installerPath $env:GITHUB_TOKEN $installerLength $InstallerSha256
 Save-ExactReleaseAsset $signatureId $signaturePath $env:GITHUB_TOKEN $signatureLength $SignatureSha256

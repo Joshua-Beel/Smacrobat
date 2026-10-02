@@ -89,10 +89,12 @@ describe('default draft verification workflow', () => {
       $script:Repository='Joshua-Beel/Smacrobat';$TargetTag='v0.2.12';$sha='A'*64
       $asset=[pscustomobject]@{id=[uint64]7;name='PDF.Workstation_0.2.12_x64-setup.exe';size=[uint64]9;state='uploaded';digest=('sha256:'+$sha.ToLowerInvariant());browser_download_url='https://github.com/Joshua-Beel/Smacrobat/releases/download/v0.2.12/PDF.Workstation_0.2.12_x64-setup.exe'}
       $release=[pscustomobject]@{assets=@($asset)}
-      $null=Get-ExactReleaseAsset $release 7 $asset.name 9 $sha
+      $segment=Get-ExactReleaseAsset $release 7 $asset.name 9 $sha;if($segment-cne'v0.2.12'){throw 'tagged segment changed'}
+      $asset.browser_download_url='https://github.com/Joshua-Beel/Smacrobat/releases/download/untagged-2194514d6aa620c2f2bb/PDF.Workstation_0.2.12_x64-setup.exe';$segment=Get-ExactReleaseAsset $release 7 $asset.name 9 $sha;if($segment-cne'untagged-2194514d6aa620c2f2bb'){throw 'draft segment changed'}
       function Reject([scriptblock]$Action,[string]$Kind){$failed=$false;try{&$Action}catch{$failed=$true};if(-not$failed){throw ($Kind+' accepted')}}
       Reject {Get-ExactReleaseAsset $release 7 $asset.name 10 $sha} 'wrong bytes'
-      $asset.browser_download_url='https://github.com/Joshua-Beel/Smacrobat/releases/download/v0.2.12/../escape.exe';Reject {Get-ExactReleaseAsset $release 7 $asset.name 9 $sha} 'traversal URL'
+      Reject {Get-ExactReleaseAsset $release 7 $asset.name 9 $sha 'untagged-00000000000000000000'} 'mismatched draft segment'
+      foreach($url in @('https://github.com/Joshua-Beel/Smacrobat/releases/download/untagged-nothex/PDF.Workstation_0.2.12_x64-setup.exe','https://github.com/foreign/Smacrobat/releases/download/v0.2.12/PDF.Workstation_0.2.12_x64-setup.exe','https://example.com/Joshua-Beel/Smacrobat/releases/download/v0.2.12/PDF.Workstation_0.2.12_x64-setup.exe','http://github.com/Joshua-Beel/Smacrobat/releases/download/v0.2.12/PDF.Workstation_0.2.12_x64-setup.exe','https://github.com/Joshua-Beel/Smacrobat/releases/download/v0.2.12/PDF.Workstation_0.2.12_x64-setup.exe?x=1','https://github.com/Joshua-Beel/Smacrobat/releases/download/v0.2.12/../PDF.Workstation_0.2.12_x64-setup.exe')){$asset.browser_download_url=$url;Reject {Get-ExactReleaseAsset $release 7 $asset.name 9 $sha} 'invalid draft URL'}
       $root=Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'inventory';[IO.Directory]::CreateDirectory($root)|Out-Null
       function Put([string]$Relative){$path=Join-Path $root $Relative;[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($path))|Out-Null;[IO.File]::WriteAllText($path,'x',[Text.UTF8Encoding]::new($false));return Get-Item $path}
       $base=@([pscustomobject]@{Target='resources/welcome.pdf'})
