@@ -146,6 +146,65 @@ const d=document.querySelector('dialog[aria-labelledby="export-image-title"]');c
     expect(result.status, result.stderr || result.stdout).toBe(0);
   });
 
+  it('runs a generic callback inside one fresh owned session and returns lifecycle fields in the original order', () => {
+    const result = runPowerShell(extractFunctions(['Invoke-FreshInstalledImagePageToolsSession'], String.raw`
+      $script:events=[Collections.Generic.List[string]]::new();$script:driver=[pscustomobject]@{Id=42;HasExited=$false}
+      $script:PrintPins=@{PortHandoffTimeoutMilliseconds=1000};$script:LaunchPins=@{WebDriverPort=4444;NativeDriverPort=4445;CleanupProcessTimeoutMilliseconds=1000};$script:ImagePagePins=@{TotalTimeoutMilliseconds=5000}
+      function Wait-FixedWebDriverPortsFree{$script:events.Add('ports')}
+      function Get-MinimalWindowsProcessEnvironment{@{SystemRoot='C:\Windows'}}
+      $capture=[pscustomobject]@{Process=$script:driver;Exceeded=$false}
+      $capture|Add-Member -MemberType ScriptMethod -Name Start -Value {$script:events.Add('start')}
+      $capture|Add-Member -MemberType ScriptMethod -Name Dispose -Value {$script:events.Add('dispose')}
+      function Start-BoundedDiscardProcess{$capture}
+      function Invoke-BoundedLoopbackJson{param($Method,$Path,$Body,$Deadline)if($Path-ceq'/status'){[pscustomobject]@{value=[pscustomobject]@{ready=$true}}}else{[pscustomobject]@{value=[pscustomobject]@{sessionId='session-1';capabilities=[pscustomobject]@{browserVersion='1.2.3.9';'msedge.msedgedriverVersion'='1.2.3.4';'msedge.userDataDir'='C:\profile'}}}}}
+      function Wait-NativeDriverStatus{'1.2.3.4'}
+      function Wait-OwnedPrintApplication{[pscustomobject]@{ProcessId=77;ProcessStartUtcTicks=88;Owned=@([pscustomobject]@{id=77})}}
+      function Get-OwnedLaunchProcesses{@([pscustomobject]@{id=77})}
+      function Get-UniqueOwnedLaunchProcesses{param($Processes)@($Processes)}
+      function Assert-PrintOwnedExecutables{$script:events.Add('owned')}
+      function Get-ExactProfileBinding{'requested-profile'}
+      function Invoke-SessionDeleteOutcome{$script:events.Add('delete');'verified'}
+      function Stop-OwnedLaunchProcesses{param($TauriDriver)$script:events.Add('stop');$TauriDriver.HasExited=$true;[pscustomobject]@{rootOutcome='verified';application='stopped';tauriDriver='stopped';edgeDriver='stopped';webview='stopped';ocrEngine='absent';other='absent'}}
+      function Wait-LaunchProcessQuiescence{[pscustomobject]@{stable=$true;processes=@()}}
+      function Get-LaunchResidualCategory{'none'}
+      function Get-LaunchResidualFacts{[pscustomobject]@{ownership='none';application=$false;tauriDriver=$false;edgeDriver=$false;webview=$false;ocrEngine=$false;other=$false}}
+      function Assert-LaunchCleanupState{param($Result)$script:events.Add('assert');if($Result.payload-cne'ok'){throw 'Cleanup received the wrong callback result.'}}
+      $callback={param($context)$script:events.Add('callback');if($context.SessionId-cne'session-1'-or$context.ApplicationProcessId-ne77-or$context.ApplicationProcessStartUtcTicks-ne88-or$context.Deadline-le[datetime]::UtcNow){throw 'Fresh-session callback context changed.'};[pscustomobject]@{payload='ok'}}
+      $value=Invoke-FreshInstalledImagePageToolsSession -ApplicationPath 'C:\app.exe' -TauriDriverPath 'C:\tauri.exe' -EdgeDriverPath 'C:\edge.exe' -ProfileRoot 'C:\profile' -SettingsRoot 'C:\settings' -ExpectedEdgeDriverVersion '1.2.3.4' -SessionCallback $callback
+      $names=@($value.PSObject.Properties.Name)
+      if(($names-join',')-cne'nativeDriverVersion,returnedRuntimeVersion,profileBinding,payload,sessionDeleted,ownedProcessTreeStopped,relevantProcessesRemaining'){throw ('Fresh-session result order changed: '+($names-join','))}
+      if(($script:events-join',')-cne'ports,start,callback,owned,delete,stop,dispose,assert'){throw ('Fresh-session order changed: '+($script:events-join','))}
+      if(-not$value.sessionDeleted-or-not$value.ownedProcessTreeStopped-or$value.relevantProcessesRemaining-ne0){throw 'Fresh-session cleanup receipt changed.'}
+    `));
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
+  it('cleans up a failed generic callback while preserving the callback error', () => {
+    const result = runPowerShell(extractFunctions(['Invoke-FreshInstalledImagePageToolsSession'], String.raw`
+      $script:events=[Collections.Generic.List[string]]::new();$script:driver=[pscustomobject]@{Id=42;HasExited=$false}
+      $script:PrintPins=@{PortHandoffTimeoutMilliseconds=1000};$script:LaunchPins=@{WebDriverPort=4444;NativeDriverPort=4445;CleanupProcessTimeoutMilliseconds=1000};$script:ImagePagePins=@{TotalTimeoutMilliseconds=5000}
+      function Wait-FixedWebDriverPortsFree{}
+      function Get-MinimalWindowsProcessEnvironment{@{}}
+      $capture=[pscustomobject]@{Process=$script:driver;Exceeded=$false};$capture|Add-Member ScriptMethod Start {};$capture|Add-Member ScriptMethod Dispose {$script:events.Add('dispose')}
+      function Start-BoundedDiscardProcess{$capture}
+      function Invoke-BoundedLoopbackJson{param($Path)if($Path-ceq'/status'){[pscustomobject]@{value=[pscustomobject]@{ready=$true}}}else{[pscustomobject]@{value=[pscustomobject]@{sessionId='session-1';capabilities=[pscustomobject]@{browserVersion='1.2.3.9'}}}}}
+      function Wait-NativeDriverStatus{'1.2.3.4'}
+      function Wait-OwnedPrintApplication{[pscustomobject]@{ProcessId=77;ProcessStartUtcTicks=88;Owned=@()}}
+      function Invoke-SessionDeleteOutcome{$script:events.Add('delete');'requestfailed'}
+      function Get-OwnedLaunchProcesses{@()}
+      function Get-UniqueOwnedLaunchProcesses{param($Processes)@($Processes)}
+      function Stop-OwnedLaunchProcesses{param($TauriDriver)$script:events.Add('stop');$TauriDriver.HasExited=$true;[pscustomobject]@{rootOutcome='verified';application='absent';tauriDriver='stopped';edgeDriver='absent';webview='absent';ocrEngine='absent';other='absent'}}
+      function Wait-LaunchProcessQuiescence{[pscustomobject]@{stable=$true;processes=@()}}
+      function Get-LaunchResidualCategory{'none'}
+      function Get-LaunchResidualFacts{[pscustomobject]@{ownership='none';application=$false;tauriDriver=$false;edgeDriver=$false;webview=$false;ocrEngine=$false;other=$false}}
+      function Assert-LaunchCleanupState{throw 'cleanup error must not replace callback error'}
+      $message='';try{Invoke-FreshInstalledImagePageToolsSession -ApplicationPath 'C:\app.exe' -TauriDriverPath 'C:\tauri.exe' -EdgeDriverPath 'C:\edge.exe' -ProfileRoot 'C:\profile' -SettingsRoot 'C:\settings' -ExpectedEdgeDriverVersion '1.2.3.4' -SessionCallback {$script:events.Add('callback');throw 'callback failure'}}catch{$message=$_.Exception.Message}
+      if($message-cne'callback failure'){throw ('Callback error precedence changed: '+$message)}
+      if(($script:events-join',')-cne'callback,delete,stop,dispose'){throw ('Failed callback cleanup order changed: '+($script:events-join','))}
+    `));
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+  });
+
   it('requires one exact 5906 pixels-per-metre PNG density chunk and matching decoded pixels', () => {
     const result = runPowerShell(String.raw`
       $ErrorActionPreference='Stop';Set-StrictMode -Version Latest

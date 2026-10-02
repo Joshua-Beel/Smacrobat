@@ -322,18 +322,15 @@ function Invoke-ImagePageExportNativeFlow {
     return Invoke-ImagePageNativeSave -ProcessId $ProcessId -ProcessStartUtcTicks $ProcessStartUtcTicks -NativeBaseline $nativeBaseline -OutputPath $ExportedPngPath -Deadline $Deadline
 }
 
-function Invoke-RealInstalledImagePageTools {
+function Invoke-FreshInstalledImagePageToolsSession {
     param(
         [Parameter(Mandatory = $true)][string]$ApplicationPath,
-        [Parameter(Mandatory = $true)][string]$PdfiumPath,
         [Parameter(Mandatory = $true)][string]$TauriDriverPath,
         [Parameter(Mandatory = $true)][string]$EdgeDriverPath,
         [Parameter(Mandatory = $true)][string]$ProfileRoot,
         [Parameter(Mandatory = $true)][string]$SettingsRoot,
-        [Parameter(Mandatory = $true)][string]$SourceImagePath,
-        [Parameter(Mandatory = $true)][string]$CreatedPdfPath,
-        [Parameter(Mandatory = $true)][string]$ExportedPngPath,
-        [Parameter(Mandatory = $true)][string]$ExpectedEdgeDriverVersion
+        [Parameter(Mandatory = $true)][string]$ExpectedEdgeDriverVersion,
+        [Parameter(Mandatory = $true)][scriptblock]$SessionCallback
     )
     $driverCapture = $null; $driver = $null; $sessionId = $null; $captured = @(); $result = $null
     $sessionDeleteOutcome = 'requestfailed'; $driverExited = $false; $driverStopOutcome = 'not-invoked'; $processesQuiescent = $false; $residualCategory = 'multiple'
@@ -364,6 +361,58 @@ function Invoke-RealInstalledImagePageTools {
         $userData = $capabilities.PSObject.Properties['msedge.userDataDir']
         $ownedApp = Wait-OwnedPrintApplication -Driver $driver -StartedAfter $startedAfter -ApplicationPath $ApplicationPath -Deadline $deadline
         $appProcessId = [int]$ownedApp.ProcessId; $appProcessStartUtcTicks = [long]$ownedApp.ProcessStartUtcTicks; $captured += @($ownedApp.Owned)
+        $result = & $SessionCallback ([pscustomobject]@{
+            SessionId=$sessionId;Deadline=$deadline;ApplicationProcessId=$appProcessId;ApplicationProcessStartUtcTicks=$appProcessStartUtcTicks
+        })
+        if ($null -eq $result) { throw 'Installed fresh-session callback returned no result.' }
+        $captured += @(Get-OwnedLaunchProcesses -RootProcessId $driver.Id -StartedAfter $startedAfter); $captured = @(Get-UniqueOwnedLaunchProcesses -Processes $captured)
+        Assert-PrintOwnedExecutables -Owned $captured -ApplicationPath $ApplicationPath -EdgeDriverPath $EdgeDriverPath -RootProcessId $driver.Id
+        $profileBinding = if ($null -ne $userData -and -not [string]::IsNullOrWhiteSpace([string]$userData.Value)) { 'session-capability-' + (Get-ExactProfileBinding -Candidate ([string]$userData.Value) -RequestedProfile $ProfileRoot -SettingsRoot $SettingsRoot) } else { Get-OwnedProfileBinding -Owned $captured -RequestedProfile $ProfileRoot -SettingsRoot $SettingsRoot }
+        if ($driverCapture.Exceeded) { throw 'WebDriver diagnostic output exceeded its discarded character cap.' }
+        $sessionResult = [ordered]@{nativeDriverVersion=$nativeVersion;returnedRuntimeVersion=$runtimeVersion;profileBinding=$profileBinding}
+        foreach ($property in $result.PSObject.Properties) { $sessionResult.Add($property.Name,$property.Value) }
+        $result = [pscustomobject]$sessionResult
+    } finally {
+        $cleanupDeadline = [datetime]::UtcNow.AddSeconds(10)
+        if ($sessionId) { $sessionDeleteOutcome = Invoke-SessionDeleteOutcome -SessionId $sessionId -Deadline $cleanupDeadline }
+        if ($driver) {
+            try { $captured += @(Get-OwnedLaunchProcesses -RootProcessId $driver.Id -StartedAfter $startedAfter); $captured = @(Get-UniqueOwnedLaunchProcesses -Processes $captured) } catch { }
+            $processCleanupDeadline = [datetime]::UtcNow.AddMilliseconds($script:LaunchPins.CleanupProcessTimeoutMilliseconds)
+            $capturedOutcomes = Stop-OwnedLaunchProcesses -TauriDriver $driver -Captured $captured -Deadline $processCleanupDeadline
+            $driverStopOutcome = [string]$capturedOutcomes.rootOutcome; $driverExited = [bool]$driver.HasExited
+            $quiescence = Wait-LaunchProcessQuiescence -Deadline $processCleanupDeadline; $processesQuiescent = [bool]$quiescence.stable
+            $remaining = @($quiescence.processes); $residualCategory = Get-LaunchResidualCategory -Processes $remaining
+            $residualFacts = Get-LaunchResidualFacts -Processes $remaining -Captured $captured
+        }
+        if ($driverCapture) { $driverCapture.Dispose() }
+    }
+    $clear = $processesQuiescent -and $residualCategory -ceq 'none'
+    Assert-LaunchCleanupState -Result $result -SessionDeleteOutcome $sessionDeleteOutcome -DriverExited $driverExited -RelevantProcessesClear $clear -DriverStopOutcome $driverStopOutcome -ResidualCategory $residualCategory -CapturedApplication $capturedOutcomes.application -CapturedTauriDriver $capturedOutcomes.tauriDriver -CapturedEdgeDriver $capturedOutcomes.edgeDriver -CapturedWebView $capturedOutcomes.webview -CapturedOcrEngine $capturedOutcomes.ocrEngine -CapturedOther $capturedOutcomes.other -ResidualOwnership $residualFacts.ownership -ResidualApplication $residualFacts.application -ResidualTauriDriver $residualFacts.tauriDriver -ResidualEdgeDriver $residualFacts.edgeDriver -ResidualWebView $residualFacts.webview -ResidualOcrEngine $residualFacts.ocrEngine -ResidualOther $residualFacts.other
+    $result | Add-Member sessionDeleted ($sessionDeleteOutcome -ceq 'verified')
+    $result | Add-Member ownedProcessTreeStopped $driverExited
+    $result | Add-Member relevantProcessesRemaining 0
+    return $result
+}
+
+function Invoke-RealInstalledImagePageTools {
+    param(
+        [Parameter(Mandatory = $true)][string]$ApplicationPath,
+        [Parameter(Mandatory = $true)][string]$PdfiumPath,
+        [Parameter(Mandatory = $true)][string]$TauriDriverPath,
+        [Parameter(Mandatory = $true)][string]$EdgeDriverPath,
+        [Parameter(Mandatory = $true)][string]$ProfileRoot,
+        [Parameter(Mandatory = $true)][string]$SettingsRoot,
+        [Parameter(Mandatory = $true)][string]$SourceImagePath,
+        [Parameter(Mandatory = $true)][string]$CreatedPdfPath,
+        [Parameter(Mandatory = $true)][string]$ExportedPngPath,
+        [Parameter(Mandatory = $true)][string]$ExpectedEdgeDriverVersion
+    )
+    $sessionCallback = {
+        param($context)
+        $sessionId = [string]$context.SessionId
+        $deadline = [datetime]$context.Deadline
+        $appProcessId = [int]$context.ApplicationProcessId
+        $appProcessStartUtcTicks = [long]$context.ApplicationProcessStartUtcTicks
         $null = Wait-ImagePageWebDriverOracle -SessionId $sessionId -Script "return {ready:document.readyState==='complete',title:document.title,create:[...document.querySelectorAll('button')].filter(x=>x.title==='Create a PDF from an image').length};" -Deadline $deadline -Stage 'home' -Predicate { param($v) [bool]$v.ready -and [string]$v.title -ceq 'PDF Workstation' -and [int]$v.create -eq 1 }
         $createOpened = Invoke-ImagePageWebDriverScript -SessionId $sessionId -Deadline $deadline -Stage 'open-create-dialog' -Script "const b=[...document.querySelectorAll('button')].filter(x=>x.title==='Create a PDF from an image');if(b.length===1)b[0].click();return b.length===1;"
         if ($createOpened -isnot [bool] -or -not $createOpened) { throw 'The exact installed Create control was unavailable.' }
@@ -388,37 +437,14 @@ function Invoke-RealInstalledImagePageTools {
         $rasterComparison = [ImagePagePdfiumRasterProof]::ComparePng($createdRaster.Rgb,$ExportedPngPath,[int]$pngProof.width,[int]$pngProof.height)
         if ([double]$rasterComparison.MeanChannelDifference -gt $script:ImagePagePins.RasterMeanChannelDifferenceMaximum -or [int]$rasterComparison.MaximumChannelDifference -gt $script:ImagePagePins.RasterMaximumChannelDifference -or [double]$rasterComparison.DifferentChannelFraction -gt $script:ImagePagePins.RasterDifferentChannelFractionMaximum) { throw 'Exported PNG pixels differ materially from the independent signed-PDFium raster of the created PDF.' }
         $exportComplete = Wait-ImagePageWebDriverOracle -SessionId $sessionId -Script "const d=document.querySelector('dialog[aria-labelledby=`"export-image-title`"]');return {title:d?.querySelector('h2')?.textContent||'',summary:[...(d?.querySelectorAll('p')||[])].some(x=>x.textContent.includes('pixel PNG at 150 DPI.')),close:[...(d?.querySelectorAll('button')||[])].filter(x=>x.textContent.trim()==='Close').length};" -Deadline $deadline -Stage 'export-completion' -Predicate { param($v) [string]$v.title -ceq 'Image export complete' -and [bool]$v.summary -and [int]$v.close -eq 1 }
-        $captured += @(Get-OwnedLaunchProcesses -RootProcessId $driver.Id -StartedAfter $startedAfter); $captured = @(Get-UniqueOwnedLaunchProcesses -Processes $captured)
-        Assert-PrintOwnedExecutables -Owned $captured -ApplicationPath $ApplicationPath -EdgeDriverPath $EdgeDriverPath -RootProcessId $driver.Id
-        $profileBinding = if ($null -ne $userData -and -not [string]::IsNullOrWhiteSpace([string]$userData.Value)) { 'session-capability-' + (Get-ExactProfileBinding -Candidate ([string]$userData.Value) -RequestedProfile $ProfileRoot -SettingsRoot $SettingsRoot) } else { Get-OwnedProfileBinding -Owned $captured -RequestedProfile $ProfileRoot -SettingsRoot $SettingsRoot }
-        if ($driverCapture.Exceeded) { throw 'WebDriver diagnostic output exceeded its discarded character cap.' }
-        $result = [pscustomobject]@{
-            nativeDriverVersion=$nativeVersion;returnedRuntimeVersion=$runtimeVersion;profileBinding=$profileBinding
+        return [pscustomobject]@{
             sourcePickerControlCategory=[string]$createNative.sourcePickerControlCategory;createSaveDialogVerified=[bool]$createNative.createSaveDialogVerified
             createdPdf=[pscustomobject]@{bytes=[uint64]$createdItem.Length;sha256=Get-ExactSha256 -Path $CreatedPdfPath;pages=[int]$createdProof.Pages;widthPoints=[Math]::Round([double]$createdProof.WidthPoints,3);heightPoints=[Math]::Round([double]$createdProof.HeightPoints,3);workspaceOpened=[bool]$workspace.image}
             exportSaveDialogVerified=[bool]$exportSaveVerified
             exportedImage=[pscustomobject]@{bytes=[uint64]$pngProof.bytes;sha256=[string]$pngProof.sha256;format='png';width=[int]$pngProof.width;height=[int]$pngProof.height;dpi=[int]$pngProof.dpi;uiCompleted=([string]$exportComplete.title -ceq 'Image export complete')}
         }
-    } finally {
-        $cleanupDeadline = [datetime]::UtcNow.AddSeconds(10)
-        if ($sessionId) { $sessionDeleteOutcome = Invoke-SessionDeleteOutcome -SessionId $sessionId -Deadline $cleanupDeadline }
-        if ($driver) {
-            try { $captured += @(Get-OwnedLaunchProcesses -RootProcessId $driver.Id -StartedAfter $startedAfter); $captured = @(Get-UniqueOwnedLaunchProcesses -Processes $captured) } catch { }
-            $processCleanupDeadline = [datetime]::UtcNow.AddMilliseconds($script:LaunchPins.CleanupProcessTimeoutMilliseconds)
-            $capturedOutcomes = Stop-OwnedLaunchProcesses -TauriDriver $driver -Captured $captured -Deadline $processCleanupDeadline
-            $driverStopOutcome = [string]$capturedOutcomes.rootOutcome; $driverExited = [bool]$driver.HasExited
-            $quiescence = Wait-LaunchProcessQuiescence -Deadline $processCleanupDeadline; $processesQuiescent = [bool]$quiescence.stable
-            $remaining = @($quiescence.processes); $residualCategory = Get-LaunchResidualCategory -Processes $remaining
-            $residualFacts = Get-LaunchResidualFacts -Processes $remaining -Captured $captured
-        }
-        if ($driverCapture) { $driverCapture.Dispose() }
-    }
-    $clear = $processesQuiescent -and $residualCategory -ceq 'none'
-    Assert-LaunchCleanupState -Result $result -SessionDeleteOutcome $sessionDeleteOutcome -DriverExited $driverExited -RelevantProcessesClear $clear -DriverStopOutcome $driverStopOutcome -ResidualCategory $residualCategory -CapturedApplication $capturedOutcomes.application -CapturedTauriDriver $capturedOutcomes.tauriDriver -CapturedEdgeDriver $capturedOutcomes.edgeDriver -CapturedWebView $capturedOutcomes.webview -CapturedOcrEngine $capturedOutcomes.ocrEngine -CapturedOther $capturedOutcomes.other -ResidualOwnership $residualFacts.ownership -ResidualApplication $residualFacts.application -ResidualTauriDriver $residualFacts.tauriDriver -ResidualEdgeDriver $residualFacts.edgeDriver -ResidualWebView $residualFacts.webview -ResidualOcrEngine $residualFacts.ocrEngine -ResidualOther $residualFacts.other
-    $result | Add-Member sessionDeleted ($sessionDeleteOutcome -ceq 'verified')
-    $result | Add-Member ownedProcessTreeStopped $driverExited
-    $result | Add-Member relevantProcessesRemaining 0
-    return $result
+    }.GetNewClosure()
+    return Invoke-FreshInstalledImagePageToolsSession -ApplicationPath $ApplicationPath -TauriDriverPath $TauriDriverPath -EdgeDriverPath $EdgeDriverPath -ProfileRoot $ProfileRoot -SettingsRoot $SettingsRoot -ExpectedEdgeDriverVersion $ExpectedEdgeDriverVersion -SessionCallback $sessionCallback
 }
 
 function Invoke-InstalledImagePageTools {
