@@ -5,7 +5,7 @@ The README records what is implemented and tested. This plan organizes the remai
 ## Team rules
 
 - GPT-6 handles planning, ownership, dependencies and acceptance decisions.
-- GPT-5.6 Sol handles complex native PDF work and adversarial review; GPT-5.6 Terra handles UI and routine integration; GPT-5.6 Luna handles bounded exploration when a slot is available.
+- GPT-5.6 Sol handles all implementation and code review. Other models may perform bounded read-only exploration when explicitly assigned.
 - Each implementation has explicit file ownership and a defined interface. Agents coordinate shared contracts before editing consumers.
 - Only one native test/build process runs at a time. Combined tests and applicable artifact checks must pass before explicit-path commits and pushes.
 - Each feature receives an independent review where capacity permits. Findings need evidence and regression coverage; unsupported or unverified behavior stays documented.

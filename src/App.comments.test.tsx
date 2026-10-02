@@ -99,6 +99,20 @@ it('drops a stale annotation query when the active tab changes', async () => {
   act(() => ui.unmount());
 });
 
+it('shares an in-flight annotation query when comments are closed and reopened', async () => {
+  let resolve!: (value: ReturnType<typeof annotations>) => void;
+  vi.mocked(documentAnnotations).mockImplementation(() => new Promise(done => { resolve = done; }));
+  let ui!: ReactTestRenderer; act(() => { ui = create(<App />); });
+  await open(ui);
+  act(() => button(ui, 'Comments').props.onClick());
+  act(() => button(ui, 'Close comments').props.onClick());
+  act(() => button(ui, 'Comments').props.onClick());
+  expect(documentAnnotations).toHaveBeenCalledTimes(1);
+  await act(async () => resolve(annotations(1, 0, [{ id: 'shared', kind: 'note', page: 0, rect: null, contents: 'Shared note' }])));
+  expect(JSON.stringify(ui.toJSON())).toContain('Shared note');
+  act(() => ui.unmount());
+});
+
 it('creates an area highlight using the current revision and an optional body', async () => {
   vi.mocked(documentAnnotations).mockResolvedValue(annotations());
   vi.mocked(createHighlight).mockResolvedValue(document(1));

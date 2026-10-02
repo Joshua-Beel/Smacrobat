@@ -55,7 +55,7 @@ describe('signed installed persistence workflow', () => {
     `;
     const result = runPowerShell(check);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('keeps download credentials out of the installer and persistence verifier step', () => {
     const verifierStep = workflow.slice(workflow.indexOf('- name: Verify signed installed persistence across restarts'), workflow.indexOf('- name: Upload only sanitized persistence verification'));

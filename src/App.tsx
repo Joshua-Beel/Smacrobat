@@ -39,6 +39,20 @@ type AnnotationsLoad = { request: string; annotations: DocumentAnnotations | nul
 type FormsLoad = { request: string; fields: DocumentFormFields | null; error: string };
 type PageLabelsLoad = { request: string; labels: DocumentPageLabels | null };
 
+const annotationRequests = new Map<string, Promise<DocumentAnnotations>>();
+const formRequests = new Map<string, Promise<DocumentFormFields>>();
+function shareRequest<T>(requests: Map<string, Promise<T>>, key: string, start: () => Promise<T>): Promise<T> {
+  const existing = requests.get(key);
+  if (existing) return existing;
+  const request = start();
+  requests.set(key, request);
+  void request.then(
+    () => { if (requests.get(key) === request) requests.delete(key); },
+    () => { if (requests.get(key) === request) requests.delete(key); },
+  );
+  return request;
+}
+
 export default function App() {
   const [preferences] = useState(readPreferences);
   const [documents, setDocuments] = useState<DocumentInfo[]>([]);
@@ -136,7 +150,7 @@ export default function App() {
     if (!doc || !annotationsNeeded) { setAnnotationsLoad({ request: '', annotations: null, error: '' }); return; }
     let disposed = false;
     setAnnotationsLoad({ request: annotationsRequest, annotations: null, error: '' });
-    documentAnnotations(doc.id, doc.revision).then(value => {
+    shareRequest(annotationRequests, annotationsRequest, () => documentAnnotations(doc.id, doc.revision)).then(value => {
       if (disposed || value.documentId !== doc.id || value.revision !== doc.revision) return;
       setAnnotationsLoad({ request: annotationsRequest, annotations: value, error: '' });
     }).catch(reason => { if (!disposed) setAnnotationsLoad({ request: annotationsRequest, annotations: null, error: String(reason) }); });
@@ -148,7 +162,7 @@ export default function App() {
     if (!doc || !formsOpen) { setFormsLoad({ request: '', fields: null, error: '' }); return; }
     let disposed = false;
     setFormsLoad({ request: formsRequest, fields: null, error: '' });
-    documentFormFields(doc.id, doc.revision).then(value => {
+    shareRequest(formRequests, formsRequest, () => documentFormFields(doc.id, doc.revision)).then(value => {
       if (disposed || value.documentId !== doc.id || value.revision !== doc.revision) return;
       setFormsLoad({ request: formsRequest, fields: value, error: '' });
     }).catch(reason => { if (!disposed) setFormsLoad({ request: formsRequest, fields: null, error: String(reason) }); });

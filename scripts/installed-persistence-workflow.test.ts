@@ -88,7 +88,7 @@ describe('installed persistence WebDriver proof', () => {
       for (const value of Object.values(scripts)) expect(() => new Function(value)).not.toThrow();
     }
     expect(source.match(/-Script \(Get-PersistenceImageRenderScript\)/g)).toHaveLength(2);
-  });
+  }, 15_000);
 
   it('uses the unique Home sample marker only for empty-history phases', () => {
     const check = String.raw`

@@ -48,3 +48,41 @@ it('disposes a stale field response after its tab changes', async () => {
   expect(fillFormCopy).not.toHaveBeenCalled();
   act(() => ui.unmount());
 });
+
+it('shares an in-flight field query when the form dialog is closed and reopened', async () => {
+  let resolve!: (value: ReturnType<typeof fields>) => void;
+  vi.mocked(documentFormFields).mockImplementation(() => new Promise(done => { resolve = done; }));
+  let ui!: ReactTestRenderer; act(() => { ui = create(<App />); });
+  await open(ui, document(1, 4));
+  act(() => ui.root.findAllByType('button').find(item => item.children.includes('All tools'))!.props.onClick());
+  act(() => ui.root.findByProps({ title: 'Fill existing fields' }).props.onClick());
+  act(() => ui.root.findAllByType('button').find(item => item.children.join('') === 'Cancel')!.props.onClick());
+  act(() => ui.root.findByProps({ title: 'Fill existing fields' }).props.onClick());
+  expect(documentFormFields).toHaveBeenCalledTimes(1);
+  await act(async () => resolve(fields(1, 4)));
+  expect(ui.root.findByProps({ 'aria-label': 'Name' }).props.value).toBe('Ada');
+  vi.mocked(documentFormFields).mockResolvedValue(fields(1, 4));
+  act(() => ui.root.findAllByType('button').find(item => item.children.join('') === 'Cancel')!.props.onClick());
+  act(() => ui.root.findByProps({ title: 'Fill existing fields' }).props.onClick());
+  await act(async () => {});
+  expect(documentFormFields).toHaveBeenCalledTimes(2);
+  act(() => ui.unmount());
+});
+
+it('retries a field query after a shared request rejects', async () => {
+  let reject!: (reason: Error) => void;
+  vi.mocked(documentFormFields).mockImplementation(() => new Promise((_resolve, fail) => { reject = fail; }));
+  let ui!: ReactTestRenderer; act(() => { ui = create(<App />); });
+  await open(ui, document(1, 4));
+  act(() => ui.root.findAllByType('button').find(item => item.children.includes('All tools'))!.props.onClick());
+  act(() => ui.root.findByProps({ title: 'Fill existing fields' }).props.onClick());
+  await act(async () => reject(new Error('query failed')));
+  expect(JSON.stringify(ui.toJSON())).toContain('query failed');
+  vi.mocked(documentFormFields).mockResolvedValue(fields(1, 4));
+  act(() => ui.root.findAllByType('button').find(item => item.children.join('') === 'Cancel')!.props.onClick());
+  act(() => ui.root.findByProps({ title: 'Fill existing fields' }).props.onClick());
+  await act(async () => {});
+  expect(documentFormFields).toHaveBeenCalledTimes(2);
+  expect(ui.root.findByProps({ 'aria-label': 'Name' }).props.value).toBe('Ada');
+  act(() => ui.unmount());
+});
