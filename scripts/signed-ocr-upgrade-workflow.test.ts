@@ -432,10 +432,12 @@ describe('manual signed OCR installer upgrade workflow', () => {
     expect(helper).toContain("DetailsTitle = 'Digital Signature Details'");
     expect(helper).toContain("ValidStatus = 'This digital signature is OK.'");
     expect(helper).toContain('[Windows.Automation.SelectionItemPattern]::Pattern');
-    expect(helper).toContain('[Windows.Automation.InvokePattern]::Pattern');
+    expect(helper).toContain('GetCurrentPattern(InvokePattern.Pattern)');
     expect(helper).toContain('TaskCreationOptions.LongRunning');
-    expect(helper).toContain('[Delegate]::CreateDelegate([Action],$pattern,$invokeMethod)');
-    expect(helper).toContain('return RunOnHelperThread(action);');
+    expect(helper).toContain('InvokeExactButtonAsync(long rootHandleValue');
+    expect(helper).toContain('AutomationElement.FromHandle(new IntPtr(rootHandleValue))');
+    expect(helper).toContain('root.Current.NativeWindowHandle != rootHandleValue');
+    expect(helper).toContain('return Task.Factory.StartNew(() =>');
     expect(helper).toContain('[Windows.Automation.ValuePattern]::Pattern');
     expect(helper).toContain("-Name 'Embedded Signatures' -ControlType ([Windows.Automation.ControlType]::DataGrid)");
     expect(helper).toContain('-Root $signatureGrids[0] -Name $ExpectedPublisher -ControlType ([Windows.Automation.ControlType]::DataItem)');
@@ -454,7 +456,8 @@ describe('manual signed OCR installer upgrade workflow', () => {
     expect(helper).toContain('$propertiesCleanupMatches');
     expect(helper).toContain('$detailsCleanupMatches');
     expect(helper).toContain('Close-PublisherUiWindow');
-    expect(helper).toContain('$detailsInvokeTask = Invoke-PublisherUiButton');
+    expect(helper).toContain('$detailsInvokeTask = Invoke-PublisherUiButton -RootHandle $propertiesHandle -RootTitle $propertiesTitle');
+    expect(helper).toContain('-InvokeTask $detailsInvokeTask');
     expect(helper).toContain('Complete-PublisherUiButtonInvoke -Task $detailsInvokeTask');
     expect(helper).toContain('JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE');
     expect(helper).toContain('TerminateJobObject(job, 125)');
@@ -462,7 +465,12 @@ describe('manual signed OCR installer upgrade workflow', () => {
     expect(helper).toContain("'SystemRoot','SystemDrive','WINDIR','ProgramData'");
     expect(helper).toContain('StdoutMaximum = 4096');
     expect(helper).toContain('StderrMaximum = 2048');
-    expect(helper).toContain("[Console]::Error.Write('publisher-ui-child-failed')");
+    expect(helper).toContain("FailureTokenPrefix = 'publisher-ui-child-failed:v1'");
+    expect(helper).toContain('New-PublisherUiChildFailureToken -Stage $script:PublisherUiChildStage -Category $script:PublisherUiChildCategory');
+    expect(helper).toContain('ConvertFrom-PublisherUiChildFailureToken');
+    expect(helper).toContain('$script:PublisherUiChildStage = $primaryFailureStage');
+    expect(helper).toContain('$script:PublisherUiChildCategory = $primaryFailureCategory');
+    expect(helper).not.toContain('[Delegate]::CreateDelegate');
     expect(helper).not.toContain('[scriptblock]$SurfaceProvider');
     expect(helper.match(/Assert-PublisherUiFileReceipt -Path \$canonical/g)).toHaveLength(2);
     expect(helper.match(/Assert-TrustedWindowsSignature -Path \$canonical/g)).toHaveLength(2);
@@ -495,32 +503,23 @@ describe('manual signed OCR installer upgrade workflow', () => {
       $rejected=$false;try{Assert-PublisherUiFileReceipt -Path $fixture -Receipt ([pscustomobject]@{bytes=$receipt.bytes;sha256=('A'*64)})}catch{$rejected=$true};if(-not$rejected){throw 'Wrong publisher UI receipt was accepted.'}
       Initialize-PublisherUiIsolation
       Initialize-PublisherUiInterop
-      Add-Type -TypeDefinition @'
-using System.Threading;
-public sealed class BlockingPublisherInvoke {
-  public readonly ManualResetEventSlim Started = new ManualResetEventSlim(false);
-  public readonly ManualResetEventSlim Release = new ManualResetEventSlim(false);
-  public int ThreadId;
-  public void Run() {
-    ThreadId = Thread.CurrentThread.ManagedThreadId;
-    Started.Set();
-    Release.Wait();
-  }
-}
-'@
-      $blocking=[BlockingPublisherInvoke]::new()
-      $invokeMethod=$blocking.GetType().GetMethod('Run',[Type[]]@())
-      $action=[Delegate]::CreateDelegate([Action],$blocking,$invokeMethod)
-      $callerThread=[Threading.Thread]::CurrentThread.ManagedThreadId
-      $invokeTask=$null
-      try{
-        $invokeTask=[Smacrobat.PublisherUi.NativeShell]::InvokeAsync($action)
-        if(-not$blocking.Started.Wait(1000)){throw 'Publisher UI helper-thread action did not start.'}
-        if($invokeTask.IsCompleted-or$blocking.ThreadId-eq$callerThread){throw 'Blocking publisher UI invocation held the caller thread.'}
-      }finally{$blocking.Release.Set()}
-      if($null-eq$invokeTask){throw 'Publisher UI helper-thread action returned no task.'}
-      Complete-PublisherUiButtonInvoke -Task $invokeTask -Deadline ([datetime]::UtcNow.AddSeconds(1))
-      if(-not$invokeTask.IsCompletedSuccessfully){throw 'Publisher UI helper-thread action did not complete after release.'}
+      $runningSource=[Threading.Tasks.TaskCompletionSource[bool]]::new()
+      if((Get-PublisherUiInvokeTaskState -Task $runningSource.Task)-cne'running'){throw 'Running publisher UI task state was misclassified.'}
+      $runningSource.SetResult($true)
+      if((Get-PublisherUiInvokeTaskState -Task $runningSource.Task)-cne'completed'){throw 'Completed publisher UI task state was misclassified.'}
+      $canceled=[Threading.Tasks.Task]::FromCanceled([Threading.CancellationToken]::new($true))
+      if((Get-PublisherUiInvokeTaskState -Task $canceled)-cne'canceled'){throw 'Canceled publisher UI task state was misclassified.'}
+      $faulted=[Threading.Tasks.Task]::FromException([InvalidOperationException]::new('controlled'))
+      if((Get-PublisherUiInvokeTaskState -Task $faulted)-cne'faulted'){throw 'Faulted publisher UI task state was misclassified.'}
+      foreach($taskCase in @(@{task=$canceled;category='invoke-canceled'},@{task=$faulted;category='invoke-faulted'})){
+        $script:PublisherUiChildCategory='unexpected';$rejected=$false
+        try{Complete-PublisherUiButtonInvoke -Task $taskCase.task -Deadline ([datetime]::UtcNow.AddSeconds(1))}catch{$rejected=$true}
+        if(-not$rejected-or$script:PublisherUiChildCategory-cne$taskCase.category){throw 'Terminal publisher UI task failure was not categorized.'}
+      }
+      $neverCompletes=[Threading.Tasks.TaskCompletionSource[bool]]::new()
+      $script:PublisherUiChildCategory='unexpected';$rejected=$false
+      try{Complete-PublisherUiButtonInvoke -Task $neverCompletes.Task -Deadline ([datetime]::UtcNow.AddMilliseconds(-1))}catch{$rejected=$true}
+      if(-not$rejected-or$script:PublisherUiChildCategory-cne'invoke-running'){throw 'Running publisher UI task deadline was not categorized.'}
       $encoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes('[Console]::Out.Write($PID);[Console]::Out.Flush();Start-Sleep -Seconds 30'))
       $arguments=@('-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',$encoded)
       $result=[Smacrobat.PublisherUiIsolation.BoundedProcess]::Run((Join-Path $PSHOME 'pwsh.exe'),$arguments,(Get-Location).Path,(Get-PublisherUiMinimalEnvironment),300,4096,2048)
@@ -534,12 +533,33 @@ public sealed class BlockingPublisherInvoke {
       if(-not$overflowResult.StdoutExceeded-or-not$overflowResult.ProcessStopped-or$overflowResult.Stdout.Length-ne128){throw 'Publisher UI helper stdout cap was not enforced.'}
 
       $json=([pscustomobject][ordered]@{uiCulture='en-US';shellPropertiesDialog=$true;digitalSignaturesTab=$true;signerRowMatched=$true;detailsDialog=$true;statusTextMatched=$true;cleanupVerified=$true;screenshotsUsed=$false}|ConvertTo-Json -Compress)
-      function New-HelperResult([string]$stdout){[pscustomobject][ordered]@{Stdout=$stdout;Stderr='';ExitCode=[int]0;ElapsedMilliseconds=[int]10;TimedOut=$false;StdoutExceeded=$false;StderrExceeded=$false;JobAssigned=$true;JobTerminated=$false;ProcessStopped=$true;ProcessId=[int]1;ProcessStartTimeUtcTicks=[long]1}}
+      function New-HelperResult([string]$stdout,[string]$stderr='',[int]$exitCode=0){[pscustomobject][ordered]@{Stdout=$stdout;Stderr=$stderr;ExitCode=$exitCode;ElapsedMilliseconds=[int]10;TimedOut=$false;StdoutExceeded=$false;StderrExceeded=$false;JobAssigned=$true;JobTerminated=$false;ProcessStopped=$true;ProcessId=[int]1;ProcessStartTimeUtcTicks=[long]1}}
       $surface=ConvertFrom-PublisherUiHelperOutput -Result (New-HelperResult $json)
       if(-not$surface.cleanupVerified-or$surface.screenshotsUsed){throw 'Exact sanitized publisher UI JSON was rejected.'}
       foreach($bad in @('{"uiCulture":',($json+$json),($json+[Environment]::NewLine))){$rejected=$false;try{ConvertFrom-PublisherUiHelperOutput -Result (New-HelperResult $bad)|Out-Null}catch{$rejected=$true};if(-not$rejected){throw 'Partial or extra publisher UI output was accepted.'}}
       $screenshot=$json.Replace('"screenshotsUsed":false','"screenshotsUsed":true')
       $rejected=$false;try{ConvertFrom-PublisherUiHelperOutput -Result (New-HelperResult $screenshot)|Out-Null}catch{$rejected=$true};if(-not$rejected){throw 'Screenshot-backed publisher UI output was accepted.'}
+      foreach($stage in $script:PublisherUiPins.FailureStages){
+        foreach($category in $script:PublisherUiPins.FailureCategories){
+          $token=New-PublisherUiChildFailureToken -Stage $stage -Category $category
+          $parsed=ConvertFrom-PublisherUiChildFailureToken -Token $token
+          if($parsed.stage-cne$stage-or$parsed.category-cne$category){throw 'Allowlisted publisher UI child failure token did not round-trip.'}
+        }
+      }
+      $fixedToken=New-PublisherUiChildFailureToken -Stage 'details-wait' -Category 'invoke-running'
+      $fixedMessage=$null;try{ConvertFrom-PublisherUiHelperOutput -Result (New-HelperResult '' $fixedToken 1)|Out-Null}catch{$fixedMessage=$_.Exception.Message}
+      if($fixedMessage-cne"Windows publisher UI helper failed at fixed stage 'details-wait' with category 'invoke-running'."){throw 'Allowlisted publisher UI child failure was not reported deterministically.'}
+      foreach($badToken in @(
+        'publisher-ui-child-failed:v1:unknown:unexpected',
+        'publisher-ui-child-failed:v1:details-wait:unknown',
+        ('publisher-ui-child-failed:v1:details-wait:unexpected'+[Environment]::NewLine),
+        'publisher-ui-child-failed:v1:details-wait:unexpected:C:\runner',
+        ('X'*161),
+        'raw hosted exception text'
+      )){
+        $badMessage=$null;try{ConvertFrom-PublisherUiHelperOutput -Result (New-HelperResult '' $badToken 1)|Out-Null}catch{$badMessage=$_.Exception.Message}
+        if($badMessage-cne'Windows publisher UI helper process did not complete safely.'-or$badMessage.Contains($badToken)){throw 'Unallowlisted publisher UI child failure data escaped its boundary.'}
+      }
     `;
     const result = runPowerShell7(check);
     expect(result.status, result.stderr || result.stdout).toBe(0);

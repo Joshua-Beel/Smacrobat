@@ -21,21 +21,31 @@ $script:PublisherUiPins = [ordered]@{
     DetailsButton = 'Details'
     DetailsTitle = 'Digital Signature Details'
     ValidStatus = 'This digital signature is OK.'
+    FailureTokenPrefix = 'publisher-ui-child-failed:v1'
+    FailureStages = @(
+        'payload','culture','fresh-surface','open-properties','wait-properties','signature-tab','signature-grid',
+        'signer-row','details-invoke','details-wait','details-status','details-signer','cleanup-details',
+        'invoke-complete','cleanup-properties'
+    )
+    FailureCategories = @(
+        'unexpected','deadline','invoke-running','invoke-completed','invoke-faulted','invoke-canceled',
+        'modal-missing','modal-owner-mismatch','modal-ambiguous','cleanup'
+    )
 }
+$script:PublisherUiChildStage = 'payload'
+$script:PublisherUiChildCategory = 'unexpected'
 
 function Initialize-PublisherUiInterop {
     if (-not ('Windows.Automation.AutomationElement' -as [type])) {
         Add-Type -AssemblyName UIAutomationClient
         Add-Type -AssemblyName UIAutomationTypes
     }
-    if ('Smacrobat.PublisherUi.NativeShell' -as [type]) { return }
+    if (-not ('Smacrobat.PublisherUi.NativeShell' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
-using System.Threading;
-using System.Threading.Tasks;
 
 namespace Smacrobat.PublisherUi {
     public static class NativeShell {
@@ -81,14 +91,6 @@ namespace Smacrobat.PublisherUi {
             if (!ShellExecuteEx(ref info)) throw new Win32Exception(Marshal.GetLastWin32Error(), "Windows Shell refused the file properties surface.");
         }
 
-        private static Task RunOnHelperThread(Action action) {
-            return Task.Factory.StartNew(action, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
-        }
-        public static Task InvokeAsync(Action action) {
-            if (action == null) throw new ArgumentNullException(nameof(action));
-            return RunOnHelperThread(action);
-        }
-
         public static bool WindowExists(long handleValue) { return IsWindow(new IntPtr(handleValue)); }
         public static long OwnerOf(long handleValue) { return GetWindow(new IntPtr(handleValue), GW_OWNER).ToInt64(); }
         public static long[] OwnedBy(long handleValue) {
@@ -109,6 +111,72 @@ namespace Smacrobat.PublisherUi {
     }
 }
 '@
+    }
+    if (-not ('Smacrobat.PublisherUi.AutomationInvoke' -as [type])) {
+        $automationReferences = @(
+            [Windows.Automation.AutomationElement].Assembly.Location,
+            [Windows.Automation.ControlType].Assembly.Location
+        ) | Sort-Object -Unique
+        Add-Type -ReferencedAssemblies $automationReferences -TypeDefinition @'
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows.Automation;
+
+namespace Smacrobat.PublisherUi {
+    public static class AutomationInvoke {
+        public static Task InvokeExactButtonAsync(long rootHandleValue, string rootTitle, string rootClass, string buttonName) {
+            if (rootHandleValue == 0) throw new ArgumentOutOfRangeException(nameof(rootHandleValue));
+            if (rootTitle == null) throw new ArgumentNullException(nameof(rootTitle));
+            if (rootClass == null) throw new ArgumentNullException(nameof(rootClass));
+            if (buttonName == null) throw new ArgumentNullException(nameof(buttonName));
+            return Task.Factory.StartNew(() => {
+                AutomationElement root = AutomationElement.FromHandle(new IntPtr(rootHandleValue));
+                if (root == null || root.Current.NativeWindowHandle != rootHandleValue ||
+                    !String.Equals(root.Current.Name, rootTitle, StringComparison.Ordinal) ||
+                    !String.Equals(root.Current.ClassName, rootClass, StringComparison.Ordinal) ||
+                    root.Current.ControlType != ControlType.Window || !root.Current.IsEnabled || root.Current.IsOffscreen) {
+                    throw new InvalidOperationException("Publisher UI invocation root identity changed.");
+                }
+                Condition condition = new AndCondition(
+                    new PropertyCondition(AutomationElement.NameProperty, buttonName),
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button),
+                    new PropertyCondition(AutomationElement.IsEnabledProperty, true));
+                AutomationElementCollection matches = root.FindAll(TreeScope.Descendants, condition);
+                if (matches.Count != 1) throw new InvalidOperationException("Publisher UI invocation action identity changed.");
+                object pattern = matches[0].GetCurrentPattern(InvokePattern.Pattern);
+                ((InvokePattern)pattern).Invoke();
+            }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        }
+    }
+}
+'@
+    }
+}
+
+function Set-PublisherUiChildStage {
+    param([Parameter(Mandatory = $true)][string]$Stage)
+    if ($script:PublisherUiPins.FailureStages -cnotcontains $Stage) { throw 'Windows publisher UI child stage is invalid.' }
+    $script:PublisherUiChildStage = $Stage
+    $script:PublisherUiChildCategory = 'unexpected'
+}
+
+function Set-PublisherUiChildCategory {
+    param([Parameter(Mandatory = $true)][string]$Category)
+    if ($script:PublisherUiPins.FailureCategories -cnotcontains $Category) { throw 'Windows publisher UI child category is invalid.' }
+    $script:PublisherUiChildCategory = $Category
+}
+
+function New-PublisherUiChildFailureToken {
+    param(
+        [Parameter(Mandatory = $true)][string]$Stage,
+        [Parameter(Mandatory = $true)][string]$Category
+    )
+    if ($script:PublisherUiPins.FailureStages -cnotcontains $Stage -or
+        $script:PublisherUiPins.FailureCategories -cnotcontains $Category) {
+        throw 'Windows publisher UI child failure token is invalid.'
+    }
+    return "$($script:PublisherUiPins.FailureTokenPrefix):$Stage`:$Category"
 }
 
 function Initialize-PublisherUiIsolation {
@@ -320,7 +388,10 @@ namespace Smacrobat.PublisherUiIsolation {
 
 function Assert-PublisherUiDeadline {
     param([Parameter(Mandatory = $true)][datetime]$Deadline)
-    if ([datetime]::UtcNow -ge $Deadline) { throw 'Windows publisher UI verification exceeded its total deadline.' }
+    if ([datetime]::UtcNow -ge $Deadline) {
+        Set-PublisherUiChildCategory -Category 'deadline'
+        throw 'Windows publisher UI verification exceeded its total deadline.'
+    }
 }
 
 function Get-PublisherUiCultureFacts {
@@ -429,15 +500,49 @@ function Wait-PublisherUiExactOwnedWindow {
     param(
         [Parameter(Mandatory = $true)][string]$Title,
         [Parameter(Mandatory = $true)][long]$ExpectedOwner,
-        [Parameter(Mandatory = $true)][datetime]$Deadline
+        [Parameter(Mandatory = $true)][datetime]$Deadline,
+        [Threading.Tasks.Task]$InvokeTask
     )
     do {
-        Assert-PublisherUiDeadline -Deadline $Deadline
+        if ($null -ne $InvokeTask) {
+            $invokeState = Get-PublisherUiInvokeTaskState -Task $InvokeTask
+            if ($invokeState -ceq 'faulted') {
+                Set-PublisherUiChildCategory -Category 'invoke-faulted'
+                throw 'Windows publisher UI details invocation faulted.'
+            }
+            if ($invokeState -ceq 'canceled') {
+                Set-PublisherUiChildCategory -Category 'invoke-canceled'
+                throw 'Windows publisher UI details invocation was canceled.'
+            }
+        }
+        if ([datetime]::UtcNow -ge $Deadline) { break }
         $matches = @(Get-PublisherUiExactOwnedWindows -Title $Title -ExpectedOwner $ExpectedOwner -Deadline $Deadline)
         if ($matches.Count -eq 1) { return $matches[0] }
-        if ($matches.Count -gt 1) { throw 'Windows publisher UI owned-window identity was ambiguous.' }
+        if ($matches.Count -gt 1) {
+            Set-PublisherUiChildCategory -Category 'modal-ambiguous'
+            throw 'Windows publisher UI owned-window identity was ambiguous.'
+        }
+        $globalMatches = @(Get-PublisherUiExactWindows -Title $Title -Deadline $Deadline)
+        if ($globalMatches.Count -gt 1) {
+            Set-PublisherUiChildCategory -Category 'modal-ambiguous'
+            throw 'Windows publisher UI details-window identity was ambiguous.'
+        }
+        if ($globalMatches.Count -eq 1) {
+            Set-PublisherUiChildCategory -Category 'modal-owner-mismatch'
+            throw 'Windows publisher UI details-window owner did not match.'
+        }
+        if ([datetime]::UtcNow -ge $Deadline) { break }
         Start-Sleep -Milliseconds $script:PublisherUiPins.PollMilliseconds
     } while ([datetime]::UtcNow -lt $Deadline)
+    if ($null -eq $InvokeTask) {
+        Set-PublisherUiChildCategory -Category 'modal-missing'
+    } else {
+        $invokeState = Get-PublisherUiInvokeTaskState -Task $InvokeTask
+        if ($invokeState -ceq 'faulted') { Set-PublisherUiChildCategory -Category 'invoke-faulted' }
+        elseif ($invokeState -ceq 'canceled') { Set-PublisherUiChildCategory -Category 'invoke-canceled' }
+        elseif ($invokeState -ceq 'completed') { Set-PublisherUiChildCategory -Category 'invoke-completed' }
+        else { Set-PublisherUiChildCategory -Category 'invoke-running' }
+    }
     throw 'Windows publisher UI expected owned window did not appear before the deadline.'
 }
 
@@ -453,18 +558,28 @@ function Invoke-PublisherUiSelection {
 }
 
 function Invoke-PublisherUiButton {
-    param([Parameter(Mandatory = $true)]$Element,[Parameter(Mandatory = $true)][datetime]$Deadline)
+    param(
+        [Parameter(Mandatory = $true)][long]$RootHandle,
+        [Parameter(Mandatory = $true)][string]$RootTitle,
+        [Parameter(Mandatory = $true)][datetime]$Deadline
+    )
     Assert-PublisherUiDeadline -Deadline $Deadline
-    $pattern = $null
-    if (-not $Element.TryGetCurrentPattern([Windows.Automation.InvokePattern]::Pattern,[ref]$pattern)) {
-        throw 'Windows publisher UI button did not expose InvokePattern.'
-    }
-    $invokeMethod = $pattern.GetType().GetMethod('Invoke',[Type[]]@())
-    if ($null -eq $invokeMethod) { throw 'Windows publisher UI button invocation method is unavailable.' }
-    $invokeAction = [Delegate]::CreateDelegate([Action],$pattern,$invokeMethod)
-    $task = [Smacrobat.PublisherUi.NativeShell]::InvokeAsync($invokeAction)
+    $task = [Smacrobat.PublisherUi.AutomationInvoke]::InvokeExactButtonAsync(
+        $RootHandle,
+        $RootTitle,
+        $script:PublisherUiPins.PropertyClass,
+        $script:PublisherUiPins.DetailsButton
+    )
     if ($null -eq $task) { throw 'Windows publisher UI button invocation did not start.' }
     return $task
+}
+
+function Get-PublisherUiInvokeTaskState {
+    param([Parameter(Mandatory = $true)][Threading.Tasks.Task]$Task)
+    if ($Task.IsCanceled) { return 'canceled' }
+    if ($Task.IsFaulted) { return 'faulted' }
+    if ($Task.IsCompletedSuccessfully) { return 'completed' }
+    return 'running'
 }
 
 function Complete-PublisherUiButtonInvoke {
@@ -473,11 +588,20 @@ function Complete-PublisherUiButtonInvoke {
         [Parameter(Mandatory = $true)][datetime]$Deadline
     )
     while (-not $Task.IsCompleted) {
-        Assert-PublisherUiDeadline -Deadline $Deadline
+        if ([datetime]::UtcNow -ge $Deadline) {
+            Set-PublisherUiChildCategory -Category 'invoke-running'
+            throw 'Windows publisher UI button invocation exceeded its deadline.'
+        }
         Start-Sleep -Milliseconds $script:PublisherUiPins.PollMilliseconds
     }
-    if ($Task.IsCanceled -or $Task.IsFaulted) {
+    $state = Get-PublisherUiInvokeTaskState -Task $Task
+    if ($state -ceq 'canceled') {
+        Set-PublisherUiChildCategory -Category 'invoke-canceled'
+        throw 'Windows publisher UI button invocation was canceled.'
+    }
+    if ($state -ceq 'faulted') {
         $null = $Task.Exception
+        Set-PublisherUiChildCategory -Category 'invoke-faulted'
         throw 'Windows publisher UI button invocation failed.'
     }
     $Task.GetAwaiter().GetResult()
@@ -525,6 +649,7 @@ function Invoke-WindowsShellPublisherSurface {
     if ($interactionDeadline -le [datetime]::UtcNow) { throw 'Windows publisher UI timeout leaves no cleanup budget.' }
     $fileName = [IO.Path]::GetFileName($Path)
     $propertiesTitle = "$fileName Properties"
+    Set-PublisherUiChildStage -Stage 'fresh-surface'
     if (@(Get-PublisherUiExactWindows -Title $propertiesTitle -Deadline $interactionDeadline).Count -ne 0 -or
         @(Get-PublisherUiExactWindows -Title $script:PublisherUiPins.DetailsTitle -Deadline $interactionDeadline).Count -ne 0) {
         throw 'Windows publisher UI verification requires a fresh matching desktop surface.'
@@ -535,33 +660,46 @@ function Invoke-WindowsShellPublisherSurface {
     [Threading.Tasks.Task]$detailsInvokeTask = $null
     $propertiesInvoked = $false
     $detailsInvoked = $false
+    $surface = $null
+    $primaryFailure = $null
+    $primaryFailureStage = $null
+    $primaryFailureCategory = $null
     try {
+        Set-PublisherUiChildStage -Stage 'open-properties'
         [Smacrobat.PublisherUi.NativeShell]::ShowProperties($Path)
         $propertiesInvoked = $true
+        Set-PublisherUiChildStage -Stage 'wait-properties'
         $properties = Wait-PublisherUiExactWindow -Title $propertiesTitle -Deadline $interactionDeadline
         $propertiesHandle = [long]$properties.Current.NativeWindowHandle
 
+        Set-PublisherUiChildStage -Stage 'signature-tab'
         $tabs = @(Get-PublisherUiExactElements -Root $properties -Name $script:PublisherUiPins.SignatureTab -ControlType ([Windows.Automation.ControlType]::TabItem) -Deadline $interactionDeadline)
         if ($tabs.Count -ne 1) { throw 'Windows publisher UI did not expose one exact Digital Signatures tab.' }
         Invoke-PublisherUiSelection -Element $tabs[0] -Deadline $interactionDeadline
 
+        Set-PublisherUiChildStage -Stage 'signature-grid'
         $signatureGrids = @(Get-PublisherUiExactElements -Root $properties -Name 'Embedded Signatures' -ControlType ([Windows.Automation.ControlType]::DataGrid) -Deadline $interactionDeadline)
         if ($signatureGrids.Count -ne 1) { throw 'Windows publisher UI did not expose one exact embedded-signatures grid.' }
+        Set-PublisherUiChildStage -Stage 'signer-row'
         $signers = @(Get-PublisherUiExactElements -Root $signatureGrids[0] -Name $ExpectedPublisher -ControlType ([Windows.Automation.ControlType]::DataItem) -Deadline $interactionDeadline)
         if ($signers.Count -ne 1) { throw 'Windows publisher UI did not expose one exact expected embedded signer row.' }
         Invoke-PublisherUiSelection -Element $signers[0] -Deadline $interactionDeadline
 
+        Set-PublisherUiChildStage -Stage 'details-invoke'
         $buttons = @(Get-PublisherUiExactElements -Root $properties -Name $script:PublisherUiPins.DetailsButton -ControlType ([Windows.Automation.ControlType]::Button) -Deadline $interactionDeadline | Where-Object { [bool]$_.Current.IsEnabled })
         if ($buttons.Count -ne 1) { throw 'Windows publisher UI did not expose one enabled embedded-signature Details action.' }
         $buttons[0].SetFocus()
         Assert-PublisherUiDeadline -Deadline $interactionDeadline
-        $detailsInvokeTask = Invoke-PublisherUiButton -Element $buttons[0] -Deadline $interactionDeadline
+        $detailsInvokeTask = Invoke-PublisherUiButton -RootHandle $propertiesHandle -RootTitle $propertiesTitle -Deadline $interactionDeadline
         $detailsInvoked = $true
 
-        $details = Wait-PublisherUiExactOwnedWindow -Title $script:PublisherUiPins.DetailsTitle -ExpectedOwner $propertiesHandle -Deadline $interactionDeadline
+        Set-PublisherUiChildStage -Stage 'details-wait'
+        $details = Wait-PublisherUiExactOwnedWindow -Title $script:PublisherUiPins.DetailsTitle -ExpectedOwner $propertiesHandle -Deadline $interactionDeadline -InvokeTask $detailsInvokeTask
         $detailsHandle = [long]$details.Current.NativeWindowHandle
+        Set-PublisherUiChildStage -Stage 'details-status'
         $status = @(Get-PublisherUiExactElements -Root $details -Name $script:PublisherUiPins.ValidStatus -ControlType ([Windows.Automation.ControlType]::Text) -Deadline $interactionDeadline)
         if ($status.Count -ne 1) { throw 'Windows publisher UI did not expose the exact valid-signature status.' }
+        Set-PublisherUiChildStage -Stage 'details-signer'
         $signerGroups = @(Get-PublisherUiExactElements -Root $details -Name 'Signer information' -ControlType ([Windows.Automation.ControlType]::Group) -Deadline $interactionDeadline)
         if ($signerGroups.Count -ne 1) { throw 'Windows publisher UI details did not expose one exact signer-information group.' }
         $publisherFields = @(Get-PublisherUiExactElements -Root $details -Name 'Name:' -ControlType ([Windows.Automation.ControlType]::Edit) -Deadline $interactionDeadline)
@@ -569,7 +707,7 @@ function Invoke-WindowsShellPublisherSurface {
             throw 'Windows publisher UI details did not expose the exact expected signer value.'
         }
 
-        return [pscustomobject]@{
+        $surface = [pscustomobject]@{
             uiCulture = $script:PublisherUiPins.Culture
             shellPropertiesDialog = $true
             digitalSignaturesTab = $true
@@ -579,21 +717,44 @@ function Invoke-WindowsShellPublisherSurface {
             cleanupVerified = $true
             screenshotsUsed = $false
         }
+    } catch {
+        $primaryFailure = $_
+        $primaryFailureStage = $script:PublisherUiChildStage
+        $primaryFailureCategory = $script:PublisherUiChildCategory
     } finally {
-        if ($propertiesHandle -eq 0 -and $propertiesInvoked) {
-            $propertiesCleanupMatches = @(Get-PublisherUiExactWindows -Title $propertiesTitle -Deadline $totalDeadline)
-            if ($propertiesCleanupMatches.Count -gt 1) { throw 'Windows publisher UI cleanup found ambiguous file properties surfaces.' }
-            if ($propertiesCleanupMatches.Count -eq 1) { $propertiesHandle = [long]$propertiesCleanupMatches[0].Current.NativeWindowHandle }
+        try {
+            Set-PublisherUiChildStage -Stage 'cleanup-details'
+            Set-PublisherUiChildCategory -Category 'cleanup'
+            if ($propertiesHandle -eq 0 -and $propertiesInvoked) {
+                $propertiesCleanupMatches = @(Get-PublisherUiExactWindows -Title $propertiesTitle -Deadline $totalDeadline)
+                if ($propertiesCleanupMatches.Count -gt 1) { throw 'Windows publisher UI cleanup found ambiguous file properties surfaces.' }
+                if ($propertiesCleanupMatches.Count -eq 1) { $propertiesHandle = [long]$propertiesCleanupMatches[0].Current.NativeWindowHandle }
+            }
+            if ($detailsHandle -eq 0 -and $detailsInvoked -and $propertiesHandle -ne 0) {
+                $detailsCleanupMatches = @(Get-PublisherUiExactOwnedWindows -Title $script:PublisherUiPins.DetailsTitle -ExpectedOwner $propertiesHandle -Deadline $totalDeadline)
+                if ($detailsCleanupMatches.Count -gt 1) { throw 'Windows publisher UI cleanup found ambiguous signature-details surfaces.' }
+                if ($detailsCleanupMatches.Count -eq 1) { $detailsHandle = [long]$detailsCleanupMatches[0].Current.NativeWindowHandle }
+            }
+            if ($detailsHandle -ne 0) { Close-PublisherUiWindow -HandleValue $detailsHandle -Deadline $totalDeadline }
+            Set-PublisherUiChildStage -Stage 'invoke-complete'
+            if ($null -ne $detailsInvokeTask) { Complete-PublisherUiButtonInvoke -Task $detailsInvokeTask -Deadline $totalDeadline }
+            Set-PublisherUiChildStage -Stage 'cleanup-properties'
+            Set-PublisherUiChildCategory -Category 'cleanup'
+            if ($propertiesHandle -ne 0) { Close-PublisherUiWindow -HandleValue $propertiesHandle -Deadline $totalDeadline }
+        } catch {
+            if ($null -eq $primaryFailure) {
+                $primaryFailure = $_
+                $primaryFailureStage = $script:PublisherUiChildStage
+                $primaryFailureCategory = $script:PublisherUiChildCategory
+            }
         }
-        if ($detailsHandle -eq 0 -and $detailsInvoked -and $propertiesHandle -ne 0) {
-            $detailsCleanupMatches = @(Get-PublisherUiExactOwnedWindows -Title $script:PublisherUiPins.DetailsTitle -ExpectedOwner $propertiesHandle -Deadline $totalDeadline)
-            if ($detailsCleanupMatches.Count -gt 1) { throw 'Windows publisher UI cleanup found ambiguous signature-details surfaces.' }
-            if ($detailsCleanupMatches.Count -eq 1) { $detailsHandle = [long]$detailsCleanupMatches[0].Current.NativeWindowHandle }
-        }
-        if ($detailsHandle -ne 0) { Close-PublisherUiWindow -HandleValue $detailsHandle -Deadline $totalDeadline }
-        if ($null -ne $detailsInvokeTask) { Complete-PublisherUiButtonInvoke -Task $detailsInvokeTask -Deadline $totalDeadline }
-        if ($propertiesHandle -ne 0) { Close-PublisherUiWindow -HandleValue $propertiesHandle -Deadline $totalDeadline }
     }
+    if ($null -ne $primaryFailure) {
+        $script:PublisherUiChildStage = $primaryFailureStage
+        $script:PublisherUiChildCategory = $primaryFailureCategory
+        throw $primaryFailure
+    }
+    return $surface
 }
 
 function Get-PublisherUiMinimalEnvironment {
@@ -654,6 +815,22 @@ function Assert-PublisherUiSurfaceProof {
     }
 }
 
+function ConvertFrom-PublisherUiChildFailureToken {
+    param([Parameter(Mandatory = $true)][string]$Token)
+    if ([string]::IsNullOrEmpty($Token) -or $Token.Length -gt 160 -or $Token -cne $Token.Trim() -or
+        $Token.Contains("`r") -or $Token.Contains("`n")) {
+        throw 'Windows publisher UI child failure token framing is invalid.'
+    }
+    $parts = @($Token.Split(':'))
+    if ($parts.Count -ne 4 -or $parts[0] -cne 'publisher-ui-child-failed' -or $parts[1] -cne 'v1' -or
+        $script:PublisherUiPins.FailureStages -cnotcontains $parts[2] -or
+        $script:PublisherUiPins.FailureCategories -cnotcontains $parts[3] -or
+        $Token -cne (New-PublisherUiChildFailureToken -Stage $parts[2] -Category $parts[3])) {
+        throw 'Windows publisher UI child failure token is invalid.'
+    }
+    return [pscustomobject][ordered]@{ stage = $parts[2]; category = $parts[3] }
+}
+
 function ConvertFrom-PublisherUiHelperOutput {
     param([Parameter(Mandatory = $true)]$Result)
     $expectedResult = @(
@@ -667,8 +844,15 @@ function ConvertFrom-PublisherUiHelperOutput {
         throw 'Windows publisher UI helper result is malformed.'
     }
     if ($Result.TimedOut) { throw 'Windows publisher UI helper exceeded its bounded deadline.' }
-    if ($Result.StdoutExceeded -or $Result.StderrExceeded -or -not $Result.JobAssigned -or -not $Result.ProcessStopped -or
-        [int]$Result.ExitCode -ne 0 -or -not [string]::IsNullOrEmpty([string]$Result.Stderr)) {
+    $boundaryUnsafe = $Result.StdoutExceeded -or $Result.StderrExceeded -or -not $Result.JobAssigned -or -not $Result.ProcessStopped
+    $childFailure = $null
+    if (-not $boundaryUnsafe -and [int]$Result.ExitCode -eq 1 -and [string]::IsNullOrEmpty([string]$Result.Stdout)) {
+        try { $childFailure = ConvertFrom-PublisherUiChildFailureToken -Token ([string]$Result.Stderr) } catch { }
+    }
+    if ($null -ne $childFailure) {
+        throw "Windows publisher UI helper failed at fixed stage '$($childFailure.stage)' with category '$($childFailure.category)'."
+    }
+    if ($boundaryUnsafe -or [int]$Result.ExitCode -ne 0 -or -not [string]::IsNullOrEmpty([string]$Result.Stderr)) {
         throw 'Windows publisher UI helper process did not complete safely.'
     }
     $stdout = [string]$Result.Stdout
@@ -794,6 +978,7 @@ function Invoke-InstalledPublisherUiProof {
 
 function Invoke-PublisherUiChild {
     param([Parameter(Mandatory = $true)][string]$Payload)
+    Set-PublisherUiChildStage -Stage 'payload'
     $decoded = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Payload)) | ConvertFrom-Json -Depth 3
     $properties = @($decoded.PSObject.Properties.Name | Sort-Object -CaseSensitive)
     if ($properties.Count -ne 3 -or (Compare-Object @('expectedPublisher','path','timeoutMilliseconds') $properties -CaseSensitive) -or
@@ -802,6 +987,7 @@ function Invoke-PublisherUiChild {
         [int]$decoded.timeoutMilliseconds -ne $script:PublisherUiPins.ChildDeadlineMilliseconds) {
         throw 'Windows publisher UI child payload is malformed.'
     }
+    Set-PublisherUiChildStage -Stage 'culture'
     $null = Get-PublisherUiCultureFacts
     return Invoke-WindowsShellPublisherSurface -Path ([IO.Path]::GetFullPath([string]$decoded.path)) `
         -ExpectedPublisher ([string]$decoded.expectedPublisher) -TimeoutMilliseconds ([int]$decoded.timeoutMilliseconds)
@@ -816,7 +1002,9 @@ if (-not [string]::IsNullOrWhiteSpace($PublisherUiChildPayload)) {
         [Console]::Out.Write(($childProof | ConvertTo-Json -Compress -Depth 3))
         exit 0
     } catch {
-        [Console]::Error.Write('publisher-ui-child-failed')
+        $failureToken = "$($script:PublisherUiPins.FailureTokenPrefix):payload:unexpected"
+        try { $failureToken = New-PublisherUiChildFailureToken -Stage $script:PublisherUiChildStage -Category $script:PublisherUiChildCategory } catch { }
+        [Console]::Error.Write($failureToken)
         exit 1
     }
 }
