@@ -433,6 +433,9 @@ describe('manual signed OCR installer upgrade workflow', () => {
     expect(helper).toContain("ValidStatus = 'This digital signature is OK.'");
     expect(helper).toContain('[Windows.Automation.SelectionItemPattern]::Pattern');
     expect(helper).toContain('[Windows.Automation.InvokePattern]::Pattern');
+    expect(helper).toContain('TaskCreationOptions.LongRunning');
+    expect(helper).toContain('[Delegate]::CreateDelegate([Action],$pattern,$invokeMethod)');
+    expect(helper).toContain('return RunOnHelperThread(action);');
     expect(helper).toContain('[Windows.Automation.ValuePattern]::Pattern');
     expect(helper).toContain("-Name 'Embedded Signatures' -ControlType ([Windows.Automation.ControlType]::DataGrid)");
     expect(helper).toContain('-Root $signatureGrids[0] -Name $ExpectedPublisher -ControlType ([Windows.Automation.ControlType]::DataItem)');
@@ -451,6 +454,8 @@ describe('manual signed OCR installer upgrade workflow', () => {
     expect(helper).toContain('$propertiesCleanupMatches');
     expect(helper).toContain('$detailsCleanupMatches');
     expect(helper).toContain('Close-PublisherUiWindow');
+    expect(helper).toContain('$detailsInvokeTask = Invoke-PublisherUiButton');
+    expect(helper).toContain('Complete-PublisherUiButtonInvoke -Task $detailsInvokeTask');
     expect(helper).toContain('JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE');
     expect(helper).toContain('TerminateJobObject(job, 125)');
     expect(helper).toContain('start.Environment.Clear()');
@@ -469,6 +474,13 @@ describe('manual signed OCR installer upgrade workflow', () => {
     expect(parentBoundary).toContain('BoundedProcess]::Run');
     expect(parentBoundary).not.toMatch(/Windows\.Automation|ShellExecuteEx|FindAll\(|TryGetCurrentPattern|\.Select\(\)|\.Invoke\(\)/);
 
+    const detailsClose = helper.indexOf('if ($detailsHandle -ne 0) { Close-PublisherUiWindow');
+    const invokeComplete = helper.indexOf('Complete-PublisherUiButtonInvoke -Task $detailsInvokeTask', detailsClose);
+    const propertiesClose = helper.indexOf('if ($propertiesHandle -ne 0) { Close-PublisherUiWindow', invokeComplete);
+    expect(detailsClose).toBeGreaterThan(-1);
+    expect(invokeComplete).toBeGreaterThan(detailsClose);
+    expect(propertiesClose).toBeGreaterThan(invokeComplete);
+
     const check = String.raw`
       $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
       Set-Location -LiteralPath '${process.cwd().replaceAll("'", "''")}'
@@ -482,6 +494,33 @@ describe('manual signed OCR installer upgrade workflow', () => {
       Assert-PublisherUiFileReceipt -Path $fixture -Receipt $receipt
       $rejected=$false;try{Assert-PublisherUiFileReceipt -Path $fixture -Receipt ([pscustomobject]@{bytes=$receipt.bytes;sha256=('A'*64)})}catch{$rejected=$true};if(-not$rejected){throw 'Wrong publisher UI receipt was accepted.'}
       Initialize-PublisherUiIsolation
+      Initialize-PublisherUiInterop
+      Add-Type -TypeDefinition @'
+using System.Threading;
+public sealed class BlockingPublisherInvoke {
+  public readonly ManualResetEventSlim Started = new ManualResetEventSlim(false);
+  public readonly ManualResetEventSlim Release = new ManualResetEventSlim(false);
+  public int ThreadId;
+  public void Run() {
+    ThreadId = Thread.CurrentThread.ManagedThreadId;
+    Started.Set();
+    Release.Wait();
+  }
+}
+'@
+      $blocking=[BlockingPublisherInvoke]::new()
+      $invokeMethod=$blocking.GetType().GetMethod('Run',[Type[]]@())
+      $action=[Delegate]::CreateDelegate([Action],$blocking,$invokeMethod)
+      $callerThread=[Threading.Thread]::CurrentThread.ManagedThreadId
+      $invokeTask=$null
+      try{
+        $invokeTask=[Smacrobat.PublisherUi.NativeShell]::InvokeAsync($action)
+        if(-not$blocking.Started.Wait(1000)){throw 'Publisher UI helper-thread action did not start.'}
+        if($invokeTask.IsCompleted-or$blocking.ThreadId-eq$callerThread){throw 'Blocking publisher UI invocation held the caller thread.'}
+      }finally{$blocking.Release.Set()}
+      if($null-eq$invokeTask){throw 'Publisher UI helper-thread action returned no task.'}
+      Complete-PublisherUiButtonInvoke -Task $invokeTask -Deadline ([datetime]::UtcNow.AddSeconds(1))
+      if(-not$invokeTask.IsCompletedSuccessfully){throw 'Publisher UI helper-thread action did not complete after release.'}
       $encoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes('[Console]::Out.Write($PID);[Console]::Out.Flush();Start-Sleep -Seconds 30'))
       $arguments=@('-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',$encoded)
       $result=[Smacrobat.PublisherUiIsolation.BoundedProcess]::Run((Join-Path $PSHOME 'pwsh.exe'),$arguments,(Get-Location).Path,(Get-PublisherUiMinimalEnvironment),300,4096,2048)

@@ -34,6 +34,8 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace Smacrobat.PublisherUi {
     public static class NativeShell {
@@ -77,6 +79,14 @@ namespace Smacrobat.PublisherUi {
             info.lpFile = path;
             info.nShow = 1;
             if (!ShellExecuteEx(ref info)) throw new Win32Exception(Marshal.GetLastWin32Error(), "Windows Shell refused the file properties surface.");
+        }
+
+        private static Task RunOnHelperThread(Action action) {
+            return Task.Factory.StartNew(action, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        }
+        public static Task InvokeAsync(Action action) {
+            if (action == null) throw new ArgumentNullException(nameof(action));
+            return RunOnHelperThread(action);
         }
 
         public static bool WindowExists(long handleValue) { return IsWindow(new IntPtr(handleValue)); }
@@ -449,7 +459,28 @@ function Invoke-PublisherUiButton {
     if (-not $Element.TryGetCurrentPattern([Windows.Automation.InvokePattern]::Pattern,[ref]$pattern)) {
         throw 'Windows publisher UI button did not expose InvokePattern.'
     }
-    ([Windows.Automation.InvokePattern]$pattern).Invoke()
+    $invokeMethod = $pattern.GetType().GetMethod('Invoke',[Type[]]@())
+    if ($null -eq $invokeMethod) { throw 'Windows publisher UI button invocation method is unavailable.' }
+    $invokeAction = [Delegate]::CreateDelegate([Action],$pattern,$invokeMethod)
+    $task = [Smacrobat.PublisherUi.NativeShell]::InvokeAsync($invokeAction)
+    if ($null -eq $task) { throw 'Windows publisher UI button invocation did not start.' }
+    return $task
+}
+
+function Complete-PublisherUiButtonInvoke {
+    param(
+        [Parameter(Mandatory = $true)][Threading.Tasks.Task]$Task,
+        [Parameter(Mandatory = $true)][datetime]$Deadline
+    )
+    while (-not $Task.IsCompleted) {
+        Assert-PublisherUiDeadline -Deadline $Deadline
+        Start-Sleep -Milliseconds $script:PublisherUiPins.PollMilliseconds
+    }
+    if ($Task.IsCanceled -or $Task.IsFaulted) {
+        $null = $Task.Exception
+        throw 'Windows publisher UI button invocation failed.'
+    }
+    $Task.GetAwaiter().GetResult()
     Assert-PublisherUiDeadline -Deadline $Deadline
 }
 
@@ -501,6 +532,7 @@ function Invoke-WindowsShellPublisherSurface {
 
     [long]$propertiesHandle = 0
     [long]$detailsHandle = 0
+    [Threading.Tasks.Task]$detailsInvokeTask = $null
     $propertiesInvoked = $false
     $detailsInvoked = $false
     try {
@@ -523,7 +555,7 @@ function Invoke-WindowsShellPublisherSurface {
         if ($buttons.Count -ne 1) { throw 'Windows publisher UI did not expose one enabled embedded-signature Details action.' }
         $buttons[0].SetFocus()
         Assert-PublisherUiDeadline -Deadline $interactionDeadline
-        Invoke-PublisherUiButton -Element $buttons[0] -Deadline $interactionDeadline
+        $detailsInvokeTask = Invoke-PublisherUiButton -Element $buttons[0] -Deadline $interactionDeadline
         $detailsInvoked = $true
 
         $details = Wait-PublisherUiExactOwnedWindow -Title $script:PublisherUiPins.DetailsTitle -ExpectedOwner $propertiesHandle -Deadline $interactionDeadline
@@ -559,6 +591,7 @@ function Invoke-WindowsShellPublisherSurface {
             if ($detailsCleanupMatches.Count -eq 1) { $detailsHandle = [long]$detailsCleanupMatches[0].Current.NativeWindowHandle }
         }
         if ($detailsHandle -ne 0) { Close-PublisherUiWindow -HandleValue $detailsHandle -Deadline $totalDeadline }
+        if ($null -ne $detailsInvokeTask) { Complete-PublisherUiButtonInvoke -Task $detailsInvokeTask -Deadline $totalDeadline }
         if ($propertiesHandle -ne 0) { Close-PublisherUiWindow -HandleValue $propertiesHandle -Deadline $totalDeadline }
     }
 }
