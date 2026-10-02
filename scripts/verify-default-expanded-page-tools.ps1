@@ -20,7 +20,7 @@ function Import-ExactFunctions {
 }
 Import-ExactFunctions (Join-Path $PSScriptRoot 'verify-signed-ocr-upgrade.ps1') @('Assert-ExactProperties','Assert-FileReceipt','Resolve-RunnerPath','Assert-FreshInstallFacts','Get-FreshInstallFacts','Get-ConflictingProcessFacts','Invoke-BoundedSilentInstaller','Get-InstallFacts','Assert-InstallFacts','Assert-ReceiptValue','Assert-ReceiptFileObject','Get-UniqueResource')
 Import-ExactFunctions (Join-Path $PSScriptRoot 'verify-signed-expanded-page-tools.ps1') @('Assert-ExpandedExactProperties','Get-ExpandedReceipt','New-ExpandedSourcePng','New-ExpandedPageSequencePdf','Assert-ExpandedImageResult','Assert-ExpandedOrganizerResult')
-Import-ExactFunctions (Join-Path $PSScriptRoot 'verify-default-draft.ps1') @('New-GitHubGetRequest','Invoke-GitHubJson','ConvertTo-ExactUInt64','Assert-ReceiptShape')
+Import-ExactFunctions (Join-Path $PSScriptRoot 'verify-default-draft.ps1') @('New-GitHubGetRequest','Assert-GitHubResponseSuccess','Invoke-GitHubJson','ConvertTo-ExactUInt64','Assert-ReceiptShape')
 
 $script:Pins=[ordered]@{ExpectedPublisher=$ExpectedPublisher}
 $script:FeaturePaths=@('src/App.tsx','src/CreatePdfDialog.tsx','src/ExportPageImageDialog.tsx','src/Organizer.tsx','src/SplitDialog.tsx','src/CropDialog.tsx','src/CombineDialog.tsx','src/InsertPagesDialog.tsx','src/ReplacePagesDialog.tsx','src/bridge.ts','src-tauri/src/image_pdf.rs','src-tauri/src/page_image.rs','src-tauri/src/split.rs','src-tauri/src/combine.rs','src-tauri/src/service.rs','src-tauri/src/main.rs','src-tauri/tauri.conf.json')

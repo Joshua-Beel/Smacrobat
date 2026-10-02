@@ -57,8 +57,13 @@ function New-GitHubGetRequest {
     param([string]$Uri,[string]$Token,[string]$Accept)
     $request=[Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get,$Uri)
     $request.Headers.Authorization=[Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer',$Token)
-    $request.Headers.Accept.ParseAdd($Accept);$request.Headers.Add('X-GitHub-Api-Version','2022-11-28')
+    $request.Headers.Accept.ParseAdd($Accept);$request.Headers.UserAgent.ParseAdd('Smacrobat-DraftVerifier');$request.Headers.Add('X-GitHub-Api-Version','2022-11-28')
     return $request
+}
+
+function Assert-GitHubResponseSuccess {
+    param($Response,[ValidateSet('release-metadata','release-asset')][string]$Stage)
+    if(-not $Response.IsSuccessStatusCode){throw "GitHub request failed at $Stage with HTTP status $([int]$Response.StatusCode)."}
 }
 
 function Invoke-GitHubJson {
@@ -69,7 +74,7 @@ function Invoke-GitHubJson {
     $response=$null
     try{
         $response=$client.SendAsync($request,[Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
-        if(-not $response.IsSuccessStatusCode){throw 'GitHub release metadata request failed.'}
+        Assert-GitHubResponseSuccess $response 'release-metadata'
         $length=$response.Content.Headers.ContentLength;if($null -ne $length-and ([uint64]$length -eq 0-or [uint64]$length -gt 1MB)){throw 'GitHub release metadata size is outside its bound.'}
         $stream=$response.Content.ReadAsStreamAsync().GetAwaiter().GetResult();$memory=[IO.MemoryStream]::new()
         try{$buffer=[byte[]]::new(16384);while(($read=$stream.Read($buffer,0,$buffer.Length))-gt 0){if($memory.Length+$read -gt 1MB){throw 'GitHub release metadata exceeded its byte bound.'};$memory.Write($buffer,0,$read)};if($memory.Length -eq 0){throw 'GitHub release metadata was empty.'};$text=[Text.Encoding]::UTF8.GetString($memory.ToArray())}finally{$memory.Dispose();$stream.Dispose()}
@@ -98,7 +103,7 @@ function Save-ExactReleaseAsset {
     $response=$null
     try{
       $response=$client.SendAsync($request,[Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
-      if(-not $response.IsSuccessStatusCode){throw 'GitHub release asset download failed.'}
+      Assert-GitHubResponseSuccess $response 'release-asset'
       $length=$response.Content.Headers.ContentLength;if($null-ne$length-and [uint64]$length-ne$Bytes){throw 'GitHub release asset content length differs from its receipt.'}
       $stream=$response.Content.ReadAsStreamAsync().GetAwaiter().GetResult();$file=[IO.File]::Open($Destination,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
       try{$buffer=[byte[]]::new(65536);[uint64]$total=0;while(($read=$stream.Read($buffer,0,$buffer.Length))-gt 0){$total += [uint64]$read;if($total -gt $Bytes){throw 'GitHub release asset exceeded its exact byte receipt.'};$file.Write($buffer,0,$read)};if($total-ne$Bytes){throw 'GitHub release asset ended before its exact byte receipt.'}}finally{$file.Dispose();$stream.Dispose()}

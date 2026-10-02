@@ -67,9 +67,11 @@ describe('default draft verification workflow', () => {
   it('uses the job-scoped draft visibility grant only for bounded GET requests', () => {
     const check = String.raw`
       $tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile((Resolve-Path ./scripts/verify-default-draft.ps1),[ref]$tokens,[ref]$errors);if($errors.Count){throw 'parse'}
-      $node=$ast.Find({param($n)$n-is[Management.Automation.Language.FunctionDefinitionAst]-and$n.Name-ceq'New-GitHubGetRequest'},$true);if(-not$node){throw 'missing'};Invoke-Expression $node.Extent.Text
+      foreach($name in @('New-GitHubGetRequest','Assert-GitHubResponseSuccess')){$node=$ast.Find({param($n)$n-is[Management.Automation.Language.FunctionDefinitionAst]-and$n.Name-ceq$name},$true);if(-not$node){throw 'missing'};Invoke-Expression $node.Extent.Text}
       $constructors=@($ast.FindAll({param($n)$n-is[Management.Automation.Language.InvokeMemberExpressionAst]-and$n.Member.Value-ceq'new'-and$n.Expression.Extent.Text-match'HttpRequestMessage'},$true));if($constructors.Count-ne1-or$constructors[0].Arguments[0].Extent.Text-cne'[Net.Http.HttpMethod]::Get'){throw 'HTTP method surface changed'}
-      $request=New-GitHubGetRequest 'https://api.github.com/repos/Joshua-Beel/Smacrobat/releases/1' 'placeholder' 'application/vnd.github+json';try{if($request.Method-ne[Net.Http.HttpMethod]::Get-or$null-ne$request.Content-or$request.RequestUri.AbsoluteUri-cne'https://api.github.com/repos/Joshua-Beel/Smacrobat/releases/1'){throw 'runtime request is not exact GET'}}finally{$request.Dispose()}
+      $request=New-GitHubGetRequest 'https://api.github.com/repos/Joshua-Beel/Smacrobat/releases/1' 'placeholder' 'application/vnd.github+json';try{if($request.Method-ne[Net.Http.HttpMethod]::Get-or$null-ne$request.Content-or$request.RequestUri.AbsoluteUri-cne'https://api.github.com/repos/Joshua-Beel/Smacrobat/releases/1'-or$request.Headers.UserAgent.ToString()-cne'Smacrobat-DraftVerifier'){throw 'runtime request is not exact authenticated GitHub GET'}}finally{$request.Dispose()}
+      foreach($code in @(401,403,404,429,500,503)){try{Assert-GitHubResponseSuccess ([pscustomobject]@{IsSuccessStatusCode=$false;StatusCode=[Net.HttpStatusCode]$code}) 'release-metadata';throw 'failure status accepted'}catch{if($_.Exception.Message-cne("GitHub request failed at release-metadata with HTTP status $code.")){throw 'failure diagnostic changed'}}}
+      Assert-GitHubResponseSuccess ([pscustomobject]@{IsSuccessStatusCode=$true;StatusCode=[Net.HttpStatusCode]::OK}) 'release-asset'
     `;
     const result = runPowerShell(check);
     expect(result.status, result.stderr || result.stdout).toBe(0);
