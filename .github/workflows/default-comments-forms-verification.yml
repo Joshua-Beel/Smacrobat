@@ -1,0 +1,118 @@
+name: Manual default installed comments and forms verification
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_version: { required: true, type: string }
+      target_tag: { required: true, type: string }
+      target_source_revision: { required: true, type: string }
+      target_release_id: { required: true, type: string }
+      installer_asset_id: { required: true, type: string }
+      installer_name: { required: true, type: string }
+      installer_bytes: { required: true, type: string }
+      installer_sha256: { required: true, type: string }
+      signature_asset_id: { required: true, type: string }
+      signature_bytes: { required: true, type: string }
+      signature_sha256: { required: true, type: string }
+      manifest_asset_id: { required: true, type: string }
+      manifest_bytes: { required: true, type: string }
+      manifest_sha256: { required: true, type: string }
+      expected_publisher: { required: true, type: string }
+      draft_proof_run_id: { required: true, type: string }
+      draft_proof_workflow_id: { required: true, type: string }
+      draft_proof_artifact_id: { required: true, type: string }
+      draft_proof_artifact_name: { required: true, type: string }
+      draft_proof_artifact_bytes: { required: true, type: string }
+      draft_proof_artifact_digest: { required: true, type: string }
+      draft_proof_workflow_revision: { required: true, type: string }
+      draft_proof_receipt_bytes: { required: true, type: string }
+      draft_proof_receipt_sha256: { required: true, type: string }
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  verify-installed-comments-forms:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - name: Require a manual master dispatch
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REPOSITORY -cne 'Joshua-Beel/Smacrobat' -or $env:GITHUB_EVENT_NAME -cne 'workflow_dispatch' -or $env:GITHUB_REF -cne 'refs/heads/master') { throw 'Dispatch only from master.' }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: { ref: '${{ github.sha }}', fetch-depth: 0, persist-credentials: false }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: Joshua-Beel/Smacrobat
+          ref: ${{ inputs.target_source_revision }}
+          fetch-depth: 0
+          persist-credentials: false
+          path: target-source
+      - name: Verify exact clean sources
+        shell: pwsh
+        env: { TARGET_SHA: '${{ inputs.target_source_revision }}', TARGET_TAG: '${{ inputs.target_tag }}' }
+        run: |
+          $head=(git rev-parse HEAD).Trim();$target=(git -C target-source rev-parse HEAD).Trim();$tag=(git -C target-source rev-parse "$env:TARGET_TAG^{commit}").Trim()
+          if($LASTEXITCODE-ne0-or$head-cne$env:GITHUB_SHA-or$target-cne$env:TARGET_SHA-or$tag-cne$env:TARGET_SHA){throw 'Source identity mismatch.'}
+          git diff --quiet --;if($LASTEXITCODE-ne0){throw 'Workflow source changed.'};git diff --cached --quiet --;if($LASTEXITCODE-ne0){throw 'Workflow index changed.'}
+          git -C target-source diff --quiet --;if($LASTEXITCODE-ne0){throw 'Target source changed.'};git -C target-source diff --cached --quiet --;if($LASTEXITCODE-ne0){throw 'Target index changed.'}
+      - name: Initialize fresh roots
+        shell: pwsh
+        run: |
+          $root=[IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\');$writer=[IO.StreamWriter]::new($env:GITHUB_ENV,$true,[Text.UTF8Encoding]::new($false));try{
+            foreach($value in @("DRAFT_PROOF_ROOT=$root\comments-forms-draft-proof","ASSET_ROOT=$root\comments-forms-assets","COMMENTS_FORMS_WORK_ROOT=$root\comments-forms-work","COMMENTS_FORMS_OUTPUT_ROOT=$root\comments-forms-output","WEBDRIVER_ROOT=$root\comments-forms-webdriver")){$writer.WriteLine($value)}
+          }finally{$writer.Dispose()}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ inputs.draft_proof_artifact_id }}
+          github-token: ${{ github.token }}
+          repository: Joshua-Beel/Smacrobat
+          run-id: ${{ inputs.draft_proof_run_id }}
+          path: ${{ env.DRAFT_PROOF_ROOT }}
+      - name: Prepare exact hosted WebDriver inputs
+        shell: pwsh
+        run: ./scripts/setup-installed-app-webdriver.ps1 -OutputRoot $env:WEBDRIVER_ROOT
+      - name: Verify installed comments and forms
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TARGET_VERSION: ${{ inputs.target_version }}
+          TARGET_TAG: ${{ inputs.target_tag }}
+          TARGET_SHA: ${{ inputs.target_source_revision }}
+          RELEASE_ID: ${{ inputs.target_release_id }}
+          INSTALLER_ID: ${{ inputs.installer_asset_id }}
+          INSTALLER_NAME: ${{ inputs.installer_name }}
+          INSTALLER_BYTES: ${{ inputs.installer_bytes }}
+          INSTALLER_SHA: ${{ inputs.installer_sha256 }}
+          SIGNATURE_ID: ${{ inputs.signature_asset_id }}
+          SIGNATURE_BYTES: ${{ inputs.signature_bytes }}
+          SIGNATURE_SHA: ${{ inputs.signature_sha256 }}
+          MANIFEST_ID: ${{ inputs.manifest_asset_id }}
+          MANIFEST_BYTES: ${{ inputs.manifest_bytes }}
+          MANIFEST_SHA: ${{ inputs.manifest_sha256 }}
+          PUBLISHER: ${{ inputs.expected_publisher }}
+          PROOF_SHA: ${{ inputs.draft_proof_workflow_revision }}
+          PROOF_RUN_ID: ${{ inputs.draft_proof_run_id }}
+          PROOF_WORKFLOW_ID: ${{ inputs.draft_proof_workflow_id }}
+          PROOF_ARTIFACT_ID: ${{ inputs.draft_proof_artifact_id }}
+          PROOF_ARTIFACT_NAME: ${{ inputs.draft_proof_artifact_name }}
+          PROOF_ARTIFACT_BYTES: ${{ inputs.draft_proof_artifact_bytes }}
+          PROOF_ARTIFACT_DIGEST: ${{ inputs.draft_proof_artifact_digest }}
+          PROOF_RECEIPT_BYTES: ${{ inputs.draft_proof_receipt_bytes }}
+          PROOF_RECEIPT_SHA: ${{ inputs.draft_proof_receipt_sha256 }}
+        run: |
+          ./scripts/verify-default-comments-forms.ps1 -ProjectRoot (Get-Location).Path -TargetSourceRoot (Resolve-Path target-source).Path -DraftProofRoot $env:DRAFT_PROOF_ROOT -AssetRoot $env:ASSET_ROOT -WorkRoot $env:COMMENTS_FORMS_WORK_ROOT -OutputRoot $env:COMMENTS_FORMS_OUTPUT_ROOT -WebDriverRoot $env:WEBDRIVER_ROOT -WorkflowSourceRevision $env:GITHUB_SHA -DraftProofWorkflowRevision $env:PROOF_SHA -DraftProofRunId $env:PROOF_RUN_ID -DraftProofWorkflowId $env:PROOF_WORKFLOW_ID -DraftProofArtifactId $env:PROOF_ARTIFACT_ID -DraftProofArtifactName $env:PROOF_ARTIFACT_NAME -DraftProofArtifactBytes $env:PROOF_ARTIFACT_BYTES -DraftProofArtifactDigest $env:PROOF_ARTIFACT_DIGEST -DraftProofReceiptBytes $env:PROOF_RECEIPT_BYTES -DraftProofReceiptSha256 $env:PROOF_RECEIPT_SHA -TargetVersion $env:TARGET_VERSION -TargetTag $env:TARGET_TAG -TargetSourceRevision $env:TARGET_SHA -TargetReleaseId $env:RELEASE_ID -InstallerAssetId $env:INSTALLER_ID -InstallerName $env:INSTALLER_NAME -InstallerBytes $env:INSTALLER_BYTES -InstallerSha256 $env:INSTALLER_SHA -SignatureAssetId $env:SIGNATURE_ID -SignatureBytes $env:SIGNATURE_BYTES -SignatureSha256 $env:SIGNATURE_SHA -ManifestAssetId $env:MANIFEST_ID -ManifestBytes $env:MANIFEST_BYTES -ManifestSha256 $env:MANIFEST_SHA -ExpectedPublisher $env:PUBLISHER
+      - name: Recheck clean tracked sources
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          git diff --quiet --;if($LASTEXITCODE-ne0){throw 'Workflow source changed.'};git diff --cached --quiet --;if($LASTEXITCODE-ne0){throw 'Workflow index changed.'}
+          git -C target-source diff --quiet --;if($LASTEXITCODE-ne0){throw 'Target source changed.'};git -C target-source diff --cached --quiet --;if($LASTEXITCODE-ne0){throw 'Target index changed.'}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() }}
+        with:
+          name: default-installed-comments-forms-${{ inputs.target_source_revision }}
+          path: ${{ env.COMMENTS_FORMS_OUTPUT_ROOT }}/default-comments-forms-verification.json
+          if-no-files-found: ignore
