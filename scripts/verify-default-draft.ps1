@@ -154,7 +154,7 @@ public static class DefaultDraftBoundedProcess {
 }
 
 function Assert-BoundedArchiveListing {
-    param([string[]]$Lines)
+    param([string[]]$Lines,[Collections.IDictionary]$ExactFallbackSizes)
     [uint64]$entries=0;$started=$false;$state=@{path=$null;size=$null;total=[uint64]0}
     function Complete-Entry {
       if($null-eq$state.path){return}
@@ -170,13 +170,31 @@ function Assert-BoundedArchiveListing {
       if($line -cmatch '^Path = (.+)$'){Complete-Entry;$state.path=$Matches[1];$entries++;if($entries -gt 512){throw 'Installer archive entry count exceeds its bound.'};continue}
       if($line.StartsWith('Size = ',[StringComparison]::Ordinal)){
         if($null-eq$state.path-or $null-ne$state.size){throw 'Installer archive has an orphan or duplicate size.'}
-        [uint64]$size=0;if(-not [uint64]::TryParse($line.Substring(7),[Globalization.NumberStyles]::None,[Globalization.CultureInfo]::InvariantCulture,[ref]$size)-or $size -gt 256MB){throw 'Installer archive entry size exceeds its bound.'}
+        [uint64]$size=0;$text=$line.Substring(7);$key=([string]$state.path).Replace('\','/')
+        if($text.Length-eq0-and$null-ne$ExactFallbackSizes-and$ExactFallbackSizes.Contains($key)){$size=[uint64]$ExactFallbackSizes[$key]}
+        elseif(-not [uint64]::TryParse($text,[Globalization.NumberStyles]::None,[Globalization.CultureInfo]::InvariantCulture,[ref]$size)){throw 'Installer archive entry size exceeds its bound.'}
+        if($size-gt256MB){throw 'Installer archive entry size exceeds its bound.'}
         $state.size=$size
       }
     }
     Complete-Entry
     if($entries -eq 0){throw 'Installer archive listing is empty.'}
     return [pscustomobject]@{entries=$entries;expandedBytes=[uint64]$state.total}
+}
+
+function Invoke-BoundedSevenZipEntry {
+    param([string]$Executable,[string]$Installer,[string]$ArchivePath,[string]$Destination,[uint64]$ExpectedBytes,[string]$ExpectedSha256)
+    if(-not('DefaultDraftBoundedBinaryProcess'-as[type])){Add-Type -TypeDefinition @'
+using System; using System.Diagnostics; using System.IO; using System.Text; using System.Threading; using System.Threading.Tasks;
+public static class DefaultDraftBoundedBinaryProcess {
+ sealed class Counter { public int Value; }
+ static async Task Copy(Stream input,string path,ulong maximum,Action overflow){using(var output=new FileStream(path,FileMode.CreateNew,FileAccess.Write,FileShare.None)){var buffer=new byte[65536];ulong total=0;while(true){int count=await input.ReadAsync(buffer,0,buffer.Length);if(count==0)break;total+=(ulong)count;if(total>maximum){overflow();throw new InvalidOperationException("Binary output exceeded its exact bound.");}await output.WriteAsync(buffer,0,count);}if(total!=maximum)throw new InvalidOperationException("Binary output ended before its exact bound.");}}
+ static async Task ReadError(StreamReader reader,int maximum,Counter counter,Action overflow){var buffer=new char[4096];while(true){int count=await reader.ReadAsync(buffer,0,buffer.Length);if(count==0)break;if(Interlocked.Add(ref counter.Value,count)>maximum){overflow();throw new InvalidOperationException("Error output exceeded its bound.");}}}
+ public static void Run(string executable,string installer,string archivePath,string destination,ulong expectedBytes){var start=new ProcessStartInfo{FileName=executable,UseShellExecute=false,CreateNoWindow=true,RedirectStandardOutput=true,RedirectStandardError=true};foreach(var value in new[]{"x","-so",installer,archivePath})start.ArgumentList.Add(value);using(var process=new Process{StartInfo=start}){if(!process.Start())throw new InvalidOperationException("Process did not start.");Action kill=()=>{try{if(!process.HasExited)process.Kill(true);}catch{}};var copy=Copy(process.StandardOutput.BaseStream,destination,expectedBytes,kill);var error=ReadError(process.StandardError,65536,new Counter(),kill);var completion=Task.WhenAll(copy,error,process.WaitForExitAsync());try{if(!completion.Wait(30000)){kill();throw new TimeoutException();}completion.GetAwaiter().GetResult();}catch{kill();throw;}if(process.ExitCode!=0)throw new InvalidOperationException("Process failed.");}}
+}
+'@}
+    try{[DefaultDraftBoundedBinaryProcess]::Run($Executable,$Installer,$ArchivePath,$Destination,$ExpectedBytes)}catch{throw 'Bounded installer entry extraction failed, timed out, or exceeded its exact byte bound.'}
+    if((Get-ExactSha256 -Path $Destination)-cne$ExpectedSha256){throw 'Streamed installer entry differs from its exact source receipt.'}
 }
 
 function Assert-ReleaseSourceVersion {
@@ -197,12 +215,16 @@ function Expand-DefaultInstaller {
     if(Test-Path -LiteralPath $Destination){throw 'Extraction destination must be fresh.'}
     $extractor=Get-InstallerExtractor
     $listing=@(Invoke-BoundedSevenZip -Executable $extractor.FullName -Arguments @('l','-slt',$Installer) -Capture)
-    $null=Assert-BoundedArchiveListing -Lines $listing
+    $welcome=@($BaseEntries|Where-Object{[string]$_.Target-ceq'resources/welcome.pdf'});if($welcome.Count-ne1){throw 'Exact welcome resource receipt is absent or ambiguous.'}
+    $fallback=@{'resources/welcome.pdf'=[uint64]$welcome[0].Receipt.Bytes}
+    $null=Assert-BoundedArchiveListing -Lines $listing -ExactFallbackSizes $fallback
     $archivePaths=Convert-SevenZipInventory -Lines $listing
     Assert-ArchiveResourceInventory -ArchivePaths $archivePaths -BaseEntries $BaseEntries
     [IO.Directory]::CreateDirectory($Destination)|Out-Null
     Assert-NoReparseAncestors -Path $Destination
-    Invoke-BoundedSevenZip -Executable $extractor.FullName -Arguments @('x',$Installer,"-o$Destination",'-y','-bd','-bb0')
+    $welcomePath=Join-Path $Destination 'resources/welcome.pdf';[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($welcomePath))|Out-Null
+    Invoke-BoundedSevenZipEntry -Executable $extractor.FullName -Installer $Installer -ArchivePath 'resources\welcome.pdf' -Destination $welcomePath -ExpectedBytes ([uint64]$welcome[0].Receipt.Bytes) -ExpectedSha256 ([string]$welcome[0].Receipt.Sha256)
+    Invoke-BoundedSevenZip -Executable $extractor.FullName -Arguments @('x',$Installer,"-o$Destination",'-y','-bd','-bb0','-xr!resources\welcome.pdf')
     Assert-NoReparseAncestors -Path $Destination
     foreach($entry in @(Get-ChildItem -LiteralPath $Destination -Recurse -Force)){
         Assert-NoReparseAncestors -Path $entry.FullName

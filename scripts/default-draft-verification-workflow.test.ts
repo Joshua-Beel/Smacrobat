@@ -112,7 +112,7 @@ describe('default draft verification workflow', () => {
       . ./scripts/ocr/installer-package.ps1
       $tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile((Resolve-Path ./scripts/verify-default-draft.ps1),[ref]$tokens,[ref]$errors)
       if($errors.Count){throw 'Verifier did not parse.'}
-      foreach($name in @('Get-ExactReleaseAsset','Assert-DefaultInventory','Assert-BoundedArchiveListing','Invoke-BoundedSevenZip','Assert-ReleaseSourceVersion','Assert-PackagedApplicationIdentity')){$node=$ast.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst]-and $n.Name-ceq$name},$true);if(-not$node){throw ('Missing '+$name)};Invoke-Expression $node.Extent.Text}
+      foreach($name in @('Get-ExactReleaseAsset','Assert-DefaultInventory','Assert-BoundedArchiveListing','Invoke-BoundedSevenZip','Invoke-BoundedSevenZipEntry','Assert-ReleaseSourceVersion','Assert-PackagedApplicationIdentity')){$node=$ast.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst]-and $n.Name-ceq$name},$true);if(-not$node){throw ('Missing '+$name)};Invoke-Expression $node.Extent.Text}
       $script:Repository='Joshua-Beel/Smacrobat';$TargetTag='v0.2.12';$sha='A'*64
       $asset=[pscustomobject]@{id=[uint64]7;name='PDF.Workstation_0.2.12_x64-setup.exe';size=[uint64]9;state='uploaded';digest=('sha256:'+$sha.ToLowerInvariant());browser_download_url='https://github.com/Joshua-Beel/Smacrobat/releases/download/v0.2.12/PDF.Workstation_0.2.12_x64-setup.exe'}
       $release=[pscustomobject]@{assets=@($asset)}
@@ -124,6 +124,9 @@ describe('default draft verification workflow', () => {
       foreach($url in @('https://github.com/Joshua-Beel/Smacrobat/releases/download/untagged-nothex/PDF.Workstation_0.2.12_x64-setup.exe','https://github.com/foreign/Smacrobat/releases/download/v0.2.12/PDF.Workstation_0.2.12_x64-setup.exe','https://example.com/Joshua-Beel/Smacrobat/releases/download/v0.2.12/PDF.Workstation_0.2.12_x64-setup.exe','http://github.com/Joshua-Beel/Smacrobat/releases/download/v0.2.12/PDF.Workstation_0.2.12_x64-setup.exe','https://github.com/Joshua-Beel/Smacrobat/releases/download/v0.2.12/PDF.Workstation_0.2.12_x64-setup.exe?x=1','https://github.com/Joshua-Beel/Smacrobat/releases/download/v0.2.12/../PDF.Workstation_0.2.12_x64-setup.exe')){$asset.browser_download_url=$url;Reject {Get-ExactReleaseAsset $release 7 $asset.name 9 $sha} 'invalid draft URL'}
       $root=Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'inventory';[IO.Directory]::CreateDirectory($root)|Out-Null
       function Put([string]$Relative){$path=Join-Path $root $Relative;[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($path))|Out-Null;[IO.File]::WriteAllText($path,'x',[Text.UTF8Encoding]::new($false));return Get-Item $path}
+      $streamSource=Put 'stream/input.bin';$streamZip=Join-Path $root 'stream.zip';Compress-Archive -LiteralPath $streamSource.FullName -DestinationPath $streamZip;$extractor=Get-InstallerExtractor;$streamHash=Get-ExactSha256 $streamSource.FullName;Invoke-BoundedSevenZipEntry $extractor.FullName $streamZip 'input.bin' (Join-Path $root 'stream-good.bin') 1 $streamHash
+      Reject {Invoke-BoundedSevenZipEntry $extractor.FullName $streamZip 'input.bin' (Join-Path $root 'stream-long.bin') 0 $streamHash} 'stream overflow'
+      Reject {Invoke-BoundedSevenZipEntry $extractor.FullName $streamZip 'input.bin' (Join-Path $root 'stream-hash.bin') 1 ('0'*64)} 'stream hash mismatch'
       $base=@([pscustomobject]@{Target='resources/welcome.pdf'})
       $paths=@('pdf-workstation.exe','resources/welcome.pdf','$PLUGINSDIR/modern-wizard.bmp','$PLUGINSDIR/nsDialogs.dll','$PLUGINSDIR/nsis_tauri_utils.dll','$PLUGINSDIR/NSISdl.dll','$PLUGINSDIR/StartMenu.dll','$PLUGINSDIR/System.dll')
       $files=@($paths|ForEach-Object{Put $_});$facts=Assert-DefaultInventory $files $root $base;if($facts.required-ne8-or$facts.actual-ne8){throw 'valid inventory failed'}
@@ -132,6 +135,10 @@ describe('default draft verification workflow', () => {
       $missing=@($files|Where-Object{$_.Name-ne'welcome.pdf'});Reject {Assert-DefaultInventory $missing $root $base} 'missing resource'
       $case=@($files)+(Put 'RESOURCES/WELCOME.PDF');Reject {Assert-DefaultInventory $case $root $base} 'case collision'
       $listing=@('----------','Path = app.exe','Size = 10','Path = data.bin','Size = 20');$bounded=Assert-BoundedArchiveListing $listing;if($bounded.entries-ne2-or$bounded.expandedBytes-ne30){throw 'bounded listing facts changed'}
+      $blank=@('----------','Path = resources\welcome.pdf','Size = ');$bounded=Assert-BoundedArchiveListing $blank @{'resources/welcome.pdf'=[uint64]9};if($bounded.entries-ne1-or$bounded.expandedBytes-ne9){throw 'exact fallback size changed'}
+      Reject {Assert-BoundedArchiveListing $blank} 'unbound blank size'
+      Reject {Assert-BoundedArchiveListing $blank @{'resources/other.pdf'=[uint64]9}} 'wrong blank-size path'
+      Reject {Assert-BoundedArchiveListing @('----------','Path = resources/pdfium/LICENSE','Size = ') @{'resources/welcome.pdf'=[uint64]9}} 'known non-welcome blank size'
       Reject {Assert-BoundedArchiveListing @('----------','Path = bomb.bin',('Size = '+(513MB)))} 'expanded-size bomb'
       Reject {Assert-BoundedArchiveListing @('----------','Path = missing.bin')} 'missing size'
       Reject {Assert-BoundedArchiveListing @('----------','Path = malformed.bin','Size = nope')} 'malformed size'
@@ -150,5 +157,5 @@ describe('default draft verification workflow', () => {
     expect(result.error).toBeUndefined();
     expect(result.status, result.stderr || result.stdout).toBe(0);
     expect(result.stdout).toContain('PASS');
-  }, 20_000);
+  }, 45_000);
 });
