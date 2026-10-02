@@ -136,9 +136,14 @@ describe('default draft verification workflow', () => {
       $case=@($files)+(Put 'RESOURCES/WELCOME.PDF');Reject {Assert-DefaultInventory $case $root $base} 'case collision'
       $listing=@('----------','Path = app.exe','Size = 10','Path = data.bin','Size = 20');$bounded=Assert-BoundedArchiveListing $listing;if($bounded.entries-ne2-or$bounded.expandedBytes-ne30){throw 'bounded listing facts changed'}
       $blank=@('----------','Path = resources\welcome.pdf','Size = ');$bounded=Assert-BoundedArchiveListing $blank @{'resources/welcome.pdf'=[uint64]9};if($bounded.entries-ne1-or$bounded.expandedBytes-ne9){throw 'exact fallback size changed'}
+      $bounded=Assert-BoundedArchiveListing @('----------','Path = resources\welcome.pdf','Size =   ') @{'resources/welcome.pdf'=[uint64]9};if($bounded.expandedBytes-ne9){throw 'whitespace fallback size changed'}
+      $bounded=Assert-BoundedArchiveListing @('----------','Path = app.exe','Size =   10  ');if($bounded.expandedBytes-ne10){throw 'padded numeric size changed'}
       Reject {Assert-BoundedArchiveListing $blank} 'unbound blank size'
+      $message='';try{Assert-BoundedArchiveListing $blank}catch{$message=$_.Exception.Message};if($message-cne'Installer archive size is blank without its exact fallback.'){throw 'blank diagnostic changed'}
       Reject {Assert-BoundedArchiveListing $blank @{'resources/other.pdf'=[uint64]9}} 'wrong blank-size path'
       Reject {Assert-BoundedArchiveListing @('----------','Path = resources/pdfium/LICENSE','Size = ') @{'resources/welcome.pdf'=[uint64]9}} 'known non-welcome blank size'
+      Reject {Assert-BoundedArchiveListing @('----------','Path = resources/pdfium/LICENSE','Size =   ') @{'resources/welcome.pdf'=[uint64]9}} 'known non-welcome whitespace size'
+      $message='';try{Assert-BoundedArchiveListing @('----------','Path = app.exe','Size = 1x')}catch{$message=$_.Exception.Message};if($message-cne'Installer archive size is nonnumeric.'){throw 'nonnumeric diagnostic changed'}
       Reject {Assert-BoundedArchiveListing @('----------','Path = bomb.bin',('Size = '+(513MB)))} 'expanded-size bomb'
       Reject {Assert-BoundedArchiveListing @('----------','Path = missing.bin')} 'missing size'
       Reject {Assert-BoundedArchiveListing @('----------','Path = malformed.bin','Size = nope')} 'malformed size'

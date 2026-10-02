@@ -170,9 +170,9 @@ function Assert-BoundedArchiveListing {
       if($line -cmatch '^Path = (.+)$'){Complete-Entry;$state.path=$Matches[1];$entries++;if($entries -gt 512){throw 'Installer archive entry count exceeds its bound.'};continue}
       if($line.StartsWith('Size = ',[StringComparison]::Ordinal)){
         if($null-eq$state.path-or $null-ne$state.size){throw 'Installer archive has an orphan or duplicate size.'}
-        [uint64]$size=0;$text=$line.Substring(7);$key=([string]$state.path).Replace('\','/')
-        if($text.Length-eq0-and$null-ne$ExactFallbackSizes-and$ExactFallbackSizes.Contains($key)){$size=[uint64]$ExactFallbackSizes[$key]}
-        elseif(-not [uint64]::TryParse($text,[Globalization.NumberStyles]::None,[Globalization.CultureInfo]::InvariantCulture,[ref]$size)){throw 'Installer archive entry size exceeds its bound.'}
+        [uint64]$size=0;$text=$line.Substring(7).Trim();$key=([string]$state.path).Replace('\','/')
+        if($text.Length-eq0){if($null-eq$ExactFallbackSizes-or-not$ExactFallbackSizes.Contains($key)){throw 'Installer archive size is blank without its exact fallback.'};$size=[uint64]$ExactFallbackSizes[$key]}
+        elseif(-not [uint64]::TryParse($text,[Globalization.NumberStyles]::None,[Globalization.CultureInfo]::InvariantCulture,[ref]$size)){throw 'Installer archive size is nonnumeric.'}
         if($size-gt256MB){throw 'Installer archive entry size exceeds its bound.'}
         $state.size=$size
       }
