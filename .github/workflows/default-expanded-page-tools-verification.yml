@@ -34,6 +34,9 @@ permissions:
 
 jobs:
   verify-installed-page-tools:
+    permissions:
+      contents: write
+      actions: read
     runs-on: windows-2022
     timeout-minutes: 90
     steps:

@@ -53,13 +53,19 @@ function Assert-ReceiptShape {
     if($Bytes -eq 0 -or $Bytes -gt $script:MaximumAssetBytes -or $Sha256 -cnotmatch '^[A-F0-9]{64}$'){throw "$Kind receipt is malformed."}
 }
 
+function New-GitHubGetRequest {
+    param([string]$Uri,[string]$Token,[string]$Accept)
+    $request=[Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get,$Uri)
+    $request.Headers.Authorization=[Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer',$Token)
+    $request.Headers.Accept.ParseAdd($Accept);$request.Headers.Add('X-GitHub-Api-Version','2022-11-28')
+    return $request
+}
+
 function Invoke-GitHubJson {
     param([string]$Uri,[string]$Token)
     $handler=[Net.Http.HttpClientHandler]::new();$handler.AllowAutoRedirect=$false
     $client=[Net.Http.HttpClient]::new($handler);$client.Timeout=[TimeSpan]::FromSeconds(30)
-    $request=[Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get,$Uri)
-    $request.Headers.Authorization=[Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer',$Token)
-    $request.Headers.Accept.ParseAdd('application/vnd.github+json');$request.Headers.Add('X-GitHub-Api-Version','2022-11-28')
+    $request=New-GitHubGetRequest $Uri $Token 'application/vnd.github+json'
     $response=$null
     try{
         $response=$client.SendAsync($request,[Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
@@ -88,8 +94,7 @@ function Save-ExactReleaseAsset {
     param([uint64]$Id,[string]$Destination,[string]$Token,[uint64]$Bytes,[string]$Sha256)
     $handler=[Net.Http.HttpClientHandler]::new();$handler.AllowAutoRedirect=$true;$handler.MaxAutomaticRedirections=5
     $client=[Net.Http.HttpClient]::new($handler);$client.Timeout=[TimeSpan]::FromSeconds(120)
-    $request=[Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get,"https://api.github.com/repos/$script:Repository/releases/assets/$Id")
-    $request.Headers.Authorization=[Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer',$Token);$request.Headers.Accept.ParseAdd('application/octet-stream');$request.Headers.Add('X-GitHub-Api-Version','2022-11-28')
+    $request=New-GitHubGetRequest "https://api.github.com/repos/$script:Repository/releases/assets/$Id" $Token 'application/octet-stream'
     $response=$null
     try{
       $response=$client.SendAsync($request,[Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()

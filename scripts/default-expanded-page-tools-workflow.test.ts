@@ -16,7 +16,7 @@ function runPowerShell(source: string) {
 describe('default installed expanded page-tools workflow', () => {
   it('is manual, pinned, exact-input driven, and has no signing, release, build, or OCR capability', () => {
     expect(workflow).toContain('workflow_dispatch:'); expect(workflow).not.toMatch(/^\s*(push|pull_request|schedule):/m);
-    expect(workflow).toContain('runs-on: windows-2022'); expect(workflow).toContain('contents: read'); expect(workflow).toContain('actions: read');
+    expect(workflow).toContain('runs-on: windows-2022'); expect(workflow).toContain('contents: read'); expect(workflow).toContain('actions: read'); expect(workflow.match(/contents:\s*write/g)).toHaveLength(1); expect(workflow.indexOf('contents: write')).toBeGreaterThan(workflow.indexOf('verify-installed-page-tools:')); expect(workflow).not.toMatch(/actions:\s*write|id-token:\s*write/);
     for (const name of ['draft_proof_run_id','draft_proof_workflow_id','draft_proof_artifact_id','draft_proof_artifact_name','draft_proof_artifact_bytes','draft_proof_artifact_digest','draft_proof_workflow_revision','draft_proof_receipt_bytes','draft_proof_receipt_sha256','target_release_id','installer_asset_id','installer_bytes','installer_sha256']) expect(workflow).toContain(`${name}:`);
     const uses=[...workflow.matchAll(/^\s*-?\s*uses:\s*([^\s#]+)\s*$/gm)].map(x=>x[1]);
     expect(uses).toEqual(['actions/checkout@11d5960a326750d5838078e36cf38b85af677262','actions/checkout@11d5960a326750d5838078e36cf38b85af677262','actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093','actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02']);
@@ -34,6 +34,9 @@ describe('default installed expanded page-tools workflow', () => {
     expect(verifier).toContain('no OCR, updater cryptography, comments, forms, print, or general behavior claim');
     expect(verifier).not.toContain("TargetVersion-cne'0.2.11'");
     expect(verifier).not.toMatch(/Write-(?:Host|Verbose|Debug)|Invoke-AzureArtifactSigningCli|artifact-signing-cli/);
+    expect(verifier).toContain('$env:GITHUB_TOKEN=$null;$env:GH_TOKEN=$null;$token=$null');
+    expect(verifier.indexOf('$env:GITHUB_TOKEN=$null')).toBeLessThan(verifier.indexOf('Invoke-BoundedSilentInstaller $installer'));
+    expect(verifier).not.toMatch(/HttpMethod\]::(?:Post|Put|Patch|Delete)|Invoke-RestMethod|Invoke-WebRequest|gh\s+(?:release|api)/i);
   });
 
   it('executes real receipt and independent-parity guards against stale, OCR, unsigned-scope, and changed redownload proofs', () => {

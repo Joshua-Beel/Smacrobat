@@ -24,7 +24,9 @@ describe('default draft verification workflow', () => {
     expect(workflow).not.toMatch(/^\s*(push|pull_request|schedule):/m);
     expect(workflow).toContain('runs-on: windows-2022');
     expect(workflow).toContain('contents: read');
-    expect(workflow).not.toMatch(/contents:\s*write|actions:\s*write|id-token:\s*write/);
+    expect(workflow.match(/contents:\s*write/g)).toHaveLength(1);
+    expect(workflow.indexOf('contents: write')).toBeGreaterThan(workflow.indexOf('verify-default-draft:'));
+    expect(workflow).not.toMatch(/actions:\s*write|id-token:\s*write/);
     for (const input of ['target_version', 'target_tag', 'target_source_revision', 'target_release_id', 'installer_asset_id', 'installer_name', 'installer_bytes', 'installer_sha256', 'signature_asset_id', 'signature_bytes', 'signature_sha256', 'manifest_asset_id', 'manifest_bytes', 'manifest_sha256', 'expected_publisher']) {
       expect(workflow).toContain(`${input}:`);
     }
@@ -60,6 +62,18 @@ describe('default draft verification workflow', () => {
     expect(verifier).toContain("sourceBuildExecutableByteProvenanceReconstructed=$false");
     expect(verifier).not.toContain('ReadToEndAsync');
     expect(verifier).not.toMatch(/Write-(?:Host|Output|Verbose|Debug)|ConvertTo-SecureString|Start-Process|Remove-Item/);
+  });
+
+  it('uses the job-scoped draft visibility grant only for bounded GET requests', () => {
+    const check = String.raw`
+      $tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile((Resolve-Path ./scripts/verify-default-draft.ps1),[ref]$tokens,[ref]$errors);if($errors.Count){throw 'parse'}
+      $node=$ast.Find({param($n)$n-is[Management.Automation.Language.FunctionDefinitionAst]-and$n.Name-ceq'New-GitHubGetRequest'},$true);if(-not$node){throw 'missing'};Invoke-Expression $node.Extent.Text
+      $constructors=@($ast.FindAll({param($n)$n-is[Management.Automation.Language.InvokeMemberExpressionAst]-and$n.Member.Value-ceq'new'-and$n.Expression.Extent.Text-match'HttpRequestMessage'},$true));if($constructors.Count-ne1-or$constructors[0].Arguments[0].Extent.Text-cne'[Net.Http.HttpMethod]::Get'){throw 'HTTP method surface changed'}
+      $request=New-GitHubGetRequest 'https://api.github.com/repos/Joshua-Beel/Smacrobat/releases/1' 'placeholder' 'application/vnd.github+json';try{if($request.Method-ne[Net.Http.HttpMethod]::Get-or$null-ne$request.Content-or$request.RequestUri.AbsoluteUri-cne'https://api.github.com/repos/Joshua-Beel/Smacrobat/releases/1'){throw 'runtime request is not exact GET'}}finally{$request.Dispose()}
+    `;
+    const result = runPowerShell(check);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+    expect(verifier).not.toMatch(/HttpMethod\]::(?:Post|Put|Patch|Delete)|Invoke-RestMethod|Invoke-WebRequest|gh\s+(?:release|api)/i);
   });
 
   it('executes the real metadata and extraction inventory guards against missing, extra, OCR, collision, and traversal-shaped cases', () => {

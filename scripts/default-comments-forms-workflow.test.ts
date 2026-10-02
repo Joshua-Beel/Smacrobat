@@ -27,14 +27,16 @@ function extractFunctions(names: string[], body: string) {
 }
 
 describe('default comments and forms workflow', () => {
-  it('is a manual master-only read-permission workflow with exact immutable actions and three-file verifier output', () => {
+  it('is a manual master-only workflow with job-scoped draft visibility and exact immutable actions', () => {
     const workflow = readFileSync(workflowPath, 'utf8');
     expect(workflow).toContain('name: Manual default installed comments and forms verification');
     expect(workflow).toContain('workflow_dispatch:');
     expect(workflow).toContain("$env:GITHUB_REF -cne 'refs/heads/master'");
     expect(workflow).toContain('contents: read');
     expect(workflow).toContain('actions: read');
-    expect(workflow).not.toMatch(/contents:\s*write|pull_request|push:|schedule:|PAT|GH_TOKEN/);
+    expect(workflow.match(/contents:\s*write/g)).toHaveLength(1);
+    expect(workflow.indexOf('contents: write')).toBeGreaterThan(workflow.indexOf('verify-installed-comments-forms:'));
+    expect(workflow).not.toMatch(/actions:\s*write|id-token:\s*write|pull_request|push:|schedule:|PAT|GH_TOKEN/);
     expect(workflow).toContain('actions/checkout@11d5960a326750d5838078e36cf38b85af677262');
     expect(workflow).toContain('actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093');
     expect(workflow).toContain('actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02');
