@@ -604,9 +604,9 @@ public static class PrintSpoolWriterFixture {
       $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
       Set-Location -LiteralPath '${process.cwd().replaceAll("'", "''")}'
       . ./scripts/installed-print-dialog.ps1
-      function New-TreeElement([int]$ownedProcessId,[int]$runtimePart,[string]$type,[string]$name,$parent){
-        $element=[pscustomobject]@{RuntimePart=$runtimePart;Parent=$parent;Clicked=$false;Current=[pscustomobject]@{ProcessId=$ownedProcessId;ControlType=[pscustomobject]@{ProgrammaticName=$type};Name=$name;AutomationId=''}}
-        $element|Add-Member -MemberType ScriptMethod -Name GetRuntimeId -Value {[int[]]@(77,$this.RuntimePart)}
+      function New-TreeElement([int]$ownedProcessId,[int]$runtimePart,[string]$type,[string]$name,$parent,[int]$identityDelayMilliseconds=0,[string]$identityError=''){
+        $element=[pscustomobject]@{RuntimePart=$runtimePart;Parent=$parent;Clicked=$false;IdentityDelayMilliseconds=$identityDelayMilliseconds;IdentityError=$identityError;Current=[pscustomobject]@{ProcessId=$ownedProcessId;ControlType=[pscustomobject]@{ProgrammaticName=$type};Name=$name;AutomationId=''}}
+        $element|Add-Member -MemberType ScriptMethod -Name GetRuntimeId -Value {if($this.IdentityDelayMilliseconds-gt0){Start-Sleep -Milliseconds $this.IdentityDelayMilliseconds};if(-not[string]::IsNullOrEmpty($this.IdentityError)){throw $this.IdentityError};[int[]]@(77,$this.RuntimePart)}
         return $element
       }
       $desktop=[pscustomobject]@{Current=[pscustomobject]@{ProcessId=0}}
@@ -659,6 +659,14 @@ public static class PrintSpoolWriterFixture {
       $script:treeElements=@($main,$pane,$outside,$existingSibling,$replacement)
       $message='';try{Wait-BoundProcessUiSurfaceClosed -ProcessId 7319 -Binding $binding -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(500)) -ElementProvider $provider -ParentProvider $parents}catch{$message=$_.Exception.Message}
       if($message-cnotmatch'unbound replacement surface'-or$replacement.Clicked){throw 'A replacement surface was accepted or actuated after the exact bound identity disappeared.'}
+      $deadlineReplacement=New-TreeElement 7319 16 'ControlType.Pane' '' $pane 80
+      $script:treeElements=@($main,$pane,$outside,$existingSibling,$deadlineReplacement)
+      $message='';try{Wait-BoundProcessUiSurfaceClosed -ProcessId 7319 -Binding $binding -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddMilliseconds(20)) -ElementProvider $provider -ParentProvider $parents}catch{$message=$_.Exception.Message}
+      if($message-cnotmatch'unbound replacement surface'-or$message-cmatch'identity deadline expired'-or$deadlineReplacement.Clicked){throw 'A snapshot crossing the close deadline did not retain the strict replacement-surface failure.'}
+      $brokenReplacement=New-TreeElement 7319 17 'ControlType.Pane' '' $pane 0 'identity provider sentinel'
+      $script:treeElements=@($main,$pane,$outside,$existingSibling,$brokenReplacement)
+      $message='';try{Wait-BoundProcessUiSurfaceClosed -ProcessId 7319 -Binding $binding -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddSeconds(1)) -ElementProvider $provider -ParentProvider $parents}catch{$message=$_.Exception.Message}
+      if($message-cne'Native process UI runtime identity was unavailable.'-or$brokenReplacement.Clicked){throw 'A genuine identity-provider error was swallowed or actuated.'}
       $script:treeElements=@($main,$pane,$outside,$existingSibling)
       Wait-BoundProcessUiSurfaceClosed -ProcessId 7319 -Binding $binding -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddSeconds(1)) -ElementProvider $provider -ParentProvider $parents
       $foreign=New-TreeElement 7320 11 'ControlType.Button' 'Cancel' $pane

@@ -139,6 +139,11 @@ describe('default draft verification workflow', () => {
       $blank=@('----------','Path = resources\welcome.pdf','Size = ');$bounded=Assert-BoundedArchiveListing $blank @{'resources/welcome.pdf'=[uint64]9};if($bounded.entries-ne1-or$bounded.expandedBytes-ne9){throw 'exact fallback size changed'}
       $bounded=Assert-BoundedArchiveListing @('----------','Path = resources\welcome.pdf','Size =   ') @{'resources/welcome.pdf'=[uint64]9};if($bounded.expandedBytes-ne9){throw 'whitespace fallback size changed'}
       $bounded=Assert-BoundedArchiveListing @('----------','Path = app.exe','Size =   10  ');if($bounded.expandedBytes-ne10){throw 'padded numeric size changed'}
+      $bounded=Assert-BoundedArchiveListing @('----------','Path = uninstall.exe','Size = ');if($bounded.entries-ne1-or$bounded.expandedBytes-ne0-or$bounded.excludedUninstaller-cne'uninstall.exe'){throw 'final generated uninstaller exclusion changed'}
+      $bounded=Assert-BoundedArchiveListing @('----------','Path = uninstall.exe','Size = 105704');if($bounded.excludedUninstaller-cne'uninstall.exe'){throw 'numeric generated uninstaller exclusion changed'}
+      Reject {Assert-BoundedArchiveListing @('----------','Path = prefix/uninstall.exe','Size = ')} 'nested blank uninstaller'
+      Reject {Assert-BoundedArchiveListing @('----------','Path = uninstall.exe','Size = ','Path = later.bin','Size = 1')} 'nonfinal blank uninstaller'
+      Reject {Assert-BoundedArchiveListing @('----------','Path = uninstall.exe','Size = ','Path = prefix/uninstall.exe','Size = ')} 'duplicate blank uninstaller'
       Reject {Assert-BoundedArchiveListing $blank} 'unbound blank size'
       $message='';try{Assert-BoundedArchiveListing $blank}catch{$message=$_.Exception.Message};if($message-cne'Installer archive size is blank. EntryBucket=welcome-without-exact-fallback EntryOrdinal=1.'){throw 'welcome blank diagnostic changed'}
       Reject {Assert-BoundedArchiveListing $blank @{'resources/other.pdf'=[uint64]9}} 'wrong blank-size path'

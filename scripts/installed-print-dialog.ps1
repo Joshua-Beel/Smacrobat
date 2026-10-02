@@ -2432,7 +2432,13 @@ function Wait-BoundProcessUiSurfaceClosed {
         throw "Native print UI stage '$Stage' $nativeCloseFailure; uiStructure=$structure; closeState=$closeState."
     }
     while ([datetime]::UtcNow -lt $Deadline) {
-        $current = @(Get-ProcessUiTreeSnapshot -ProcessId $ProcessId -Deadline $Deadline -ElementProvider $ElementProvider -ParentProvider $ParentProvider)
+        try { $current = @(Get-ProcessUiTreeSnapshot -ProcessId $ProcessId -Deadline $Deadline -ElementProvider $ElementProvider -ParentProvider $ParentProvider) }
+        catch {
+            $snapshotFailure = [string]$_.Exception.Message
+            $deadlineFailure = $snapshotFailure -ceq 'Native process UI snapshot deadline expired.' -or $snapshotFailure -ceq 'Native process UI snapshot exceeded its deadline.' -or $snapshotFailure -ceq 'Native process UI identity deadline expired.' -or $snapshotFailure -ceq 'Native process UI ancestry deadline expired.'
+            if ($deadlineFailure -and [datetime]::UtcNow -ge $Deadline) { break }
+            throw
+        }
         $structure = Get-SanitizedObservedUiStructureJson -ProcessId $ProcessId -Elements @($current | ForEach-Object { $_.element }) -Scope 'process-descendants'
         if ([datetime]::UtcNow -ge $Deadline) { break }
         $byIdentity = @{}

@@ -155,22 +155,31 @@ public static class DefaultDraftBoundedProcess {
 
 function Assert-BoundedArchiveListing {
     param([string[]]$Lines,[Collections.IDictionary]$ExactFallbackSizes,[Collections.IDictionary]$KnownPaths)
-    [uint64]$entries=0;$started=$false;$state=@{path=$null;size=$null;total=[uint64]0}
+    [uint64]$entries=0;$started=$false;$state=@{path=$null;size=$null;total=[uint64]0;excluded=$false;excludedUninstaller=$null}
     function Complete-Entry {
       if($null-eq$state.path){return}
+      if($state.excluded){
+        if($null-ne$state.excludedUninstaller){throw 'Installer archive has duplicate excluded uninstallers.'}
+        $state.excludedUninstaller=[string]$state.path;$state.path=$null;$state.size=$null;$state.excluded=$false;return
+      }
       if($null-eq$state.size){throw 'Installer archive entry has no exact numeric size.'}
       $scriptSize=[uint64]$state.size
       if([uint64]::MaxValue-[uint64]$state.total-lt$scriptSize){throw 'Installer archive expanded size overflowed.'};$state.total=[uint64]$state.total+$scriptSize
       if([uint64]$state.total -gt 512MB){throw 'Installer archive expanded size exceeds its bound.'}
-      $state.path=$null;$state.size=$null
+      $state.path=$null;$state.size=$null;$state.excluded=$false
     }
     foreach($line in $Lines){
       if($line -ceq '----------'){$started=$true;continue}
       if(-not$started){continue}
-      if($line -cmatch '^Path = (.+)$'){Complete-Entry;$state.path=$Matches[1];$entries++;if($entries -gt 512){throw 'Installer archive entry count exceeds its bound.'};continue}
+      if($line -cmatch '^Path = (.+)$'){if($state.excluded){throw 'Excluded installer uninstaller is not the final archive entry.'};Complete-Entry;$state.path=$Matches[1];$entries++;if($entries -gt 512){throw 'Installer archive entry count exceeds its bound.'};continue}
       if($line.StartsWith('Size = ',[StringComparison]::Ordinal)){
         if($null-eq$state.path-or $null-ne$state.size){throw 'Installer archive has an orphan or duplicate size.'}
         [uint64]$size=0;$text=$line.Substring(7).Trim();$key=([string]$state.path).Replace('\','/')
+        if($key.Equals('uninstall.exe',[StringComparison]::OrdinalIgnoreCase)){
+          if($text.Length-gt0-and-not [uint64]::TryParse($text,[Globalization.NumberStyles]::None,[Globalization.CultureInfo]::InvariantCulture,[ref]$size)){throw 'Installer archive size is nonnumeric.'}
+          if($size-gt256MB){throw 'Installer archive entry size exceeds its bound.'}
+          $state.excluded=$true;$state.size=[uint64]0;continue
+        }
         if($text.Length-eq0){
           if($null-ne$ExactFallbackSizes-and$ExactFallbackSizes.Contains($key)){$size=[uint64]$ExactFallbackSizes[$key]}
           else{
@@ -190,7 +199,7 @@ function Assert-BoundedArchiveListing {
     }
     Complete-Entry
     if($entries -eq 0){throw 'Installer archive listing is empty.'}
-    return [pscustomobject]@{entries=$entries;expandedBytes=[uint64]$state.total}
+    return [pscustomobject]@{entries=$entries;expandedBytes=[uint64]$state.total;excludedUninstaller=$state.excludedUninstaller}
 }
 
 function Invoke-BoundedSevenZipEntry {
@@ -235,14 +244,17 @@ function Expand-DefaultInstaller {
     $listing=@(Invoke-BoundedSevenZip -Executable $extractor.FullName -Arguments @('l','-slt',$Installer) -Capture)
     $welcome=@($BaseEntries|Where-Object{[string]$_.Target-ceq'resources/welcome.pdf'});if($welcome.Count-ne1){throw 'Exact welcome resource receipt is absent or ambiguous.'}
     $fallback=@{'resources/welcome.pdf'=[uint64]$welcome[0].Receipt.Bytes};$known=@{};foreach($entry in $BaseEntries){$key=[string]$entry.Target;if($known.Contains($key)){throw 'Base resource inventory has a duplicate path.'};$known[$key]=$true}
-    try{$null=Assert-BoundedArchiveListing -Lines $listing -ExactFallbackSizes $fallback -KnownPaths $known}catch{$primary=$_.Exception.Message;$version=Get-SevenZipVersionFact $extractor.FullName;throw ($primary+' SevenZipVersion='+$version+'.')}
+    try{$listingFacts=Assert-BoundedArchiveListing -Lines $listing -ExactFallbackSizes $fallback -KnownPaths $known}catch{$primary=$_.Exception.Message;$version=Get-SevenZipVersionFact $extractor.FullName;throw ($primary+' SevenZipVersion='+$version+'.')}
+    $script:OptionalUninstallerExcluded=$null-ne$listingFacts.excludedUninstaller
     $archivePaths=Convert-SevenZipInventory -Lines $listing
     Assert-ArchiveResourceInventory -ArchivePaths $archivePaths -BaseEntries $BaseEntries
     [IO.Directory]::CreateDirectory($Destination)|Out-Null
     Assert-NoReparseAncestors -Path $Destination
     $welcomePath=Join-Path $Destination 'resources/welcome.pdf';[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($welcomePath))|Out-Null
     Invoke-BoundedSevenZipEntry -Executable $extractor.FullName -Installer $Installer -ArchivePath 'resources\welcome.pdf' -Destination $welcomePath -ExpectedBytes ([uint64]$welcome[0].Receipt.Bytes) -ExpectedSha256 ([string]$welcome[0].Receipt.Sha256)
-    Invoke-BoundedSevenZip -Executable $extractor.FullName -Arguments @('x',$Installer,"-o$Destination",'-y','-bd','-bb0','-xr!resources\welcome.pdf')
+    $extractArguments=@('x',$Installer,"-o$Destination",'-y','-bd','-bb0','-xr!resources\welcome.pdf')
+    if($null-ne$listingFacts.excludedUninstaller){$extractArguments+='-x!uninstall.exe'}
+    Invoke-BoundedSevenZip -Executable $extractor.FullName -Arguments $extractArguments
     Assert-NoReparseAncestors -Path $Destination
     foreach($entry in @(Get-ChildItem -LiteralPath $Destination -Recurse -Force)){
         Assert-NoReparseAncestors -Path $entry.FullName
@@ -329,6 +341,6 @@ $record=[ordered]@{
  assets=@([ordered]@{role='installer';id=$installerId;name=$InstallerName;bytes=$installerLength;sha256=$InstallerSha256},[ordered]@{role='detachedUpdaterSignature';id=$signatureId;name="$InstallerName.sig";bytes=$signatureLength;sha256=$SignatureSha256},[ordered]@{role='updaterManifest';id=$manifestId;name='latest.json';bytes=$manifestLength;sha256=$ManifestSha256})
  packagedApplication=[ordered]@{bytes=[uint64]$application.Length;sha256=Get-ExactSha256 $application.FullName}
  baseResources=@($resourceReceipts|Sort-Object target);signatures=[ordered]@{expectedPublisher=$ExpectedPublisher;installer='Valid';application='Valid';pdfium='Valid';trustedTimestampsRequired=$true}
- verification=[ordered]@{draft=$true;prerelease=$false;exactAssetInventory=$true;exactExtractedInventory=$true;targetSourceSixVersionsMatched=$true;packagedApplicationIdentityAndVersionMatched=$true;sourceBuildExecutableByteProvenanceReconstructed=$false;requiredExtractedFiles=$inventory.required;actualExtractedFiles=$inventory.actual;optionalUninstaller=$inventory.optionalUninstaller;ocrBundled=$false;manifestSignatureTextBound=$true;detachedUpdaterCryptographyVerified=$false;installedBehaviorVerified=$false}
+ verification=[ordered]@{draft=$true;prerelease=$false;exactAssetInventory=$true;exactExtractedInventory=$true;targetSourceSixVersionsMatched=$true;packagedApplicationIdentityAndVersionMatched=$true;sourceBuildExecutableByteProvenanceReconstructed=$false;requiredExtractedFiles=$inventory.required;actualExtractedFiles=$inventory.actual;optionalUninstaller=$inventory.optionalUninstaller;optionalUninstallerExcluded=[bool]$script:OptionalUninstallerExcluded;ocrBundled=$false;manifestSignatureTextBound=$true;detachedUpdaterCryptographyVerified=$false;installedBehaviorVerified=$false}
 }
 [IO.File]::WriteAllText((Join-Path $outputRoot 'default-draft-verification.json'),($record|ConvertTo-Json -Depth 20),[Text.UTF8Encoding]::new($false))
