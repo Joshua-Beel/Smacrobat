@@ -178,10 +178,11 @@ public sealed class NonCooperativeResponseStream : MemoryStream {
         $rejected=$false;try{Assert-ExtractedCrateTree -Source $source}catch{$rejected=$true};if(-not$rejected){throw 'Extracted reparse point accepted.'}
         $hostile=Join-Path $root 'hostile-repo';$cargoFolder=Join-Path $hostile '.cargo';[IO.Directory]::CreateDirectory($cargoFolder)|Out-Null
         [IO.File]::WriteAllText((Join-Path $cargoFolder 'config.toml'),'[source.crates-io] replace-with="hostile"',[Text.UTF8Encoding]::new($false))
-        $cleanSource=Join-Path $root 'clean-source';[IO.Directory]::CreateDirectory($cleanSource)|Out-Null
+        $driveRoot=Join-Path $root 'drive-root';$cleanPhysical=Join-Path $driveRoot 'clean-source';[IO.Directory]::CreateDirectory($cleanPhysical)|Out-Null
+        $driveName='SmacrobatCargoFixture';New-PSDrive -Name $driveName -PSProvider FileSystem -Root $driveRoot|Out-Null;$cleanSource=$driveName+':\clean-source'
         $cargoHome=Join-Path $root 'cargo-home';$install=Join-Path $root 'install';$marker=Join-Path $root 'cargo-provider-called'
         Push-Location $hostile
-        try{Invoke-IsolatedCargoInstall -Cargo 'cargo.exe' -Source $cleanSource -InstallRoot $install -CargoHome $cargoHome -ProcessProvider {param($cargo,$firstArgument)$arguments=@($firstArgument)+@($args);[IO.File]::WriteAllText($marker,'called');if($cargo-cne'cargo.exe'-or-not(Get-Location).Path.Equals($cleanSource,[StringComparison]::OrdinalIgnoreCase)-or$env:CARGO_HOME-cne$cargoHome-or$arguments.Count-ne6-or($arguments-join ' ')-cne('install --path . --locked --root '+$install)){throw 'Cargo isolation contract changed.'};0}.GetNewClosure()}finally{Pop-Location}
+        try{Invoke-IsolatedCargoInstall -Cargo 'cargo.exe' -Source $cleanSource -InstallRoot $install -CargoHome $cargoHome -ProcessProvider {param($cargo,[Parameter(ValueFromRemainingArguments=$true)][object[]]$arguments)[IO.File]::WriteAllText($marker,'called');$cargoExact=$cargo-ceq'cargo.exe';$locationExact=(Get-Location).Path.Equals($cleanSource,[StringComparison]::OrdinalIgnoreCase);$homeExact=$env:CARGO_HOME-ceq$cargoHome;$countExact=$arguments.Count-eq6;$orderExact=($arguments-join ' ')-ceq('install --path . --locked --root '+$install);if(-not($cargoExact-and$locationExact-and$homeExact-and$countExact-and$orderExact)){throw ('Cargo isolation contract changed; cargoExact={0}; locationExact={1}; homeExact={2}; countExact={3}; orderExact={4}.'-f$cargoExact,$locationExact,$homeExact,$countExact,$orderExact)};0}.GetNewClosure()}finally{Pop-Location;Remove-PSDrive -Name $driveName}
         if(-not(Test-Path -LiteralPath $marker -PathType Leaf)){throw 'Isolated Cargo provider was not invoked.'}
       `,
     );
