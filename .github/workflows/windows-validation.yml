@@ -1,0 +1,69 @@
+name: Manual Windows validation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-validation-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify exact clean dispatched source
+        shell: pwsh
+        run: |
+          $head = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $head -cne $env:GITHUB_SHA) { throw 'Checked-out HEAD does not match github.sha.' }
+          git diff --quiet --
+          if ($LASTEXITCODE -ne 0) { throw 'Tracked working-tree files changed after checkout.' }
+          git diff --cached --quiet --
+          if ($LASTEXITCODE -ne 0) { throw 'The tracked index changed after checkout.' }
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+
+      - name: Verify hosted cross-drive topology
+        shell: pwsh
+        run: |
+          $workspaceDrive = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)).TrimEnd('\')
+          $tempDrive = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath([IO.Path]::GetTempPath())).TrimEnd('\')
+          $workspaceDriveSet = $workspaceDrive -match '^[A-Za-z]:$'
+          $tempDriveSet = $tempDrive -match '^[A-Za-z]:$'
+          $drivesDiffer = $workspaceDriveSet -and $tempDriveSet -and -not $workspaceDrive.Equals($tempDrive,[StringComparison]::OrdinalIgnoreCase)
+          Write-Output ('HOSTED_TOPOLOGY workspaceDriveSet={0} tempDriveSet={1} drivesDiffer={2}' -f $workspaceDriveSet.ToString().ToLowerInvariant(),$tempDriveSet.ToString().ToLowerInvariant(),$drivesDiffer.ToString().ToLowerInvariant())
+          if (-not $drivesDiffer) { throw 'Windows validation requires repository and temporary paths on different drive letters.' }
+
+      - run: npm ci
+      - run: npm run fixtures
+      - run: ./scripts/setup-pdfium.ps1
+        shell: pwsh
+      - name: Fetch locked Windows Cargo registry for offline notice checks
+        run: cargo fetch --locked --target x86_64-pc-windows-msvc --manifest-path src-tauri/Cargo.toml
+      - run: npm test -- --maxWorkers=2
+      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+      - run: npm run build
+
+      - name: Recheck tracked source
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          git diff --quiet --
+          if ($LASTEXITCODE -ne 0) { throw 'Windows validation changed tracked working-tree files.' }
+          git diff --cached --quiet --
+          if ($LASTEXITCODE -ne 0) { throw 'Windows validation changed the tracked index.' }
