@@ -1,8 +1,28 @@
 import { describe, expect, it } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 
 const workflow = readFileSync('.github/workflows/release.yml', 'utf8');
+const versionValidator = readFileSync('scripts/assert-release-version.ps1', 'utf8');
+
+function versionFixture(lineEnding: '\n' | '\r\n') {
+  const root = mkdtempSync(join(tmpdir(), 'smacrobat-release-version-'));
+  for (const path of ['package.json', 'package-lock.json', 'src-tauri/tauri.conf.json', 'src-tauri/Cargo.toml', 'src-tauri/Cargo.lock']) {
+    const target = join(root, path);
+    mkdirSync(dirname(target), { recursive: true });
+    const source = readFileSync(path, 'utf8').replace(/\r?\n/g, lineEnding);
+    writeFileSync(target, source, 'utf8');
+  }
+  return root;
+}
+
+function validateFixture(root: string) {
+  return spawnSync('pwsh', ['-NoProfile', '-NonInteractive', '-File', 'scripts/assert-release-version.ps1', '-ProjectRoot', root, '-Version', '0.2.9'], {
+    cwd: process.cwd(), encoding: 'utf8', timeout: 10_000,
+  });
+}
 
 describe('release workflow contract', () => {
   it('pins every action to an immutable full commit SHA', () => {
@@ -22,9 +42,8 @@ describe('release workflow contract', () => {
     expect(workflow).toContain('fetch-depth: 0');
     expect(workflow).toContain('ref: ${{ github.sha }}');
     expect(workflow).toContain("'^v(?<version>\\d+\\.\\d+\\.\\d+)$'");
-    for (const source of ['package.json', 'package-lock.json', 'src-tauri/tauri.conf.json', 'src-tauri/Cargo.toml', 'src-tauri/Cargo.lock']) {
-      expect(workflow).toContain(source);
-    }
+    expect(workflow).toContain('./scripts/assert-release-version.ps1 -ProjectRoot (Get-Location).Path -Version $version');
+    for (const source of ['package.json', 'package-lock.json', 'src-tauri/tauri.conf.json', 'src-tauri/Cargo.toml', 'src-tauri/Cargo.lock']) expect(versionValidator).toContain(source);
     expect(workflow).toContain('git rev-parse HEAD');
     expect(workflow).toContain('git rev-parse "$($env:GITHUB_REF_NAME)^{commit}"');
     expect(workflow).toContain('$head -cne $env:GITHUB_SHA -or $tagCommit -cne $env:GITHUB_SHA');
@@ -34,19 +53,33 @@ describe('release workflow contract', () => {
     expect(workflow).not.toMatch(/gh release (?:edit|upload).*--latest|gh release edit.*--draft=false/);
   });
 
-  it('resolves the package-lock root with its empty-string key in PowerShell 7', () => {
-    expect(workflow).toContain('ConvertFrom-Json -AsHashtable');
-    expect(workflow).toContain("$lockRoot = $packageLock['packages']['']");
-    const command = String.raw`
-      $packageLock = Get-Content package-lock.json -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable
-      $lockRoot = $packageLock['packages']['']
-      if ($packageLock.version -cne '0.2.8' -or $lockRoot.version -cne '0.2.8') { throw 'Wrong package-lock versions.' }
-    `;
-    const result = spawnSync('pwsh', ['-NoProfile', '-NonInteractive', '-Command', command], {
-      cwd: process.cwd(), encoding: 'utf8', timeout: 10_000,
-    });
-    expect(result.status, result.stderr || result.stdout).toBe(0);
-  }, 15_000);
+  it('executes the exact six-source validator for LF, CRLF, mismatches, missing roots, and duplicate Cargo packages', () => {
+    expect(versionValidator).toContain('ConvertFrom-Json -AsHashtable');
+    expect(versionValidator).toContain("$lockRoot = $packageLock['packages']['']");
+    const roots: string[] = [];
+    try {
+      for (const ending of ['\n', '\r\n'] as const) {
+        const root = versionFixture(ending); roots.push(root);
+        const result = validateFixture(root);
+        expect(result.status, result.stderr || result.stdout).toBe(0);
+      }
+      for (const mutate of [
+        (root: string) => { const value = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')); value.version = '9.9.9'; writeFileSync(join(root, 'package.json'), JSON.stringify(value), 'utf8'); },
+        (root: string) => { const value = JSON.parse(readFileSync(join(root, 'package-lock.json'), 'utf8')); value.version = '9.9.9'; writeFileSync(join(root, 'package-lock.json'), JSON.stringify(value), 'utf8'); },
+        (root: string) => { const value = JSON.parse(readFileSync(join(root, 'package-lock.json'), 'utf8')); value.packages[''].version = '9.9.9'; writeFileSync(join(root, 'package-lock.json'), JSON.stringify(value), 'utf8'); },
+        (root: string) => { const value = JSON.parse(readFileSync(join(root, 'src-tauri/tauri.conf.json'), 'utf8')); value.version = '9.9.9'; writeFileSync(join(root, 'src-tauri/tauri.conf.json'), JSON.stringify(value), 'utf8'); },
+        (root: string) => writeFileSync(join(root, 'src-tauri/Cargo.toml'), readFileSync(join(root, 'src-tauri/Cargo.toml'), 'utf8').replace('version = "0.2.9"', 'version = "9.9.9"'), 'utf8'),
+        (root: string) => writeFileSync(join(root, 'src-tauri/Cargo.lock'), readFileSync(join(root, 'src-tauri/Cargo.lock'), 'utf8').replace('name = "pdf-workstation"\nversion = "0.2.9"', 'name = "pdf-workstation"\nversion = "9.9.9"'), 'utf8'),
+        (root: string) => { const value = JSON.parse(readFileSync(join(root, 'package-lock.json'), 'utf8')); delete value.packages['']; writeFileSync(join(root, 'package-lock.json'), JSON.stringify(value), 'utf8'); },
+        (root: string) => writeFileSync(join(root, 'src-tauri/Cargo.lock'), `${readFileSync(join(root, 'src-tauri/Cargo.lock'), 'utf8')}\n[[package]]\nname = "pdf-workstation"\nversion = "0.2.9"\n`, 'utf8'),
+      ]) {
+        const root = versionFixture('\n'); roots.push(root); mutate(root);
+        expect(validateFixture(root).status).not.toBe(0);
+      }
+    } finally {
+      for (const root of roots) rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it('fails closed on signing and publishes only the explicit three-asset draft inventory', () => {
     for (const secret of [
@@ -76,14 +109,14 @@ describe('release workflow contract', () => {
     const tauri = JSON.parse(readFileSync('src-tauri/tauri.conf.json', 'utf8'));
     const cargo = readFileSync('src-tauri/Cargo.toml', 'utf8').match(/^version = "([^"]+)"$/m)?.[1];
     const cargoLock = readFileSync('src-tauri/Cargo.lock', 'utf8').match(/\[\[package\]\]\r?\nname = "pdf-workstation"\r?\nversion = "([^"]+)"/)?.[1];
-    expect([pkg.version, npmLock.version, npmLock.packages[''].version, tauri.version, cargo, cargoLock]).toEqual(Array(6).fill('0.2.8'));
+    expect([pkg.version, npmLock.version, npmLock.packages[''].version, tauri.version, cargo, cargoLock]).toEqual(Array(6).fill('0.2.9'));
     expect(tauri.plugins.updater).toEqual({
       pubkey: 'dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDg1OTcwQzM0QUVBQkQ3NzUKUldSMTE2dXVOQXlYaFdZN0k1Mk1CcSt2NS81bzNRTERRbU16ejYxTDNiS3V6b1RTZ0tuTlRjZVEK',
       endpoints: ['https://github.com/Joshua-Beel/Smacrobat/releases/latest/download/latest.json'],
       windows: { installMode: 'passive' },
     });
     const notes = readFileSync('docs/release-notes.md', 'utf8');
-    expect(notes).toMatch(/^## 0\.2\.8 \(draft candidate\)/);
+    expect(notes).toMatch(/^## 0\.2\.9 \(draft candidate\)/);
     expect(notes).toContain('Hardens update recovery.');
     expect(notes).toContain('does not bundle OCR');
     expect(notes).toContain('does not create searchable/document OCR');
