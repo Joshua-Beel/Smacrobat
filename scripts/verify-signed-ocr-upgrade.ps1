@@ -5,7 +5,8 @@ param(
     [Parameter(Mandatory = $true)][string]$WorkRoot,
     [Parameter(Mandatory = $true)][string]$OutputRoot,
     [Parameter(Mandatory = $true)][string]$WebDriverRoot,
-    [Parameter(Mandatory = $true)][string]$WebViewProfileRoot
+    [Parameter(Mandatory = $true)][string]$WebViewProfileRoot,
+    [Parameter(Mandatory = $true)][ValidateSet('HostedNonInteractive')][string]$PublisherUiMode
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -668,6 +669,34 @@ function Invoke-InstalledEngineOcrSmoke {
     }
 }
 
+function New-HostedPublisherUiNotAttemptedEvidence {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)]$Receipt,
+        [Parameter(Mandatory = $true)][ValidateSet('installer','installed-application')][string]$Kind,
+        [Parameter(Mandatory = $true)][string]$ExpectedPublisher,
+        [scriptblock]$SignatureProvider
+    )
+    $canonical = [IO.Path]::GetFullPath($Path)
+    Assert-PublisherUiFileReceipt -Path $canonical -Receipt $Receipt
+    $null = Assert-TrustedWindowsSignature -Path $canonical -SignatureProvider $SignatureProvider -ExpectedPublisher $ExpectedPublisher
+    Assert-PublisherUiFileReceipt -Path $canonical -Receipt $Receipt
+    $null = Assert-TrustedWindowsSignature -Path $canonical -SignatureProvider $SignatureProvider -ExpectedPublisher $ExpectedPublisher
+    return [pscustomobject][ordered]@{
+        kind = $Kind
+        fileName = [IO.Path]::GetFileName($canonical)
+        bytes = [uint64]$Receipt.bytes
+        sha256 = [string]$Receipt.sha256
+        publisher = $ExpectedPublisher
+        authenticodeStatus = 'Valid'
+        trustedTimestampVerified = $true
+        shellPublisherUiAttempted = $false
+        shellPublisherUiVerified = $false
+        notAttemptedReason = 'github-hosted-noninteractive-session'
+        screenshotsUsed = $false
+    }
+}
+
 function Write-SanitizedUpgradeRecord {
     param(
         [Parameter(Mandatory = $true)][string]$OutputRoot,
@@ -675,42 +704,39 @@ function Write-SanitizedUpgradeRecord {
         [Parameter(Mandatory = $true)]$Receipt,
         [Parameter(Mandatory = $true)]$InstalledEngineSmoke,
         [Parameter(Mandatory = $true)]$InstalledAppLaunch,
-        [Parameter(Mandatory = $true)]$InstallerPublisherUi,
-        [Parameter(Mandatory = $true)]$ApplicationPublisherUi
+        [Parameter(Mandatory = $true)]$InstallerPublisherEvidence,
+        [Parameter(Mandatory = $true)]$ApplicationPublisherEvidence
     )
-    $publisherUiContracts = @(
-        [pscustomobject]@{ Value = $InstallerPublisherUi; Kind = 'installer'; FileName = $script:Pins.SignedInstallerName; Bytes = [uint64]$script:Pins.SignedInstallerBytes; Sha256 = [string]$script:Pins.SignedInstallerSha256 },
-        [pscustomobject]@{ Value = $ApplicationPublisherUi; Kind = 'installed-application'; FileName = 'pdf-workstation.exe'; Bytes = [uint64]$Receipt.packagedApplication.bytes; Sha256 = [string]$Receipt.packagedApplication.sha256 }
+    $publisherEvidenceContracts = @(
+        [pscustomobject]@{ Value = $InstallerPublisherEvidence; Kind = 'installer'; FileName = $script:Pins.SignedInstallerName; Bytes = [uint64]$script:Pins.SignedInstallerBytes; Sha256 = [string]$script:Pins.SignedInstallerSha256 },
+        [pscustomobject]@{ Value = $ApplicationPublisherEvidence; Kind = 'installed-application'; FileName = 'pdf-workstation.exe'; Bytes = [uint64]$Receipt.packagedApplication.bytes; Sha256 = [string]$Receipt.packagedApplication.sha256 }
     )
-    foreach ($contract in $publisherUiContracts) {
+    foreach ($contract in $publisherEvidenceContracts) {
         $value = $contract.Value
         Assert-ExactProperties -Value $value -Expected @(
-            'kind','fileName','bytes','sha256','publisher','uiCulture','shellPropertiesDialog','digitalSignaturesTab',
-            'signerRowMatched','detailsDialog','statusTextMatched','trustedTimestampVerified','cleanupVerified','screenshotsUsed'
-        ) -Kind 'Windows publisher UI receipt'
+            'kind','fileName','bytes','sha256','publisher','authenticodeStatus','trustedTimestampVerified',
+            'shellPublisherUiAttempted','shellPublisherUiVerified','notAttemptedReason','screenshotsUsed'
+        ) -Kind 'Hosted publisher evidence receipt'
         if ([string]$value.kind -cne [string]$contract.Kind -or
             [string]$value.fileName -cne [string]$contract.FileName -or
             [uint64]$value.bytes -ne [uint64]$contract.Bytes -or
             [string]$value.sha256 -cne [string]$contract.Sha256 -or
             [string]$value.publisher -cne $script:Pins.ExpectedPublisher -or
-            [string]$value.uiCulture -cne 'en-US' -or
-            $value.shellPropertiesDialog -isnot [bool] -or -not $value.shellPropertiesDialog -or
-            $value.digitalSignaturesTab -isnot [bool] -or -not $value.digitalSignaturesTab -or
-            $value.signerRowMatched -isnot [bool] -or -not $value.signerRowMatched -or
-            $value.detailsDialog -isnot [bool] -or -not $value.detailsDialog -or
-            $value.statusTextMatched -isnot [bool] -or -not $value.statusTextMatched -or
+            [string]$value.authenticodeStatus -cne 'Valid' -or
             $value.trustedTimestampVerified -isnot [bool] -or -not $value.trustedTimestampVerified -or
-            $value.cleanupVerified -isnot [bool] -or -not $value.cleanupVerified -or
+            $value.shellPublisherUiAttempted -isnot [bool] -or $value.shellPublisherUiAttempted -or
+            $value.shellPublisherUiVerified -isnot [bool] -or $value.shellPublisherUiVerified -or
+            [string]$value.notAttemptedReason -cne 'github-hosted-noninteractive-session' -or
             $value.screenshotsUsed -isnot [bool] -or $value.screenshotsUsed) {
-            throw 'Windows publisher UI receipt is incomplete or malformed.'
+            throw 'Hosted publisher evidence receipt is incomplete or malformed.'
         }
     }
     if (Test-Path -LiteralPath $OutputRoot) { throw 'Sanitized output root must be fresh.' }
     [IO.Directory]::CreateDirectory($OutputRoot) | Out-Null
     Assert-NoReparseAncestors -Path $OutputRoot
     $record = [ordered]@{
-        schemaVersion = 5
-        scope = 'Ephemeral GitHub-hosted silent NSIS installation, manual upgrade, Windows Explorer Digital Signatures publisher UI, direct installed-engine OCR smoke, and installed signed application WebView launch/native IPC/sample-render/current-page OCR completion verification; OCR accuracy, other native dialogs, native visuals, UAC and SmartScreen prompts, user documents, printing, preferences, drag-and-drop, and updater behavior are not established.'
+        schemaVersion = 6
+        scope = 'Ephemeral GitHub-hosted silent NSIS installation, manual upgrade, exact Authenticode publisher and trusted-timestamp verification, direct installed-engine OCR smoke, and installed signed application WebView launch/native IPC/sample-render/current-page OCR completion verification; the noninteractive hosted session does not attempt or verify Windows Explorer Digital Signatures UI, and OCR accuracy, other native dialogs, native visuals, UAC and SmartScreen prompts, user documents, printing, preferences, drag-and-drop, and updater behavior are not established.'
         mode = 'ephemeral-current-user-silent-manual-upgrade'
         workflowSourceRevision = $WorkflowSourceRevision
         signedArtifactSourceRevision = $script:Pins.SignedSourceRevision
@@ -724,7 +750,15 @@ function Write-SanitizedUpgradeRecord {
             installedApplication = [ordered]@{ bytes = [uint64]$Receipt.packagedApplication.bytes; sha256 = [string]$Receipt.packagedApplication.sha256 }
             installedEngineOcrSmoke = $InstalledEngineSmoke
             installedApplicationLaunch = $InstalledAppLaunch
-            publisherUi = [ordered]@{ installer = $InstallerPublisherUi; installedApplication = $ApplicationPublisherUi }
+            publisherUi = [ordered]@{
+                mode = 'hosted-noninteractive'
+                attempted = $false
+                verified = $false
+                reason = 'github-hosted-noninteractive-session'
+                screenshotsUsed = $false
+                installer = $InstallerPublisherEvidence
+                installedApplication = $ApplicationPublisherEvidence
+            }
             publisher = $script:Pins.ExpectedPublisher
             signatures = [ordered]@{ installer = 'Valid'; application = 'Valid'; pdfium = 'Valid'; engine = 'Valid'; trustedTimestampsRequired = $true }
         }
@@ -744,8 +778,10 @@ function Write-SanitizedUpgradeRecord {
             samplePdfOpened = $true
             samplePdfiumRenderVerified = $true
             launchProcessCleanupVerified = $true
-            installerShellPublisherUiVerified = $true
-            installedApplicationShellPublisherUiVerified = $true
+            publisherUiMode = 'hosted-noninteractive'
+            publisherUiAttempted = $false
+            installerShellPublisherUiVerified = $false
+            installedApplicationShellPublisherUiVerified = $false
             publisherUiScreenshotsUsed = $false
             uacPublisherPromptVerified = $false
             smartScreenPublisherPromptVerified = $false
@@ -780,6 +816,9 @@ function Write-SanitizedUpgradeRecord {
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $runnerFacts = Get-HostedRunnerFacts -ProjectRoot $projectRoot
 Assert-HostedRunnerFacts -Facts $runnerFacts
+if ($PublisherUiMode -cne 'HostedNonInteractive') {
+    throw 'GitHub-hosted upgrade verification requires exact HostedNonInteractive publisher UI mode.'
+}
 
 $runnerTemp = [string]$env:RUNNER_TEMP
 if ([string]::IsNullOrWhiteSpace($runnerTemp)) { throw 'RUNNER_TEMP is unavailable.' }
@@ -816,7 +855,7 @@ $receiptSets = Assert-SignedArtifactReceipt -Receipt $receipt
 
 $freshFacts = Get-FreshInstallFacts -InstallRoot $installRoot -SettingsRoot $settingsRoot -RegistryPath $registryPath -InstallerPaths @($baselinePath,$signedInstaller)
 Assert-FreshInstallFacts -Facts $freshFacts
-$installerPublisherUi = Invoke-InstalledPublisherUiProof `
+$installerPublisherEvidence = New-HostedPublisherUiNotAttemptedEvidence `
     -Path $signedInstaller `
     -Receipt ([pscustomobject]@{ bytes = $script:Pins.SignedInstallerBytes; sha256 = $script:Pins.SignedInstallerSha256 }) `
     -Kind 'installer' `
@@ -858,7 +897,7 @@ if ($processFacts.applicationProcessPresent -or $processFacts.installerProcessPr
 $upgraded = Get-InstallFacts -RegistryPath $registryPath -ExpectedInstallRoot $installRoot
 Assert-InstallFacts -Facts $upgraded -ExpectedVersion '0.2.6' -ExpectedInstallRoot $installRoot -ExpectedApplication $receipt.packagedApplication -ExpectedSignatureStatus 'Valid' -ExpectedPublisher $script:Pins.ExpectedPublisher -ExpectedTimestamp $true
 $installedResources = Assert-InstalledSignedResources -InstallRoot $installRoot -Receipt $receipt -ReceiptSets $receiptSets
-$applicationPublisherUi = Invoke-InstalledPublisherUiProof `
+$applicationPublisherEvidence = New-HostedPublisherUiNotAttemptedEvidence `
     -Path $installedResources.Application.FullName `
     -Receipt $receipt.packagedApplication `
     -Kind 'installed-application' `
@@ -911,7 +950,7 @@ $record = Write-SanitizedUpgradeRecord `
     -Receipt $receipt `
     -InstalledEngineSmoke $installedEngineSmoke `
     -InstalledAppLaunch $installedAppLaunch `
-    -InstallerPublisherUi $installerPublisherUi `
-    -ApplicationPublisherUi $applicationPublisherUi
+    -InstallerPublisherEvidence $installerPublisherEvidence `
+    -ApplicationPublisherEvidence $applicationPublisherEvidence
 Write-Output 'Ephemeral silent installer upgrade verification succeeded.'
 Write-Output ('Sanitized record SHA-256: ' + (Get-ExactSha256 -Path $record))
