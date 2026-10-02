@@ -18,6 +18,8 @@ The signed-upgrade verifier requires explicit `HostedNonInteractive` mode on Git
 
 ## Signing key
 
+The first `v0.2.7` tag-triggered [release run 37017454064](https://github.com/Joshua-Beel/Smacrobat/actions/runs/37017454064) failed closed in its version-validation step. PowerShell 7 rejected the plain `ConvertFrom-Json` result for `package-lock.json` because its `packages` object contains the required empty-string root key. Dependency installation, frontend and native tests, signing, installer build, asset upload, and draft creation were all skipped. The workflow now parses that file with `-AsHashtable` and indexes the root package explicitly; a PowerShell 7 regression executes the exact lookup. The existing tag remains immutable, so the corrected workflow requires a later version/tag rather than an unchanged rerun or tag rewrite.
+
 Store the private updater signing key outside Git and preserve a secure backup. Replacing or losing it prevents existing installations from accepting future updates. Never commit it or print it in logs. The public key lives in `src-tauri/tauri.conf.json`.
 
 Store the private key in the repository Actions secret `TAURI_SIGNING_PRIVATE_KEY`. Set `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` only when the chosen key is password-protected. Do not generate a replacement key for each release.

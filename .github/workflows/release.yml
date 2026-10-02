@@ -49,8 +49,8 @@ jobs:
           }
           $version = $Matches.version
           $package = Get-Content package.json -Raw -Encoding UTF8 | ConvertFrom-Json
-          $packageLock = Get-Content package-lock.json -Raw -Encoding UTF8 | ConvertFrom-Json
-          $lockRoot = $packageLock.packages.PSObject.Properties[''].Value
+          $packageLock = Get-Content package-lock.json -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable
+          $lockRoot = $packageLock['packages']['']
           $tauri = Get-Content src-tauri/tauri.conf.json -Raw -Encoding UTF8 | ConvertFrom-Json
           $cargo = Get-Content src-tauri/Cargo.toml -Raw -Encoding UTF8
           $cargoVersionMatch = [regex]::Match($cargo, '(?m)^version = "([^"]+)"$')
