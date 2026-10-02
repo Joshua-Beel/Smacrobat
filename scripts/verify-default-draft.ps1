@@ -154,7 +154,7 @@ public static class DefaultDraftBoundedProcess {
 }
 
 function Assert-BoundedArchiveListing {
-    param([string[]]$Lines,[Collections.IDictionary]$ExactFallbackSizes)
+    param([string[]]$Lines,[Collections.IDictionary]$ExactFallbackSizes,[Collections.IDictionary]$KnownPaths)
     [uint64]$entries=0;$started=$false;$state=@{path=$null;size=$null;total=[uint64]0}
     function Complete-Entry {
       if($null-eq$state.path){return}
@@ -171,7 +171,18 @@ function Assert-BoundedArchiveListing {
       if($line.StartsWith('Size = ',[StringComparison]::Ordinal)){
         if($null-eq$state.path-or $null-ne$state.size){throw 'Installer archive has an orphan or duplicate size.'}
         [uint64]$size=0;$text=$line.Substring(7).Trim();$key=([string]$state.path).Replace('\','/')
-        if($text.Length-eq0){if($null-eq$ExactFallbackSizes-or-not$ExactFallbackSizes.Contains($key)){throw 'Installer archive size is blank without its exact fallback.'};$size=[uint64]$ExactFallbackSizes[$key]}
+        if($text.Length-eq0){
+          if($null-ne$ExactFallbackSizes-and$ExactFallbackSizes.Contains($key)){$size=[uint64]$ExactFallbackSizes[$key]}
+          else{
+            $bucket='unknown'
+            if(Test-ArchiveTargetMatch $key 'resources/welcome.pdf'){$bucket='welcome-without-exact-fallback'}
+            elseif($null-ne$KnownPaths-and@($KnownPaths.Keys|Where-Object{Test-ArchiveTargetMatch $key ([string]$_)}).Count-gt0){$bucket='base-other'}
+            elseif(Test-ArchiveTargetMatch $key 'pdf-workstation.exe'){$bucket='executable'}
+            elseif(@('$PLUGINSDIR/System.dll','$PLUGINSDIR/modern-wizard.bmp','$PLUGINSDIR/nsDialogs.dll','$PLUGINSDIR/nsis_tauri_utils.dll','$PLUGINSDIR/StartMenu.dll','$PLUGINSDIR/NSISdl.dll')|Where-Object{Test-ArchiveTargetMatch $key $_}){$bucket='nsis-support'}
+            elseif($key-ceq'[0]'){$bucket='nsis-container'}
+            throw "Installer archive size is blank. EntryBucket=$bucket EntryOrdinal=$entries."
+          }
+        }
         elseif(-not [uint64]::TryParse($text,[Globalization.NumberStyles]::None,[Globalization.CultureInfo]::InvariantCulture,[ref]$size)){throw 'Installer archive size is nonnumeric.'}
         if($size-gt256MB){throw 'Installer archive entry size exceeds its bound.'}
         $state.size=$size
@@ -192,9 +203,16 @@ public static class DefaultDraftBoundedBinaryProcess {
  static async Task ReadError(StreamReader reader,int maximum,Counter counter,Action overflow){var buffer=new char[4096];while(true){int count=await reader.ReadAsync(buffer,0,buffer.Length);if(count==0)break;if(Interlocked.Add(ref counter.Value,count)>maximum){overflow();throw new InvalidOperationException("Error output exceeded its bound.");}}}
  public static void Run(string executable,string installer,string archivePath,string destination,ulong expectedBytes){var start=new ProcessStartInfo{FileName=executable,UseShellExecute=false,CreateNoWindow=true,RedirectStandardOutput=true,RedirectStandardError=true};foreach(var value in new[]{"x","-so",installer,archivePath})start.ArgumentList.Add(value);using(var process=new Process{StartInfo=start}){if(!process.Start())throw new InvalidOperationException("Process did not start.");Action kill=()=>{try{if(!process.HasExited)process.Kill(true);}catch{}};var copy=Copy(process.StandardOutput.BaseStream,destination,expectedBytes,kill);var error=ReadError(process.StandardError,65536,new Counter(),kill);var completion=Task.WhenAll(copy,error,process.WaitForExitAsync());try{if(!completion.Wait(30000)){kill();throw new TimeoutException();}completion.GetAwaiter().GetResult();}catch{kill();throw;}if(process.ExitCode!=0)throw new InvalidOperationException("Process failed.");}}
 }
+
 '@}
     try{[DefaultDraftBoundedBinaryProcess]::Run($Executable,$Installer,$ArchivePath,$Destination,$ExpectedBytes)}catch{throw 'Bounded installer entry extraction failed, timed out, or exceeded its exact byte bound.'}
     if((Get-ExactSha256 -Path $Destination)-cne$ExpectedSha256){throw 'Streamed installer entry differs from its exact source receipt.'}
+}
+
+function Get-SevenZipVersionFact {
+    param([string]$Executable,[scriptblock]$Runner)
+    try{$lines=if($Runner){@(& $Runner)}else{@(Invoke-BoundedSevenZip -Executable $Executable -Arguments @('i') -TimeoutMilliseconds 5000 -Capture)};foreach($line in $lines){if($line-cmatch'^7-Zip (\d+\.\d+)'){return $Matches[1]}}}catch{}
+    return 'unknown'
 }
 
 function Assert-ReleaseSourceVersion {
@@ -216,8 +234,8 @@ function Expand-DefaultInstaller {
     $extractor=Get-InstallerExtractor
     $listing=@(Invoke-BoundedSevenZip -Executable $extractor.FullName -Arguments @('l','-slt',$Installer) -Capture)
     $welcome=@($BaseEntries|Where-Object{[string]$_.Target-ceq'resources/welcome.pdf'});if($welcome.Count-ne1){throw 'Exact welcome resource receipt is absent or ambiguous.'}
-    $fallback=@{'resources/welcome.pdf'=[uint64]$welcome[0].Receipt.Bytes}
-    $null=Assert-BoundedArchiveListing -Lines $listing -ExactFallbackSizes $fallback
+    $fallback=@{'resources/welcome.pdf'=[uint64]$welcome[0].Receipt.Bytes};$known=@{};foreach($entry in $BaseEntries){$key=[string]$entry.Target;if($known.Contains($key)){throw 'Base resource inventory has a duplicate path.'};$known[$key]=$true}
+    try{$null=Assert-BoundedArchiveListing -Lines $listing -ExactFallbackSizes $fallback -KnownPaths $known}catch{$primary=$_.Exception.Message;$version=Get-SevenZipVersionFact $extractor.FullName;throw ($primary+' SevenZipVersion='+$version+'.')}
     $archivePaths=Convert-SevenZipInventory -Lines $listing
     Assert-ArchiveResourceInventory -ArchivePaths $archivePaths -BaseEntries $BaseEntries
     [IO.Directory]::CreateDirectory($Destination)|Out-Null

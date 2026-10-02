@@ -70,6 +70,7 @@ describe('default draft verification workflow', () => {
     expect(verifier).toContain("$memory.Length+$read -gt 1MB");
     expect(verifier).toContain("$total -gt $Bytes");
     expect(verifier).toContain("sourceBuildExecutableByteProvenanceReconstructed=$false");
+    expect(verifier).toContain("-Arguments @('i') -TimeoutMilliseconds 5000 -Capture");
     expect(verifier).not.toContain('ReadToEndAsync');
     expect(verifier).not.toMatch(/Write-(?:Host|Output|Verbose|Debug)|ConvertTo-SecureString|Start-Process|Remove-Item/);
   });
@@ -112,7 +113,7 @@ describe('default draft verification workflow', () => {
       . ./scripts/ocr/installer-package.ps1
       $tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile((Resolve-Path ./scripts/verify-default-draft.ps1),[ref]$tokens,[ref]$errors)
       if($errors.Count){throw 'Verifier did not parse.'}
-      foreach($name in @('Get-ExactReleaseAsset','Assert-DefaultInventory','Assert-BoundedArchiveListing','Invoke-BoundedSevenZip','Invoke-BoundedSevenZipEntry','Assert-ReleaseSourceVersion','Assert-PackagedApplicationIdentity')){$node=$ast.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst]-and $n.Name-ceq$name},$true);if(-not$node){throw ('Missing '+$name)};Invoke-Expression $node.Extent.Text}
+      foreach($name in @('Get-ExactReleaseAsset','Assert-DefaultInventory','Assert-BoundedArchiveListing','Invoke-BoundedSevenZip','Invoke-BoundedSevenZipEntry','Get-SevenZipVersionFact','Assert-ReleaseSourceVersion','Assert-PackagedApplicationIdentity')){$node=$ast.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst]-and $n.Name-ceq$name},$true);if(-not$node){throw ('Missing '+$name)};Invoke-Expression $node.Extent.Text}
       $script:Repository='Joshua-Beel/Smacrobat';$TargetTag='v0.2.12';$sha='A'*64
       $asset=[pscustomobject]@{id=[uint64]7;name='PDF.Workstation_0.2.12_x64-setup.exe';size=[uint64]9;state='uploaded';digest=('sha256:'+$sha.ToLowerInvariant());browser_download_url='https://github.com/Joshua-Beel/Smacrobat/releases/download/v0.2.12/PDF.Workstation_0.2.12_x64-setup.exe'}
       $release=[pscustomobject]@{assets=@($asset)}
@@ -139,11 +140,14 @@ describe('default draft verification workflow', () => {
       $bounded=Assert-BoundedArchiveListing @('----------','Path = resources\welcome.pdf','Size =   ') @{'resources/welcome.pdf'=[uint64]9};if($bounded.expandedBytes-ne9){throw 'whitespace fallback size changed'}
       $bounded=Assert-BoundedArchiveListing @('----------','Path = app.exe','Size =   10  ');if($bounded.expandedBytes-ne10){throw 'padded numeric size changed'}
       Reject {Assert-BoundedArchiveListing $blank} 'unbound blank size'
-      $message='';try{Assert-BoundedArchiveListing $blank}catch{$message=$_.Exception.Message};if($message-cne'Installer archive size is blank without its exact fallback.'){throw 'blank diagnostic changed'}
+      $message='';try{Assert-BoundedArchiveListing $blank}catch{$message=$_.Exception.Message};if($message-cne'Installer archive size is blank. EntryBucket=welcome-without-exact-fallback EntryOrdinal=1.'){throw 'welcome blank diagnostic changed'}
       Reject {Assert-BoundedArchiveListing $blank @{'resources/other.pdf'=[uint64]9}} 'wrong blank-size path'
-      Reject {Assert-BoundedArchiveListing @('----------','Path = resources/pdfium/LICENSE','Size = ') @{'resources/welcome.pdf'=[uint64]9}} 'known non-welcome blank size'
+      $message='';try{Assert-BoundedArchiveListing @('----------','Path = prefix/resources/pdfium/LICENSE','Size = ') @{'resources/welcome.pdf'=[uint64]9} @{'resources/pdfium/LICENSE'=$true}}catch{$message=$_.Exception.Message};if($message-cne'Installer archive size is blank. EntryBucket=base-other EntryOrdinal=1.'){throw 'known blank diagnostic changed'}
+      $message='';try{Assert-BoundedArchiveListing @('----------','Path = [0]','Size = ')}catch{$message=$_.Exception.Message};if($message-cne'Installer archive size is blank. EntryBucket=nsis-container EntryOrdinal=1.'){throw 'container blank diagnostic changed'}
+      $message='';try{Assert-BoundedArchiveListing @('----------','Path = prefix/pdf-workstation.exe','Size = ')}catch{$message=$_.Exception.Message};if($message-cne'Installer archive size is blank. EntryBucket=executable EntryOrdinal=1.'){throw 'package blank diagnostic changed'}
       Reject {Assert-BoundedArchiveListing @('----------','Path = resources/pdfium/LICENSE','Size =   ') @{'resources/welcome.pdf'=[uint64]9}} 'known non-welcome whitespace size'
       $message='';try{Assert-BoundedArchiveListing @('----------','Path = app.exe','Size = 1x')}catch{$message=$_.Exception.Message};if($message-cne'Installer archive size is nonnumeric.'){throw 'nonnumeric diagnostic changed'}
+      if((Get-SevenZipVersionFact 'ignored' {throw 'probe failure'})-cne'unknown'-or(Get-SevenZipVersionFact 'ignored' {'7-Zip 26.03 (x64)'})-cne'26.03'){throw 'version fact fallback changed'}
       Reject {Assert-BoundedArchiveListing @('----------','Path = bomb.bin',('Size = '+(513MB)))} 'expanded-size bomb'
       Reject {Assert-BoundedArchiveListing @('----------','Path = missing.bin')} 'missing size'
       Reject {Assert-BoundedArchiveListing @('----------','Path = malformed.bin','Size = nope')} 'malformed size'
