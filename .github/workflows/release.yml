@@ -67,6 +67,8 @@ jobs:
         shell: pwsh
       - name: Fetch locked Windows Cargo registry for offline notice checks
         run: cargo fetch --locked --target x86_64-pc-windows-msvc --manifest-path src-tauri/Cargo.toml
+      - name: Verify bundled dependency notices are current
+        run: node scripts/dependency-notices.mjs --check
       - run: npm test -- --maxWorkers=2
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
       - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9

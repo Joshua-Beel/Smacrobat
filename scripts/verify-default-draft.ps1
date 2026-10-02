@@ -1,0 +1,280 @@
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory=$true)][string]$ProjectRoot,
+    [Parameter(Mandatory=$true)][string]$TargetSourceRoot,
+    [Parameter(Mandatory=$true)][string]$AssetRoot,
+    [Parameter(Mandatory=$true)][string]$WorkRoot,
+    [Parameter(Mandatory=$true)][string]$OutputRoot,
+    [Parameter(Mandatory=$true)][string]$WorkflowSourceRevision,
+    [Parameter(Mandatory=$true)][string]$TargetVersion,
+    [Parameter(Mandatory=$true)][string]$TargetTag,
+    [Parameter(Mandatory=$true)][string]$TargetSourceRevision,
+    [Parameter(Mandatory=$true)][string]$TargetReleaseId,
+    [Parameter(Mandatory=$true)][string]$InstallerAssetId,
+    [Parameter(Mandatory=$true)][string]$InstallerName,
+    [Parameter(Mandatory=$true)][string]$InstallerBytes,
+    [Parameter(Mandatory=$true)][string]$InstallerSha256,
+    [Parameter(Mandatory=$true)][string]$SignatureAssetId,
+    [Parameter(Mandatory=$true)][string]$SignatureBytes,
+    [Parameter(Mandatory=$true)][string]$SignatureSha256,
+    [Parameter(Mandatory=$true)][string]$ManifestAssetId,
+    [Parameter(Mandatory=$true)][string]$ManifestBytes,
+    [Parameter(Mandatory=$true)][string]$ManifestSha256,
+    [Parameter(Mandatory=$true)][string]$ExpectedPublisher
+)
+$ErrorActionPreference='Stop'
+Set-StrictMode -Version Latest
+
+. (Join-Path $PSScriptRoot 'ocr/installer-package.ps1')
+. (Join-Path $PSScriptRoot 'ocr/windows-signing.ps1')
+
+$script:Repository='Joshua-Beel/Smacrobat'
+$script:MaximumAssetBytes=[uint64](256MB)
+
+function ConvertTo-ExactUInt64 {
+    param([string]$Value,[string]$Kind)
+    [uint64]$parsed=0
+    if(-not [uint64]::TryParse($Value,[Globalization.NumberStyles]::None,[Globalization.CultureInfo]::InvariantCulture,[ref]$parsed)-or $parsed -eq 0){throw "$Kind must be one positive base-10 integer."}
+    return $parsed
+}
+
+function Resolve-ProofPath {
+    param([string]$Path,[string]$RunnerTemp,[switch]$Fresh)
+    $root=[IO.Path]::GetFullPath($RunnerTemp).TrimEnd('\')
+    $candidate=[IO.Path]::GetFullPath($Path).TrimEnd('\')
+    if(-not $candidate.StartsWith($root+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'Proof paths must remain beneath RUNNER_TEMP.'}
+    Assert-NoReparseAncestors -Path $candidate
+    if($Fresh -and (Test-Path -LiteralPath $candidate)){throw 'Proof path must be fresh.'}
+    return $candidate
+}
+
+function Assert-ReceiptShape {
+    param([uint64]$Bytes,[string]$Sha256,[string]$Kind)
+    if($Bytes -eq 0 -or $Bytes -gt $script:MaximumAssetBytes -or $Sha256 -cnotmatch '^[A-F0-9]{64}$'){throw "$Kind receipt is malformed."}
+}
+
+function Invoke-GitHubJson {
+    param([string]$Uri,[string]$Token)
+    $handler=[Net.Http.HttpClientHandler]::new();$handler.AllowAutoRedirect=$false
+    $client=[Net.Http.HttpClient]::new($handler);$client.Timeout=[TimeSpan]::FromSeconds(30)
+    $request=[Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get,$Uri)
+    $request.Headers.Authorization=[Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer',$Token)
+    $request.Headers.Accept.ParseAdd('application/vnd.github+json');$request.Headers.Add('X-GitHub-Api-Version','2022-11-28')
+    $response=$null
+    try{
+        $response=$client.SendAsync($request,[Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+        if(-not $response.IsSuccessStatusCode){throw 'GitHub release metadata request failed.'}
+        $length=$response.Content.Headers.ContentLength;if($null -ne $length-and ([uint64]$length -eq 0-or [uint64]$length -gt 1MB)){throw 'GitHub release metadata size is outside its bound.'}
+        $stream=$response.Content.ReadAsStreamAsync().GetAwaiter().GetResult();$memory=[IO.MemoryStream]::new()
+        try{$buffer=[byte[]]::new(16384);while(($read=$stream.Read($buffer,0,$buffer.Length))-gt 0){if($memory.Length+$read -gt 1MB){throw 'GitHub release metadata exceeded its byte bound.'};$memory.Write($buffer,0,$read)};if($memory.Length -eq 0){throw 'GitHub release metadata was empty.'};$text=[Text.Encoding]::UTF8.GetString($memory.ToArray())}finally{$memory.Dispose();$stream.Dispose()}
+        try{return $text|ConvertFrom-Json}catch{throw 'GitHub release metadata was malformed.'}
+    }finally{if($null-ne$response){$response.Dispose()};$request.Dispose();$client.Dispose();$handler.Dispose()}
+}
+
+function Get-ExactReleaseAsset {
+    param($Release,[uint64]$Id,[string]$Name,[uint64]$Bytes,[string]$Sha256)
+    $matches=@($Release.assets|Where-Object{[uint64]$_.id -eq $Id})
+    if($matches.Count -ne 1){throw 'Draft asset id is absent or ambiguous.'}
+    $asset=$matches[0]
+    $uri=[Uri][string]$asset.browser_download_url
+    $expectedPath="/$script:Repository/releases/download/$TargetTag/$Name"
+    if([string]$asset.name -cne $Name -or [uint64]$asset.size -ne $Bytes -or [string]$asset.state -cne 'uploaded' -or
+       [string]$asset.digest -cne ('sha256:'+$Sha256.ToLowerInvariant()) -or $uri.Scheme -cne 'https' -or $uri.DnsSafeHost -cne 'github.com' -or
+       $uri.UserInfo -or $uri.Query -or $uri.Fragment -or [Uri]::UnescapeDataString($uri.AbsolutePath) -cne $expectedPath){throw 'Draft asset metadata does not match its exact receipt.'}
+    return $asset
+}
+
+function Save-ExactReleaseAsset {
+    param([uint64]$Id,[string]$Destination,[string]$Token,[uint64]$Bytes,[string]$Sha256)
+    $handler=[Net.Http.HttpClientHandler]::new();$handler.AllowAutoRedirect=$true;$handler.MaxAutomaticRedirections=5
+    $client=[Net.Http.HttpClient]::new($handler);$client.Timeout=[TimeSpan]::FromSeconds(120)
+    $request=[Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get,"https://api.github.com/repos/$script:Repository/releases/assets/$Id")
+    $request.Headers.Authorization=[Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer',$Token);$request.Headers.Accept.ParseAdd('application/octet-stream');$request.Headers.Add('X-GitHub-Api-Version','2022-11-28')
+    $response=$null
+    try{
+      $response=$client.SendAsync($request,[Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+      if(-not $response.IsSuccessStatusCode){throw 'GitHub release asset download failed.'}
+      $length=$response.Content.Headers.ContentLength;if($null-ne$length-and [uint64]$length-ne$Bytes){throw 'GitHub release asset content length differs from its receipt.'}
+      $stream=$response.Content.ReadAsStreamAsync().GetAwaiter().GetResult();$file=[IO.File]::Open($Destination,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+      try{$buffer=[byte[]]::new(65536);[uint64]$total=0;while(($read=$stream.Read($buffer,0,$buffer.Length))-gt 0){$total += [uint64]$read;if($total -gt $Bytes){throw 'GitHub release asset exceeded its exact byte receipt.'};$file.Write($buffer,0,$read)};if($total-ne$Bytes){throw 'GitHub release asset ended before its exact byte receipt.'}}finally{$file.Dispose();$stream.Dispose()}
+    }finally{if($null-ne$response){$response.Dispose()};$request.Dispose();$client.Dispose();$handler.Dispose()}
+    $item=Get-Item -LiteralPath $Destination
+    if([uint64]$item.Length -ne $Bytes -or (Get-ExactSha256 -Path $Destination) -cne $Sha256){throw 'Downloaded draft asset does not match its exact receipt.'}
+}
+
+function Invoke-BoundedSevenZip {
+    param([string]$Executable,[string[]]$Arguments,[int]$TimeoutMilliseconds=120000,[switch]$Capture)
+    if(-not ('DefaultDraftBoundedProcess' -as [type])){
+      Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+public static class DefaultDraftBoundedProcess {
+  sealed class Counter { public int Value; }
+  static async Task<string> ReadBounded(System.IO.StreamReader reader, int maximum, Counter counter, Action overflow) {
+    var value = new StringBuilder(); var buffer = new char[8192];
+    while (true) { int count = await reader.ReadAsync(buffer, 0, buffer.Length); if (count == 0) break; if (Interlocked.Add(ref counter.Value, count) > maximum) { overflow(); throw new InvalidOperationException("Bounded process output exceeded its limit."); } value.Append(buffer, 0, count); }
+    return value.ToString();
+  }
+  public static string Run(string executable, string[] arguments, int timeoutMilliseconds, int maximumCharacters) {
+    var start = new ProcessStartInfo { FileName=executable, UseShellExecute=false, CreateNoWindow=true, WindowStyle=ProcessWindowStyle.Hidden, RedirectStandardOutput=true, RedirectStandardError=true };
+    foreach (var argument in arguments) start.ArgumentList.Add(argument);
+    using (var process = new Process { StartInfo=start }) {
+      if (!process.Start()) throw new InvalidOperationException("Bounded process did not start.");
+      Action kill = () => { try { if (!process.HasExited) process.Kill(true); } catch {} };
+      var counter = new Counter(); var stdout = ReadBounded(process.StandardOutput, maximumCharacters, counter, kill); var stderr = ReadBounded(process.StandardError, maximumCharacters, counter, kill);
+      try { if (!process.WaitForExit(timeoutMilliseconds)) { kill(); process.WaitForExit(); throw new TimeoutException("Bounded process timed out."); } Task.WaitAll(stdout, stderr); }
+      catch { kill(); throw; }
+      if (process.ExitCode != 0) throw new InvalidOperationException("Bounded process failed.");
+      return stdout.Result;
+    }
+  }
+}
+'@
+    }
+    try{$stdout=[DefaultDraftBoundedProcess]::Run($Executable,$Arguments,$TimeoutMilliseconds,2MB)}catch{throw 'Bounded 7-Zip process failed, timed out, or exceeded its output bound.'}
+    if($Capture){return @($stdout -split '\r?\n')}
+}
+
+function Assert-BoundedArchiveListing {
+    param([string[]]$Lines)
+    [uint64]$entries=0;$started=$false;$state=@{path=$null;size=$null;total=[uint64]0}
+    function Complete-Entry {
+      if($null-eq$state.path){return}
+      if($null-eq$state.size){throw 'Installer archive entry has no exact numeric size.'}
+      $scriptSize=[uint64]$state.size
+      if([uint64]::MaxValue-[uint64]$state.total-lt$scriptSize){throw 'Installer archive expanded size overflowed.'};$state.total=[uint64]$state.total+$scriptSize
+      if([uint64]$state.total -gt 512MB){throw 'Installer archive expanded size exceeds its bound.'}
+      $state.path=$null;$state.size=$null
+    }
+    foreach($line in $Lines){
+      if($line -ceq '----------'){$started=$true;continue}
+      if(-not$started){continue}
+      if($line -cmatch '^Path = (.+)$'){Complete-Entry;$state.path=$Matches[1];$entries++;if($entries -gt 512){throw 'Installer archive entry count exceeds its bound.'};continue}
+      if($line.StartsWith('Size = ',[StringComparison]::Ordinal)){
+        if($null-eq$state.path-or $null-ne$state.size){throw 'Installer archive has an orphan or duplicate size.'}
+        [uint64]$size=0;if(-not [uint64]::TryParse($line.Substring(7),[Globalization.NumberStyles]::None,[Globalization.CultureInfo]::InvariantCulture,[ref]$size)-or $size -gt 256MB){throw 'Installer archive entry size exceeds its bound.'}
+        $state.size=$size
+      }
+    }
+    Complete-Entry
+    if($entries -eq 0){throw 'Installer archive listing is empty.'}
+    return [pscustomobject]@{entries=$entries;expandedBytes=[uint64]$state.total}
+}
+
+function Assert-ReleaseSourceVersion {
+    param([string]$WorkflowRoot,[string]$SourceRoot,[string]$Version)
+    & (Join-Path $WorkflowRoot 'scripts/assert-release-version.ps1') -ProjectRoot $SourceRoot -Version $Version
+}
+
+function Assert-PackagedApplicationIdentity {
+    param([string]$Path,[string]$Version,[scriptblock]$VersionProvider)
+    $facts=if($VersionProvider){&$VersionProvider $Path}else{(Get-Item -LiteralPath $Path).VersionInfo}
+    if([string]$facts.FileVersion -cne $Version-or [string]$facts.ProductVersion -cne $Version-or [string]$facts.ProductName -cne 'PDF Workstation'){
+      throw 'Packaged application product identity or version differs from the exact release source.'
+    }
+}
+
+function Expand-DefaultInstaller {
+    param([string]$Installer,[string]$Destination,[object[]]$BaseEntries)
+    if(Test-Path -LiteralPath $Destination){throw 'Extraction destination must be fresh.'}
+    $extractor=Get-InstallerExtractor
+    $listing=@(Invoke-BoundedSevenZip -Executable $extractor.FullName -Arguments @('l','-slt',$Installer) -Capture)
+    $null=Assert-BoundedArchiveListing -Lines $listing
+    $archivePaths=Convert-SevenZipInventory -Lines $listing
+    Assert-ArchiveResourceInventory -ArchivePaths $archivePaths -BaseEntries $BaseEntries
+    [IO.Directory]::CreateDirectory($Destination)|Out-Null
+    Assert-NoReparseAncestors -Path $Destination
+    Invoke-BoundedSevenZip -Executable $extractor.FullName -Arguments @('x',$Installer,"-o$Destination",'-y','-bd','-bb0')
+    Assert-NoReparseAncestors -Path $Destination
+    foreach($entry in @(Get-ChildItem -LiteralPath $Destination -Recurse -Force)){
+        Assert-NoReparseAncestors -Path $entry.FullName
+        if(($entry.Attributes -band [IO.FileAttributes]::ReparsePoint)-ne 0){throw 'Extracted installer contains a reparse point.'}
+    }
+    return @(Get-ChildItem -LiteralPath $Destination -Recurse -File -Force)
+}
+
+function Assert-DefaultInventory {
+    param([object[]]$Files,[string]$Root,[object[]]$BaseEntries)
+    $canonical=[IO.Path]::GetFullPath($Root).TrimEnd('\')
+    $actual=New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach($file in $Files){
+        $path=[IO.Path]::GetFullPath([string]$file.FullName)
+        if(-not $path.StartsWith($canonical+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'Extracted file escaped the proof root.'}
+        Assert-NoReparseAncestors -Path $path
+        $relative=$path.Substring($canonical.Length+1).Replace('\','/')
+        if([string]::IsNullOrWhiteSpace($relative)-or $relative.Contains('..')-or -not $actual.Add($relative)){throw 'Extracted inventory has an unsafe, duplicate, or case-colliding path.'}
+    }
+    $required=New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $null=$required.Add('pdf-workstation.exe')
+    foreach($entry in $BaseEntries){$null=$required.Add([string]$entry.Target)}
+    foreach($path in @('$PLUGINSDIR/modern-wizard.bmp','$PLUGINSDIR/nsDialogs.dll','$PLUGINSDIR/nsis_tauri_utils.dll','$PLUGINSDIR/NSISdl.dll','$PLUGINSDIR/StartMenu.dll','$PLUGINSDIR/System.dll')){$null=$required.Add($path)}
+    foreach($path in $required){if(-not $actual.Contains($path)){throw 'Extracted installer is missing an exact payload or NSIS support file.'}}
+    foreach($path in $actual){if(-not $required.Contains($path)-and -not $path.Equals('uninstall.exe',[StringComparison]::OrdinalIgnoreCase)){throw 'Extracted installer contains an unexpected file.'}}
+    if($actual.Count -ne $required.Count -and $actual.Count -ne ($required.Count+1)){throw 'Extracted installer cardinality is unsupported.'}
+    if(@($actual|Where-Object{$_.StartsWith('resources/ocr/',[StringComparison]::OrdinalIgnoreCase)-or $_.ToLowerInvariant().Contains('/resources/ocr/')}).Count -ne 0){throw 'Default installer unexpectedly contains OCR resources.'}
+    return [pscustomobject]@{required=[uint64]$required.Count;actual=[uint64]$actual.Count;optionalUninstaller=$actual.Contains('uninstall.exe')}
+}
+
+function Get-UniqueExtractedFile {
+    param([object[]]$Files,[string]$Suffix,[string]$Kind)
+    $shape=$Suffix.Replace('\','/')
+    $matches=@($Files|Where-Object{$value=$_.FullName.Replace('\','/');$value.Equals($shape,[StringComparison]::OrdinalIgnoreCase)-or $value.EndsWith('/'+$shape,[StringComparison]::OrdinalIgnoreCase)})
+    if($matches.Count -ne 1){throw "$Kind is absent or ambiguous."}
+    return $matches[0]
+}
+
+if($TargetVersion -cnotmatch '^\d+\.\d+\.\d+$'-or $TargetTag -cne "v$TargetVersion"-or $WorkflowSourceRevision -cnotmatch '^[a-f0-9]{40}$'-or $TargetSourceRevision -cnotmatch '^[a-f0-9]{40}$'-or [string]::IsNullOrWhiteSpace($ExpectedPublisher)){throw 'Draft identity inputs are malformed.'}
+Assert-ReleaseSourceVersion -WorkflowRoot $ProjectRoot -SourceRoot $TargetSourceRoot -Version $TargetVersion
+$releaseId=ConvertTo-ExactUInt64 $TargetReleaseId 'Release id';$installerId=ConvertTo-ExactUInt64 $InstallerAssetId 'Installer asset id';$signatureId=ConvertTo-ExactUInt64 $SignatureAssetId 'Signature asset id';$manifestId=ConvertTo-ExactUInt64 $ManifestAssetId 'Manifest asset id'
+$installerLength=ConvertTo-ExactUInt64 $InstallerBytes 'Installer bytes';$signatureLength=ConvertTo-ExactUInt64 $SignatureBytes 'Signature bytes';$manifestLength=ConvertTo-ExactUInt64 $ManifestBytes 'Manifest bytes'
+Assert-ReceiptShape $installerLength $InstallerSha256 'Installer';Assert-ReceiptShape $signatureLength $SignatureSha256 'Signature';Assert-ReceiptShape $manifestLength $ManifestSha256 'Manifest'
+if($InstallerName -cne "PDF.Workstation_${TargetVersion}_x64-setup.exe"){throw 'Installer name is not the exact release asset name.'}
+$runnerTemp=$env:RUNNER_TEMP;if([string]::IsNullOrWhiteSpace($runnerTemp)){throw 'RUNNER_TEMP is unavailable.'}
+$assetRoot=Resolve-ProofPath $AssetRoot $runnerTemp -Fresh;$workRoot=Resolve-ProofPath $WorkRoot $runnerTemp -Fresh;$outputRoot=Resolve-ProofPath $OutputRoot $runnerTemp -Fresh
+[IO.Directory]::CreateDirectory($assetRoot)|Out-Null;[IO.Directory]::CreateDirectory($workRoot)|Out-Null;[IO.Directory]::CreateDirectory($outputRoot)|Out-Null
+if([string]::IsNullOrWhiteSpace($env:GITHUB_TOKEN)){throw 'GitHub token is unavailable.'}
+$release=Invoke-GitHubJson "https://api.github.com/repos/$script:Repository/releases/$releaseId" $env:GITHUB_TOKEN
+$expectedNames=@($InstallerName,"$InstallerName.sig",'latest.json')|Sort-Object
+$actualNames=@($release.assets|ForEach-Object{[string]$_.name}|Sort-Object)
+if([uint64]$release.id -ne $releaseId-or [string]$release.tag_name -cne $TargetTag-or -not [bool]$release.draft-or [bool]$release.prerelease-or [string]$release.target_commitish -cne $TargetSourceRevision-or $actualNames.Count -ne 3-or (Compare-Object $expectedNames $actualNames -CaseSensitive)){throw 'Release is not the exact source-bound three-asset draft.'}
+$null=Get-ExactReleaseAsset $release $installerId $InstallerName $installerLength $InstallerSha256
+$null=Get-ExactReleaseAsset $release $signatureId "$InstallerName.sig" $signatureLength $SignatureSha256
+$null=Get-ExactReleaseAsset $release $manifestId 'latest.json' $manifestLength $ManifestSha256
+$installerPath=Join-Path $assetRoot $InstallerName;$signaturePath=Join-Path $assetRoot "$InstallerName.sig";$manifestPath=Join-Path $assetRoot 'latest.json'
+Save-ExactReleaseAsset $installerId $installerPath $env:GITHUB_TOKEN $installerLength $InstallerSha256
+Save-ExactReleaseAsset $signatureId $signaturePath $env:GITHUB_TOKEN $signatureLength $SignatureSha256
+Save-ExactReleaseAsset $manifestId $manifestPath $env:GITHUB_TOKEN $manifestLength $ManifestSha256
+$signatureText=(Get-Content -LiteralPath $signaturePath -Raw -Encoding UTF8).Trim();if([string]::IsNullOrWhiteSpace($signatureText)-or [Text.Encoding]::UTF8.GetByteCount($signatureText)-gt 65536){throw 'Detached updater signature text is malformed.'}
+try{$manifest=Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8|ConvertFrom-Json}catch{throw 'Updater manifest is malformed.'}
+$platform=$manifest.platforms.'windows-x86_64';$notes=Get-Content -LiteralPath (Join-Path $TargetSourceRoot 'docs/release-notes.md') -Raw -Encoding UTF8
+$expectedUrl="https://github.com/$script:Repository/releases/download/$TargetTag/$InstallerName"
+if([string]$manifest.version -cne $TargetVersion-or [string]$platform.url -cne $expectedUrl-or [string]$platform.signature -cne $signatureText-or [string]$manifest.notes -cne $notes){throw 'Updater manifest is not exactly bound to version, URL, signature text, and tagged notes.'}
+$null=Assert-TrustedWindowsSignature -Path $installerPath -ExpectedPublisher $ExpectedPublisher
+$base=Get-BaseBundleResourceMap -ProjectRoot $TargetSourceRoot
+if([uint64]$base.Count -ne 26){throw 'Default tagged-source resource inventory is not exactly 26 files.'}
+$extractionRoot=Join-Path $workRoot 'extracted-installer';$files=Expand-DefaultInstaller $installerPath $extractionRoot $base.Entries
+$inventory=Assert-DefaultInventory $files $extractionRoot $base.Entries
+$application=Get-UniqueExtractedFile $files 'pdf-workstation.exe' 'Packaged application';Assert-PackagedApplicationIdentity -Path $application.FullName -Version $TargetVersion;$null=Assert-TrustedWindowsSignature -Path $application.FullName -ExpectedPublisher $ExpectedPublisher
+$resourceReceipts=@()
+foreach($entry in $base.Entries){
+    $match=Get-UniqueExtractedFile $files ([string]$entry.Target) 'Base resource'
+    if([string]$entry.Target -ceq 'resources/pdfium/bin/pdfium.dll'){
+        Assert-SignedPdfiumEquivalent -UnsignedPath $entry.Source -SignedPath $match.FullName -ExpectedPublisher $ExpectedPublisher
+        $resourceReceipts+=[ordered]@{target=$entry.Target;bytes=[uint64]$match.Length;sha256=Get-ExactSha256 $match.FullName;unsignedBytes=[uint64]$entry.Receipt.Bytes;unsignedSha256=[string]$entry.Receipt.Sha256}
+    }else{
+        if([uint64]$match.Length -ne [uint64]$entry.Receipt.Bytes-or (Get-ExactSha256 $match.FullName)-cne [string]$entry.Receipt.Sha256){throw 'Extracted base resource differs from tagged source.'}
+        $resourceReceipts+=[ordered]@{target=$entry.Target;bytes=[uint64]$match.Length;sha256=[string]$entry.Receipt.Sha256}
+    }
+}
+$record=[ordered]@{
+ schemaVersion=1;scope='Read-only default draft download and extraction proof; no installation, launch, updater cryptographic verification, or publication claim.';mode='default-draft-extraction';workflowSourceRevision=$WorkflowSourceRevision;targetVersion=$TargetVersion;targetTag=$TargetTag;targetSourceRevision=$TargetSourceRevision;releaseId=$releaseId
+ assets=@([ordered]@{role='installer';id=$installerId;name=$InstallerName;bytes=$installerLength;sha256=$InstallerSha256},[ordered]@{role='detachedUpdaterSignature';id=$signatureId;name="$InstallerName.sig";bytes=$signatureLength;sha256=$SignatureSha256},[ordered]@{role='updaterManifest';id=$manifestId;name='latest.json';bytes=$manifestLength;sha256=$ManifestSha256})
+ packagedApplication=[ordered]@{bytes=[uint64]$application.Length;sha256=Get-ExactSha256 $application.FullName}
+ baseResources=@($resourceReceipts|Sort-Object target);signatures=[ordered]@{expectedPublisher=$ExpectedPublisher;installer='Valid';application='Valid';pdfium='Valid';trustedTimestampsRequired=$true}
+ verification=[ordered]@{draft=$true;prerelease=$false;exactAssetInventory=$true;exactExtractedInventory=$true;targetSourceSixVersionsMatched=$true;packagedApplicationIdentityAndVersionMatched=$true;sourceBuildExecutableByteProvenanceReconstructed=$false;requiredExtractedFiles=$inventory.required;actualExtractedFiles=$inventory.actual;optionalUninstaller=$inventory.optionalUninstaller;ocrBundled=$false;manifestSignatureTextBound=$true;detachedUpdaterCryptographyVerified=$false;installedBehaviorVerified=$false}
+}
+[IO.File]::WriteAllText((Join-Path $outputRoot 'default-draft-verification.json'),($record|ConvertTo-Json -Depth 20),[Text.UTF8Encoding]::new($false))

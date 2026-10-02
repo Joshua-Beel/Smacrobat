@@ -34,6 +34,8 @@ describe('Windows validation workflow', () => {
       'run: npm run fixtures',
       'run: ./scripts/setup-pdfium.ps1',
       'run: cargo fetch --locked --target x86_64-pc-windows-msvc --manifest-path src-tauri/Cargo.toml',
+      'Verify bundled dependency notices are current',
+      'run: node scripts/dependency-notices.mjs --check',
       'run: npm test -- --maxWorkers=2',
       'run: cargo test --locked --manifest-path src-tauri/Cargo.toml',
       'run: npm run build',

@@ -2943,7 +2943,7 @@ dependencies = [
 
 [[package]]
 name = "pdf-workstation"
-version = "0.2.11"
+version = "0.2.12"
 dependencies = [
  "image",
  "lopdf",

@@ -3,10 +3,10 @@
   "target": "x86_64-pc-windows-msvc",
   "coverage": "Conservative resolved Cargo Windows graph, including build/auxiliary packages, plus non-development npm lock entries. Runtime-candidate is not proof of linked code. PDFium notices are packaged separately. Five exact MPL-2.0 crate source archives are packaged with verified locations and hashes; this collection does not determine the app license or complete release licensing review.",
   "inputHashes": {
-    "src-tauri/Cargo.lock": "00b7b3c4523e27c26763b6a8807acaa48b60ddec7b2878a5e3bd45ff4078e2d9",
-    "src-tauri/Cargo.toml": "894d8f16b1657038506ef3a50e6a74acbd75ded39067eed790ee3d9b9b20ecf7",
-    "package-lock.json": "879c35708df222e14484fdc713666a2a3c8de68efd3a6f7c9da9dde85a889431",
-    "package.json": "540167cab7f03a90238afd1634e05f621dc4426a1b009295624055ebe75c19e3",
+    "src-tauri/Cargo.lock": "a8597d8de93062f5d192a2fdac14f8dc76a19baddcb0c29787c31cab3bfb6c3a",
+    "src-tauri/Cargo.toml": "dd8bb5fabe94334d0ecfe26544a22772f8e8aa07db978cbcf29f6ef6c9597372",
+    "package-lock.json": "a1f1fbe3a2da3dc5ba90e7c44e41ad345e43f126a5f06e6e52fb408b0dfbdcde",
+    "package.json": "cd977b6ef4c878781c31668f6c3e4209b559130e044e5285d67f9d2f5b93c320",
     "scripts/notice-supplements/manifest.json": "f0700cbb9d20d43f42d709852e7961194d22937a41bf1fad5063e27f5fae2121",
     "scripts/mpl-source-archives.manifest.json": "d5575a6facde7afb4f4faae54009bb776da8b0d1410c68de1915c7a46a73e915"
   },

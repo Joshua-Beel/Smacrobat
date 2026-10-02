@@ -1,0 +1,109 @@
+import { describe, expect, it } from 'vitest';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+
+const workflow = readFileSync('.github/workflows/default-draft-verification.yml', 'utf8');
+const verifier = readFileSync('scripts/verify-default-draft.ps1', 'utf8');
+
+function runPowerShell(source: string) {
+  const root = `target/default-draft-test-${randomUUID()}`;
+  mkdirSync(root, { recursive: true });
+  const script = `${root}/run.ps1`;
+  writeFileSync(script, source, 'utf8');
+  try {
+    return spawnSync('pwsh', ['-NoProfile', '-NonInteractive', '-File', script], { encoding: 'utf8', timeout: 30_000 });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+describe('default draft verification workflow', () => {
+  it('is a pinned manual read-only proof with exact user-supplied receipts and no release or install capability', () => {
+    expect(workflow).toContain('workflow_dispatch:');
+    expect(workflow).not.toMatch(/^\s*(push|pull_request|schedule):/m);
+    expect(workflow).toContain('runs-on: windows-2022');
+    expect(workflow).toContain('contents: read');
+    expect(workflow).not.toMatch(/contents:\s*write|actions:\s*write|id-token:\s*write/);
+    for (const input of ['target_version', 'target_tag', 'target_source_revision', 'target_release_id', 'installer_asset_id', 'installer_name', 'installer_bytes', 'installer_sha256', 'signature_asset_id', 'signature_bytes', 'signature_sha256', 'manifest_asset_id', 'manifest_bytes', 'manifest_sha256', 'expected_publisher']) {
+      expect(workflow).toContain(`${input}:`);
+    }
+    const uses = [...workflow.matchAll(/^\s*-?\s*uses:\s*([^\s#]+)\s*$/gm)].map(match => match[1]);
+    expect(uses).toEqual([
+      'actions/checkout@11d5960a326750d5838078e36cf38b85af677262',
+      'actions/checkout@11d5960a326750d5838078e36cf38b85af677262',
+      'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02',
+    ]);
+    for (const use of uses) expect(use).toMatch(/@[0-9a-f]{40}$/);
+    expect(workflow.match(/persist-credentials: false/g)).toHaveLength(2);
+    expect(workflow).toContain('ref: ${{ inputs.target_source_revision }}');
+    expect(workflow).toContain('git -C target-source rev-parse "$env:TARGET_TAG^{commit}"');
+    expect(workflow).toContain('if: ${{ always() }}');
+    expect(workflow).not.toMatch(/gh release|cargo |npm run build|setup-dotnet|artifact-signing|Start-Process|\.\/(?:target-source\/)?src-tauri\/target/);
+    expect(workflow).not.toMatch(/secrets\.|TAURI_SIGNING_PRIVATE_KEY|AZURE_(?:TENANT|CLIENT|SIGNING)/);
+  });
+
+  it('binds a bounded three-asset draft to exact source resources and separates signature text from crypto proof', () => {
+    expect(verifier).toContain("$base.Count -ne 26");
+    expect(verifier).toContain('Assert-SignedPdfiumEquivalent');
+    expect(verifier).toContain('Assert-ReleaseSourceVersion -WorkflowRoot $ProjectRoot -SourceRoot $TargetSourceRoot -Version $TargetVersion');
+    expect(verifier).toContain('Assert-PackagedApplicationIdentity -Path $application.FullName -Version $TargetVersion');
+    expect(verifier).toContain('Convert-SevenZipInventory -Lines $listing');
+    expect(verifier).toContain('Assert-ArchiveResourceInventory -ArchivePaths $archivePaths -BaseEntries $BaseEntries');
+    expect(verifier).toContain("throw 'Extracted installer contains a reparse point.'");
+    expect(verifier).toContain('Assert-TrustedWindowsSignature -Path $installerPath');
+    expect(verifier).toContain("detachedUpdaterCryptographyVerified=$false");
+    expect(verifier).toContain("ocrBundled=$false");
+    expect(verifier).toContain("$actualNames.Count -ne 3");
+    expect(verifier).toContain("$memory.Length+$read -gt 1MB");
+    expect(verifier).toContain("$total -gt $Bytes");
+    expect(verifier).toContain("sourceBuildExecutableByteProvenanceReconstructed=$false");
+    expect(verifier).not.toContain('ReadToEndAsync');
+    expect(verifier).not.toMatch(/Write-(?:Host|Output|Verbose|Debug)|ConvertTo-SecureString|Start-Process|Remove-Item/);
+  });
+
+  it('executes the real metadata and extraction inventory guards against missing, extra, OCR, collision, and traversal-shaped cases', () => {
+    const check = String.raw`
+      $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
+      Set-Location -LiteralPath '${process.cwd().replaceAll("'", "''")}'
+      . ./scripts/ocr/installer-package.ps1
+      $tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile((Resolve-Path ./scripts/verify-default-draft.ps1),[ref]$tokens,[ref]$errors)
+      if($errors.Count){throw 'Verifier did not parse.'}
+      foreach($name in @('Get-ExactReleaseAsset','Assert-DefaultInventory','Assert-BoundedArchiveListing','Invoke-BoundedSevenZip','Assert-ReleaseSourceVersion','Assert-PackagedApplicationIdentity')){$node=$ast.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst]-and $n.Name-ceq$name},$true);if(-not$node){throw ('Missing '+$name)};Invoke-Expression $node.Extent.Text}
+      $script:Repository='Joshua-Beel/Smacrobat';$TargetTag='v0.2.12';$sha='A'*64
+      $asset=[pscustomobject]@{id=[uint64]7;name='PDF.Workstation_0.2.12_x64-setup.exe';size=[uint64]9;state='uploaded';digest=('sha256:'+$sha.ToLowerInvariant());browser_download_url='https://github.com/Joshua-Beel/Smacrobat/releases/download/v0.2.12/PDF.Workstation_0.2.12_x64-setup.exe'}
+      $release=[pscustomobject]@{assets=@($asset)}
+      $null=Get-ExactReleaseAsset $release 7 $asset.name 9 $sha
+      function Reject([scriptblock]$Action,[string]$Kind){$failed=$false;try{&$Action}catch{$failed=$true};if(-not$failed){throw ($Kind+' accepted')}}
+      Reject {Get-ExactReleaseAsset $release 7 $asset.name 10 $sha} 'wrong bytes'
+      $asset.browser_download_url='https://github.com/Joshua-Beel/Smacrobat/releases/download/v0.2.12/../escape.exe';Reject {Get-ExactReleaseAsset $release 7 $asset.name 9 $sha} 'traversal URL'
+      $root=Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'inventory';[IO.Directory]::CreateDirectory($root)|Out-Null
+      function Put([string]$Relative){$path=Join-Path $root $Relative;[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($path))|Out-Null;[IO.File]::WriteAllText($path,'x',[Text.UTF8Encoding]::new($false));return Get-Item $path}
+      $base=@([pscustomobject]@{Target='resources/welcome.pdf'})
+      $paths=@('pdf-workstation.exe','resources/welcome.pdf','$PLUGINSDIR/modern-wizard.bmp','$PLUGINSDIR/nsDialogs.dll','$PLUGINSDIR/nsis_tauri_utils.dll','$PLUGINSDIR/NSISdl.dll','$PLUGINSDIR/StartMenu.dll','$PLUGINSDIR/System.dll')
+      $files=@($paths|ForEach-Object{Put $_});$facts=Assert-DefaultInventory $files $root $base;if($facts.required-ne8-or$facts.actual-ne8){throw 'valid inventory failed'}
+      $extra=@($files)+(Put 'extra.dll');Reject {Assert-DefaultInventory $extra $root $base} 'extra file'
+      $ocr=@($files)+(Put 'resources/ocr/bad/model.bin');Reject {Assert-DefaultInventory $ocr $root $base} 'OCR file'
+      $missing=@($files|Where-Object{$_.Name-ne'welcome.pdf'});Reject {Assert-DefaultInventory $missing $root $base} 'missing resource'
+      $case=@($files)+(Put 'RESOURCES/WELCOME.PDF');Reject {Assert-DefaultInventory $case $root $base} 'case collision'
+      $listing=@('----------','Path = app.exe','Size = 10','Path = data.bin','Size = 20');$bounded=Assert-BoundedArchiveListing $listing;if($bounded.entries-ne2-or$bounded.expandedBytes-ne30){throw 'bounded listing facts changed'}
+      Reject {Assert-BoundedArchiveListing @('----------','Path = bomb.bin',('Size = '+(513MB)))} 'expanded-size bomb'
+      Reject {Assert-BoundedArchiveListing @('----------','Path = missing.bin')} 'missing size'
+      Reject {Assert-BoundedArchiveListing @('----------','Path = malformed.bin','Size = nope')} 'malformed size'
+      Reject {Assert-BoundedArchiveListing @('----------','Size = 1')} 'orphan size'
+      Reject {Assert-BoundedArchiveListing @('----------','Path = duplicate.bin','Size = 1','Size = 1')} 'duplicate size'
+      $many=@('----------');for($index=0;$index-lt513;$index++){$many+=('Path = file-'+$index);$many+='Size = 1'};Reject {Assert-BoundedArchiveListing $many} 'entry-count bomb'
+      Reject {Invoke-BoundedSevenZip -Executable (Get-Command pwsh).Source -Arguments @('-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 2') -TimeoutMilliseconds 100} 'process timeout'
+      Reject {Invoke-BoundedSevenZip -Executable (Get-Command pwsh).Source -Arguments @('-NoProfile','-NonInteractive','-Command',"[Console]::Out.Write('x'*(3MB))") -TimeoutMilliseconds 10000} 'process output overflow'
+      $fake=Put 'version-fixture.exe';$goodVersion={param($path)[pscustomobject]@{FileVersion='0.2.12';ProductVersion='0.2.12';ProductName='PDF Workstation'}};$oldVersion={param($path)[pscustomobject]@{FileVersion='0.2.11';ProductVersion='0.2.11';ProductName='PDF Workstation'}}
+      Assert-PackagedApplicationIdentity $fake.FullName '0.2.12' $goodVersion;Reject {Assert-PackagedApplicationIdentity $fake.FullName '0.2.12' $oldVersion} 'old application'
+      $source=Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'source';foreach($relative in @('package.json','package-lock.json','src-tauri/tauri.conf.json','src-tauri/Cargo.toml','src-tauri/Cargo.lock')){$destination=Join-Path $source $relative;[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($destination))|Out-Null;[IO.File]::Copy((Join-Path (Get-Location) $relative),$destination)}
+      Assert-ReleaseSourceVersion (Get-Location).Path $source '0.2.12';$package=Get-Content (Join-Path $source 'package.json') -Raw|ConvertFrom-Json;$package.version='9.9.9';[IO.File]::WriteAllText((Join-Path $source 'package.json'),($package|ConvertTo-Json -Depth 20),[Text.UTF8Encoding]::new($false));Reject {Assert-ReleaseSourceVersion (Get-Location).Path $source '0.2.12'} 'source version mismatch'
+      Write-Output PASS
+    `;
+    const result = runPowerShell(check);
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr || result.stdout).toBe(0);
+    expect(result.stdout).toContain('PASS');
+  }, 20_000);
+});

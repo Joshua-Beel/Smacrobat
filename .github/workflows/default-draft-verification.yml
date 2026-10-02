@@ -1,0 +1,135 @@
+name: Manual default draft verification
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_version: { description: Exact stable version, required: true, type: string }
+      target_tag: { description: Exact stable tag, required: true, type: string }
+      target_source_revision: { description: Exact 40-character release source SHA, required: true, type: string }
+      target_release_id: { description: Exact draft release ID, required: true, type: string }
+      installer_asset_id: { description: Exact installer asset ID, required: true, type: string }
+      installer_name: { description: Exact installer asset name, required: true, type: string }
+      installer_bytes: { description: Exact installer byte count, required: true, type: string }
+      installer_sha256: { description: Exact uppercase installer SHA-256, required: true, type: string }
+      signature_asset_id: { description: Exact detached-signature asset ID, required: true, type: string }
+      signature_bytes: { description: Exact detached-signature byte count, required: true, type: string }
+      signature_sha256: { description: Exact uppercase detached-signature SHA-256, required: true, type: string }
+      manifest_asset_id: { description: Exact latest.json asset ID, required: true, type: string }
+      manifest_bytes: { description: Exact latest.json byte count, required: true, type: string }
+      manifest_sha256: { description: Exact uppercase latest.json SHA-256, required: true, type: string }
+      expected_publisher: { description: Exact trusted Authenticode publisher, required: true, type: string }
+
+permissions:
+  contents: read
+
+concurrency:
+  group: default-draft-verification-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  verify-default-draft:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - name: Require a manual master dispatch
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REPOSITORY -cne 'Joshua-Beel/Smacrobat' -or $env:GITHUB_EVENT_NAME -cne 'workflow_dispatch' -or $env:GITHUB_REF -cne 'refs/heads/master') {
+            throw 'Dispatch default draft verification only from master.'
+          }
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: Joshua-Beel/Smacrobat
+          ref: ${{ inputs.target_source_revision }}
+          fetch-depth: 0
+          persist-credentials: false
+          path: target-source
+
+      - name: Verify exact clean workflow and target sources
+        shell: pwsh
+        env:
+          TARGET_SOURCE_REVISION: ${{ inputs.target_source_revision }}
+          TARGET_TAG: ${{ inputs.target_tag }}
+        run: |
+          $head=(git rev-parse HEAD).Trim()
+          $targetHead=(git -C target-source rev-parse HEAD).Trim()
+          $tagHead=(git -C target-source rev-parse "$env:TARGET_TAG^{commit}").Trim()
+          if ($LASTEXITCODE -ne 0 -or $head -cne $env:GITHUB_SHA -or $targetHead -cne $env:TARGET_SOURCE_REVISION -or $tagHead -cne $env:TARGET_SOURCE_REVISION) { throw 'Workflow checkout, target checkout, and target tag are not exact.' }
+          git diff --quiet --
+          if ($LASTEXITCODE -ne 0) { throw 'Workflow source has tracked changes.' }
+          git diff --cached --quiet --
+          if ($LASTEXITCODE -ne 0) { throw 'Workflow source index has changes.' }
+          git -C target-source diff --quiet --
+          if ($LASTEXITCODE -ne 0) { throw 'Target source has tracked changes.' }
+          git -C target-source diff --cached --quiet --
+          if ($LASTEXITCODE -ne 0) { throw 'Target source index has changes.' }
+
+      - name: Initialize fresh proof paths
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP) -or [string]::IsNullOrWhiteSpace($env:GITHUB_ENV)) { throw 'Runner paths are unavailable.' }
+          $root=[IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\')
+          $writer=[IO.StreamWriter]::new($env:GITHUB_ENV,$true,[Text.UTF8Encoding]::new($false))
+          try {
+            $writer.WriteLine("DRAFT_ASSET_ROOT=$root\default-draft-assets")
+            $writer.WriteLine("DRAFT_WORK_ROOT=$root\default-draft-work")
+            $writer.WriteLine("DRAFT_OUTPUT_ROOT=$root\default-draft-output")
+          } finally { $writer.Dispose() }
+
+      - name: Verify exact default draft without installation
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TARGET_VERSION: ${{ inputs.target_version }}
+          TARGET_TAG: ${{ inputs.target_tag }}
+          TARGET_SOURCE_REVISION: ${{ inputs.target_source_revision }}
+          TARGET_RELEASE_ID: ${{ inputs.target_release_id }}
+          INSTALLER_ASSET_ID: ${{ inputs.installer_asset_id }}
+          INSTALLER_NAME: ${{ inputs.installer_name }}
+          INSTALLER_BYTES: ${{ inputs.installer_bytes }}
+          INSTALLER_SHA256: ${{ inputs.installer_sha256 }}
+          SIGNATURE_ASSET_ID: ${{ inputs.signature_asset_id }}
+          SIGNATURE_BYTES: ${{ inputs.signature_bytes }}
+          SIGNATURE_SHA256: ${{ inputs.signature_sha256 }}
+          MANIFEST_ASSET_ID: ${{ inputs.manifest_asset_id }}
+          MANIFEST_BYTES: ${{ inputs.manifest_bytes }}
+          MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
+          EXPECTED_PUBLISHER: ${{ inputs.expected_publisher }}
+        run: |
+          ./scripts/verify-default-draft.ps1 `
+            -ProjectRoot (Get-Location).Path -TargetSourceRoot (Resolve-Path target-source).Path `
+            -AssetRoot $env:DRAFT_ASSET_ROOT -WorkRoot $env:DRAFT_WORK_ROOT -OutputRoot $env:DRAFT_OUTPUT_ROOT `
+            -WorkflowSourceRevision $env:GITHUB_SHA -TargetVersion $env:TARGET_VERSION -TargetTag $env:TARGET_TAG `
+            -TargetSourceRevision $env:TARGET_SOURCE_REVISION -TargetReleaseId $env:TARGET_RELEASE_ID `
+            -InstallerAssetId $env:INSTALLER_ASSET_ID -InstallerName $env:INSTALLER_NAME -InstallerBytes $env:INSTALLER_BYTES -InstallerSha256 $env:INSTALLER_SHA256 `
+            -SignatureAssetId $env:SIGNATURE_ASSET_ID -SignatureBytes $env:SIGNATURE_BYTES -SignatureSha256 $env:SIGNATURE_SHA256 `
+            -ManifestAssetId $env:MANIFEST_ASSET_ID -ManifestBytes $env:MANIFEST_BYTES -ManifestSha256 $env:MANIFEST_SHA256 `
+            -ExpectedPublisher $env:EXPECTED_PUBLISHER
+
+      - name: Recheck clean sources
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          git diff --quiet --
+          if ($LASTEXITCODE -ne 0) { throw 'Workflow source changed during verification.' }
+          git diff --cached --quiet --
+          if ($LASTEXITCODE -ne 0) { throw 'Workflow source index changed during verification.' }
+          git -C target-source diff --quiet --
+          if ($LASTEXITCODE -ne 0) { throw 'Target source changed during verification.' }
+          git -C target-source diff --cached --quiet --
+          if ($LASTEXITCODE -ne 0) { throw 'Target source index changed during verification.' }
+
+      - name: Upload only the sanitized default draft receipt
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: default-draft-verification-${{ inputs.target_source_revision }}
+          path: ${{ env.DRAFT_OUTPUT_ROOT }}/default-draft-verification.json
+          if-no-files-found: ignore
