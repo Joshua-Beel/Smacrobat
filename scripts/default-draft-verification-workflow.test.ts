@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 
 const workflow = readFileSync('.github/workflows/default-draft-verification.yml', 'utf8');
 const verifier = readFileSync('scripts/verify-default-draft.ps1', 'utf8');
+const pdfiumPreparation = readFileSync('scripts/prepare-default-draft-pdfium.ps1', 'utf8');
 
 function runPowerShell(source: string) {
   const root = `target/default-draft-test-${randomUUID()}`;
@@ -43,6 +44,15 @@ describe('default draft verification workflow', () => {
     expect(workflow).toContain('if: ${{ always() }}');
     expect(workflow).not.toMatch(/gh release|cargo |npm run build|setup-dotnet|artifact-signing|Start-Process|\.\/(?:target-source\/)?src-tauri\/target/);
     expect(workflow).not.toMatch(/secrets\.|TAURI_SIGNING_PRIVATE_KEY|AZURE_(?:TENANT|CLIENT|SIGNING)/);
+    const preparation = workflow.indexOf('Prepare exact pinned PDFium resources in target source');
+    const proof = workflow.indexOf('Verify exact default draft without installation');
+    expect(preparation).toBeGreaterThan(workflow.indexOf('Verify exact clean workflow and target sources'));
+    expect(proof).toBeGreaterThan(preparation);
+    expect(workflow).toContain("./scripts/prepare-default-draft-pdfium.ps1 -TargetSourceRoot (Resolve-Path target-source).Path");
+    expect(pdfiumPreparation).toContain("$assetId=[uint64]441936973");
+    expect(pdfiumPreparation).toContain("$assetBytes=[uint64]3733154");
+    expect(pdfiumPreparation).toContain("$assetSha256='73CC0DE638AC2095E7445BF56A38200A5B7C7CA0E9F4BA144598F2457377AC08'");
+    expect(pdfiumPreparation).not.toMatch(/setup-pdfium|cargo|Start-Process|Invoke-Expression/);
   });
 
   it('binds a bounded three-asset draft to exact source resources and separates signature text from crypto proof', () => {
@@ -76,6 +86,23 @@ describe('default draft verification workflow', () => {
     const result = runPowerShell(check);
     expect(result.status, result.stderr || result.stdout).toBe(0);
     expect(verifier).not.toMatch(/HttpMethod\]::(?:Post|Put|Patch|Delete)|Invoke-RestMethod|Invoke-WebRequest|gh\s+(?:release|api)/i);
+  });
+
+  it('rejects changed PDFium release identity and unsafe archive entry types or expanded sizes', () => {
+    const check = String.raw`
+      $tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile((Resolve-Path ./scripts/prepare-default-draft-pdfium.ps1),[ref]$tokens,[ref]$errors);if($errors.Count){throw 'parse'}
+      foreach($name in @('Assert-PdfiumReleaseMetadata','ConvertFrom-PdfiumTarListing')){$node=$ast.Find({param($n)$n-is[Management.Automation.Language.FunctionDefinitionAst]-and$n.Name-ceq$name},$true);if(-not$node){throw 'missing'};Invoke-Expression $node.Extent.Text}
+      $assetId=[uint64]441936973;$assetName='pdfium-win-x64.tgz';$assetBytes=[uint64]3733154;$assetSha256='73CC0DE638AC2095E7445BF56A38200A5B7C7CA0E9F4BA144598F2457377AC08';$downloadUrl='https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/7881/pdfium-win-x64.tgz'
+      $asset=[pscustomobject]@{id=$assetId;name=$assetName;size=$assetBytes;state='uploaded';digest=('sha256:'+$assetSha256.ToLowerInvariant());browser_download_url=$downloadUrl};$metadata=[pscustomobject]@{tag_name='chromium/7881';draft=$false;prerelease=$false;published_at='2026-06-08T00:00:00Z';assets=@($asset)}
+      Assert-PdfiumReleaseMetadata $metadata
+      function Reject([scriptblock]$action){$failed=$false;try{&$action}catch{$failed=$true};if(-not$failed){throw 'unsafe fixture accepted'}}
+      $metadata.draft=$true;Reject {Assert-PdfiumReleaseMetadata $metadata};$metadata.draft=$false;$asset.digest='sha256:'+('0'*64);Reject {Assert-PdfiumReleaseMetadata $metadata};$asset.digest='sha256:'+$assetSha256.ToLowerInvariant()
+      $expectedEntries=@('safe.txt');$null=ConvertFrom-PdfiumTarListing '-rw-r--r--  0 runner runner 12 Jun 08 12:05 safe.txt'
+      Reject {ConvertFrom-PdfiumTarListing 'lrwxrwxrwx  0 runner runner 0 Jun 08 12:05 safe.txt -> ../escape'}
+      Reject {ConvertFrom-PdfiumTarListing '-rw-r--r--  0 runner runner 34603008 Jun 08 12:05 safe.txt'}
+    `;
+    const result = runPowerShell(check);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
   });
 
   it('executes the real metadata and extraction inventory guards against missing, extra, OCR, collision, and traversal-shaped cases', () => {

@@ -85,6 +85,10 @@ jobs:
             $writer.WriteLine("DRAFT_OUTPUT_ROOT=$root\default-draft-output")
           } finally { $writer.Dispose() }
 
+      - name: Prepare exact pinned PDFium resources in target source
+        shell: pwsh
+        run: ./scripts/prepare-default-draft-pdfium.ps1 -TargetSourceRoot (Resolve-Path target-source).Path -WorkRoot (Join-Path $env:RUNNER_TEMP 'default-draft-pdfium-prep')
+
       - name: Verify exact default draft without installation
         shell: pwsh
         env:

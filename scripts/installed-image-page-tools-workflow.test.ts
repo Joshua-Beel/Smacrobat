@@ -5,14 +5,14 @@ import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-function runPowerShell(source: string) {
+function runPowerShell(source: string, timeout = 60_000) {
   const root = join(tmpdir(), `smacrobat-image-page-tools-${randomUUID()}`);
   mkdirSync(root, { recursive: true });
   const path = join(root, 'run.ps1');
   writeFileSync(path, source, 'utf8');
   try {
     return spawnSync('pwsh.exe', ['-NoProfile', '-NonInteractive', '-File', path], {
-      encoding: 'utf8', timeout: 60_000, env: { ...process.env, IMAGE_PAGE_TEST_ROOT: root },
+      encoding: 'utf8', timeout, env: { ...process.env, IMAGE_PAGE_TEST_ROOT: root },
     });
   } finally { rmSync(root, { recursive: true, force: true }); }
 }
@@ -34,6 +34,11 @@ function extractFunctions(names: string[], body: string) {
 }
 
 describe('installed image page-tools verifier', () => {
+  it('enforces the caller-selected PowerShell timeout', () => {
+    const result = runPowerShell('Start-Sleep -Seconds 30', 100);
+    expect(result.error && (result.error as NodeJS.ErrnoException).code).toBe('ETIMEDOUT');
+  });
+
   it('parses and composes the reviewed process-bound Open and exact native Save seams', () => {
     const source = readFileSync('scripts/installed-image-page-tools.ps1', 'utf8');
     const parsed = spawnSync('pwsh.exe', ['-NoProfile', '-NonInteractive', '-Command',
@@ -248,9 +253,9 @@ const d=document.querySelector('dialog[aria-labelledby="export-image-title"]');c
       $movedOffset=$iendOffset-$physicalTotal;$moved=[byte[]]::new($bytes.Length);[Array]::Copy($withoutPhysical,0,$moved,0,$movedOffset);[Array]::Copy($bytes,$physicalOffset,$moved,$movedOffset,$physicalTotal);[Array]::Copy($withoutPhysical,$movedOffset,$moved,$movedOffset+$physicalTotal,$withoutPhysical.Length-$movedOffset);[IO.File]::WriteAllBytes((Join-Path $root 'late-density.png'),$moved)
       $lateRejected=$false;try{Get-ImagePagePngProof -Path (Join-Path $root 'late-density.png')}catch{$lateRejected=$_.Exception.Message-ceq'Exported PNG pHYs chunk must precede the first IDAT chunk.'}
       if(-not$missingRejected-or-not$wrongRejected-or-not$duplicateRejected-or-not$crcRejected-or-not$lateRejected){throw "PNG regressions failed: missing=$missingRejected wrong=$wrongRejected duplicate=$duplicateRejected crc=$crcRejected late=$lateRejected"}
-    `);
+    `, 12_000);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('requires the deterministic source-color regions in the independent signed-PDFium raster', () => {
     const result = runPowerShell(String.raw`
