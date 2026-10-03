@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { Undo2, Redo2 } from 'lucide-react';
 import { ArrowDownToLine, ArrowUpRight, Bookmark, ChevronDown, ChevronLeft, ChevronRight, ChevronsUpDown, CircleHelp, Combine, File, FileCheck2, FileImage, FileOutput, FilePenLine, FilePlus2, Files, FolderOpen, Hand, Highlighter, Home, LayoutGrid, List, Maximize, Menu, MessageSquare, Minimize2, Minus, MoreHorizontal, MousePointer2, PanelLeftClose, Pencil, Plus, Printer, RotateCw, Save, ScanLine, Search, ShieldCheck, Signature, SlidersHorizontal, Star, Sun, Type, X, ZoomIn, ZoomOut, type LucideIcon } from 'lucide-react';
-import { closeDocument, cancelPasswordRequest, native, openDocument, reopenDocument, editPages, saveCopy, splitDocument, cropPages, resetCrops, combineDocuments, insertPagesCopy, replacePagesCopy, documentFormFields, fillFormCopy, documentAnnotations, documentPageLabels, createPdfFromImage, exportPageImage, redactDocument, createComment, updateComment, deleteComment, createHighlight, createTextHighlight, updateHighlight, deleteHighlight, ocrCapability as getOcrCapability, type Annotation, type CommentRect, type CropInsets, type CreatePdfOptions, type DocumentAnnotations, type DocumentFormFields, type FormPatch, type OcrCapability, type OpenResult, type PageImageExport, type PageImageExportRequest, type RasterRedactionRect, type SplitOutput, type SavedCopy } from './bridge';
+import { closeDocument, cancelPasswordRequest, native, openDocument, reopenDocument, editPages, saveCopy, splitDocument, cropPages, resetCrops, combineDocuments, insertPagesCopy, replacePagesCopy, documentFormFields, fillFormCopy, documentAnnotations, documentPageLabels, createPdfFromImage, exportPageImage, redactDocument, createComment, updateComment, deleteComment, createHighlight, createTextHighlight, updateHighlight, deleteHighlight, createSearchableOcrCopy, cancelPageOcr, ocrCapability as getOcrCapability, type Annotation, type CommentRect, type CropInsets, type CreatePdfOptions, type DocumentAnnotations, type DocumentFormFields, type FormPatch, type OcrCapability, type OpenResult, type PageImageExport, type PageImageExportRequest, type RasterRedactionRect, type SplitOutput, type SavedCopy } from './bridge';
 import { clampPage, toolGroups, type DocumentInfo, type PageEdit } from './model';
 import { pageLabelDescription, pageLabelFor, validatePageLabels, type DocumentPageLabels } from './pageLabels';
 import Viewer from './Viewer';
@@ -13,6 +13,8 @@ import SearchPanel, { type ActiveSearch } from './SearchPanel';
 import BookmarksPanel from './BookmarksPanel';
 import PageText from './PageText';
 import PageOcrDialog, { type PageOcrTarget } from './PageOcrDialog';
+import SearchableOcrDialog from './SearchableOcrDialog';
+import { validateSearchableOcrCapability, type SearchableOcrTarget } from './searchableOcr';
 import PasswordDialog from './PasswordDialog';
 import PrintDialog from './PrintDialog';
 import DocumentProperties from './DocumentProperties';
@@ -69,7 +71,9 @@ export default function App() {
   const [bookmarksOpen, setBookmarksOpen] = useState(false);
   const [pageTextOpen, setPageTextOpen] = useState(false);
   const [pageOcrTarget, setPageOcrTarget] = useState<PageOcrTarget | null>(null);
-  const [ocr, setOcr] = useState<OcrCapability>({ available: false, reason: native ? 'Checking OCR availability…' : 'OCR is unavailable in the browser preview.', language: null });
+  const unavailableOcr = (reason: string): OcrCapability => ({ available: false, reason, language: null, searchablePdfAvailable: false, searchablePdfReason: reason, searchablePdfDpi: null, searchablePdfMaxPages: 32, searchablePdfMaxPixels: 33_554_432, searchablePdfMaxWords: 100_000, searchablePdfMaxTextBytes: 8_388_608, searchablePdfCharacters: null });
+  const [ocr, setOcr] = useState<OcrCapability>(() => unavailableOcr(native ? 'Checking OCR availability…' : 'OCR is unavailable in the browser preview.'));
+  const [searchableOcrTarget, setSearchableOcrTarget] = useState<SearchableOcrTarget | null>(null);
   const [printOpen, setPrintOpen] = useState(false);
   const [propertiesOpen, setPropertiesOpen] = useState(false);
   const [noticesOpen, setNoticesOpen] = useState(false);
@@ -122,16 +126,18 @@ export default function App() {
     let disposed = false;
     if (!native) return;
     void getOcrCapability().then(capability => {
-      const coherent = capability?.available === true && capability.reason === null && capability.language === 'eng' || capability?.available === false && typeof capability.reason === 'string' && capability.reason.trim().length > 0 && capability.language === null;
+      const pageCoherent = capability?.available === true && capability.reason === null && capability.language === 'eng' || capability?.available === false && typeof capability.reason === 'string' && capability.reason.trim().length > 0 && capability.language === null;
+      const searchableCoherent = typeof capability?.searchablePdfAvailable === 'boolean' && capability.searchablePdfMaxPages === 32 && capability.searchablePdfMaxPixels === 33_554_432 && capability.searchablePdfMaxWords === 100_000 && capability.searchablePdfMaxTextBytes === 8_388_608 && (capability.searchablePdfAvailable ? capability.searchablePdfReason === null && capability.searchablePdfDpi === 150 && capability.searchablePdfCharacters === 'printable ASCII words only' : typeof capability.searchablePdfReason === 'string' && capability.searchablePdfReason.trim().length > 0 && capability.searchablePdfDpi === null && capability.searchablePdfCharacters === null);
+      const coherent = pageCoherent && searchableCoherent;
       if (!disposed && coherent) setOcr(capability);
-      else if (!disposed) setOcr({ available: false, reason: 'OCR is unavailable in this build.', language: null });
-    }).catch(() => { if (!disposed) setOcr({ available: false, reason: 'OCR is unavailable in this build.', language: null }); });
+      else if (!disposed) setOcr(unavailableOcr('OCR is unavailable in this build.'));
+    }).catch(() => { if (!disposed) setOcr(unavailableOcr('OCR is unavailable in this build.')); });
     return () => { disposed = true; };
   }, []);
   const latest = useRef({ documents, busy, active, dialogOpen: false });
   latest.current = {
     documents, busy, active,
-    dialogOpen: updatesOpen || pageTextOpen || pageOcrTarget !== null || printOpen || propertiesOpen || noticesOpen || passwordRequest !== null || pendingClose !== null || createOpen || pageImageTarget !== null || combineOpen || insertOpen || replaceOpen || formsOpen || commentEditor !== null,
+    dialogOpen: updatesOpen || pageTextOpen || pageOcrTarget !== null || searchableOcrTarget !== null || printOpen || propertiesOpen || noticesOpen || passwordRequest !== null || pendingClose !== null || createOpen || pageImageTarget !== null || combineOpen || insertOpen || replaceOpen || formsOpen || commentEditor !== null,
   };
   useEffect(() => {
     if (!native) return;
@@ -189,7 +195,7 @@ export default function App() {
   }, [doc?.id, doc?.revision, doc?.pages.length, pageLabelsRequest]);
   const pageLabels = pageLabelsLoad.request === pageLabelsRequest ? pageLabelsLoad.labels : null;
   const activate = (id: number) => {
-    if (busy || redactionDraft || closingDocument.current !== null) return;
+    if (busy || redactionDraft || searchableOcrTarget || closingDocument.current !== null) return;
     const document = documents.find(item => item.id === id);
     if (!document) return;
     if (pageOcrTarget && pageOcrTarget.id !== id) setPageOcrTarget(null);
@@ -211,14 +217,14 @@ export default function App() {
     else if (result?.status === 'password_required') { passwordBlocking.current = true; setPasswordRequest({ challenge: result, organize }); }
   };
   const open = useCallback(async (example = false, organize = false) => {
-    if (busy || closingDocument.current !== null) return;
+    if (busy || searchableOcrTarget || closingDocument.current !== null) return;
     setBusy(true); setError(''); setMenu(false);
     try {
       acceptOpen(await openDocument(example), organize);
     } catch (e) { setError(String(e)); } finally { setBusy(false); }
-  }, [busy]);
+  }, [busy, searchableOcrTarget]);
   const reopen = async (path: string) => {
-    if (busy || closingDocument.current !== null) return;
+    if (busy || searchableOcrTarget || closingDocument.current !== null) return;
     const existing = documents.find(document => document.path === path);
     if (existing) { activate(existing.id); return; }
     setBusy(true); setError('');
@@ -228,7 +234,7 @@ export default function App() {
     finally { if (mounted.current) setBusy(false); }
   };
   const close = async (id: number, discard = false) => {
-    if (busy || redactionDraft || closingDocument.current !== null) return;
+    if (busy || redactionDraft || searchableOcrTarget || closingDocument.current !== null) return;
     if (!discard && documents.find(document => document.id === id)?.dirty) { setPendingClose(id); return; }
     if (pageOcrTarget?.id === id) setPageOcrTarget(null);
     closingDocument.current = id; setBusy(true); setError('');
@@ -243,13 +249,13 @@ export default function App() {
     const next = clampPage(page, info.pages.length); readingPages.current.set(info.id, next); setPage(next); setTarget(value => ({ page: next, token: value.token + 1 }));
   };
   const edit = async (action: PageEdit): Promise<boolean> => {
-    if (!doc || busy || closingDocument.current !== null) return false;
+    if (!doc || busy || searchableOcrTarget || closingDocument.current !== null) return false;
     setBusy(true); setError(''); setNotice('');
     try { updateDocument(await editPages(doc.id, action)); return true; }
     catch (e) { setError(String(e)); return false; } finally { setBusy(false); }
   };
   const save = async (pages?: number[]) => {
-    if (!doc || busy || closingDocument.current !== null) return;
+    if (!doc || busy || searchableOcrTarget || closingDocument.current !== null) return;
     setBusy(true); setError(''); setNotice('');
     try {
       const result = await saveCopy(doc.id, pages);
@@ -375,7 +381,7 @@ export default function App() {
     launchComments(); setRedactionDraft(null); setHand(false); setCommentMode(false); setHighlightMode(true);
   };
   const launchRedaction = () => {
-    if (!doc || busy || closingDocument.current !== null) return;
+    if (!doc || busy || searchableOcrTarget || closingDocument.current !== null) return;
     const currentPage = clampPage(page, doc.pages.length);
     retainedTextHighlightSelection.current=null; pointerTextHighlightSelection.current=null; setTextHighlightSelection(null);
     setMenu(false); setOrganizing(false); setView('document'); closeSearch(); setBookmarksOpen(false); setCommentsOpen(false); setCommentEditor(null); setCommentMode(false); setHighlightMode(false); setHand(false);
@@ -473,28 +479,42 @@ export default function App() {
     try { return await exportPageImage(request); }
     finally { setBusy(false); }
   };
-  const launchCreate = () => { if (busy || redactionDraft || closingDocument.current !== null) return; setMenu(false); setCreateOpen(true); };
+  const launchCreate = () => { if (busy || redactionDraft || searchableOcrTarget || closingDocument.current !== null) return; setMenu(false); setCreateOpen(true); };
   const launchPageImageExport = () => {
-    if (!doc || busy || redactionDraft || closingDocument.current !== null) return;
+    if (!doc || busy || redactionDraft || searchableOcrTarget || closingDocument.current !== null) return;
     const currentPage = clampPage(page, doc.pages.length), size = doc.pages[clampPage(page, doc.pages.length)];
     if (!size) return;
     setMenu(false); setPageImageTarget({ id: doc.id, revision: doc.revision, page: currentPage, size });
   };
-  const launchOrganizer = () => { if (busy || redactionDraft || closingDocument.current !== null) return; if (doc) { setOrganizing(true); setView('document'); } else void open(false, true); };
+  const launchOrganizer = () => { if (busy || redactionDraft || searchableOcrTarget || closingDocument.current !== null) return; if (doc) { setOrganizing(true); setView('document'); } else void open(false, true); };
   const launchCombine = () => {
-    if (busy || redactionDraft || closingDocument.current !== null) return;
+    if (busy || redactionDraft || searchableOcrTarget || closingDocument.current !== null) return;
     if (documents.length < 2) { setNotice('Open two PDFs to combine them.'); return; }
     setMenu(false); setOrganizing(false); setView('document'); setCombineOpen(true);
   };
   const launchForms = () => {
-    if (!doc || busy || redactionDraft || closingDocument.current !== null) return;
+    if (!doc || busy || redactionDraft || searchableOcrTarget || closingDocument.current !== null) return;
     setMenu(false); setOrganizing(false); closeSearch(); setBookmarksOpen(false); setFormsOpen(true);
   };
   const launchPageOcr = () => {
-    if (!doc || busy || redactionDraft || closingDocument.current !== null || !ocr.available) return;
+    if (!doc || busy || redactionDraft || searchableOcrTarget || closingDocument.current !== null || !ocr.available) return;
     const currentPage = clampPage(page, doc.pages.length);
     setMenu(false); setOrganizing(false); closeSearch(); setBookmarksOpen(false);
     setPageOcrTarget({ id: doc.id, revision: doc.revision, page: currentPage, name: doc.name });
+  };
+  const searchableCapability = { searchablePdfAvailable: ocr.searchablePdfAvailable, searchablePdfReason: ocr.searchablePdfReason, searchablePdfDpi: ocr.searchablePdfDpi, searchablePdfMaxPages: ocr.searchablePdfMaxPages, searchablePdfMaxPixels: ocr.searchablePdfMaxPixels, searchablePdfMaxWords: ocr.searchablePdfMaxWords, searchablePdfMaxTextBytes: ocr.searchablePdfMaxTextBytes, searchablePdfCharacters: ocr.searchablePdfCharacters };
+  const searchableCapabilityError = validateSearchableOcrCapability(searchableCapability);
+  const launchSearchableOcr = () => {
+    if (!doc || busy || redactionDraft || pageOcrTarget || closingDocument.current !== null || searchableCapabilityError || doc.pages.length > ocr.searchablePdfMaxPages) return;
+    setMenu(false); setOrganizing(false); closeSearch(); setBookmarksOpen(false);
+    setSearchableOcrTarget({ documentId: doc.id, revision: doc.revision });
+  };
+  const createSearchableCopy = async (request: { requestId: string; documentId: number; revision: number }): Promise<SavedCopy | null> => {
+    const source = documents.find(document => document.id === request.documentId);
+    if (!source || source.revision !== request.revision || busy || closingDocument.current !== null) throw new Error('This document changed. Reopen searchable OCR and try again.');
+    setBusy(true); setError(''); setNotice('');
+    try { return await createSearchableOcrCopy(request); }
+    finally { setBusy(false); }
   };
   const launchInsert = () => {
     if (busy || closingDocument.current !== null) return;
@@ -516,7 +536,7 @@ export default function App() {
   };
   useEffect(() => {
     const listener = (event: KeyboardEvent) => {
-      if (updatesOpen || pageTextOpen || pageOcrTarget || printOpen || propertiesOpen || noticesOpen || passwordRequest || pendingClose !== null || createOpen || pageImageTarget || combineOpen || insertOpen || replaceOpen || commentEditor) return;
+      if (updatesOpen || pageTextOpen || pageOcrTarget || searchableOcrTarget || printOpen || propertiesOpen || noticesOpen || passwordRequest || pendingClose !== null || createOpen || pageImageTarget || combineOpen || insertOpen || replaceOpen || commentEditor) return;
       if ((event.target as HTMLElement | null)?.closest?.('dialog')) return;
       if (redactionDraft && event.ctrlKey) { event.preventDefault(); return; }
       if (event.ctrlKey && event.key.toLowerCase() === 'o') { event.preventDefault(); void open(); }
@@ -570,9 +590,10 @@ export default function App() {
     </header>
     {menu && <div className={s.menuPopover}>
       <button disabled={!!redactionDraft} onClick={() => void open()}>Open… <kbd>Ctrl+O</kbd></button><button disabled={!!redactionDraft} onClick={() => void open(true)}>Open sample PDF</button>
-      <button disabled={!doc || busy || !!redactionDraft} onClick={() => { setMenu(false); void save(); }}>Save a copy… <kbd>Ctrl+S</kbd></button>
+      <button disabled={!doc || busy || !!redactionDraft || !!searchableOcrTarget} onClick={() => { setMenu(false); void save(); }}>Save a copy… <kbd>Ctrl+S</kbd></button>
       <button disabled={!doc || busy || !!redactionDraft} onClick={launchPageImageExport}>Export page as image…</button>
       <button disabled={!doc || busy || !!redactionDraft || !ocr.available} onClick={launchPageOcr} title={ocr.available ? 'Recognize text on the current page in English' : ocr.reason || 'OCR is unavailable in this build.'}>Recognize current page…</button>
+      <button disabled={!doc || busy || !!redactionDraft || !!searchableCapabilityError || (doc?.pages.length ?? 0) > ocr.searchablePdfMaxPages} onClick={launchSearchableOcr} title={searchableCapabilityError || ((doc?.pages.length ?? 0) > ocr.searchablePdfMaxPages ? `Searchable OCR is limited to ${ocr.searchablePdfMaxPages} pages.` : 'Create a fixed-150-DPI searchable copy in this verified opt-in build.')}>Create searchable OCR copy…</button>
       <button disabled={!!redactionDraft} onClick={() => { setMenu(false); launchOrganizer(); }}>Organize pages</button>
       <button disabled={!doc || busy || !!redactionDraft} onClick={() => { setMenu(false); setPropertiesOpen(true); }}>Document properties… <kbd>Ctrl+D</kbd></button><hr />
       <button onClick={() => { setDark(v => !v); setMenu(false); }}>Switch to {dark ? 'light' : 'dark'} theme</button>
@@ -583,6 +604,7 @@ export default function App() {
     {updatesOpen && <Updates dirty={documents.some(document => document.dirty)} busy={busy} setBusy={setBusy} close={() => setUpdatesOpen(false)} />}
     {pageTextOpen && doc && <PageText key={`${doc.id}-${doc.revision}-${page}`} document={doc} page={page} close={() => setPageTextOpen(false)} />}
     {pageOcrTarget && <PageOcrDialog key={`${pageOcrTarget.id}-${pageOcrTarget.revision}-${pageOcrTarget.page}`} target={pageOcrTarget} setBusy={setBusy} close={() => setPageOcrTarget(null)} />}
+    {searchableOcrTarget && <SearchableOcrDialog key={`${searchableOcrTarget.documentId}-${searchableOcrTarget.revision}`} capability={searchableCapability} target={searchableOcrTarget} createRequestId={() => crypto.randomUUID()} create={createSearchableCopy} cancel={cancelPageOcr} opened={copy => opened(copy.document, false)} close={() => setSearchableOcrTarget(null)} />}
     {passwordRequest && <PasswordDialog key={passwordRequest.challenge.request_id} challenge={passwordRequest.challenge} onOpened={info => { passwordBlocking.current = false; opened(info, passwordRequest.organize); setPasswordRequest(null); }} onClose={() => { passwordBlocking.current = false; setPasswordRequest(null); }} />}
     {printOpen && doc && <PrintDialog document={doc} page={page} setBusy={setBusy} close={() => setPrintOpen(false)} />}
     {propertiesOpen && doc && <DocumentProperties key={`${doc.id}-${doc.revision}`} document={doc} close={() => setPropertiesOpen(false)} />}
@@ -600,7 +622,7 @@ export default function App() {
       remove={commentEditor.kind === 'edit' ? () => commentEditor.annotation.kind === 'note' ? mutateAnnotation(current => deleteComment(current.id, current.revision, commentEditor.annotation.id)) : mutateAnnotation(current => deleteHighlight(current.id, current.revision, commentEditor.annotation.id)) : undefined} close={() => setCommentEditor(null)} />}
     <div className={s.globalbar}>
       <nav className={s.primaryNav}><button className={toolsOpen && view !== 'home' ? s.selectedNav : ''} disabled={!!redactionDraft} onClick={() => view === 'document' ? setToolsOpen(v => !v) : setView('tools')}>All tools</button><button disabled>Edit</button><button disabled>Convert</button><button disabled>E-sign</button></nav>
-      <div className={s.globalActions}><IconButton icon={Search} label="Find text" disabled={!doc || busy || !!redactionDraft} active={searchOpen} onClick={() => { setView('document'); setOrganizing(false); searchOpen ? closeSearch() : setSearchOpen(true); }} /><span className={s.divider} /><IconButton icon={Undo2} label="Undo" disabled={busy || !!redactionDraft || !doc?.can_undo} onClick={() => void edit({ kind: 'undo' })} /><IconButton icon={Redo2} label="Redo" disabled={busy || !!redactionDraft || !doc?.can_redo} onClick={() => void edit({ kind: 'redo' })} /><IconButton icon={Save} label="Save a copy" disabled={busy || !!redactionDraft || !doc} onClick={() => void save()} /><IconButton icon={Printer} label="Print" disabled={busy || !!redactionDraft || !doc} onClick={() => setPrintOpen(true)} /><IconButton icon={Sun} label="Toggle theme" onClick={() => setDark(v => !v)} /><IconButton icon={CircleHelp} label="Build information" onClick={() => setNotice('Organize Pages and document search are available. Other tools marked unavailable are planned for later milestones. Save a Copy writes a new file and preserves your original.')} /><button className={s.openButton} onClick={() => void open()} disabled={busy || !!redactionDraft}><FolderOpen size={16} /> {busy ? 'Working…' : 'Open a file'}</button></div>
+      <div className={s.globalActions}><IconButton icon={Search} label="Find text" disabled={!doc || busy || !!redactionDraft || !!searchableOcrTarget} active={searchOpen} onClick={() => { setView('document'); setOrganizing(false); searchOpen ? closeSearch() : setSearchOpen(true); }} /><span className={s.divider} /><IconButton icon={Undo2} label="Undo" disabled={busy || !!redactionDraft || !!searchableOcrTarget || !doc?.can_undo} onClick={() => void edit({ kind: 'undo' })} /><IconButton icon={Redo2} label="Redo" disabled={busy || !!redactionDraft || !!searchableOcrTarget || !doc?.can_redo} onClick={() => void edit({ kind: 'redo' })} /><IconButton icon={Save} label="Save a copy" disabled={busy || !!redactionDraft || !!searchableOcrTarget || !doc} onClick={() => void save()} /><IconButton icon={Printer} label="Print" disabled={busy || !!redactionDraft || !!searchableOcrTarget || !doc} onClick={() => { if (!searchableOcrTarget) setPrintOpen(true); }} /><IconButton icon={Sun} label="Toggle theme" onClick={() => setDark(v => !v)} /><IconButton icon={CircleHelp} label="Build information" onClick={() => setNotice('Organize Pages and document search are available. Other tools marked unavailable are planned for later milestones. Save a Copy writes a new file and preserves your original.')} /><button className={s.openButton} onClick={() => void open()} disabled={busy || !!redactionDraft || !!searchableOcrTarget}><FolderOpen size={16} /> {busy ? 'Working…' : 'Open a file'}</button></div>
     </div>
     {(error || notice) && <div className={`${s.banner} ${error ? s.error : ''}`} role={error ? 'alert' : 'status'}><span>{error || notice}</span><IconButton icon={X} label="Dismiss message" onClick={() => { setError(''); setNotice(''); }} /></div>}
     <main className={s.main}>

@@ -4,6 +4,7 @@ import App from './App';
 import type { DocumentInfo } from './model';
 
 const source: DocumentInfo = { id: 3, name: 'source.pdf', path: 'C:/source.pdf', pages: [{ width: 612, height: 792 }, { width: 612, height: 792 }], revision: 9, dirty: true, can_undo: true, can_redo: false };
+const searchableUnavailable={searchablePdfAvailable:false,searchablePdfReason:'Searchable OCR is unavailable.',searchablePdfDpi:null,searchablePdfMaxPages:32,searchablePdfMaxPixels:33_554_432,searchablePdfMaxWords:100_000,searchablePdfMaxTextBytes:8_388_608,searchablePdfCharacters:null};
 const mocks = vi.hoisted(() => ({ openDocument: vi.fn(), ocrCapability: vi.fn(), recognizePageOcr: vi.fn(), cancelPageOcr: vi.fn() }));
 
 vi.mock('@tauri-apps/api/window', () => ({ getCurrentWindow: () => ({ onCloseRequested: vi.fn().mockResolvedValue(vi.fn()) }) }));
@@ -26,7 +27,7 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllGlobals());
 
 it('keeps Scan & OCR disabled when this build has no opt-in engine', async () => {
-  mocks.ocrCapability.mockResolvedValue({ available: false, reason: 'OCR is not enabled in this build.', language: null });
+  mocks.ocrCapability.mockResolvedValue({ available: false, reason: 'OCR is not enabled in this build.', language: null, ...searchableUnavailable });
   const ui = await mount();
   await act(async () => button(ui, 'Open a file').props.onClick());
   openMenu(ui);
@@ -37,7 +38,7 @@ it('keeps Scan & OCR disabled when this build has no opt-in engine', async () =>
 });
 
 it('fails closed for an incoherent OCR capability response', async () => {
-  mocks.ocrCapability.mockResolvedValue({ available: true, reason: 'unexpected', language: 'eng' });
+  mocks.ocrCapability.mockResolvedValue({ available: true, reason: 'unexpected', language: 'eng', ...searchableUnavailable });
   const ui = await mount();
   await act(async () => button(ui, 'Open a file').props.onClick());
   openMenu(ui);
@@ -48,7 +49,7 @@ it('fails closed for an incoherent OCR capability response', async () => {
 });
 
 it('uses capability-gated OCR for the current physical page without mutating source state', async () => {
-  mocks.ocrCapability.mockResolvedValue({ available: true, reason: null, language: 'eng' });
+  mocks.ocrCapability.mockResolvedValue({ available: true, reason: null, language: 'eng', ...searchableUnavailable });
   mocks.recognizePageOcr.mockImplementation((request: { requestId: string }) => Promise.resolve({ status: 'recognized', requestId: request.requestId, documentId: 3, revision: 9, page: 1, dpi: 150, language: 'eng', width: 612, height: 792, text: 'OCR text' }));
   const ui = await mount();
   await act(async () => button(ui, 'Open a file').props.onClick());
