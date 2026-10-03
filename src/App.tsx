@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { Undo2, Redo2 } from 'lucide-react';
 import { ArrowDownToLine, ArrowUpRight, Bookmark, ChevronDown, ChevronLeft, ChevronRight, ChevronsUpDown, CircleHelp, Combine, File, FileCheck2, FileImage, FileOutput, FilePenLine, FilePlus2, Files, FolderOpen, Hand, Highlighter, Home, LayoutGrid, List, Maximize, Menu, MessageSquare, Minimize2, Minus, MoreHorizontal, MousePointer2, PanelLeftClose, Pencil, Plus, Printer, RotateCw, Save, ScanLine, Search, ShieldCheck, Signature, SlidersHorizontal, Star, Sun, Type, X, ZoomIn, ZoomOut, type LucideIcon } from 'lucide-react';
-import { closeDocument, cancelPasswordRequest, native, openDocument, reopenDocument, editPages, saveCopy, splitDocument, cropPages, resetCrops, combineDocuments, insertPagesCopy, replacePagesCopy, documentFormFields, fillFormCopy, documentAnnotations, documentPageLabels, createPdfFromImage, chooseImagePdfSources, createPdfFromImages, cancelImagePdfSources, inspectImageReplacementTarget, replacePdfImageCopy, cancelImageReplacement, inspectTextReplacementTarget, replacePdfTextCopy, cancelTextReplacement, exportPageImage, redactDocument, createComment, updateComment, deleteComment, createHighlight, createTextHighlight, updateHighlight, deleteHighlight, createSearchableOcrCopy, cancelPageOcr, ocrCapability as getOcrCapability, type Annotation, type CommentRect, type CropInsets, type CreatePdfOptions, type DocumentAnnotations, type DocumentFormFields, type FormPatch, type ImageReplacementTarget, type TextReplacementTarget, type OcrCapability, type OpenResult, type PageImageExport, type PageImageExportRequest, type RasterRedactionRect, type SplitOutput, type SavedCopy } from './bridge';
+import { closeDocument, cancelPasswordRequest, native, openDocument, reopenDocument, checkpointRecovery, restoreRecovery, editPages, saveCopy, splitDocument, cropPages, resetCrops, combineDocuments, insertPagesCopy, replacePagesCopy, documentFormFields, fillFormCopy, documentAnnotations, documentPageLabels, createPdfFromImage, chooseImagePdfSources, createPdfFromImages, cancelImagePdfSources, inspectImageReplacementTarget, replacePdfImageCopy, cancelImageReplacement, inspectTextReplacementTarget, replacePdfTextCopy, cancelTextReplacement, exportPageImage, redactDocument, createComment, updateComment, deleteComment, createHighlight, createTextHighlight, updateHighlight, deleteHighlight, createSearchableOcrCopy, cancelPageOcr, ocrCapability as getOcrCapability, type Annotation, type CommentRect, type CropInsets, type CreatePdfOptions, type DocumentAnnotations, type DocumentFormFields, type FormPatch, type ImageReplacementTarget, type TextReplacementTarget, type OcrCapability, type OpenResult, type PageImageExport, type PageImageExportRequest, type RasterRedactionRect, type SplitOutput, type SavedCopy } from './bridge';
 import { clampPage, toolGroups, type DocumentInfo, type PageEdit } from './model';
 import { pageLabelDescription, pageLabelFor, validatePageLabels, type DocumentPageLabels } from './pageLabels';
 import Viewer from './Viewer';
@@ -210,9 +210,11 @@ export default function App() {
     setActive(id); setView('document'); setPage(next); setTarget(value => ({ page: next, token: value.token + 1 }));
   };
   const trackPage = (value: number) => { if (doc) { const next = clampPage(value, doc.pages.length); readingPages.current.set(doc.id, next); setPage(next); } };
-  const opened = (info: DocumentInfo, organize: boolean) => {
+  const opened = (info: DocumentInfo, organize: boolean, initialPage = 0) => {
+    const openedPage = clampPage(initialPage, info.pages.length);
     setDocuments(list => [...list, info]); setRecentFiles(list => rememberFile(list, info)); setOrganizing(organize);
-    setActive(info.id); setView('document'); setPage(0); setTarget(value => ({ page: 0, token: value.token + 1 }));
+    readingPages.current.set(info.id, openedPage);
+    setActive(info.id); setView('document'); setPage(openedPage); setTarget(value => ({ page: openedPage, token: value.token + 1 }));
   };
   const acceptOpen = (result: OpenResult | null, organize: boolean) => {
     if (!mounted.current) {
@@ -239,6 +241,33 @@ export default function App() {
       acceptOpen(await reopenDocument(path), false);
     } catch (e) { if (mounted.current) setError(`Could not reopen this file. It may have moved or been deleted. ${String(e)}`); }
     finally { if (mounted.current) setBusy(false); }
+  };
+  const recoveryBlocked = busy || redactionDraft !== null || searchableOcrTarget !== null || newCopyModalOpen || updatesOpen || pageTextOpen || pageOcrTarget !== null || printOpen || propertiesOpen || noticesOpen || passwordRequest !== null || pendingClose !== null || createOpen || pageImageTarget !== null || combineOpen || insertOpen || replaceOpen || formsOpen || commentEditor !== null || closingDocument.current !== null;
+  const checkpoint = async () => {
+    if (!doc?.dirty || recoveryBlocked) return;
+    const captured = { id: doc.id, revision: doc.revision, currentPage: clampPage(page, doc.pages.length) };
+    setBusy(true); setError(''); setNotice(''); setMenu(false);
+    try {
+      const receipt = await checkpointRecovery(captured.id, captured.revision, captured.currentPage);
+      if (receipt.documentId !== captured.id || receipt.revision !== captured.revision || receipt.currentPage !== captured.currentPage) throw new Error('Recovery checkpoint acknowledgement did not match this document revision.');
+      if (mounted.current) setNotice('Recovery point saved for this revision. Recovery is manual, not automatic; full power-loss durability is not proven.');
+    } catch (e) { if (mounted.current) setError(String(e)); } finally { if (mounted.current) setBusy(false); }
+  };
+  const restore = async () => {
+    if (recoveryBlocked) return;
+    setBusy(true); setError(''); setNotice(''); setMenu(false);
+    try {
+      const result = await restoreRecovery();
+      if (!result) return;
+      const coherent = Number.isSafeInteger(result.document?.id) && result.document.id > 0 && result.document.dirty === true && Array.isArray(result.document.pages) && result.document.pages.length > 0 && Number.isInteger(result.currentPage) && result.currentPage >= 0 && result.currentPage < result.document.pages.length;
+      if (!coherent || !mounted.current) {
+        if (Number.isSafeInteger(result.document?.id) && result.document.id > 0) void closeDocument(result.document.id).catch(() => {});
+        if (!mounted.current) return;
+        throw new Error('Recovery returned an invalid edited document.');
+      }
+      opened(result.document, false, result.currentPage);
+      setNotice('Recovered unsaved edits from the selected source PDF. The source file was not changed.');
+    } catch (e) { if (mounted.current) setError(String(e)); } finally { if (mounted.current) setBusy(false); }
   };
   const close = async (id: number, discard = false) => {
     if (busy || redactionDraft || searchableOcrTarget || newCopyModalOpen || closingDocument.current !== null) return;
@@ -609,6 +638,8 @@ export default function App() {
       <span className={s.windowTitle}>PDF Workstation</span>
     </header>
     {menu && <div className={s.menuPopover}>
+      <button disabled={!doc?.dirty || recoveryBlocked} onClick={() => void checkpoint()}>Create manual recovery point</button>
+      <button disabled={recoveryBlocked} onClick={() => void restore()}>Restore manual recovery point</button><hr />
       <button disabled={!!redactionDraft || newCopyModalOpen} onClick={() => void open()}>Open… <kbd>Ctrl+O</kbd></button><button disabled={!!redactionDraft || newCopyModalOpen} onClick={() => void open(true)}>Open sample PDF</button>
       <button disabled={!doc || busy || !!redactionDraft || !!searchableOcrTarget || newCopyModalOpen} onClick={() => { setMenu(false); void save(); }}>Save a copy… <kbd>Ctrl+S</kbd></button>
       <button disabled={!doc || busy || !!redactionDraft || newCopyModalOpen} onClick={launchPageImageExport}>Export page as image…</button>

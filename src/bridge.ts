@@ -10,6 +10,10 @@ export async function openDocument(example = false): Promise<OpenResult | null> 
 }
 export const closeDocument = (id: number) => invoke<void>('close_document', { id });
 export const reopenDocument = (path: string) => invoke<OpenResult>('reopen_document', { path });
+export type RecoveryCheckpointReceipt = { documentId: number; revision: number; currentPage: number };
+export type RecoveryRestoreResult = { document: DocumentInfo; currentPage: number };
+export const checkpointRecovery = (id: number, revision: number, currentPage: number) => invoke<RecoveryCheckpointReceipt>('checkpoint_recovery', { id, revision, currentPage });
+export const restoreRecovery = () => invoke<RecoveryRestoreResult | null>('restore_recovery');
 export const unlockDocument = (requestId: number, password: string) => invoke<OpenResult>('unlock_document', { requestId, password });
 export const cancelPasswordRequest = (requestId: number) => invoke<void>('cancel_password_request', { requestId });
 export type OcrCapability = {
