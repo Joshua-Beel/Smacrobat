@@ -36,8 +36,8 @@ describe('Windows validation workflow', () => {
       'run: cargo fetch --locked --target x86_64-pc-windows-msvc --manifest-path src-tauri/Cargo.toml',
       'Verify bundled dependency notices are current',
       'run: node scripts/dependency-notices.mjs --check',
-      'run: npm test -- --maxWorkers=2',
-      'run: cargo test --locked --manifest-path src-tauri/Cargo.toml',
+      'run: npm test -- --pool=threads --maxWorkers=1 --minWorkers=1 --no-file-parallelism',
+      'run: ./scripts/run-native-recovery-gates.ps1',
       'run: npm run build',
       'Recheck tracked source',
     ];

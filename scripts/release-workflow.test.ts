@@ -6,6 +6,8 @@ import { dirname, join } from 'node:path';
 
 const workflow = readFileSync('.github/workflows/release.yml', 'utf8');
 const versionValidator = readFileSync('scripts/assert-release-version.ps1', 'utf8');
+const serviceSource = readFileSync('src-tauri/src/service.rs', 'utf8');
+const restartSource = readFileSync('src-tauri/src/recovery_restart_tests.rs', 'utf8');
 
 function versionFixture(lineEnding: '\n' | '\r\n') {
   const root = mkdtempSync(join(tmpdir(), 'smacrobat-release-version-'));
@@ -83,8 +85,14 @@ describe('release workflow contract', () => {
 
   it('fails closed on signing and publishes only the explicit three-asset draft inventory', () => {
     expect(workflow.indexOf('run: node scripts/dependency-notices.mjs --check')).toBeGreaterThan(workflow.indexOf('run: cargo fetch --locked --target x86_64-pc-windows-msvc --manifest-path src-tauri/Cargo.toml'));
-    expect(workflow.indexOf('run: node scripts/dependency-notices.mjs --check')).toBeLessThan(workflow.indexOf('- run: npm test -- --maxWorkers=2'));
-    expect(workflow).toContain('- run: npm test -- --maxWorkers=2');
+    const frontendGate = '- run: npm test -- --pool=threads --maxWorkers=1 --minWorkers=1 --no-file-parallelism';
+    expect(workflow.indexOf('run: node scripts/dependency-notices.mjs --check')).toBeLessThan(workflow.indexOf(frontendGate));
+    expect(workflow).toContain(frontendGate);
+    expect(workflow).toContain('- run: ./scripts/run-native-recovery-gates.ps1\n        shell: pwsh');
+    expect(workflow).not.toMatch(/run: cargo test/);
+    expect(serviceSource).toContain('fn recovery_checkpoint_ack_is_durable_and_explicit_restore_replays_exact_state()');
+    expect(serviceSource).toContain('fn explicit_discard_is_idempotent_and_resolves_post_publish_lock()');
+    expect(restartSource).toContain('fn restart_recovery_survives_fresh_workers()');
     for (const secret of [
       'TAURI_SIGNING_PRIVATE_KEY',
       'AZURE_TENANT_ID',
