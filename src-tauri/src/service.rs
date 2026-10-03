@@ -2029,6 +2029,10 @@ fn current_info(session: &EditSession, original: &DocumentInfo, document: &PdfDo
 }
 
 #[cfg(test)]
+#[path = "recovery_restart_tests.rs"]
+mod recovery_restart_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use image::ImageDecoder;
