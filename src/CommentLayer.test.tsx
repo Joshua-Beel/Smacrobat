@@ -5,6 +5,18 @@ import CommentLayer, { commentRectAtPoint, highlightRectFromPoints } from './Com
 const imageBounds = () => ({ left: 10, top: 20, width: 400, height: 200 } as DOMRect);
 
 describe('CommentLayer', () => {
+  it('converts a redaction drag to displayed-page points and renders point rectangles', () => {
+    const createRedaction = vi.fn(); const bounds = { left: 10, top: 20, width: 200, height: 100 } as DOMRect;
+    let ui!: ReactTestRenderer;
+    act(() => { ui = create(<CommentLayer page={3} pageWidth={400} pageHeight={200} creatingComment={false} creatingHighlight={false} creatingRedaction redactions={[{ x: 40, y: 40, width: 80, height: 60 }]} onCommentCreate={vi.fn()} onHighlightCreate={vi.fn()} onRedactionCreate={createRedaction} onSelect={vi.fn()} imageBounds={() => bounds} annotations={[]} />); });
+    const layer = ui.root.findByProps({ 'data-testid': 'comment-layer' });
+    const target = { setPointerCapture:vi.fn() };
+    act(() => layer.props.onPointerDown({ button:0, target, currentTarget:target, clientX:30, clientY:30, pointerId:7 }));
+    act(() => layer.props.onPointerUp({ currentTarget:target, clientX:110, clientY:70, pointerId:7 }));
+    expect(createRedaction).toHaveBeenCalledWith(3, { x:40, y:20, width:160, height:80 });
+    const preview = ui.root.findAllByProps({ 'aria-hidden': 'true' }).find(node => node.props.style?.left === '10%');
+    expect(preview?.props.style).toMatchObject({ left:'10%', top:'20%', width:'20%', height:'30%' });
+  });
   it('creates a centered 20-point displayed-page rectangle and clamps it at the edge', () => {
     expect(commentRectAtPoint(.5, .5, 200, 100)).toEqual({ x: .45, y: .4, width: .1, height: .2 });
     expect(commentRectAtPoint(0, 1, 200, 100)).toEqual({ x: 0, y: .8, width: .1, height: .2 });

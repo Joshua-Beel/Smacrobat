@@ -1,0 +1,13 @@
+# Raster redaction
+
+The source build can create a rasterized PDF copy with black rectangles over selected areas on one page. Open a PDF, go to **All tools**, choose **Redact a PDF**, and drag over the areas to remove. You can remove individual marks, clear the list, or choose **Create redacted copy** to open the Windows save picker.
+
+The tool captures the current document revision and physical page when it opens. It accepts 1–256 finite, positive rectangles contained by that page's displayed bounds after the current crop and cardinal rotation. The marks apply only to that captured page. Switching documents, closing or opening files, saving, printing, editing, and launching conflicting tools are blocked while a draft is active. Escape, Select, or Pan cancels the draft. Canceling the save picker or receiving an error retains the draft for another attempt.
+
+The new copy rasterizes every current edited page at a fixed 150 DPI and blacks the marked pixel areas on the captured page. It opens as a clean new document session after saving, while the source file and source session remain unchanged. The output deliberately has no searchable or editable text, vector content, forms, annotations, metadata, bookmarks, or attachments. This loss applies to every page, including pages without redaction marks.
+
+Native validation permits at most 4,096 current pages, 32,000,000 pixels on any page, and 32,000,000 pixels across the whole document; the pixel limits normally bind before the page-count limit. It refuses stale or closed sessions, encrypted or restricted PDFs, signed or certified PDFs, malformed input, parser disagreement, invalid rectangles, and an existing output path. The save path is selected natively and publication does not replace an existing file.
+
+Before publication, native code applies the exact clean-raster oracle, reopens and renders every output page with PDFium, checks the page count, and requires empty text extraction. Two focused service tests and nine writer/oracle tests cover the native path. The frontend's six affected files pass 37 tests, including point conversion, bounds and count limits, exact request capture, cancellation and error retention, success opening, and draft exclusivity. The production frontend build transforms 1,941 modules successfully.
+
+This evidence covers controlled source-build behavior. It does not yet verify an installed application, native desktop pointer interaction, arbitrary PDFs, cross-viewer appearance, or permanent removal claims beyond the validated clean-raster output contract. The interface does not offer adjustable DPI, marks on multiple pages in one operation, text inference, or draft undo; use Remove, Clear all, or cancel and begin again.

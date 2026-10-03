@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { Undo2, Redo2 } from 'lucide-react';
 import { ArrowDownToLine, ArrowUpRight, Bookmark, ChevronDown, ChevronLeft, ChevronRight, ChevronsUpDown, CircleHelp, Combine, File, FileCheck2, FileImage, FileOutput, FilePenLine, FilePlus2, Files, FolderOpen, Hand, Highlighter, Home, LayoutGrid, List, Maximize, Menu, MessageSquare, Minimize2, Minus, MoreHorizontal, MousePointer2, PanelLeftClose, Pencil, Plus, Printer, RotateCw, Save, ScanLine, Search, ShieldCheck, Signature, SlidersHorizontal, Star, Sun, Type, X, ZoomIn, ZoomOut, type LucideIcon } from 'lucide-react';
-import { closeDocument, cancelPasswordRequest, native, openDocument, reopenDocument, editPages, saveCopy, splitDocument, cropPages, resetCrops, combineDocuments, insertPagesCopy, replacePagesCopy, documentFormFields, fillFormCopy, documentAnnotations, documentPageLabels, createPdfFromImage, exportPageImage, createComment, updateComment, deleteComment, createHighlight, createTextHighlight, updateHighlight, deleteHighlight, ocrCapability as getOcrCapability, type Annotation, type CommentRect, type CropInsets, type CreatePdfOptions, type DocumentAnnotations, type DocumentFormFields, type FormPatch, type OcrCapability, type OpenResult, type PageImageExport, type PageImageExportRequest, type SplitOutput, type SavedCopy } from './bridge';
+import { closeDocument, cancelPasswordRequest, native, openDocument, reopenDocument, editPages, saveCopy, splitDocument, cropPages, resetCrops, combineDocuments, insertPagesCopy, replacePagesCopy, documentFormFields, fillFormCopy, documentAnnotations, documentPageLabels, createPdfFromImage, exportPageImage, redactDocument, createComment, updateComment, deleteComment, createHighlight, createTextHighlight, updateHighlight, deleteHighlight, ocrCapability as getOcrCapability, type Annotation, type CommentRect, type CropInsets, type CreatePdfOptions, type DocumentAnnotations, type DocumentFormFields, type FormPatch, type OcrCapability, type OpenResult, type PageImageExport, type PageImageExportRequest, type RasterRedactionRect, type SplitOutput, type SavedCopy } from './bridge';
 import { clampPage, toolGroups, type DocumentInfo, type PageEdit } from './model';
 import { pageLabelDescription, pageLabelFor, validatePageLabels, type DocumentPageLabels } from './pageLabels';
 import Viewer from './Viewer';
@@ -25,13 +25,15 @@ import CreatePdfDialog from './CreatePdfDialog';
 import ExportPageImageDialog, { type PageImageTarget } from './ExportPageImageDialog';
 import PageList from './PageList';
 import CommentsPanel from './CommentsPanel';
+import RedactPanel from './RedactPanel';
 import CommentEditor, { type AnnotationDraft } from './CommentEditor';
 import type { TextHighlightSelection, TextHighlightSelectionSource } from './textHighlightSelection';
+import { appendRedaction, type RedactionDraft } from './redaction';
 import { readPreferences, savePreferences, type FitMode } from './preferences';
 import { readRecentFiles, saveRecentFiles, rememberFile } from './recentFiles';
 import s from './Workspace.module.css';
 
-const icons: Record<string, LucideIcon> = { 'Create a PDF': FilePlus2, 'Combine files': Combine, 'Organize pages': LayoutGrid, 'Edit a PDF': FilePenLine, 'Export a PDF': FileOutput, 'Scan & OCR': ScanLine, 'Fill forms': Signature, 'Protect a PDF': ShieldCheck, 'Comment': MessageSquare, 'Compress a PDF': ArrowDownToLine };
+const icons: Record<string, LucideIcon> = { 'Create a PDF': FilePlus2, 'Combine files': Combine, 'Organize pages': LayoutGrid, 'Edit a PDF': FilePenLine, 'Export a PDF': FileOutput, 'Scan & OCR': ScanLine, 'Fill forms': Signature, 'Protect a PDF': ShieldCheck, 'Redact a PDF': ShieldCheck, 'Comment': MessageSquare, 'Compress a PDF': ArrowDownToLine };
 function IconButton({ icon: Icon, label, onClick, onPointerDown, disabled = false, active = false }: { icon: LucideIcon; label: string; onClick?: () => void; onPointerDown?: () => void; disabled?: boolean; active?: boolean }) {
   return <button className={`${s.iconButton} ${active ? s.activeIcon : ''}`} aria-label={label} title={disabled && !onClick ? `${label} — not implemented yet` : label} onPointerDown={onPointerDown} onClick={onClick} disabled={disabled}><Icon size={19} strokeWidth={1.7} /></button>;
 }
@@ -99,6 +101,7 @@ export default function App() {
   const [commentsOpen, setCommentsOpen] = useState(false);
   const [commentMode, setCommentMode] = useState(false);
   const [highlightMode, setHighlightMode] = useState(false);
+  const [redactionDraft, setRedactionDraft] = useState<RedactionDraft | null>(null);
   const [annotationsLoad, setAnnotationsLoad] = useState<AnnotationsLoad>({ request: '', annotations: null, error: '' });
   const [pageLabelsLoad, setPageLabelsLoad] = useState<PageLabelsLoad>({ request: '', labels: null });
   const [commentEditor, setCommentEditor] = useState<AnnotationDraft | null>(null);
@@ -143,6 +146,7 @@ export default function App() {
   const closeSearch = useCallback(() => { setSearchOpen(false); setActiveSearch(null); }, []);
   useEffect(() => { setActiveSearch(null); }, [active, doc?.revision, organizing, searchOpen]);
   useEffect(() => { setCommentMode(false); setHighlightMode(false); setCommentsOpen(false); setCommentEditor(null); setFormsOpen(false); }, [active]);
+  useEffect(() => { setRedactionDraft(null); }, [active, doc?.revision]);
   useEffect(() => { retainedTextHighlightSelection.current = null; pointerTextHighlightSelection.current = null; setTextHighlightSelection(null); }, [active, doc?.revision, hand, commentMode, highlightMode]);
   const annotationsNeeded = commentMode || highlightMode || commentsOpen || commentEditor !== null || textHighlightSelection !== null;
   const annotationsRequest = doc ? `${doc.id}:${doc.revision}` : '';
@@ -185,7 +189,7 @@ export default function App() {
   }, [doc?.id, doc?.revision, doc?.pages.length, pageLabelsRequest]);
   const pageLabels = pageLabelsLoad.request === pageLabelsRequest ? pageLabelsLoad.labels : null;
   const activate = (id: number) => {
-    if (busy || closingDocument.current !== null) return;
+    if (busy || redactionDraft || closingDocument.current !== null) return;
     const document = documents.find(item => item.id === id);
     if (!document) return;
     if (pageOcrTarget && pageOcrTarget.id !== id) setPageOcrTarget(null);
@@ -224,7 +228,7 @@ export default function App() {
     finally { if (mounted.current) setBusy(false); }
   };
   const close = async (id: number, discard = false) => {
-    if (busy || closingDocument.current !== null) return;
+    if (busy || redactionDraft || closingDocument.current !== null) return;
     if (!discard && documents.find(document => document.id === id)?.dirty) { setPendingClose(id); return; }
     if (pageOcrTarget?.id === id) setPageOcrTarget(null);
     closingDocument.current = id; setBusy(true); setError('');
@@ -361,14 +365,34 @@ export default function App() {
     setHand(false); setCommentMode(false); setHighlightMode(true); setCommentsOpen(false);
   };
   const launchComments = () => {
-    if (!doc || busy || closingDocument.current !== null) return;
+    if (!doc || busy || redactionDraft || closingDocument.current !== null) return;
     closeSearch(); setBookmarksOpen(false); setOrganizing(false); setView('document'); setCommentsOpen(true);
   };
   const launchCommentMode = () => {
-    launchComments(); setHand(false); setHighlightMode(false); setCommentMode(true);
+    launchComments(); setRedactionDraft(null); setHand(false); setHighlightMode(false); setCommentMode(true);
   };
   const launchHighlightMode = () => {
-    launchComments(); setHand(false); setCommentMode(false); setHighlightMode(true);
+    launchComments(); setRedactionDraft(null); setHand(false); setCommentMode(false); setHighlightMode(true);
+  };
+  const launchRedaction = () => {
+    if (!doc || busy || closingDocument.current !== null) return;
+    const currentPage = clampPage(page, doc.pages.length);
+    retainedTextHighlightSelection.current=null; pointerTextHighlightSelection.current=null; setTextHighlightSelection(null);
+    setMenu(false); setOrganizing(false); setView('document'); closeSearch(); setBookmarksOpen(false); setCommentsOpen(false); setCommentEditor(null); setCommentMode(false); setHighlightMode(false); setHand(false);
+    setRedactionDraft({ id: doc.id, revision: doc.revision, page: currentPage, rectangles: [] });
+  };
+  const addRedaction = (redactionPage: number, rect: RasterRedactionRect) => {
+    if (!busy) setRedactionDraft(draft => appendRedaction(draft, doc, redactionPage, rect));
+  };
+  const applyRedaction = async () => {
+    const draft = redactionDraft;
+    if (!draft || !doc || busy || closingDocument.current !== null || draft.id !== doc.id || draft.revision !== doc.revision || draft.page < 0 || draft.page >= doc.pages.length || draft.rectangles.length < 1 || draft.rectangles.length > 256) { setError('The document changed. Start redaction again.'); return; }
+    setBusy(true); setError(''); setNotice('');
+    try {
+      const result = await redactDocument(draft);
+      if (result) { setRedactionDraft(null); opened(result.document, false); }
+    } catch (reason) { setError(String(reason)); }
+    finally { setBusy(false); }
   };
   const combine = async (first: { id: number; revision: number }, second: { id: number; revision: number }): Promise<SavedCopy | null> => {
     if (busy || closingDocument.current !== null) throw new Error('The workspace is not ready to combine PDFs.');
@@ -449,25 +473,25 @@ export default function App() {
     try { return await exportPageImage(request); }
     finally { setBusy(false); }
   };
-  const launchCreate = () => { if (busy || closingDocument.current !== null) return; setMenu(false); setCreateOpen(true); };
+  const launchCreate = () => { if (busy || redactionDraft || closingDocument.current !== null) return; setMenu(false); setCreateOpen(true); };
   const launchPageImageExport = () => {
-    if (!doc || busy || closingDocument.current !== null) return;
+    if (!doc || busy || redactionDraft || closingDocument.current !== null) return;
     const currentPage = clampPage(page, doc.pages.length), size = doc.pages[clampPage(page, doc.pages.length)];
     if (!size) return;
     setMenu(false); setPageImageTarget({ id: doc.id, revision: doc.revision, page: currentPage, size });
   };
-  const launchOrganizer = () => { if (busy || closingDocument.current !== null) return; if (doc) { setOrganizing(true); setView('document'); } else void open(false, true); };
+  const launchOrganizer = () => { if (busy || redactionDraft || closingDocument.current !== null) return; if (doc) { setOrganizing(true); setView('document'); } else void open(false, true); };
   const launchCombine = () => {
-    if (busy || closingDocument.current !== null) return;
+    if (busy || redactionDraft || closingDocument.current !== null) return;
     if (documents.length < 2) { setNotice('Open two PDFs to combine them.'); return; }
     setMenu(false); setOrganizing(false); setView('document'); setCombineOpen(true);
   };
   const launchForms = () => {
-    if (!doc || busy || closingDocument.current !== null) return;
+    if (!doc || busy || redactionDraft || closingDocument.current !== null) return;
     setMenu(false); setOrganizing(false); closeSearch(); setBookmarksOpen(false); setFormsOpen(true);
   };
   const launchPageOcr = () => {
-    if (!doc || busy || closingDocument.current !== null || !ocr.available) return;
+    if (!doc || busy || redactionDraft || closingDocument.current !== null || !ocr.available) return;
     const currentPage = clampPage(page, doc.pages.length);
     setMenu(false); setOrganizing(false); closeSearch(); setBookmarksOpen(false);
     setPageOcrTarget({ id: doc.id, revision: doc.revision, page: currentPage, name: doc.name });
@@ -494,12 +518,13 @@ export default function App() {
     const listener = (event: KeyboardEvent) => {
       if (updatesOpen || pageTextOpen || pageOcrTarget || printOpen || propertiesOpen || noticesOpen || passwordRequest || pendingClose !== null || createOpen || pageImageTarget || combineOpen || insertOpen || replaceOpen || commentEditor) return;
       if ((event.target as HTMLElement | null)?.closest?.('dialog')) return;
+      if (redactionDraft && event.ctrlKey) { event.preventDefault(); return; }
       if (event.ctrlKey && event.key.toLowerCase() === 'o') { event.preventDefault(); void open(); }
       if (event.ctrlKey && event.key.toLowerCase() === 'f' && doc) { event.preventDefault(); setView('document'); setOrganizing(false); setSearchOpen(true); return; }
       if (event.ctrlKey && event.key.toLowerCase() === 'p' && doc) { event.preventDefault(); if (!busy) setPrintOpen(true); return; }
       if (event.ctrlKey && event.key.toLowerCase() === 'd' && doc) { event.preventDefault(); if (!busy) setPropertiesOpen(true); return; }
       if (event.key === 'Escape' && searchOpen) { closeSearch(); return; }
-      if (event.key === 'Escape' && (commentsOpen || commentMode || highlightMode)) { setCommentsOpen(false); setCommentMode(false); setHighlightMode(false); return; }
+      if (event.key === 'Escape' && (commentsOpen || commentMode || highlightMode || redactionDraft)) { setCommentsOpen(false); setCommentMode(false); setHighlightMode(false); setRedactionDraft(null); return; }
       if ((event.target as HTMLElement).matches('input,select,textarea')) return;
       if (event.key === 'F4') { event.preventDefault(); event.shiftKey ? setToolsOpen(v => !v) : setNav(v => !v); }
       if (event.ctrlKey && event.key === '2') { event.preventDefault(); setFit('width'); }
@@ -513,7 +538,7 @@ export default function App() {
       if (event.key === 'PageUp') { event.preventDefault(); go(page - 1); }
       if (event.key === 'Home') { event.preventDefault(); go(0); }
       if (event.key === 'End') { event.preventDefault(); go(doc.pages.length - 1); }
-      if (event.key.toLowerCase() === 'h' && !event.ctrlKey) { setHand(true); setCommentMode(false); setHighlightMode(false); }
+      if (event.key.toLowerCase() === 'h' && !event.ctrlKey) { setHand(true); setCommentMode(false); setHighlightMode(false); setRedactionDraft(null); }
       if (event.ctrlKey && event.key === 'Tab') { event.preventDefault(); const i = documents.findIndex(d => d.id === active); activate(documents[(i + 1) % documents.length].id); }
       if (event.ctrlKey && event.key.toLowerCase() === 'w') { event.preventDefault(); void close(doc.id); }
     };
@@ -524,31 +549,32 @@ export default function App() {
   const toolRow = (name: string, index: number) => {
     const Icon = icons[name] || FileCheck2;
     const pageOcr = name === 'Scan & OCR';
-    const available = name === 'Create a PDF' || name === 'Export a PDF' || name === 'Organize pages' || name === 'Combine files' || name === 'Comment' || name === 'Fill forms' || pageOcr && ocr.available;
+    const redaction = name === 'Redact a PDF';
+    const available = name === 'Create a PDF' || name === 'Export a PDF' || name === 'Organize pages' || name === 'Combine files' || name === 'Comment' || name === 'Fill forms' || redaction || pageOcr && ocr.available;
     const create = name === 'Create a PDF';
     const imageExport = name === 'Export a PDF';
     const combine = name === 'Combine files';
     const comment = name === 'Comment';
     const forms = name === 'Fill forms';
-    const disabled = busy || !available || (combine && documents.length < 2) || ((comment || forms || imageExport || pageOcr) && !doc);
-    return <button key={name} className={s.toolRow} disabled={disabled} onClick={create ? launchCreate : imageExport ? launchPageImageExport : pageOcr ? launchPageOcr : combine ? launchCombine : comment ? launchCommentMode : forms ? launchForms : launchOrganizer} title={combine && documents.length < 2 ? 'Open two PDFs to combine them' : (comment || forms || imageExport || pageOcr) && !doc ? 'Open a PDF first' : imageExport ? 'Export the current page as image' : pageOcr ? (ocr.available ? 'Recognize text on the current page in English' : ocr.reason || 'OCR is unavailable in this build.') : forms ? 'Fill existing fields' : available ? name : `${name} — planned, not implemented yet`}><span className={s.toolIcon} style={{ color: ['#7361b3', '#277bb4', '#239576', '#bc6b25'][index % 4] }}><Icon size={21} strokeWidth={1.7} /></span><span>{imageExport ? 'Export page as image' : name}</span></button>;
+    const disabled = busy || !!redactionDraft || !available || (combine && documents.length < 2) || ((comment || forms || imageExport || redaction || pageOcr) && !doc);
+    return <button key={name} className={s.toolRow} disabled={disabled} onClick={create ? launchCreate : imageExport ? launchPageImageExport : pageOcr ? launchPageOcr : combine ? launchCombine : comment ? launchCommentMode : forms ? launchForms : redaction ? launchRedaction : launchOrganizer} title={combine && documents.length < 2 ? 'Open two PDFs to combine them' : (comment || forms || imageExport || redaction || pageOcr) && !doc ? 'Open a PDF first' : imageExport ? 'Export the current page as image' : redaction ? 'Permanently blank marked areas in a rasterized copy' : pageOcr ? (ocr.available ? 'Recognize text on the current page in English' : ocr.reason || 'OCR is unavailable in this build.') : forms ? 'Fill existing fields' : available ? name : `${name} — planned, not implemented yet`}><span className={s.toolIcon} style={{ color: ['#7361b3', '#277bb4', '#239576', '#bc6b25'][index % 4] }}><Icon size={21} strokeWidth={1.7} /></span><span>{imageExport ? 'Export page as image' : name}</span></button>;
   };
   return <div className={`${s.app} ${dark ? s.dark : ''}`}>
     <header className={s.tabbar}>
       <div className={s.appMark}><Files size={21} /></div>
       <button className={s.menuButton} onClick={() => setMenu(v => !v)} aria-expanded={menu}><Menu size={17} /> Menu</button>
-      <button className={`${s.homeTab} ${view === 'home' ? s.selectedTab : ''}`} aria-label="Home" onClick={() => setView('home')}><Home size={19} /></button>
-      <div className={s.documentTabs}>{documents.map(document => <div key={document.id} className={`${s.documentTab} ${view === 'document' && active === document.id ? s.selectedTab : ''}`}><button disabled={busy} onClick={() => activate(document.id)}><File size={15} /><span>{document.name}{document.dirty ? ' *' : ''}</span></button><IconButton icon={X} label={`Close ${document.name}`} disabled={busy} onClick={() => void close(document.id)} /></div>)}</div>
-      <button className={s.createButton} disabled={busy} onClick={launchCreate} title="Create a PDF from an image"><Plus size={17} /> Create</button>
+      <button className={`${s.homeTab} ${view === 'home' ? s.selectedTab : ''}`} aria-label="Home" disabled={!!redactionDraft} onClick={() => setView('home')}><Home size={19} /></button>
+      <div className={s.documentTabs}>{documents.map(document => <div key={document.id} className={`${s.documentTab} ${view === 'document' && active === document.id ? s.selectedTab : ''}`}><button disabled={busy || !!redactionDraft} onClick={() => activate(document.id)}><File size={15} /><span>{document.name}{document.dirty ? ' *' : ''}</span></button><IconButton icon={X} label={`Close ${document.name}`} disabled={busy || !!redactionDraft} onClick={() => void close(document.id)} /></div>)}</div>
+      <button className={s.createButton} disabled={busy || !!redactionDraft} onClick={launchCreate} title="Create a PDF from an image"><Plus size={17} /> Create</button>
       <span className={s.windowTitle}>PDF Workstation</span>
     </header>
     {menu && <div className={s.menuPopover}>
-      <button onClick={() => void open()}>Open… <kbd>Ctrl+O</kbd></button><button onClick={() => void open(true)}>Open sample PDF</button>
-      <button disabled={!doc || busy} onClick={() => { setMenu(false); void save(); }}>Save a copy… <kbd>Ctrl+S</kbd></button>
-      <button disabled={!doc || busy} onClick={launchPageImageExport}>Export page as image…</button>
-      <button disabled={!doc || busy || !ocr.available} onClick={launchPageOcr} title={ocr.available ? 'Recognize text on the current page in English' : ocr.reason || 'OCR is unavailable in this build.'}>Recognize current page…</button>
-      <button onClick={() => { setMenu(false); launchOrganizer(); }}>Organize pages</button>
-      <button disabled={!doc || busy} onClick={() => { setMenu(false); setPropertiesOpen(true); }}>Document properties… <kbd>Ctrl+D</kbd></button><hr />
+      <button disabled={!!redactionDraft} onClick={() => void open()}>Open… <kbd>Ctrl+O</kbd></button><button disabled={!!redactionDraft} onClick={() => void open(true)}>Open sample PDF</button>
+      <button disabled={!doc || busy || !!redactionDraft} onClick={() => { setMenu(false); void save(); }}>Save a copy… <kbd>Ctrl+S</kbd></button>
+      <button disabled={!doc || busy || !!redactionDraft} onClick={launchPageImageExport}>Export page as image…</button>
+      <button disabled={!doc || busy || !!redactionDraft || !ocr.available} onClick={launchPageOcr} title={ocr.available ? 'Recognize text on the current page in English' : ocr.reason || 'OCR is unavailable in this build.'}>Recognize current page…</button>
+      <button disabled={!!redactionDraft} onClick={() => { setMenu(false); launchOrganizer(); }}>Organize pages</button>
+      <button disabled={!doc || busy || !!redactionDraft} onClick={() => { setMenu(false); setPropertiesOpen(true); }}>Document properties… <kbd>Ctrl+D</kbd></button><hr />
       <button onClick={() => { setDark(v => !v); setMenu(false); }}>Switch to {dark ? 'light' : 'dark'} theme</button>
       <button disabled={busy} onClick={() => { setMenu(false); setUpdatesOpen(true); }}>Check for updates…</button>
       <button disabled={busy} onClick={() => { setMenu(false); setNoticesOpen(true); }}>Third-party notices…</button>
@@ -573,8 +599,8 @@ export default function App() {
       : commentEditor.annotation.kind === 'note' ? mutateAnnotation(current => updateComment(current.id, current.revision, commentEditor.annotation.id, contents || '')) : mutateAnnotation(current => updateHighlight(current.id, current.revision, commentEditor.annotation.id, contents))}
       remove={commentEditor.kind === 'edit' ? () => commentEditor.annotation.kind === 'note' ? mutateAnnotation(current => deleteComment(current.id, current.revision, commentEditor.annotation.id)) : mutateAnnotation(current => deleteHighlight(current.id, current.revision, commentEditor.annotation.id)) : undefined} close={() => setCommentEditor(null)} />}
     <div className={s.globalbar}>
-      <nav className={s.primaryNav}><button className={toolsOpen && view !== 'home' ? s.selectedNav : ''} onClick={() => view === 'document' ? setToolsOpen(v => !v) : setView('tools')}>All tools</button><button disabled>Edit</button><button disabled>Convert</button><button disabled>E-sign</button></nav>
-      <div className={s.globalActions}><IconButton icon={Search} label="Find text" disabled={!doc || busy} active={searchOpen} onClick={() => { setView('document'); setOrganizing(false); searchOpen ? closeSearch() : setSearchOpen(true); }} /><span className={s.divider} /><IconButton icon={Undo2} label="Undo" disabled={busy || !doc?.can_undo} onClick={() => void edit({ kind: 'undo' })} /><IconButton icon={Redo2} label="Redo" disabled={busy || !doc?.can_redo} onClick={() => void edit({ kind: 'redo' })} /><IconButton icon={Save} label="Save a copy" disabled={busy || !doc} onClick={() => void save()} /><IconButton icon={Printer} label="Print" disabled={busy || !doc} onClick={() => setPrintOpen(true)} /><IconButton icon={Sun} label="Toggle theme" onClick={() => setDark(v => !v)} /><IconButton icon={CircleHelp} label="Build information" onClick={() => setNotice('Organize Pages and document search are available. Other tools marked unavailable are planned for later milestones. Save a Copy writes a new file and preserves your original.')} /><button className={s.openButton} onClick={() => void open()} disabled={busy}><FolderOpen size={16} /> {busy ? 'Working…' : 'Open a file'}</button></div>
+      <nav className={s.primaryNav}><button className={toolsOpen && view !== 'home' ? s.selectedNav : ''} disabled={!!redactionDraft} onClick={() => view === 'document' ? setToolsOpen(v => !v) : setView('tools')}>All tools</button><button disabled>Edit</button><button disabled>Convert</button><button disabled>E-sign</button></nav>
+      <div className={s.globalActions}><IconButton icon={Search} label="Find text" disabled={!doc || busy || !!redactionDraft} active={searchOpen} onClick={() => { setView('document'); setOrganizing(false); searchOpen ? closeSearch() : setSearchOpen(true); }} /><span className={s.divider} /><IconButton icon={Undo2} label="Undo" disabled={busy || !!redactionDraft || !doc?.can_undo} onClick={() => void edit({ kind: 'undo' })} /><IconButton icon={Redo2} label="Redo" disabled={busy || !!redactionDraft || !doc?.can_redo} onClick={() => void edit({ kind: 'redo' })} /><IconButton icon={Save} label="Save a copy" disabled={busy || !!redactionDraft || !doc} onClick={() => void save()} /><IconButton icon={Printer} label="Print" disabled={busy || !!redactionDraft || !doc} onClick={() => setPrintOpen(true)} /><IconButton icon={Sun} label="Toggle theme" onClick={() => setDark(v => !v)} /><IconButton icon={CircleHelp} label="Build information" onClick={() => setNotice('Organize Pages and document search are available. Other tools marked unavailable are planned for later milestones. Save a Copy writes a new file and preserves your original.')} /><button className={s.openButton} onClick={() => void open()} disabled={busy || !!redactionDraft}><FolderOpen size={16} /> {busy ? 'Working…' : 'Open a file'}</button></div>
     </div>
     {(error || notice) && <div className={`${s.banner} ${error ? s.error : ''}`} role={error ? 'alert' : 'status'}><span>{error || notice}</span><IconButton icon={X} label="Dismiss message" onClick={() => { setError(''); setNotice(''); }} /></div>}
     <main className={s.main}>
@@ -588,9 +614,10 @@ export default function App() {
           {!listed.length && <div className={s.empty}><div className={s.emptyIcon}><Files size={36} strokeWidth={1.25} /></div><h3>{query ? 'No matching files' : section === 'Starred' ? 'Keep important files close' : 'Your documents start here'}</h3><p>{query ? 'Try another file name.' : section === 'Starred' ? 'Star an open file to find it here.' : 'Open a PDF from your computer to start reading.'}</p>{!query && section !== 'Starred' && <><button className={s.openButton} onClick={() => void open()} disabled={busy}>Open a file</button><button className={s.textButton} onClick={() => void open(true)} disabled={busy}>Explore a sample PDF <ChevronRight size={15} /></button></>}</div>}
           <p className={s.foundationNote}>Viewer + Organize Pages · More tools are in development{!native ? ' · Browser preview' : ''}</p>
         </section>
-      </> : view === 'tools' ? <section className={s.toolsCatalog}><div className={s.catalogHeading}><div><p className={s.eyebrow}>THE COMPLETE WORKSPACE</p><h1>All tools</h1><p>Create a PDF, export a page as image, Combine Files, Organize Pages, and Fill forms are ready. OCR is available only when enabled in an opt-in source build. Other advanced tools are planned for later milestones.</p></div><label className={s.search}><Search size={16} /><input aria-label="Search tools" placeholder="Find a tool" value={query} onChange={e => setQuery(e.target.value)} /></label></div>{toolGroups.map(group => <section key={group.name}><h2>{group.name}</h2><div className={s.catalogGrid}>{group.tools.filter(name => name.toLowerCase().includes(query.toLowerCase())).map((name, i) => <div className={s.catalogCard} key={name}>{toolRow(name, i)}<span className={s.planned}>{name === 'Create a PDF' || name === 'Export a PDF' || name === 'Organize pages' || name === 'Combine files' || name === 'Fill forms' || name === 'Scan & OCR' && ocr.available ? 'Available' : 'Not available yet'}</span></div>)}</div></section>)}</section> : doc ? <>
-        {toolsOpen && <aside className={s.toolsPanel}><div className={s.panelHeading}><h2>All tools</h2><IconButton icon={PanelLeftClose} label="Collapse all tools" onClick={() => setToolsOpen(false)} /></div>{['Export a PDF', 'Edit a PDF', 'Create a PDF', 'Combine files', 'Organize pages', 'Comment', 'Fill forms', 'Scan & OCR', 'Protect a PDF', 'Compress a PDF'].map(toolRow)}<button className={s.textButton} onClick={() => setView('tools')}>View all tools <ChevronRight size={15} /></button><div className={s.panelNote}>Export page as image, Create a PDF, Combine Files, Organize Pages, and Fill forms are available. More tools are in development.</div></aside>}
-        {organizing ? <Organizer key={doc.id} document={doc} currentPage={page} pageLabels={pageLabels} busy={busy} edit={edit} save={save} split={split} crop={crop} resetCrop={resetCrop} insert={launchInsert} replace={launchReplace} close={() => setOrganizing(false)} /> : <div className={s.documentArea}><Viewer key={`${doc.id}-${doc.revision}`} document={doc} zoom={zoom} fit={fit} target={target} onPage={trackPage} hand={hand} search={activeSearch} annotations={annotations?.status === 'supported' ? annotations.annotations : []} commentMode={commentMode} highlightMode={highlightMode} annotationAvailable={annotations?.status === 'supported'} annotationInteractive={commentMode && !hand && !highlightMode} onCommentCreate={beginComment} onHighlightCreate={beginHighlight} onAnnotationSelect={selectAnnotation} onTextSelection={receiveTextHighlightSelection} /><div className={s.quickToolbar}><IconButton icon={MousePointer2} label="Select text on page" active={!hand && !commentMode && !highlightMode} onClick={() => { setHand(false); setCommentMode(false); setHighlightMode(false); }} /><IconButton icon={Highlighter} label="Highlight selected text" disabled={busy || !textHighlightSelection || annotations?.status !== 'supported'} onPointerDown={captureTextHighlightSelection} onClick={beginTextHighlight} /><IconButton icon={Hand} label="Pan document" active={hand} onClick={() => { setHand(true); setCommentMode(false); setHighlightMode(false); }} /><IconButton icon={Type} label="Read and copy page text" onClick={() => setPageTextOpen(true)} /><span className={s.horizontalDivider} /><IconButton icon={MessageSquare} label="Add comment" active={commentMode} disabled={busy} onClick={launchCommentMode} /><IconButton icon={Highlighter} label="Add area highlight" active={highlightMode} disabled={busy} onClick={launchHighlightMode} /><IconButton icon={Pencil} label="Draw" disabled /><IconButton icon={Type} label="Fill existing fields" disabled={busy} onClick={launchForms} /><IconButton icon={Signature} label="Add signature" disabled /><span className={s.horizontalDivider} /><IconButton icon={MoreHorizontal} label="Customize quick tools" disabled /></div></div>}
+      </> : view === 'tools' ? <section className={s.toolsCatalog}><div className={s.catalogHeading}><div><p className={s.eyebrow}>THE COMPLETE WORKSPACE</p><h1>All tools</h1><p>Create a PDF, export a page as image, Combine Files, Organize Pages, Fill forms, and raster redaction are ready. OCR is available only when enabled in an opt-in source build. Other advanced tools are planned for later milestones.</p></div><label className={s.search}><Search size={16} /><input aria-label="Search tools" placeholder="Find a tool" value={query} onChange={e => setQuery(e.target.value)} /></label></div>{toolGroups.map(group => <section key={group.name}><h2>{group.name}</h2><div className={s.catalogGrid}>{group.tools.filter(name => name.toLowerCase().includes(query.toLowerCase())).map((name, i) => <div className={s.catalogCard} key={name}>{toolRow(name, i)}<span className={s.planned}>{name === 'Create a PDF' || name === 'Export a PDF' || name === 'Organize pages' || name === 'Combine files' || name === 'Fill forms' || name === 'Redact a PDF' || name === 'Scan & OCR' && ocr.available ? 'Available' : 'Not available yet'}</span></div>)}</div></section>)}</section> : doc ? <>
+        {toolsOpen && <aside className={s.toolsPanel}><div className={s.panelHeading}><h2>All tools</h2><IconButton icon={PanelLeftClose} label="Collapse all tools" onClick={() => setToolsOpen(false)} /></div>{['Export a PDF', 'Edit a PDF', 'Create a PDF', 'Combine files', 'Organize pages', 'Comment', 'Fill forms', 'Redact a PDF', 'Scan & OCR', 'Protect a PDF', 'Compress a PDF'].map(toolRow)}<button className={s.textButton} onClick={() => setView('tools')}>View all tools <ChevronRight size={15} /></button><div className={s.panelNote}>Export page as image, Create a PDF, Combine Files, Organize Pages, Fill forms, and raster redaction are available. More tools are in development.</div></aside>}
+        {organizing ? <Organizer key={doc.id} document={doc} currentPage={page} pageLabels={pageLabels} busy={busy} edit={edit} save={save} split={split} crop={crop} resetCrop={resetCrop} insert={launchInsert} replace={launchReplace} close={() => setOrganizing(false)} /> : <div className={s.documentArea}><Viewer key={`${doc.id}-${doc.revision}`} document={doc} zoom={zoom} fit={fit} target={target} onPage={trackPage} hand={hand} search={activeSearch} annotations={annotations?.status === 'supported' ? annotations.annotations : []} commentMode={commentMode} highlightMode={highlightMode} redactionPage={redactionDraft?.page ?? null} redactions={redactionDraft?.rectangles ?? []} annotationAvailable={annotations?.status === 'supported'} annotationInteractive={commentMode && !hand && !highlightMode && !redactionDraft} onCommentCreate={beginComment} onHighlightCreate={beginHighlight} onRedactionCreate={addRedaction} onAnnotationSelect={selectAnnotation} onTextSelection={receiveTextHighlightSelection} /><div className={s.quickToolbar}><IconButton icon={MousePointer2} label="Select text on page" active={!hand && !commentMode && !highlightMode && !redactionDraft} onClick={() => { setHand(false); setCommentMode(false); setHighlightMode(false); setRedactionDraft(null); }} /><IconButton icon={Highlighter} label="Highlight selected text" disabled={busy || !!redactionDraft || !textHighlightSelection || annotations?.status !== 'supported'} onPointerDown={captureTextHighlightSelection} onClick={beginTextHighlight} /><IconButton icon={Hand} label="Pan document" active={hand} onClick={() => { setHand(true); setCommentMode(false); setHighlightMode(false); setRedactionDraft(null); }} /><IconButton icon={Type} label="Read and copy page text" disabled={!!redactionDraft} onClick={() => setPageTextOpen(true)} /><span className={s.horizontalDivider} /><IconButton icon={MessageSquare} label="Add comment" active={commentMode} disabled={busy || !!redactionDraft} onClick={launchCommentMode} /><IconButton icon={Highlighter} label="Add area highlight" active={highlightMode} disabled={busy || !!redactionDraft} onClick={launchHighlightMode} /><IconButton icon={Pencil} label="Draw" disabled /><IconButton icon={Type} label="Fill existing fields" disabled={busy || !!redactionDraft} onClick={launchForms} /><IconButton icon={Signature} label="Add signature" disabled /><span className={s.horizontalDivider} /><IconButton icon={MoreHorizontal} label="Customize quick tools" disabled /></div></div>}
+        {!organizing && redactionDraft && doc && <RedactPanel page={redactionDraft.page} rectangles={redactionDraft.rectangles} busy={busy} remove={index => setRedactionDraft(draft => draft ? { ...draft, rectangles: draft.rectangles.filter((_, current) => current !== index) } : null)} clear={() => setRedactionDraft(draft => draft ? { ...draft, rectangles: [] } : null)} apply={() => void applyRedaction()} close={() => setRedactionDraft(null)} />}
         {!organizing && commentsOpen && doc && <CommentsPanel key={`${doc.id}-${doc.revision}`} document={doc} page={page} annotations={annotations} error={annotationsLoad.request === annotationsRequest ? annotationsLoad.error : ''} selectedId={commentEditor?.kind === 'edit' ? commentEditor.annotation.id : null} onAddComment={addCommentOnCurrentPage} onAddHighlight={addHighlightOnCurrentPage} onSelect={selectAnnotation} close={() => setCommentsOpen(false)} />}
         {!organizing && bookmarksOpen && <BookmarksPanel key={`${doc.id}-${doc.revision}`} document={doc} go={go} close={() => setBookmarksOpen(false)} />}
         {!organizing && searchOpen && !bookmarksOpen && <SearchPanel key={`${doc.id}-${doc.revision}`} document={doc} go={go} close={closeSearch} onHighlights={receiveSearch} />}
