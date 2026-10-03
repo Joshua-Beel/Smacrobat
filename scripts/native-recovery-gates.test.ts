@@ -1,8 +1,16 @@
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { expect, it } from 'vitest';
+
+it('runs the isolated process and integration storage probes through the bounded receipt gate', () => {
+  const helper = readFileSync('scripts/run-native-recovery-gates.ps1', 'utf8');
+  expect(helper).toContain("Name = 'recovery_store::process_tests::cross_process_lock_serializes_admission_and_generations'; Target = @('--bin', 'pdf-workstation'); Ignored = $true");
+  expect(helper).toContain("Name = 'aggregate_record_count_rejects_new_sources_but_allows_exact_replacement'; Target = @('--test', 'recovery_store'); Ignored = $false");
+  expect(helper).toContain("if ([bool]$probe.Ignored) { $arguments += '--ignored' }");
+  expect(helper).toContain("$arguments += @('--exact', '--test-threads=1')");
+});
 
 it('rejects a zero-test Cargo success receipt before accepting a required recovery probe', () => {
   const root = join('target', `native-recovery-gate-${randomUUID()}`);

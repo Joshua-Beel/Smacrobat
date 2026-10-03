@@ -7,12 +7,18 @@ $manifest = 'src-tauri/Cargo.toml'
 if ($LASTEXITCODE -ne 0) { throw 'The serialized native test gate failed.' }
 
 $required = @(
-  'service::tests::recovery_checkpoint_ack_is_durable_and_explicit_restore_replays_exact_state',
-  'service::tests::explicit_discard_is_idempotent_and_resolves_post_publish_lock',
-  'service::recovery_restart_tests::restart_recovery_survives_fresh_workers'
+  @{ Name = 'service::tests::recovery_checkpoint_ack_is_durable_and_explicit_restore_replays_exact_state'; Target = @('--bin', 'pdf-workstation'); Ignored = $true },
+  @{ Name = 'service::tests::explicit_discard_is_idempotent_and_resolves_post_publish_lock'; Target = @('--bin', 'pdf-workstation'); Ignored = $true },
+  @{ Name = 'service::recovery_restart_tests::restart_recovery_survives_fresh_workers'; Target = @('--bin', 'pdf-workstation'); Ignored = $true },
+  @{ Name = 'recovery_store::process_tests::cross_process_lock_serializes_admission_and_generations'; Target = @('--bin', 'pdf-workstation'); Ignored = $true },
+  @{ Name = 'aggregate_record_count_rejects_new_sources_but_allows_exact_replacement'; Target = @('--test', 'recovery_store'); Ignored = $false }
 )
-foreach ($testName in $required) {
-  $output = @(& $CargoPath test --locked --manifest-path $manifest --bin pdf-workstation $testName -- --ignored --exact --test-threads=1 2>&1 | ForEach-Object { $_.ToString() })
+foreach ($probe in $required) {
+  $testName = [string]$probe.Name
+  $arguments = @('test', '--locked', '--manifest-path', $manifest) + @($probe.Target) + @($testName, '--')
+  if ([bool]$probe.Ignored) { $arguments += '--ignored' }
+  $arguments += @('--exact', '--test-threads=1')
+  $output = @(& $CargoPath @arguments 2>&1 | ForEach-Object { $_.ToString() })
   $status = $LASTEXITCODE
   $text = $output -join "`n"
   if ([Text.Encoding]::UTF8.GetByteCount($text) -gt 65536) { throw "The required native test receipt exceeded its output bound: $testName" }
