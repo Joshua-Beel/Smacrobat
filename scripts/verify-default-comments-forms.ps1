@@ -12,7 +12,7 @@ $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
 
 function Import-CommentsFormsFunctions { param([string]$Path,[string[]]$Names)
  $tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile($Path,[ref]$tokens,[ref]$errors);if($errors.Count){throw 'A trusted comments/forms helper did not parse.'}
- foreach($name in $Names){$node=$ast.Find({param($value)$value-is[Management.Automation.Language.FunctionDefinitionAst]-and$value.Name-ceq$name},$true);if(-not$node){throw "Trusted comments/forms helper is missing: $name"};Invoke-Expression $node.Extent.Text}
+ foreach($name in $Names){$node=$ast.Find({param($value)$value-is[Management.Automation.Language.FunctionDefinitionAst]-and$value.Name-ceq$name},$true);if(-not$node){throw "Trusted comments/forms helper is missing: $name"};Set-Item -Path ("Function:script:"+$name) -Value $node.Body.GetScriptBlock()}
 }
 Import-CommentsFormsFunctions (Join-Path $PSScriptRoot 'verify-signed-ocr-upgrade.ps1') @('Assert-ExactProperties','Assert-FileReceipt','Resolve-RunnerPath','Assert-FreshInstallFacts','Get-FreshInstallFacts','Get-ConflictingProcessFacts','Invoke-BoundedSilentInstaller','Get-InstallFacts','Assert-InstallFacts','Assert-ReceiptValue','Assert-ReceiptFileObject','Get-UniqueResource')
 Import-CommentsFormsFunctions (Join-Path $PSScriptRoot 'verify-default-expanded-page-tools.ps1') @('Assert-DefaultDraftReceipt','Assert-InstalledDefaultResources','Invoke-OwnedCleanup','Assert-EmptyProcessFacts','Assert-OwnedCleanupState','Complete-PrimaryAndCleanup')

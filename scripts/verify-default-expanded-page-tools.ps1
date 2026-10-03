@@ -16,7 +16,7 @@ $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
 function Import-ExactFunctions {
  param([string]$Path,[string[]]$Names)
  $tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile($Path,[ref]$tokens,[ref]$errors);if($errors.Count){throw 'A trusted helper script did not parse.'}
- foreach($name in $Names){$node=$ast.Find({param($value)$value-is[Management.Automation.Language.FunctionDefinitionAst]-and$value.Name-ceq$name},$true);if(-not$node){throw "Trusted helper is missing: $name"};Invoke-Expression $node.Extent.Text}
+ foreach($name in $Names){$node=$ast.Find({param($value)$value-is[Management.Automation.Language.FunctionDefinitionAst]-and$value.Name-ceq$name},$true);if(-not$node){throw "Trusted helper is missing: $name"};Set-Item -Path ("Function:script:"+$name) -Value $node.Body.GetScriptBlock()}
 }
 Import-ExactFunctions (Join-Path $PSScriptRoot 'verify-signed-ocr-upgrade.ps1') @('Assert-ExactProperties','Assert-FileReceipt','Resolve-RunnerPath','Assert-FreshInstallFacts','Get-FreshInstallFacts','Get-ConflictingProcessFacts','Invoke-BoundedSilentInstaller','Get-InstallFacts','Assert-InstallFacts','Assert-ReceiptValue','Assert-ReceiptFileObject','Get-UniqueResource')
 Import-ExactFunctions (Join-Path $PSScriptRoot 'verify-signed-expanded-page-tools.ps1') @('Assert-ExpandedExactProperties','Get-ExpandedReceipt','New-ExpandedSourcePng','New-ExpandedPageSequencePdf','Assert-ExpandedImageResult','Assert-ExpandedOrganizerResult')

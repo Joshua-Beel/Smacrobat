@@ -44,6 +44,19 @@ describe('default installed expanded page-tools workflow', () => {
     expect(verifier).not.toMatch(/HttpMethod\]::(?:Post|Put|Patch|Delete)|Invoke-RestMethod|Invoke-WebRequest|gh\s+(?:release|api)/i);
   });
 
+  it('retains exact imported helper functions after the importer returns', () => {
+    const check=String.raw`
+      $ErrorActionPreference='Stop';Set-StrictMode -Version Latest;Set-Location -LiteralPath '${process.cwd().replaceAll("'", "''")}'
+      $tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile((Resolve-Path ./scripts/verify-default-expanded-page-tools.ps1),[ref]$tokens,[ref]$errors);if($errors.Count){throw ($errors|Out-String)}
+      $node=$ast.Find({param($n)$n-is[Management.Automation.Language.FunctionDefinitionAst]-and$n.Name-ceq'Import-ExactFunctions'},$true);Invoke-Expression $node.Extent.Text
+      Import-ExactFunctions (Resolve-Path ./scripts/verify-default-draft.ps1) @('ConvertTo-ExactUInt64','New-GitHubGetRequest','Assert-GitHubResponseSuccess','Invoke-GitHubJson')
+      foreach($name in @('ConvertTo-ExactUInt64','New-GitHubGetRequest','Assert-GitHubResponseSuccess','Invoke-GitHubJson')){if(-not(Get-Command $name -CommandType Function -ErrorAction SilentlyContinue)){throw ('Imported helper did not persist: '+$name)}}
+      if((ConvertTo-ExactUInt64 '7' 'test')-ne7){throw 'Imported helper did not execute.'}
+      Write-Output PASS
+    `;
+    const result=runPowerShell(check);expect(result.error).toBeUndefined();expect(result.status,result.stderr||result.stdout).toBe(0);expect(result.stdout).toContain('PASS');
+  });
+
   it('executes real receipt and independent-parity guards against stale, OCR, unsigned-scope, and changed redownload proofs', () => {
     const check=String.raw`
       $ErrorActionPreference='Stop';Set-StrictMode -Version Latest;Set-Location -LiteralPath '${process.cwd().replaceAll("'", "''")}'

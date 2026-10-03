@@ -49,6 +49,21 @@ describe('default comments and forms workflow', () => {
     expect(workflow.indexOf(pdfiumPrep)).toBeLessThan(workflow.indexOf('./scripts/verify-default-comments-forms.ps1'));
   });
 
+  it('retains exact imported helpers from both trusted verifier scripts', () => {
+    const check=String.raw`
+      $ErrorActionPreference='Stop';Set-StrictMode -Version Latest;Set-Location -LiteralPath '${process.cwd().replaceAll("'", "''")}'
+      $tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile((Resolve-Path ./scripts/verify-default-comments-forms.ps1),[ref]$tokens,[ref]$errors);if($errors.Count){throw ($errors|Out-String)}
+      $node=$ast.Find({param($n)$n-is[Management.Automation.Language.FunctionDefinitionAst]-and$n.Name-ceq'Import-CommentsFormsFunctions'},$true);Invoke-Expression $node.Extent.Text
+      Import-CommentsFormsFunctions (Resolve-Path ./scripts/verify-signed-ocr-upgrade.ps1) @('Assert-ReceiptValue')
+      Import-CommentsFormsFunctions (Resolve-Path ./scripts/verify-default-expanded-page-tools.ps1) @('Assert-EmptyProcessFacts')
+      foreach($name in @('Assert-ReceiptValue','Assert-EmptyProcessFacts')){if(-not(Get-Command $name -CommandType Function -ErrorAction SilentlyContinue)){throw ('Imported helper did not persist: '+$name)}}
+      Assert-ReceiptValue ([pscustomobject]@{bytes=[uint64]1;sha256=('A'*64)}) 'test'
+      Assert-EmptyProcessFacts ([pscustomobject]@{applicationProcessPresent=$false;installerProcessPresent=$false}) 'test'
+      Write-Output PASS
+    `;
+    const result=runPowerShell(check);expect(result.error).toBeUndefined();expect(result.status,result.stderr||result.stdout).toBe(0);expect(result.stdout).toContain('PASS');
+  });
+
   it('parses and pins Step 1 identity, independent Step 2 reproof, token clearing, exact install checks, and bounded cleanup', () => {
     const source = readFileSync(verifierPath, 'utf8');
     const parsed = spawnSync('pwsh.exe', ['-NoProfile', '-NonInteractive', '-Command', `$t=$null;$e=$null;[Management.Automation.Language.Parser]::ParseFile('${process.cwd().replaceAll("'", "''")}\\scripts\\verify-default-comments-forms.ps1',[ref]$t,[ref]$e)|Out-Null;if($e.Count){$e|% ToString;exit 1}`], { encoding: 'utf8' });
