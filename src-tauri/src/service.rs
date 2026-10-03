@@ -145,6 +145,8 @@ enum Request {
     CreateMultiImagePdf(crate::image_pdf::PreparedMultiImagePdf, PathBuf, Reply<ReplyLease<SavedCopy>>),
     InspectImageReplacement(u64, u64, u16, Reply<crate::image_edit::ImageEditTargetInfo>),
     ReplaceImageCopy(u64, u64, u16, crate::image_edit::ImageEditTargetInfo, Vec<u8>, PathBuf, Reply<ReplyLease<SavedCopy>>),
+    InspectTextReplacement(u64, u64, u16, Reply<TextReplacementInspection>),
+    ReplaceTextCopy(u64, u64, u16, TextReplacementInspection, String, PathBuf, Reply<ReplyLease<SavedCopy>>),
     Close(u64, Reply<()>),
     Edit(u64, PageEdit, Reply<DocumentInfo>),
     Crop(u64, u16, u64, CropRect, Reply<DocumentInfo>),
@@ -1108,6 +1110,18 @@ impl PdfService {
                         let result = result.map(|saved| { let saved_id = saved.document.id; ReplyLease::new(saved, UnclaimedReply::Document(saved_id), resource_cleanup.clone()) });
                         if let Err(Ok(saved)) = reply.send(result) { documents.remove(&saved.document.id); sessions.remove(&saved.document.id); }
                     }
+                    Request::InspectTextReplacement(id, revision, page, reply) => {
+                        let result=(||{let(session,_)=sessions.get(&id).ok_or("Document is closed")?;let original=documents.get(&id).ok_or("Document is closed")?;checked_text_replacement(session,original,id,revision,page)})();let _=reply.send(result);
+                    }
+                    Request::ReplaceTextCopy(id, revision, page, expected, replacement, path, reply) => {
+                        if reply.is_closed(){continue} let result=(||{
+                            let(session,_)=sessions.get(&id).ok_or("Document is closed")?;let original=documents.get(&id).ok_or("Document is closed")?;let current=checked_text_replacement(session,original,id,revision,page)?;if current!=expected{return Err("The text replacement target changed. Inspect it again.".into())}
+                            let bytes=crate::text_edit::replace_text_run(&session.source,u32::from(page)+1,&replacement)?;let engine=pdfium.as_ref().map_err(Clone::clone)?;let output=engine.load_pdf_from_byte_vec(bytes.clone(),None).map_err(|e|format!("Text replacement output could not be opened: {e}"))?;
+                            let after_target=crate::text_edit::inspect_text_run(&bytes,u32::from(page)+1)?;let after=text_replacement_geometry(&output,id,revision,page,after_target)?;if after.target.text!=replacement{return Err("Text replacement extraction does not match the requested text.".into())}
+                            verify_text_pixels(original,&output,page,&current.bounds,&after.bounds)?;
+                            if reply.is_closed(){return Err("Text replacement was canceled.".into())} write_new_file(&path,&bytes)?;let pages=page_sizes(&output)?;let new_id=next_id;next_id+=1;let info=DocumentInfo{id:new_id,name:path.file_name().unwrap_or_default().to_string_lossy().into_owned(),path:path.to_string_lossy().into_owned(),pages,revision:0,dirty:false,can_undo:false,can_redo:false};sessions.insert(new_id,(EditSession::new(bytes,info.pages.len()),info.clone()));documents.insert(new_id,std::rc::Rc::new(output));Ok(SavedCopy{path:path.to_string_lossy().into_owned(),document:info})
+                        })();let result=result.map(|saved|{let saved_id=saved.document.id;ReplyLease::new(saved,UnclaimedReply::Document(saved_id),resource_cleanup.clone())});if let Err(Ok(saved))=reply.send(result){documents.remove(&saved.document.id);sessions.remove(&saved.document.id);}
+                    }
                     Request::Save(id, pages, path, reply) => {
                         let result = (|| {
                             let (session, original) = sessions.get_mut(&id).ok_or("Document is closed")?;
@@ -1226,6 +1240,8 @@ impl PdfService {
     pub async fn replace_image_copy(&self, id: u64, revision: u64, page: u16, expected: crate::image_edit::ImageEditTargetInfo, replacement_rgb: Vec<u8>, path: PathBuf) -> Result<SavedCopy, String> {
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::ReplaceImageCopy(id, revision, page, expected, replacement_rgb, path, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?.map(ReplyLease::accept)
     }
+    pub async fn inspect_text_replacement(&self,id:u64,revision:u64,page:u16)->Result<TextReplacementInspection,String>{let(tx,rx)=oneshot::channel();self.sender.send(Request::InspectTextReplacement(id,revision,page,tx)).map_err(|e|e.to_string())?;rx.await.map_err(|e|e.to_string())?}
+    pub async fn replace_text_copy(&self,id:u64,revision:u64,page:u16,expected:TextReplacementInspection,replacement:String,path:PathBuf)->Result<SavedCopy,String>{let(tx,rx)=oneshot::channel();self.sender.send(Request::ReplaceTextCopy(id,revision,page,expected,replacement,path,tx)).map_err(|e|e.to_string())?;rx.await.map_err(|e|e.to_string())?.map(ReplyLease::accept)}
     pub async fn crop_pages(&self, id: u64, pages: Vec<u16>, revision: u64, insets: CropInsets) -> Result<DocumentInfo, String> {
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::CropPages(id, pages, revision, insets, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
     }
@@ -1446,6 +1462,32 @@ fn checked_image_replacement(session: &EditSession, document: &PdfDocument<'_>, 
 }
 
 #[cfg(windows)]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TextReplacementInspection { pub(crate) target: crate::text_edit::TextEditTarget, pub(crate) bounds: crate::text_edit_commands::TextReplacementBounds }
+
+#[cfg(windows)]
+fn text_replacement_geometry(document:&PdfDocument<'_>,id:u64,revision:u64,page:u16,target:crate::text_edit::TextEditTarget)->Result<TextReplacementInspection,String>{
+    let pdf_page=document.pages().get(page as i32).map_err(|e|e.to_string())?;let geometry=crate::text_geometry::inspect(&pdf_page,id,page,revision)?;
+    if geometry.status!="ok"||geometry.truncated||geometry.characters.len()!=target.text.len(){return Err("Text replacement requires complete one-byte PDFium character geometry.".into())}
+    let extracted=geometry.characters.iter().map(|c|c.text.as_str()).collect::<String>();if extracted!=target.text{return Err("Text replacement source text disagrees with PDFium extraction.".into())}
+    let mut left=1.0f32;let mut top=1.0f32;let mut right=0.0f32;let mut bottom=0.0f32;
+    for c in &geometry.characters{if c.text.len()!=1||c.angle!=0{return Err("Text replacement requires one positioned cardinal glyph per source byte.".into())}let b=c.bounds.as_ref().ok_or("Text replacement requires bounds for every glyph.")?;left=left.min(b.x);top=top.min(b.y);right=right.max(b.x+b.width);bottom=bottom.max(b.y+b.height)}
+    if right<=left||bottom<=top{return Err("Text replacement glyph bounds are invalid.".into())}
+    Ok(TextReplacementInspection{target,bounds:crate::text_edit_commands::TextReplacementBounds{x:left,y:top,width:right-left,height:bottom-top}})
+}
+
+#[cfg(windows)]
+fn checked_text_replacement(session:&EditSession,document:&PdfDocument<'_>,id:u64,revision:u64,page:u16)->Result<TextReplacementInspection,String>{
+    if session.revision!=revision{return Err("Document changed. Inspect the text again.".into())}if !matches!(document.permissions().security_handler_revision(),Ok(PdfSecurityHandlerRevision::Unprotected)){return Err("Text replacement does not support encrypted or restricted PDFs.".into())}session.page_image_export_guard()?;
+    if session.plan.len()!=document.pages().len() as usize||session.plan.iter().enumerate().any(|(i,s)|s.source!=i||s.turns!=0||s.crop.is_some()||!s.notes.is_empty()){return Err("Text replacement requires the original unedited page order, geometry, and annotations.".into())}if usize::from(page)>=session.plan.len(){return Err("Text replacement page is out of range.".into())}let target=crate::text_edit::inspect_text_run(&session.source,u32::from(page)+1)?;text_replacement_geometry(document,id,revision,page,target)
+}
+
+#[cfg(windows)]
+fn verify_text_pixels(before:&PdfDocument<'_>,after:&PdfDocument<'_>,page:u16,a:&crate::text_edit_commands::TextReplacementBounds,b:&crate::text_edit_commands::TextReplacementBounds)->Result<(),String>{
+    const SIDE:i32=1000;let render=|d:&PdfDocument<'_>|->Result<Vec<u8>,String>{let p=d.pages().get(page as i32).map_err(|e|e.to_string())?;let bitmap=p.render_with_config(&PdfRenderConfig::new().set_fixed_size(SIDE,SIDE).set_format(PdfBitmapFormat::BGRA).set_reverse_byte_order(false).clear_before_rendering(true).set_clear_color(PdfColor::WHITE)).map_err(|e|e.to_string())?;Ok(bitmap.as_raw_bytes().to_vec())};let x0=((a.x.min(b.x)*SIDE as f32).floor() as i32-1).max(0);let y0=((a.y.min(b.y)*SIDE as f32).floor() as i32-1).max(0);let x1=(((a.x+a.width).max(b.x+b.width)*SIDE as f32).ceil() as i32+1).min(SIDE);let y1=(((a.y+a.height).max(b.y+b.height)*SIDE as f32).ceil() as i32+1).min(SIDE);let lhs=render(before)?;let rhs=render(after)?;if lhs.len()!=rhs.len(){return Err("Text replacement render dimensions changed.".into())}for y in 0..SIDE{for x in 0..SIDE{if (x<x0||x>=x1||y<y0||y>=y1)&&lhs[((y*SIDE+x)*4)as usize..][..4]!=rhs[((y*SIDE+x)*4)as usize..][..4]{return Err("Text replacement changed pixels outside the glyph ink bounds.".into())}}}Ok(())
+}
+
+#[cfg(windows)]
 fn publish_searchable_file(
     path: &PathBuf,
     bytes: &[u8],
@@ -1650,7 +1692,7 @@ mod tests {
     macro_rules! accepted_reply_values {
         ($($value:ty),* $(,)?) => { $(impl TestReplyValue for $value { type Accepted = Self; fn accept(self) -> Self { self } })* };
     }
-    accepted_reply_values!((), Vec<u8>, Vec<u64>, Vec<Option<String>>, String, DocumentInfo, SavedCopy, OpenResult, PrintSnapshotInfo, PrintBitmap, PageImagePreflight, RasterRedactionPreflight, SearchableOcrPreflight, PageImageReceipt, BookmarkList, RenderWork, BookmarkWork, OcrWork, OcrWorkerState, crate::ocr::OcrPageRaster, crate::image_edit::ImageEditTargetInfo, crate::page_labels::DocumentPageLabels, crate::document_properties::DocumentProperties, crate::text_geometry::PageTextGeometry, crate::split::SplitOutput, crate::comments::CommentList, crate::comments::AnnotationList, crate::forms::FormFields);
+    accepted_reply_values!((), Vec<u8>, Vec<u64>, Vec<Option<String>>, String, DocumentInfo, SavedCopy, OpenResult, PrintSnapshotInfo, PrintBitmap, PageImagePreflight, RasterRedactionPreflight, SearchableOcrPreflight, PageImageReceipt, BookmarkList, RenderWork, BookmarkWork, OcrWork, OcrWorkerState, crate::ocr::OcrPageRaster, crate::image_edit::ImageEditTargetInfo, TextReplacementInspection, crate::page_labels::DocumentPageLabels, crate::document_properties::DocumentProperties, crate::text_geometry::PageTextGeometry, crate::split::SplitOutput, crate::comments::CommentList, crate::comments::AnnotationList, crate::forms::FormFields);
     fn call<T: TestReplyValue>(service: &PdfService, request: impl FnOnce(Reply<T>) -> Request) -> Result<T::Accepted, String> {
         let (tx, rx) = oneshot::channel(); service.sender.send(request(tx)).unwrap(); rx.blocking_recv().unwrap().map(TestReplyValue::accept)
     }
@@ -4549,6 +4591,12 @@ mod tests {
         assert_eq!(output.get_object(image_id).unwrap().as_stream().unwrap().decompressed_content().unwrap(), replacement);
         assert_eq!(saved.document.revision, 0); assert!(!saved.document.dirty);
         for id in [source.id, saved.document.id] { call(&service, |reply| Request::Close(id, reply)).unwrap(); }
+    }
+
+    #[test]
+    fn strict_text_replacement_requires_pdfium_geometry_and_preserves_source_session(){
+        use lopdf::{content::{Content,Operation},dictionary,Dictionary,Document,Object,Stream};let mut pdf=Document::with_version("1.7");let pages=pdf.new_object_id();let font=pdf.add_object(dictionary!{"Type"=>"Font","Subtype"=>"Type1","BaseFont"=>"Helvetica","Encoding"=>"WinAnsiEncoding"});let content=Content{operations:vec![Operation::new("BT",vec![]),Operation::new("Tf",vec![Object::Name(b"F1".to_vec()),24.into()]),Operation::new("Tm",vec![1.into(),0.into(),0.into(),1.into(),40.into(),80.into()]),Operation::new("Tj",vec![Object::string_literal("123")]),Operation::new("ET",vec![])]}.encode().unwrap();let stream=pdf.add_object(Stream::new(Dictionary::new(),content));let page=pdf.add_object(dictionary!{"Type"=>"Page","Parent"=>pages,"MediaBox"=>vec![0.into(),0.into(),200.into(),120.into()],"Resources"=>dictionary!{"Font"=>dictionary!{"F1"=>font}},"Contents"=>stream});pdf.objects.insert(pages,dictionary!{"Type"=>"Pages","Count"=>1,"Kids"=>vec![Object::Reference(page)]}.into());let root=pdf.add_object(dictionary!{"Type"=>"Catalog","Pages"=>pages});pdf.trailer.set("Root",root);pdf.reference_table.cross_reference_type=lopdf::xref::XrefType::CrossReferenceTable;pdf.trailer.remove(b"Type");let mut source_bytes=Vec::new();pdf.save_to(&mut source_bytes).unwrap();
+        let service=PdfService::start(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/pdfium/bin/pdfium.dll"));let folder=tempfile::tempdir().unwrap();let source_path=folder.path().join("text-source.pdf");std::fs::write(&source_path,&source_bytes).unwrap();let source=call(&service,|reply|Request::Open(source_path.clone(),reply)).unwrap();let rotated=call(&service,|reply|Request::Edit(source.id,PageEdit::Rotate{pages:vec![0],clockwise:true},reply)).unwrap();assert!(call(&service,|reply|Request::InspectTextReplacement(source.id,rotated.revision,0,reply)).is_err());let restored=call(&service,|reply|Request::Edit(source.id,PageEdit::Undo,reply)).unwrap();assert!(restored.can_redo);let target=call(&service,|reply|Request::InspectTextReplacement(source.id,restored.revision,0,reply)).unwrap();assert_eq!(target.target.text,"123");let output=folder.path().join("text-copy.pdf");let saved=call(&service,|reply|Request::ReplaceTextCopy(source.id,restored.revision,0,target,"789".into(),output.clone(),reply)).unwrap();assert_eq!(crate::text_edit::inspect_text_run(&std::fs::read(&output).unwrap(),1).unwrap().text,"789");assert_eq!(std::fs::read(&source_path).unwrap(),source_bytes);let redone=call(&service,|reply|Request::Edit(source.id,PageEdit::Redo,reply)).unwrap();assert!(redone.dirty&&redone.can_undo);assert_eq!(saved.document.revision,0);for id in[source.id,saved.document.id]{call(&service,|reply|Request::Close(id,reply)).unwrap();}
     }
 
     #[test]

@@ -6,6 +6,7 @@ mod print_commands;
 mod document_properties;
 mod text_geometry;
 mod text_edit;
+mod text_edit_commands;
 mod split;
 mod combine;
 mod comments;
@@ -262,6 +263,18 @@ async fn replace_pdf_image_copy(app: tauri::AppHandle, service: State<'_, PdfSer
 #[tauri::command]
 fn cancel_image_replacement(selections: State<'_, image_edit_commands::ImageReplacementSelections>, selection_id: String) -> Result<(), String> { selections.cancel(&selection_id) }
 
+#[cfg(windows)]
+#[tauri::command]
+async fn inspect_text_replacement_target(service:State<'_,PdfService>,selections:State<'_,text_edit_commands::TextReplacementSelections>,document_id:u64,revision:u64,page:u16)->Result<text_edit_commands::TextReplacementTarget,String>{let info=service.inspect_text_replacement(document_id,revision,page).await?;selections.register(document_id,revision,page,info.target.text,info.bounds)}
+
+#[cfg(windows)]
+#[tauri::command]
+async fn replace_pdf_text_copy(app:tauri::AppHandle,service:State<'_,PdfService>,selections:State<'_,text_edit_commands::TextReplacementSelections>,selection_id:String,document_id:u64,revision:u64,run_id:String,replacement:String)->Result<Option<service::SavedCopy>,String>{let(target,attempt)=selections.begin(&selection_id,document_id,revision)?;if run_id!=target.run_id{return Err("The text replacement run is unavailable.".into())}let current=service.inspect_text_replacement(document_id,revision,target.page).await?;if current.target.text!=target.text||current.bounds!=target.bounds{return Err("The text replacement target changed. Inspect it again.".into())}let window=app.get_webview_window("main").ok_or("Application window is unavailable")?;let path=tauri::async_runtime::spawn_blocking(move||rfd::FileDialog::new().set_parent(&window).set_title("Save PDF with replaced text as a new file").add_filter("PDF documents",&["pdf"]).set_file_name("text-replaced.pdf").save_file()).await.map_err(|e|e.to_string())?;let result=match path{Some(path)=>{image_pdf_commands::validate_output_path(&path)?;service.replace_text_copy(document_id,revision,target.page,current,replacement,path).await.map(Some)},None=>Ok(None)};if matches!(&result,Ok(Some(_))){attempt.commit_success()?}result}
+
+#[cfg(windows)]
+#[tauri::command]
+fn cancel_text_replacement(selections:State<'_,text_edit_commands::TextReplacementSelections>,selection_id:String)->Result<(),String>{selections.cancel(&selection_id)}
+
 #[tauri::command]
 async fn split_document(app: tauri::AppHandle, service: State<'_, PdfService>, id: u64, revision: u64, pages_per_file: usize) -> Result<Option<split::SplitOutput>, String> {
     let window = app.get_webview_window("main").ok_or("Application window is unavailable")?;
@@ -327,7 +340,8 @@ fn main() {
         app.manage(image_pdf_commands::ImagePdfSelections::default());
         #[cfg(windows)]
         app.manage(image_edit_commands::ImageReplacementSelections::default());
+        app.manage(text_edit_commands::TextReplacementSelections::default());
         Ok(())
-    }).invoke_handler(tauri::generate_handler![read_update_attempt, write_update_attempt, clear_update_attempt, document_form_fields, fill_form_copy, open_document, reopen_document, open_example, render_page, export_page_image, close_document, edit_pages, crop_page, crop_pages, reset_crops, create_pdf_from_image, choose_image_pdf_sources, create_pdf_from_images, cancel_image_pdf_sources, inspect_image_replacement_target, replace_pdf_image_copy, cancel_image_replacement, create_comment, update_comment, delete_comment, document_comments, document_annotations, create_highlight, create_text_highlight, update_highlight, delete_highlight, save_copy, redact_document, split_document, combine_documents, insert_pages_copy, replace_pages_copy, page_text, page_text_geometry, document_bookmarks, document_page_labels, document_properties, dependency_notices, unlock_document, cancel_password_request, ocr_capability, recognize_page_ocr, create_searchable_ocr_copy, cancel_page_ocr, print_commands::print_document, print_commands::cancel_print])
+    }).invoke_handler(tauri::generate_handler![read_update_attempt, write_update_attempt, clear_update_attempt, document_form_fields, fill_form_copy, open_document, reopen_document, open_example, render_page, export_page_image, close_document, edit_pages, crop_page, crop_pages, reset_crops, create_pdf_from_image, choose_image_pdf_sources, create_pdf_from_images, cancel_image_pdf_sources, inspect_image_replacement_target, replace_pdf_image_copy, cancel_image_replacement, inspect_text_replacement_target, replace_pdf_text_copy, cancel_text_replacement, create_comment, update_comment, delete_comment, document_comments, document_annotations, create_highlight, create_text_highlight, update_highlight, delete_highlight, save_copy, redact_document, split_document, combine_documents, insert_pages_copy, replace_pages_copy, page_text, page_text_geometry, document_bookmarks, document_page_labels, document_properties, dependency_notices, unlock_document, cancel_password_request, ocr_capability, recognize_page_ocr, create_searchable_ocr_copy, cancel_page_ocr, print_commands::print_document, print_commands::cancel_print])
       .run(tauri::generate_context!()).expect("Desktop application failed");
 }
