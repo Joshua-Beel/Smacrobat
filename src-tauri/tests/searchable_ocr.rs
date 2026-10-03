@@ -1,0 +1,211 @@
+#[path = "../src/searchable_ocr.rs"]
+mod searchable_ocr;
+
+use searchable_ocr::{map_words_to_display, parse_tesseract_tsv, MAX_TSV_BYTES_PER_PAGE};
+
+const HEADER: &str =
+    "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext";
+
+fn document(rows: &[&str]) -> String {
+    std::iter::once(HEADER)
+        .chain(rows.iter().copied())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn one_line(words: &[&str]) -> String {
+    let mut rows = vec![
+        "1\t1\t0\t0\t0\t0\t0\t0\t1000\t500\t-1\t",
+        "2\t1\t1\t0\t0\t0\t0\t0\t1000\t500\t-1\t",
+        "3\t1\t1\t1\t0\t0\t0\t0\t1000\t500\t-1\t",
+        "4\t1\t1\t1\t1\t0\t0\t0\t1000\t500\t-1\t",
+    ];
+    rows.extend_from_slice(words);
+    document(&rows)
+}
+
+#[test]
+fn parses_decimal_confidence_and_maps_non_square_geometry() {
+    let tsv = document(&[
+        "1\t1\t0\t0\t0\t0\t0\t0\t1000\t500\t-1\t",
+        "2\t1\t1\t0\t0\t0\t0\t0\t1000\t500\t-1\t",
+        "3\t1\t1\t1\t0\t0\t0\t0\t1000\t500\t-1\t",
+        "4\t1\t1\t1\t1\t0\t0\t0\t1000\t300\t-1\t",
+        "5\t1\t1\t1\t1\t1\t100\t50\t200\t100\t96.125\tHello",
+        "5\t1\t1\t1\t1\t2\t400\t200\t100\t50\t88\tworld!",
+        "4\t1\t1\t1\t2\t0\t0\t300\t100\t100\t-1\t",
+        "5\t1\t1\t1\t2\t1\t20\t300\t80\t40\t75.5\tAgain",
+    ]);
+    let parsed = parse_tesseract_tsv(tsv.as_bytes(), 1000, 500).unwrap();
+    assert_eq!(parsed.extracted_text, "Hello world!\nAgain");
+    let display = map_words_to_display(&parsed, 612.0, 792.0).unwrap();
+    assert!((display[0].x - 61.2).abs() < 1e-9);
+    assert!((display[0].y - 79.2).abs() < 1e-9);
+    assert!((display[0].width - 122.4).abs() < 1e-9);
+    assert!((display[0].height - 158.4).abs() < 1e-9);
+}
+
+#[test]
+fn permits_a_blank_page_and_crlf() {
+    let parsed = parse_tesseract_tsv(
+        format!("{HEADER}\r\n1\t1\t0\t0\t0\t0\t0\t0\t20\t10\t-1\t\r\n").as_bytes(),
+        20,
+        10,
+    )
+    .unwrap();
+    assert!(parsed.words.is_empty());
+    assert!(parsed.extracted_text.is_empty());
+}
+
+#[test]
+fn rejects_wrong_header_and_malformed_rows() {
+    assert!(parse_tesseract_tsv(b"wrong", 10, 10).is_err());
+    assert!(parse_tesseract_tsv(format!("{HEADER}\n1\t1").as_bytes(), 10, 10).is_err());
+    assert!(parse_tesseract_tsv(format!("{HEADER}\n").as_bytes(), 10, 10).is_err());
+    assert!(parse_tesseract_tsv(format!("{HEADER}\n\n").as_bytes(), 10, 10).is_err());
+}
+
+#[test]
+fn rejects_non_ascii_control_and_whitespace_word_text() {
+    for text in ["café", "two words", "bad\tfield"] {
+        let row = format!("5\t1\t1\t1\t1\t1\t0\t0\t5\t5\t90\t{text}");
+        let tsv = one_line(&[&row]);
+        assert!(parse_tesseract_tsv(tsv.as_bytes(), 1000, 500).is_err());
+    }
+}
+
+#[test]
+fn rejects_boxes_outside_raster_and_integer_overflow() {
+    for row in [
+        "5\t1\t1\t1\t1\t1\t999\t0\t2\t1\t90\tA",
+        "5\t1\t1\t1\t1\t1\t4294967295\t0\t2\t1\t90\tA",
+        "5\t1\t1\t1\t1\t1\t0\t499\t1\t2\t90\tA",
+    ] {
+        let tsv = one_line(&[row]);
+        assert!(parse_tesseract_tsv(tsv.as_bytes(), 1000, 500).is_err());
+    }
+}
+
+#[test]
+fn rejects_invalid_confidence_and_unhandled_structural_text() {
+    for row in [
+        "5\t1\t1\t1\t1\t1\t0\t0\t1\t1\tNaN\tA",
+        "5\t1\t1\t1\t1\t1\t0\t0\t1\t1\t101\tA",
+        "5\t1\t1\t1\t1\t1\t0\t0\t1\t1\t-1\tA",
+        "4\t1\t1\t1\t1\t0\t0\t0\t1\t1\t-1\thidden",
+        "4\t1\t1\t1\t1\t0\t0\t0\t1\t1\t0\t",
+    ] {
+        let tsv = one_line(&[row]);
+        assert!(parse_tesseract_tsv(tsv.as_bytes(), 1000, 500).is_err());
+    }
+}
+
+#[test]
+fn rejects_ambiguous_or_duplicate_word_order() {
+    for second in [
+        "5\t1\t1\t1\t1\t1\t2\t0\t1\t1\t90\tB",
+        "5\t1\t1\t1\t0\t2\t2\t0\t1\t1\t90\tB",
+        "5\t1\t1\t0\t2\t1\t2\t0\t1\t1\t90\tB",
+    ] {
+        let tsv = one_line(&["5\t1\t1\t1\t1\t1\t0\t0\t1\t1\t90\tA", second]);
+        assert!(parse_tesseract_tsv(tsv.as_bytes(), 1000, 500).is_err());
+    }
+}
+
+#[test]
+fn enforces_input_limit_before_parsing() {
+    let oversized = vec![0xff; MAX_TSV_BYTES_PER_PAGE + 1];
+    assert!(parse_tesseract_tsv(&oversized, 10, 10).is_err());
+    assert!(parse_tesseract_tsv(&[0xff], 10, 10).is_err());
+}
+
+#[test]
+fn rejects_invalid_display_dimensions() {
+    let tsv = document(&["1\t1\t0\t0\t0\t0\t0\t0\t10\t10\t-1\t"]);
+    let parsed = parse_tesseract_tsv(tsv.as_bytes(), 10, 10).unwrap();
+    for dimensions in [(0.0, 1.0), (1.0, -1.0), (f64::NAN, 1.0)] {
+        assert!(map_words_to_display(&parsed, dimensions.0, dimensions.1).is_err());
+    }
+}
+
+#[test]
+fn rejects_missing_mismatched_or_duplicate_hierarchy() {
+    let cases = [
+        vec!["5\t1\t1\t1\t1\t1\t0\t0\t1\t1\t90\tA"],
+        vec![
+            "1\t1\t0\t0\t0\t0\t0\t0\t1000\t500\t-1\t",
+            "3\t1\t1\t1\t0\t0\t0\t0\t100\t100\t-1\t",
+        ],
+        vec![
+            "1\t1\t0\t0\t0\t0\t0\t0\t1000\t500\t-1\t",
+            "2\t1\t1\t0\t0\t0\t0\t0\t100\t100\t-1\t",
+            "2\t1\t1\t0\t0\t0\t0\t0\t100\t100\t-1\t",
+        ],
+        vec![
+            "1\t1\t0\t0\t0\t0\t0\t0\t1000\t500\t-1\t",
+            "2\t1\t1\t0\t0\t0\t0\t0\t100\t100\t-1\t",
+            "3\t1\t2\t1\t0\t0\t0\t0\t100\t100\t-1\t",
+        ],
+    ];
+    for rows in cases {
+        let tsv = document(&rows);
+        assert!(parse_tesseract_tsv(tsv.as_bytes(), 1000, 500).is_err());
+    }
+}
+
+#[test]
+fn rejects_every_incomplete_terminal_hierarchy() {
+    let rows = [
+        "1\t1\t0\t0\t0\t0\t0\t0\t1000\t500\t-1\t",
+        "2\t1\t1\t0\t0\t0\t0\t0\t1000\t500\t-1\t",
+        "3\t1\t1\t1\t0\t0\t0\t0\t1000\t500\t-1\t",
+        "4\t1\t1\t1\t1\t0\t0\t0\t1000\t500\t-1\t",
+    ];
+    assert!(parse_tesseract_tsv(HEADER.as_bytes(), 1000, 500).is_err());
+    for end in 2..=rows.len() {
+        let tsv = document(&rows[..end]);
+        assert!(parse_tesseract_tsv(tsv.as_bytes(), 1000, 500).is_err());
+    }
+}
+
+#[test]
+fn rejects_children_outside_parent_boxes() {
+    let tsv = document(&[
+        "1\t1\t0\t0\t0\t0\t0\t0\t1000\t500\t-1\t",
+        "2\t1\t1\t0\t0\t0\t0\t0\t100\t100\t-1\t",
+        "3\t1\t1\t1\t0\t0\t90\t90\t20\t20\t-1\t",
+    ]);
+    assert!(parse_tesseract_tsv(tsv.as_bytes(), 1000, 500).is_err());
+}
+
+#[test]
+fn forged_pages_cannot_produce_invalid_display_geometry() {
+    use searchable_ocr::{OcrWord, ParsedTsvPage};
+
+    let word = OcrWord {
+        block: 1,
+        paragraph: 1,
+        line: 1,
+        word: 1,
+        left: 9,
+        top: 0,
+        width: 2,
+        height: 1,
+        confidence: 90.0,
+        text: "A".into(),
+    };
+    let zero = ParsedTsvPage {
+        raster_width: 0,
+        raster_height: 10,
+        words: vec![],
+        extracted_text: String::new(),
+    };
+    assert!(map_words_to_display(&zero, 100.0, 100.0).is_err());
+    let outside = ParsedTsvPage {
+        raster_width: 10,
+        raster_height: 10,
+        words: vec![word],
+        extracted_text: "A".into(),
+    };
+    assert!(map_words_to_display(&outside, 100.0, 100.0).is_err());
+}
