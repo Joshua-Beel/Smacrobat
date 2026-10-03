@@ -197,10 +197,10 @@ async fn create_pdf_from_image(app: tauri::AppHandle, service: State<'_, PdfServ
 
 #[cfg(windows)]
 #[tauri::command]
-async fn choose_image_pdf_sources(app: tauri::AppHandle, selections: State<'_, image_pdf_commands::ImagePdfSelections>) -> Result<Option<image_pdf_commands::ImagePdfSelection>, String> {
+async fn choose_image_pdf_sources(app: tauri::AppHandle, selections: State<'_, image_pdf_commands::ImagePdfSelections>, replace_selection_id: Option<String>) -> Result<Option<image_pdf_commands::ImagePdfSelection>, String> {
     let window = app.get_webview_window("main").ok_or("Application window is unavailable")?;
     let paths = tauri::async_runtime::spawn_blocking(move || rfd::FileDialog::new().set_parent(&window).set_title("Choose PNG or JPEG images").add_filter("PNG and JPEG images", &["png", "jpg", "jpeg"]).pick_files()).await.map_err(|error| error.to_string())?;
-    paths.map(|paths| selections.reserve(paths)).transpose()
+    paths.map(|paths| selections.reserve_replacing(paths, replace_selection_id.as_deref())).transpose()
 }
 
 #[cfg(windows)]

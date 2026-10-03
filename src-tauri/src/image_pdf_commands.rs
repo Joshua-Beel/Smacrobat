@@ -58,7 +58,12 @@ impl Drop for ImagePdfAttempt<'_> {
 }
 
 impl ImagePdfSelections {
-    pub(crate) fn reserve(&self, paths: Vec<PathBuf>) -> Result<ImagePdfSelection, String> {
+    #[cfg(test)]
+    fn reserve(&self, paths: Vec<PathBuf>) -> Result<ImagePdfSelection, String> {
+        self.reserve_replacing(paths, None)
+    }
+
+    pub(crate) fn reserve_replacing(&self, paths: Vec<PathBuf>, replace_selection_id: Option<&str>) -> Result<ImagePdfSelection, String> {
         if paths.is_empty() || paths.len() > crate::image_pdf::MAX_MULTI_SOURCES { return Err("Choose 1 to 32 PNG or JPEG images.".into()); }
         let mut sources = Vec::with_capacity(paths.len());
         let mut identities = HashSet::new();
@@ -86,7 +91,13 @@ impl ImagePdfSelections {
             source_id: source.id.clone(), name: source.name.clone(),
         }).collect();
         let mut active = self.active.lock().map_err(|_| "Image selection state is unavailable.")?;
-        if active.is_some() { return Err("Finish or cancel the current image selection first.".into()); }
+        match (active.as_ref(), replace_selection_id) {
+            (Some(selection), Some(id)) if selection.id == id && !selection.in_flight => {}
+            (Some(_), Some(_)) => return Err("The image selection being replaced is unavailable or busy.".into()),
+            (Some(_), None) => return Err("Finish or cancel the current image selection first.".into()),
+            (None, Some(_)) => return Err("The image selection being replaced is unavailable.".into()),
+            (None, None) => {}
+        }
         *active = Some(ReservedSelection { id: selection_id.clone(), sources, in_flight: false });
         Ok(ImagePdfSelection { selection_id, sources: public_sources })
     }
@@ -246,6 +257,28 @@ mod tests {
         let (_, final_attempt) = selections.begin_attempt(&selection.selection_id, &ids).unwrap();
         drop(final_attempt);
         selections.cancel(&selection.selection_id).unwrap();
+    }
+
+    #[test]
+    fn replacement_selection_swaps_only_after_new_sources_validate() {
+        let folder = tempfile::tempdir().unwrap();
+        let first = folder.path().join("first.png");
+        let second = folder.path().join("second.png");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let selections = ImagePdfSelections::default();
+        let original = selections.reserve(vec![first.clone()]).unwrap();
+        assert!(selections.reserve_replacing(vec![first.clone(), first], Some(&original.selection_id)).is_err());
+        let ids = vec![original.sources[0].source_id.clone()];
+        let (bytes, retained) = selections.begin_attempt(&original.selection_id, &ids).unwrap();
+        assert_eq!(bytes, vec![b"first".to_vec()]);
+        drop(retained);
+        let replacement = selections.reserve_replacing(vec![second], Some(&original.selection_id)).unwrap();
+        assert!(selections.begin_attempt(&original.selection_id, &ids).err().unwrap().contains("unavailable"));
+        let replacement_ids = vec![replacement.sources[0].source_id.clone()];
+        let (bytes, attempt) = selections.begin_attempt(&replacement.selection_id, &replacement_ids).unwrap();
+        assert_eq!(bytes, vec![b"second".to_vec()]);
+        drop(attempt);
     }
 
     fn first_path(folder: &Path) -> PathBuf { folder.join("first.png") }
