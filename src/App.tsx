@@ -343,8 +343,8 @@ export default function App() {
     return true;
   }
   const close = async (id: number, discard = false) => {
-    if (busy || recoveryOffer || redactionDraft || searchableOcrTarget || newCopyModalOpen || closingDocument.current !== null) return;
     const locked = recoveryLocked.has(id);
+    if (busy || recoveryOffer && (!locked || recoveryOffer.document.id !== id) || redactionDraft || searchableOcrTarget || newCopyModalOpen || closingDocument.current !== null) return;
     if (!discard && !locked && documents.find(document => document.id === id)?.dirty) { setPendingClose(id); return; }
     if (pageOcrTarget?.id === id) setPageOcrTarget(null);
     closingDocument.current = id; setBusy(true); setError('');
@@ -356,6 +356,11 @@ export default function App() {
         if (receipt.documentId !== current.id || receipt.revision !== current.revision) throw new Error('Recovery discard acknowledgement did not match this document revision.');
       }
       await closeDocument(id); readingPages.current.delete(id); setDocuments(list => list.filter(d => d.id !== id));
+      if (locked) {
+        setRecoveryLocked(current => { const next = new Set(current); next.delete(id); return next; });
+        setRecoveryOffer(current => current?.document.id === id ? null : current);
+        setError('The edit may be saved in recovery, but its final confirmation failed. Reopen this PDF and choose Keep recovered edits or Open original.');
+      }
       if (latest.current.active === id) { setActive(null); setView('home'); }
     } catch (e) {
       const revision = documents.find(document => document.id === id)?.revision;

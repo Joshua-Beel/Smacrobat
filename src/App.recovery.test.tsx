@@ -156,6 +156,23 @@ it('closes and guides reopening after an equal-revision open-original tombstone 
   expect(JSON.stringify(ui.toJSON())).toContain('Reopen this PDF');
 });
 
+it('retries generic close for a locked Open-original failure while retaining its offer', async () => {
+  vi.mocked(openDocument).mockResolvedValue({ status: 'opened', document: cleanSource, recovery: { revision: 4, currentPage: 1 } });
+  vi.mocked(openOriginal).mockRejectedValue({ code: 'recoveryCommittedReopenRequired', documentId: 7, requestedRevision: 0, committedRevision: 0 });
+  vi.mocked(closeDocument).mockRejectedValueOnce(new Error('worker unavailable')).mockResolvedValueOnce();
+  await mount();
+  await act(async () => button('Open original').props.onClick());
+  expect(closeDocument).toHaveBeenCalledExactlyOnceWith(7);
+  expect(JSON.stringify(ui.toJSON())).toContain('locked PDF could not close');
+  expect(JSON.stringify(ui.toJSON())).toContain('Recovered edits are available');
+  await act(async () => button('Retry closing tab').props.onClick());
+  expect(closeDocument).toHaveBeenCalledTimes(2);
+  expect(closeDocument).toHaveBeenLastCalledWith(7);
+  expect(ui.root.findAllByProps({ 'data-viewed-document': 7 })).toHaveLength(0);
+  expect(JSON.stringify(ui.toJSON())).not.toContain('Recovered edits are available');
+  expect(JSON.stringify(ui.toJSON())).toContain('Reopen this PDF');
+});
+
 it('retains the recovery choice and clean session when a choice fails', async () => {
   vi.mocked(openDocument).mockResolvedValue({ status: 'opened', document: cleanSource, recovery: { revision: 4, currentPage: 1 } });
   vi.mocked(keepRecoveredEdits).mockRejectedValue(new Error('journal unavailable'));
