@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "scope": "Template only. Keep the manifest beside exact controlled inputs and saved outputs from one acceptance run; the verifier refuses paths outside that directory.",
+  "cases": [
+    {
+      "id": "image-pdf-example",
+      "profile": "image-pdf",
+      "source": "fixtures/example-input.png",
+      "sourceSha256": "replace-with-64-lowercase-hex",
+      "output": "outputs/image-output.pdf",
+      "outputSha256": "replace-with-64-lowercase-hex",
+      "page": 1,
+      "dpi": 144,
+      "pixelSize": [1224, 1584],
+      "samples": [
+        {
+          "name": "white page margin",
+          "region": [0, 0, 24, 24],
+          "minimum": [250, 250, 250],
+          "maximum": [255, 255, 255]
+        }
+      ]
+    }
+  ]
+}
