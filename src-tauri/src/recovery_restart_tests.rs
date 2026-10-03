@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 const ROOT_ENV: &str = "SMACROBAT_RECOVERY_RESTART_ROOT";
@@ -28,20 +28,52 @@ fn bounded_read(path: &Path) -> Vec<u8> {
     std::fs::read(path).expect("restart fixture read")
 }
 
+fn plain_directory(path: &Path) -> PathBuf {
+    let metadata = std::fs::symlink_metadata(path).expect("restart fixture directory metadata");
+    assert!(metadata.is_dir() && !metadata.file_type().is_symlink(), "restart fixture directory must be plain");
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        assert_eq!(metadata.file_attributes() & 0x400, 0, "restart fixture directory must not be a reparse point");
+    }
+    std::fs::canonicalize(path).expect("canonical restart fixture directory")
+}
+
+fn contained(path: &Path, root: &Path) -> PathBuf {
+    let canonical = std::fs::canonicalize(path).expect("canonical restart fixture path");
+    assert!(canonical.starts_with(root), "restart fixture escaped its owned root");
+    canonical
+}
+
+fn plain_contained_file(path: &Path, root: &Path) -> PathBuf {
+    let metadata = std::fs::symlink_metadata(path).expect("restart fixture file metadata");
+    assert!(metadata.is_file() && !metadata.file_type().is_symlink(), "restart fixture file must be plain");
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        assert_eq!(metadata.file_attributes() & 0x400, 0, "restart fixture file must not be a reparse point");
+    }
+    contained(path, root)
+}
+
 fn fixture_root() -> PathBuf {
     let root = PathBuf::from(std::env::var_os(ROOT_ENV).expect("restart fixture root must be supplied by the parent test"));
     assert!(root.is_absolute(), "restart fixture root must be absolute");
-    let root = std::fs::canonicalize(root).expect("canonical restart fixture root");
-    let temp = std::fs::canonicalize(std::env::temp_dir()).expect("canonical temporary directory");
+    let root = plain_directory(&root);
+    let temp = plain_directory(&std::env::temp_dir());
     assert_eq!(root.parent(), Some(temp.as_path()), "restart fixture root must be a direct temporary-directory child");
     let nonce = std::env::var(NONCE_ENV).expect("restart fixture nonce must be supplied by the parent test");
-    assert_eq!(bounded_read(&root.join(".owned")), nonce.as_bytes(), "restart fixture ownership marker mismatch");
+    let marker = plain_contained_file(&root.join(".owned"), &root);
+    assert_eq!(bounded_read(&marker), nonce.as_bytes(), "restart fixture ownership marker mismatch");
     root
 }
 
 fn fixture_paths() -> (PathBuf, PathBuf, PathBuf) {
     let root = fixture_root();
-    (root.join("source.pdf"), root.join("recovery"), root.join("render.sha256"))
+    let source = plain_contained_file(&root.join("source.pdf"), &root);
+    let recovery = plain_directory(&root.join("recovery"));
+    assert!(recovery.starts_with(&root), "recovery fixture escaped its owned root");
+    (source, recovery, root.join("render.sha256"))
 }
 
 fn worker(recovery: PathBuf) -> PdfService {
@@ -80,6 +112,7 @@ fn restart_child_a_persists_without_close() {
     let mut receipt = OpenOptions::new().write(true).create_new(true).open(&render_receipt).expect("create owned render receipt");
     receipt.write_all(&Sha256::digest(&pixels)).expect("write bounded render receipt");
     receipt.sync_all().expect("synchronize bounded render receipt");
+    plain_contained_file(&render_receipt, &fixture_root());
 
     let record = crate::recovery_store::read_recovery(&recovery, source_identity(&source), None, 0)
         .expect("read active recovery").expect("active recovery record");
@@ -96,7 +129,7 @@ fn restart_child_b_keeps_and_undoes() {
     let source = bounded_read(&source_path);
     let expected_source = bounded_read(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/welcome.pdf"));
     assert_eq!(Sha256::digest(&source), Sha256::digest(&expected_source));
-    let expected_render = bounded_read(&render_receipt);
+    let expected_render = bounded_read(&plain_contained_file(&render_receipt, &fixture_root()));
     assert_eq!(expected_render.len(), 32);
 
     let service = worker(recovery.clone());
@@ -151,10 +184,11 @@ fn run_child(name: &str, root: &Path, nonce: &str) {
         .env_clear()
         .env(ROOT_ENV, root)
         .env(NONCE_ENV, nonce)
+        .env("RUST_BACKTRACE", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    for name in ["SystemRoot", "WINDIR", "TEMP", "TMP", "PATH", "PATHEXT"] {
+    for name in ["SystemRoot", "WINDIR", "TEMP", "TMP"] {
         if let Some(value) = std::env::var_os(name) { command.env(name, value); }
     }
     let mut child = command.spawn().expect("spawn owned restart child");
@@ -176,25 +210,36 @@ fn run_child(name: &str, root: &Path, nonce: &str) {
 #[test]
 #[ignore = "uses three fresh PDFium worker processes and retained owned fixtures"]
 fn restart_recovery_survives_fresh_workers() {
-    let seed = SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock").as_nanos();
-    let (root, nonce) = (0_u32..64).find_map(|attempt| {
-        let nonce = format!("{}-{seed}-{attempt}", std::process::id());
-        let root = std::env::temp_dir().join(format!("smacrobat-recovery-restart-{nonce}"));
-        match std::fs::create_dir(&root) {
-            Ok(()) => Some((root, nonce)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
-            Err(error) => panic!("create owned restart fixture: {error}"),
-        }
-    }).expect("create unique owned restart fixture");
-    let recovery = root.join("recovery");
-    std::fs::create_dir(&recovery).expect("create owned recovery fixture");
+    let parent = plain_directory(&std::env::temp_dir());
+    let mut random = [0u8; 16];
+    #[cfg(windows)]
+    {
+        use windows::Win32::Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG};
+        let status = unsafe { BCryptGenRandom(None, &mut random, BCRYPT_USE_SYSTEM_PREFERRED_RNG) };
+        assert!(status.0 >= 0, "system random UUID generation failed");
+    }
+    #[cfg(not(windows))]
+    panic!("restart recovery proof is Windows-only");
+    random[6] = (random[6] & 0x0f) | 0x40;
+    random[8] = (random[8] & 0x3f) | 0x80;
+    let nonce = format!("{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}", random[0], random[1], random[2], random[3], random[4], random[5], random[6], random[7], random[8], random[9], random[10], random[11], random[12], random[13], random[14], random[15]);
+    let root = parent.join(format!("smacrobat-recovery-restart-{nonce}"));
+    std::fs::create_dir(&root).expect("create unique owned restart fixture");
+    let root = plain_directory(&root);
+    assert!(root.starts_with(&parent), "owned restart fixture escaped the temporary parent");
     let mut marker = OpenOptions::new().write(true).create_new(true).open(root.join(".owned")).expect("create ownership marker");
     marker.write_all(nonce.as_bytes()).expect("write ownership marker");
     marker.sync_all().expect("synchronize ownership marker");
+    contained(&root.join(".owned"), &root);
+    let recovery = root.join("recovery");
+    std::fs::create_dir(&recovery).expect("create owned recovery fixture");
+    let recovery = plain_directory(&recovery);
+    assert!(recovery.starts_with(&root), "owned recovery fixture escaped its root");
     std::fs::copy(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/welcome.pdf"),
         root.join("source.pdf"),
     ).expect("copy deterministic source fixture");
+    plain_contained_file(&root.join("source.pdf"), &root);
 
     let prefix = "service::recovery_restart_tests";
     run_child(&format!("{prefix}::restart_child_a_persists_without_close"), &root, &nonce);
