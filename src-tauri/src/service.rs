@@ -1,4 +1,4 @@
-use std::{collections::{HashMap, HashSet, VecDeque}, io::{Cursor, Write}, path::PathBuf, sync::{mpsc, OnceLock}};
+use std::{collections::{HashMap, HashSet, VecDeque}, io::{Cursor, Write}, path::PathBuf, sync::{Arc, Mutex, mpsc, OnceLock}};
 use pdfium_render::prelude::*;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -133,6 +133,7 @@ enum Request {
     #[cfg(windows)]
     ValidateOcrResult(crate::ocr::OcrPageRequest, crate::ocr_process::OcrWorkerHold, Reply<()>),
     Render(u64, u16, i32, Reply<Vec<u8>>),
+    AdmittedRender(u64, u16, i32, u64),
     Text(u64, u16, u64, Reply<String>),
     TextGeometry(u64, u16, u64, Reply<crate::text_geometry::PageTextGeometry>),
     Bookmarks(u64, u64, Reply<BookmarkList>),
@@ -174,7 +175,7 @@ impl RequestQueue {
         const WINDOW: usize = 32;
         const MAX_CLEANUP_OVERTAKES: usize = 2;
         if self.deferred.is_empty() { self.deferred.push_back(receiver.recv()?); }
-        if matches!(self.deferred.front(), Some(Request::Render(..))) && self.cleanup_overtakes < MAX_CLEANUP_OVERTAKES {
+        if matches!(self.deferred.front(), Some(Request::Render(..)|Request::AdmittedRender(..))) && self.cleanup_overtakes < MAX_CLEANUP_OVERTAKES {
             let mut index = 1;
             while index < WINDOW {
                 if index == self.deferred.len() {
@@ -184,7 +185,7 @@ impl RequestQueue {
                     }
                 }
                 match &self.deferred[index] {
-                    Request::Render(..) => index += 1,
+                    Request::Render(..)|Request::AdmittedRender(..) => index += 1,
                     Request::Close(..) | Request::EndPrint(..) => {
                         self.cleanup_overtakes += 1;
                         return Ok(self.deferred.remove(index).expect("The cleanup index is buffered"));
@@ -198,7 +199,7 @@ impl RequestQueue {
     }
 }
 #[derive(Clone)]
-pub struct PdfService { sender: mpsc::Sender<Request> }
+pub struct PdfService { sender: RequestSender }
 static PDF_SERVICE: OnceLock<PdfService> = OnceLock::new();
 type CacheKey = (u64, u16, i32);
 struct Cache { entries: VecDeque<(CacheKey, Vec<u8>, usize)>, weight: usize }
@@ -219,11 +220,13 @@ impl Cache {
 }
 impl PdfService {
     pub fn start(library: PathBuf) -> Self {
-        PDF_SERVICE.get_or_init(|| Self::start_worker(library)).clone()
+        PDF_SERVICE.get_or_init(|| Self::start_worker(library,if cfg!(test){4096}else{32})).clone()
     }
-    fn start_worker(library: PathBuf) -> Self {
-        let (sender, receiver) = mpsc::channel();
-        let resource_cleanup = sender.clone();
+    fn start_worker(library: PathBuf,render_limit:usize) -> Self {
+        let (raw_sender, receiver) = mpsc::channel();
+        let resource_cleanup = raw_sender.clone();
+        let render_admission=Arc::new(Mutex::new(RenderAdmission::default()));
+        let sender=RequestSender{inner:raw_sender,renders:render_admission.clone(),limit:render_limit};
         std::thread::Builder::new().name("pdf-worker".into()).spawn(move || {
             let pdfium = Pdfium::bind_to_library(library).map(Pdfium::new).map_err(|e| format!("PDF engine could not start: {e}"));
             let mut documents = HashMap::new();
@@ -616,7 +619,7 @@ impl PdfService {
                         let result = result.map(|info| { let cleanup = UnclaimedReply::Document(info.id); ReplyLease::new(info, cleanup, resource_cleanup.clone()) });
                         if let Err(Ok(info)) = reply.send(result) { documents.remove(&info.id); sessions.remove(&info.id); }
                     },
-                    Request::Render(id, page, width, reply) => {
+                    Request::AdmittedRender(id,page,width,token)=>{let reply={let mut a=render_admission.lock().expect("render admission mutex poisoned");let key=a.keys.iter().find_map(|(key,value)|(*value==token).then_some(*key));if let Some(key)=key{a.keys.remove(&key);}a.replies.remove(&token)};let Some(reply)=reply else{continue};
                         #[cfg(test)]
                         { render_work.entry(id).or_default().dequeued += 1; }
                         if reply.is_closed() {
@@ -647,6 +650,7 @@ impl PdfService {
                         };
                         let _ = reply.send(result);
                     },
+                    Request::Render(..)=>unreachable!("viewer renders are admitted before channel insertion"),
                     Request::Properties(id, revision, reply) => {
                         if reply.is_closed() { continue; }
                         let result = (|| {
@@ -1431,6 +1435,20 @@ fn checked_ocr_request(
         Ok((crate::ocr::raster_dimensions(width, height)?, width, height))
     })?;
     Ok((dimensions, spec, width, height))
+}
+type RenderKey=(u64,u16,i32,u64);
+#[derive(Default)]struct RenderAdmission{epoch:u64,next:u64,keys:HashMap<RenderKey,u64>,replies:HashMap<u64,Reply<Vec<u8>>>}
+#[derive(Clone)]struct RequestSender{inner:mpsc::Sender<Request>,renders:Arc<Mutex<RenderAdmission>>,limit:usize}
+impl RequestSender{
+    fn send(&self,request:Request)->Result<(),mpsc::SendError<Request>>{
+        if let Request::Render(id,page,width,reply)=request{
+            let mut a=self.renders.lock().expect("render admission mutex poisoned");let key=(id,page,width,a.epoch);
+            if let Some(token)=a.keys.get(&key).copied(){if let Some(old)=a.replies.insert(token,reply){let _=old.send(Err("Viewer render was superseded by a newer request.".into()));}return Ok(())}
+            if a.keys.len()>=self.limit{let _=reply.send(Err("Viewer render queue is full. Try again.".into()));return Ok(())}
+            a.next=a.next.wrapping_add(1);let token=a.next;a.keys.insert(key,token);a.replies.insert(token,reply);
+            if let Err(mpsc::SendError(marker))=self.inner.send(Request::AdmittedRender(id,page,width,token)){a.keys.remove(&key);a.replies.remove(&token);return Err(mpsc::SendError(marker))}Ok(())
+        }else{{let mut a=self.renders.lock().expect("render admission mutex poisoned");a.epoch=a.epoch.wrapping_add(1);}self.inner.send(request)}
+    }
 }
 
 #[cfg(windows)]
@@ -4474,6 +4492,23 @@ mod tests {
         assert_eq!(std::fs::read(&output).unwrap(), existing);
         call(&service, |reply| Request::Close(saved.document.id, reply)).unwrap();
         call(&service, |reply| Request::Close(info.id, reply)).unwrap();
+    }
+    #[test]
+    fn bounded_viewer_backlog_reports_overflow_supersession_and_drains_dropped_receivers(){
+        let(sender,receiver,state)=admission_sender();let mut admitted=Vec::new();for width in 64..96{let(tx,rx)=oneshot::channel();sender.send(Request::Render(1,0,width,tx)).unwrap();admitted.push(Some(rx));}
+        let(replacement_tx,replacement_rx)=oneshot::channel();sender.send(Request::Render(1,0,64,replacement_tx)).unwrap();assert!(admitted[0].take().unwrap().blocking_recv().unwrap().unwrap_err().contains("superseded"));for width in 96..104{let(tx,rx)=oneshot::channel();sender.send(Request::Render(1,0,width,tx)).unwrap();assert!(rx.blocking_recv().unwrap().unwrap_err().contains("queue is full"));}for value in admitted.iter_mut().skip(1).take(12){drop(value.take());}
+        let(close_tx,_)=oneshot::channel();sender.send(Request::Close(1,close_tx)).unwrap();let mut markers=0;for request in receiver.try_iter(){if let Request::AdmittedRender(_,_,_,token)=request{markers+=1;let reply={let mut a=state.lock().unwrap();let key=a.keys.iter().find_map(|(key,value)|(*value==token).then_some(*key)).unwrap();a.keys.remove(&key);a.replies.remove(&token)};if let Some(reply)=reply{if !reply.is_closed(){let _=reply.send(Err("Document is closed".into()));}}}}assert_eq!(markers,32);assert_eq!(state.lock().unwrap().keys.len(),0);assert!(replacement_rx.blocking_recv().unwrap().unwrap_err().contains("closed"));for receiver in admitted.into_iter().flatten(){assert!(receiver.blocking_recv().unwrap().unwrap_err().contains("closed"));}
+    }
+    fn admission_sender()->(RequestSender,mpsc::Receiver<Request>,Arc<Mutex<RenderAdmission>>){let(inner,receiver)=mpsc::channel();let renders=Arc::new(Mutex::new(RenderAdmission::default()));(RequestSender{inner,renders:renders.clone(),limit:32},receiver,renders)}
+    #[test]
+    fn viewer_render_admission_bounds_coalesces_and_respects_barriers(){
+        let(sender,receiver,state)=admission_sender();let mut replies=Vec::new();
+        for width in 64..96{let(tx,rx)=oneshot::channel();sender.send(Request::Render(1,0,width,tx)).unwrap();replies.push(rx)}
+        assert_eq!(state.lock().unwrap().keys.len(),32);
+        let(tx,overflow)=oneshot::channel();sender.send(Request::Render(1,0,96,tx)).unwrap();assert!(overflow.blocking_recv().unwrap().unwrap_err().contains("queue is full"));
+        let(old_tx,old_rx)=oneshot::channel();let(sender2,receiver2,state2)=admission_sender();sender2.send(Request::Render(7,2,300,old_tx)).unwrap();let(new_tx,_new_rx)=oneshot::channel();sender2.send(Request::Render(7,2,300,new_tx)).unwrap();assert!(old_rx.blocking_recv().unwrap().unwrap_err().contains("superseded"));assert_eq!(receiver2.try_iter().count(),1);assert_eq!(state2.lock().unwrap().keys.len(),1);
+        let(close_tx,_)=oneshot::channel();sender2.send(Request::Close(99,close_tx)).unwrap();let(after_tx,_)=oneshot::channel();sender2.send(Request::Render(7,2,300,after_tx)).unwrap();assert_eq!(receiver2.try_iter().count(),2,"a non-render barrier must split coalescing epochs");assert_eq!(state2.lock().unwrap().keys.len(),2);
+        drop(replies);assert_eq!(receiver.try_iter().filter(|r|matches!(r,Request::AdmittedRender(..))).count(),32);
     }
     #[test]
     fn searchable_ocr_publication_reopens_pixels_and_exact_pdfium_text() {
