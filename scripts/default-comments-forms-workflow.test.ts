@@ -44,6 +44,9 @@ describe('default comments and forms workflow', () => {
     expect(workflow).toContain('default-comments-forms-verification.json');
     expect(workflow.match(/git diff --cached --quiet --/g)).toHaveLength(2);
     expect(workflow.match(/git -C target-source diff --cached --quiet --/g)).toHaveLength(2);
+    const pdfiumPrep = "./scripts/prepare-default-draft-pdfium.ps1 -TargetSourceRoot (Resolve-Path target-source).Path -WorkRoot (Join-Path $env:RUNNER_TEMP 'default-installed-pdfium-prep')";
+    expect(workflow).toContain(pdfiumPrep);
+    expect(workflow.indexOf(pdfiumPrep)).toBeLessThan(workflow.indexOf('./scripts/verify-default-comments-forms.ps1'));
   });
 
   it('parses and pins Step 1 identity, independent Step 2 reproof, token clearing, exact install checks, and bounded cleanup', () => {

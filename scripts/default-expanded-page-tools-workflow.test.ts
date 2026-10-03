@@ -21,12 +21,17 @@ describe('default installed expanded page-tools workflow', () => {
     const uses=[...workflow.matchAll(/^\s*-?\s*uses:\s*([^\s#]+)\s*$/gm)].map(x=>x[1]);
     expect(uses).toEqual(['actions/checkout@11d5960a326750d5838078e36cf38b85af677262','actions/checkout@11d5960a326750d5838078e36cf38b85af677262','actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093','actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02']);
     expect(workflow.match(/persist-credentials: false/g)).toHaveLength(2);
+    const pdfiumPrep = "./scripts/prepare-default-draft-pdfium.ps1 -TargetSourceRoot (Resolve-Path target-source).Path -WorkRoot (Join-Path $env:RUNNER_TEMP 'default-installed-pdfium-prep')";
+    expect(workflow).toContain(pdfiumPrep);
+    expect(workflow.indexOf(pdfiumPrep)).toBeLessThan(workflow.indexOf('./scripts/verify-default-expanded-page-tools.ps1'));
+    expect(workflow.match(/git -C target-source diff --cached --quiet --/g)).toHaveLength(2);
     expect(workflow).not.toMatch(/secrets\.|AZURE_|TAURI_SIGNING|artifact-signing|gh release|cargo |npm run build|setup-dotnet/);
   });
 
   it('reuses unchanged page-tool helpers, reruns Step 1 independently, and limits its claims', () => {
     for (const path of ['installed-image-page-tools.ps1','installed-organizer-tools.ps1','installed-structural-page-tools.ps1','verify-default-draft.ps1']) expect(verifier).toContain(path);
     expect(verifier).toContain('Assert-IndependentReceiptParity $receipt $independent');
+    expect(verifier).not.toMatch(/Import-ExactFunctions[^\r\n]+Assert-ReceiptShape/);
     expect(verifier).toContain("featureBlobCount=$script:FeaturePaths.Count");
     expect(verifier).toContain("sourceBuildExecutableByteProvenanceReconstructed");
     expect(verifier).toContain('Invoke-SilentUninstall');

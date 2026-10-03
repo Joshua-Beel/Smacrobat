@@ -74,6 +74,9 @@ jobs:
           repository: Joshua-Beel/Smacrobat
           run-id: ${{ inputs.draft_proof_run_id }}
           path: ${{ env.DRAFT_PROOF_ROOT }}
+      - name: Prepare exact pinned PDFium resources in target source
+        shell: pwsh
+        run: ./scripts/prepare-default-draft-pdfium.ps1 -TargetSourceRoot (Resolve-Path target-source).Path -WorkRoot (Join-Path $env:RUNNER_TEMP 'default-installed-pdfium-prep')
       - name: Prepare exact hosted WebDriver inputs
         shell: pwsh
         run: ./scripts/setup-installed-app-webdriver.ps1 -OutputRoot $env:WEBDRIVER_ROOT
