@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { Undo2, Redo2 } from 'lucide-react';
 import { ArrowDownToLine, ArrowUpRight, Bookmark, ChevronDown, ChevronLeft, ChevronRight, ChevronsUpDown, CircleHelp, Combine, File, FileCheck2, FileImage, FileOutput, FilePenLine, FilePlus2, Files, FolderOpen, Hand, Highlighter, Home, LayoutGrid, List, Maximize, Menu, MessageSquare, Minimize2, Minus, MoreHorizontal, MousePointer2, PanelLeftClose, Pencil, Plus, Printer, RotateCw, Save, ScanLine, Search, ShieldCheck, Signature, SlidersHorizontal, Star, Sun, Type, X, ZoomIn, ZoomOut, type LucideIcon } from 'lucide-react';
@@ -36,6 +36,7 @@ import type { TextHighlightSelection, TextHighlightSelectionSource } from './tex
 import { appendRedaction, type RedactionDraft } from './redaction';
 import { readPreferences, savePreferences, type FitMode } from './preferences';
 import { readRecentFiles, saveRecentFiles, rememberFile } from './recentFiles';
+import { restoreModalFocus } from './modalFocus';
 import s from './Workspace.module.css';
 
 const icons: Record<string, LucideIcon> = { 'Create a PDF': FilePlus2, 'Combine files': Combine, 'Organize pages': LayoutGrid, 'Edit a PDF': FilePenLine, 'Export a PDF': FileOutput, 'Scan & OCR': ScanLine, 'Fill forms': Signature, 'Protect a PDF': ShieldCheck, 'Redact a PDF': ShieldCheck, 'Comment': MessageSquare, 'Compress a PDF': ArrowDownToLine };
@@ -120,9 +121,23 @@ export default function App() {
   const retainedTextHighlightSelection = useRef<TextHighlightSelection | null>(null);
   const pointerTextHighlightSelection = useRef<TextHighlightSelection | null>(null);
   const [pendingClose, setPendingClose] = useState<number | 'window' | null>(null);
+  const menuButton = useRef<HTMLButtonElement | null>(null);
+  const lastWorkspaceFocus = useRef<HTMLElement | null>(null);
+  const modalReturnFocus = useRef<HTMLElement | null>(null);
+  const modalWasOpen = useRef(false);
   const closingDocument = useRef<number | null>(null);
   const mounted = useRef(true);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
+  const modalOpen = updatesOpen || pageTextOpen || pageOcrTarget !== null || searchableOcrTarget !== null || newCopyModalOpen || printOpen || propertiesOpen || noticesOpen || passwordRequest !== null || pendingClose !== null || createOpen || pageImageTarget !== null || combineOpen || insertOpen || replaceOpen || formsOpen || commentEditor !== null;
+  useLayoutEffect(() => {
+    if (modalOpen && !modalWasOpen.current) {
+      modalReturnFocus.current = lastWorkspaceFocus.current;
+    } else if (!modalOpen && modalWasOpen.current) {
+      restoreModalFocus(modalReturnFocus.current, menuButton.current);
+      modalReturnFocus.current = null;
+    }
+    modalWasOpen.current = modalOpen;
+  }, [modalOpen]);
   useEffect(() => {
     if (!savePreferences({ dark, zoom, fit, hand, toolsOpen, nav })) setNotice('Your reading preferences could not be saved. They will last for this session only.');
   }, [dark, zoom, fit, hand, toolsOpen, nav]);
@@ -628,10 +643,10 @@ export default function App() {
     const disabled = busy || !!redactionDraft || newCopyModalOpen || !available || (combine && documents.length < 2) || ((comment || forms || imageExport || redaction || pageOcr) && !doc);
     return <button key={name} className={s.toolRow} disabled={disabled} onClick={create ? launchCreate : imageExport ? launchPageImageExport : pageOcr ? launchPageOcr : combine ? launchCombine : comment ? launchCommentMode : forms ? launchForms : redaction ? launchRedaction : launchOrganizer} title={combine && documents.length < 2 ? 'Open two PDFs to combine them' : (comment || forms || imageExport || redaction || pageOcr) && !doc ? 'Open a PDF first' : imageExport ? 'Export the current page as image' : redaction ? 'Permanently blank marked areas in a rasterized copy' : pageOcr ? (ocr.available ? 'Recognize text on the current page in English' : ocr.reason || 'OCR is unavailable in this build.') : forms ? 'Fill existing fields' : available ? name : `${name} — planned, not implemented yet`}><span className={s.toolIcon} style={{ color: ['#7361b3', '#277bb4', '#239576', '#bc6b25'][index % 4] }}><Icon size={21} strokeWidth={1.7} /></span><span>{imageExport ? 'Export page as image' : name}</span></button>;
   };
-  return <div className={`${s.app} ${dark ? s.dark : ''}`}>
+  return <div className={`${s.app} ${dark ? s.dark : ''}`} onFocusCapture={event => { if (!event.target.closest('dialog')) lastWorkspaceFocus.current = event.target; }}>
     <header className={s.tabbar}>
       <div className={s.appMark}><Files size={21} /></div>
-      <button className={s.menuButton} onClick={() => setMenu(v => !v)} aria-expanded={menu}><Menu size={17} /> Menu</button>
+      <button ref={menuButton} className={s.menuButton} onClick={() => setMenu(v => !v)} aria-expanded={menu}><Menu size={17} /> Menu</button>
       <button className={`${s.homeTab} ${view === 'home' ? s.selectedTab : ''}`} aria-label="Home" disabled={!!redactionDraft || newCopyModalOpen} onClick={() => { if (!newCopyModalOpen) setView('home'); }}><Home size={19} /></button>
       <div className={s.documentTabs}>{documents.map(document => <div key={document.id} className={`${s.documentTab} ${view === 'document' && active === document.id ? s.selectedTab : ''}`}><button disabled={busy || !!redactionDraft || newCopyModalOpen} onClick={() => activate(document.id)}><File size={15} /><span>{document.name}{document.dirty ? ' *' : ''}</span></button><IconButton icon={X} label={`Close ${document.name}`} disabled={busy || !!redactionDraft || newCopyModalOpen} onClick={() => void close(document.id)} /></div>)}</div>
       <button className={s.createButton} disabled={busy || !!redactionDraft || newCopyModalOpen} onClick={launchCreate} title="Create a PDF from an image"><Plus size={17} /> Create</button>

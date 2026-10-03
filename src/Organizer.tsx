@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { ArrowDownToLine, ArrowLeft, ArrowRight, CheckSquare, Crop, Files, RotateCcw, RotateCw, Scissors, Trash2, Undo2, Redo2, X } from 'lucide-react';
 import type { SplitOutput } from './bridge';
 import type { DocumentInfo, PageEdit } from './model';
@@ -10,6 +10,7 @@ import ConfirmDialog from './ConfirmDialog';
 import SplitDialog from './SplitDialog';
 import CropDialog, { type CropPage } from './CropDialog';
 import type { CropInsets } from './bridge';
+import { restoreModalFocus } from './modalFocus';
 
 const clampPage = (page: number, pageCount: number) => Math.min(Math.max(page, 0), Math.max(pageCount - 1, 0));
 
@@ -43,6 +44,10 @@ export default function Organizer({ document, currentPage = 0, pageLabels = null
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [splitOpen, setSplitOpen] = useState(false);
   const [cropTarget, setCropTarget] = useState<{ id: number; revision: number; pages: CropPage[] } | null>(null);
+  const closeButton = useRef<HTMLButtonElement | null>(null);
+  const lastWorkspaceFocus = useRef<HTMLElement | null>(null);
+  const modalReturnFocus = useRef<HTMLElement | null>(null);
+  const modalWasOpen = useRef(false);
   const lastClicked = useRef(clampPage(currentPage, document.pages.length));
   const resetInFlight = useRef(false);
   useEffect(() => {
@@ -52,6 +57,15 @@ export default function Organizer({ document, currentPage = 0, pageLabels = null
     if (selected.length > 0 && !bounded.length) { setSelected([fallback]); setRange(String(fallback + 1)); }
     else if (bounded.length !== selected.length) setSelected(bounded);
   }, [document.pages.length, selected]);
+  const modalOpen = confirmDelete || splitOpen || cropTarget !== null;
+  useLayoutEffect(() => {
+    if (modalOpen && !modalWasOpen.current) modalReturnFocus.current = lastWorkspaceFocus.current;
+    else if (!modalOpen && modalWasOpen.current) {
+      restoreModalFocus(modalReturnFocus.current, closeButton.current);
+      modalReturnFocus.current = null;
+    }
+    modalWasOpen.current = modalOpen;
+  }, [modalOpen]);
   const moveTo = async () => {
     if (busy || selected.length !== 1) return;
     const position = Number(destination);
@@ -86,8 +100,8 @@ export default function Organizer({ document, currentPage = 0, pageLabels = null
     resetInFlight.current = true; setError('');
     void resetCrop({ id: document.id, revision: document.revision, pages }).finally(() => { resetInFlight.current = false; });
   };
-  return <section className={s.organizer} aria-label="Organize pages workspace">
-    <div className={s.heading}><div><h1>Organize pages</h1><p>Rotate, reorder, or extract pages. Save your changes as a new PDF.</p></div><button onClick={close} disabled={busy}><X size={17} /> Close tool</button></div>
+  return <section className={s.organizer} aria-label="Organize pages workspace" onFocusCapture={event => { if (!event.target.closest('dialog')) lastWorkspaceFocus.current = event.target; }}>
+    <div className={s.heading}><div><h1>Organize pages</h1><p>Rotate, reorder, or extract pages. Save your changes as a new PDF.</p></div><button ref={closeButton} onClick={close} disabled={busy}><X size={17} /> Close tool</button></div>
     <div className={s.toolbar}>
       <label>Pages <input aria-label="Page selection range" placeholder="1-3, 5" value={range} onChange={e => setRange(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') { try { setSelected(parsePageRange(range, document.pages.length)); setError(''); } catch (e) { setError(String(e)); } } }} disabled={busy} /></label>
       <button disabled={busy} onClick={() => { try { setSelected(parsePageRange(range, document.pages.length)); setError(''); } catch (e) { setError(String(e)); } }}>Select</button>
