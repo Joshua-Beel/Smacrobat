@@ -14,7 +14,7 @@
     "icon": ["icons/icon.ico"],
     "createUpdaterArtifacts": true,
     "windows": { "nsis": { "installMode": "currentUser" }, "webviewInstallMode": { "type": "downloadBootstrapper" } },
-    "resources": ["resources/pdfium/bin/pdfium.dll", "resources/welcome.pdf", "resources/pdfium/LICENSE", "resources/pdfium/licenses/*", "resources/third-party-licenses/inventory.json", "resources/third-party-licenses/THIRD-PARTY-NOTICES.txt", "resources/third-party-sources/*"]
+    "resources": ["resources/pdfium/bin/pdfium.dll", "resources/pdfium/VERSION", "resources/pdfium/args.gn", "resources/welcome.pdf", "resources/pdfium/LICENSE", "resources/pdfium/licenses/*", "resources/third-party-licenses/inventory.json", "resources/third-party-licenses/THIRD-PARTY-NOTICES.txt", "resources/third-party-sources/*"]
   },
   "plugins": {
     "updater": {
