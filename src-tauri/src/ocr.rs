@@ -31,6 +31,8 @@ pub(crate) struct OcrPageRaster {
     pub(crate) request: OcrPageRequest,
     pub(crate) width: u32,
     pub(crate) height: u32,
+    pub(crate) page_width: f32,
+    pub(crate) page_height: f32,
     pub(crate) p6: Vec<u8>,
 }
 

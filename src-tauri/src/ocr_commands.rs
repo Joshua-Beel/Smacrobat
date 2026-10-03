@@ -9,6 +9,7 @@ use crate::ocr_process::{OcrCancellation, OcrProcessError, OcrProcessRunner};
 #[cfg(ocr_opt_in)]
 use crate::ocr_process::OcrExecutableIdentity;
 use crate::service::PdfService;
+use crate::searchable_ocr_job::SearchableOcrCoordinator;
 
 const OCR_REQUEST_LIMIT: usize = 4_096;
 const OCR_DPI: u16 = 150;
@@ -16,12 +17,43 @@ const UNAVAILABLE_DEFAULT: &str = "OCR is not enabled in this source build.";
 const UNAVAILABLE_RESOURCES: &str = "OCR resources could not be verified for this source build.";
 const REQUEST_LIMIT_ERROR: &str = "The OCR request limit was reached. Restart the application before starting another OCR request.";
 
+fn available_capability(searchable: bool, searchable_reason: Option<String>) -> OcrCapability {
+    OcrCapability {
+        available: true, reason: None, language: Some("eng".into()),
+        searchable_pdf_available: searchable, searchable_pdf_reason: searchable_reason,
+        searchable_pdf_dpi: searchable.then_some(150), searchable_pdf_max_pages: 32,
+        searchable_pdf_max_pixels: crate::searchable_pdf::MAX_SEARCHABLE_PIXELS,
+        searchable_pdf_max_words: crate::searchable_pdf::MAX_SEARCHABLE_WORDS,
+        searchable_pdf_max_text_bytes: crate::searchable_pdf::MAX_SEARCHABLE_TEXT_BYTES,
+        searchable_pdf_characters: searchable.then(|| "printable ASCII words only".into()),
+    }
+}
+
+fn unavailable_capability(reason: &str) -> OcrCapability {
+    OcrCapability {
+        available: false, reason: Some(reason.into()), language: None,
+        searchable_pdf_available: false, searchable_pdf_reason: Some(reason.into()), searchable_pdf_dpi: None,
+        searchable_pdf_max_pages: 32, searchable_pdf_max_pixels: crate::searchable_pdf::MAX_SEARCHABLE_PIXELS,
+        searchable_pdf_max_words: crate::searchable_pdf::MAX_SEARCHABLE_WORDS,
+        searchable_pdf_max_text_bytes: crate::searchable_pdf::MAX_SEARCHABLE_TEXT_BYTES,
+        searchable_pdf_characters: None,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OcrCapability {
     available: bool,
     reason: Option<String>,
     language: Option<String>,
+    searchable_pdf_available: bool,
+    searchable_pdf_reason: Option<String>,
+    searchable_pdf_dpi: Option<u16>,
+    searchable_pdf_max_pages: usize,
+    searchable_pdf_max_pixels: u64,
+    searchable_pdf_max_words: usize,
+    searchable_pdf_max_text_bytes: usize,
+    searchable_pdf_characters: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -53,6 +85,7 @@ pub(crate) struct OcrCommands {
 
 struct OcrCommandsInner {
     coordinator: Option<Arc<OcrCoordinator>>,
+    searchable: Option<Arc<SearchableOcrCoordinator>>,
     capability: OcrCapability,
     registry: Mutex<RequestRegistry>,
     #[cfg(test)]
@@ -74,22 +107,30 @@ enum RequestState {
 impl OcrCommands {
     pub(crate) fn new(service: PdfService, resource_dir: PathBuf) -> Self {
         let (coordinator, capability) = match configured_runner(&resource_dir) {
-            Ok(Some(runner)) => (
-                Some(Arc::new(OcrCoordinator::new(service, runner))),
-                OcrCapability { available: true, reason: None, language: Some("eng".into()) },
-            ),
+            Ok(Some(runner)) => {
+                let searchable_runner = configured_runner(&resource_dir).ok().flatten();
+                let searchable_available = searchable_runner.is_some();
+                let searchable_reason = (!searchable_available).then(|| UNAVAILABLE_RESOURCES.into());
+                let searchable = searchable_runner.map(|runner| Arc::new(SearchableOcrCoordinator::new(service.clone(), runner)));
+                return Self { inner: Arc::new(OcrCommandsInner {
+                    coordinator: Some(Arc::new(OcrCoordinator::new(service, runner))), searchable,
+                    capability: available_capability(searchable_available, searchable_reason), registry: Mutex::new(RequestRegistry::default()),
+                    #[cfg(test)] completion_hook: None,
+                }) };
+            }
             Ok(None) => (
                 None,
-                OcrCapability { available: false, reason: Some(UNAVAILABLE_DEFAULT.into()), language: None },
+                unavailable_capability(UNAVAILABLE_DEFAULT),
             ),
             Err(()) => (
                 None,
-                OcrCapability { available: false, reason: Some(UNAVAILABLE_RESOURCES.into()), language: None },
+                unavailable_capability(UNAVAILABLE_RESOURCES),
             ),
         };
         Self {
             inner: Arc::new(OcrCommandsInner {
                 coordinator,
+                searchable: None,
                 capability,
                 registry: Mutex::new(RequestRegistry::default()),
                 #[cfg(test)]
@@ -103,7 +144,8 @@ impl OcrCommands {
         Self {
             inner: Arc::new(OcrCommandsInner {
                 coordinator: Some(Arc::new(coordinator)),
-                capability: OcrCapability { available: true, reason: None, language: Some("eng".into()) },
+                searchable: None,
+                capability: available_capability(false, Some(UNAVAILABLE_RESOURCES.into())),
                 registry: Mutex::new(RequestRegistry::default()),
                 completion_hook,
             }),
@@ -136,6 +178,20 @@ impl OcrCommands {
         let result = task.await.map_err(|_| "OCR failed internally.".to_owned())?;
         reply_drop.disarm();
         result.map(|result| receipt(request_id, result)).map_err(public_error)
+    }
+
+    pub(crate) async fn create_searchable(
+        &self, request_id: String, document_id: u64, revision: u64, page_count: usize, path: PathBuf,
+    ) -> Result<crate::service::SavedCopy, String> {
+        validate_uuid(&request_id)?;
+        let coordinator = self.inner.searchable.clone().ok_or_else(|| self.inner.capability.searchable_pdf_reason.clone().unwrap_or_else(|| UNAVAILABLE_DEFAULT.into()))?;
+        let cancellation = self.begin(&request_id)?;
+        let mut reply_drop = ReplyDropCancellation::new(cancellation.clone());
+        let cleanup = ActiveRequestCleanup { inner: self.inner.clone(), request_id };
+        let task = tauri::async_runtime::spawn(async move { let _cleanup = cleanup; coordinator.create(document_id, revision, page_count, path, cancellation).await });
+        let result = task.await.map_err(|_| "OCR failed internally.".to_owned())?;
+        reply_drop.disarm();
+        result.map_err(public_error)
     }
 
     pub(crate) fn cancel(&self, request_id: String) -> Result<OcrCancelAck, String> {
@@ -280,6 +336,17 @@ fn validate_request_id(request_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_uuid(value: &str) -> Result<(), String> {
+    let bytes = value.as_bytes();
+    let valid = bytes.len() == 36
+        && [8, 13, 18, 23].into_iter().all(|index| bytes[index] == b'-')
+        && bytes.iter().enumerate().all(|(index, byte)| [8, 13, 18, 23].contains(&index) || byte.is_ascii_hexdigit())
+        && bytes[14] == b'4'
+        && matches!(bytes[19].to_ascii_lowercase(), b'8' | b'9' | b'a' | b'b');
+    if !valid { return Err("Searchable OCR request ID must be a fresh UUID v4.".into()); }
+    Ok(())
+}
+
 #[cfg(ocr_opt_in)]
 fn configured_runner(resource_dir: &Path) -> Result<Option<OcrProcessRunner>, ()> {
     let relative = option_env!("PDF_WORKSTATION_OCR_RESOURCE_RELATIVE").ok_or(())?;
@@ -323,7 +390,8 @@ mod tests {
         OcrCommands {
             inner: Arc::new(OcrCommandsInner {
                 coordinator: None,
-                capability: OcrCapability { available: false, reason: Some(UNAVAILABLE_DEFAULT.into()), language: None },
+                searchable: None,
+                capability: unavailable_capability(UNAVAILABLE_DEFAULT),
                 registry: Mutex::new(RequestRegistry::default()),
                 completion_hook: None,
             }),
@@ -378,6 +446,24 @@ mod tests {
         }
         for invalid in ["", "contains space", "../path", "é", &"x".repeat(65)] {
             assert!(validate_request_id(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn searchable_requests_require_uuid_v4_ids() {
+        for valid in [
+            "550e8400-e29b-41d4-a716-446655440000",
+            "550E8400-E29B-41D4-B716-446655440000",
+        ] {
+            assert!(validate_uuid(valid).is_ok());
+        }
+        for invalid in [
+            "request_1",
+            "550e8400-e29b-11d4-a716-446655440000",
+            "550e8400-e29b-41d4-c716-446655440000",
+            "550e8400e29b41d4a716446655440000",
+        ] {
+            assert!(validate_uuid(invalid).is_err());
         }
     }
 
@@ -483,7 +569,7 @@ mod tests {
         let folder = tempfile::tempdir().unwrap();
         let (request, source_path, source) = tauri::async_runtime::block_on(known_page(&service, folder.path()));
         let commands = OcrCommands::new(service.clone(), root().join("src-tauri/target/debug"));
-        assert_eq!(commands.capability(), OcrCapability { available: true, reason: None, language: Some("eng".into()) });
+        assert_eq!(commands.capability(), available_capability(true, None));
         let receipt = tauri::async_runtime::block_on(commands.recognize(
             "command-exact".into(), request.document_id, request.revision, request.page,
         )).unwrap();
@@ -605,7 +691,7 @@ mod tests {
         let service = PdfService::start(root().join("src-tauri/resources/pdfium/bin/pdfium.dll"));
         let missing = tempfile::tempdir().unwrap();
         let commands = OcrCommands::new(service.clone(), missing.path().to_path_buf());
-        assert_eq!(commands.capability(), OcrCapability { available: false, reason: Some(UNAVAILABLE_RESOURCES.into()), language: None });
+        assert_eq!(commands.capability(), unavailable_capability(UNAVAILABLE_RESOURCES));
 
         let tampered = tempfile::tempdir().unwrap();
         copy_runtime_resources(tampered.path());
@@ -615,14 +701,14 @@ mod tests {
         bytes[last] ^= 1;
         std::fs::write(&engine, bytes).unwrap();
         let commands = OcrCommands::new(service.clone(), tampered.path().to_path_buf());
-        assert_eq!(commands.capability(), OcrCapability { available: false, reason: Some(UNAVAILABLE_RESOURCES.into()), language: None });
+        assert_eq!(commands.capability(), unavailable_capability(UNAVAILABLE_RESOURCES));
 
         let linked = tempfile::tempdir().unwrap();
         let actual_resources = root().join("src-tauri/target/debug/resources").canonicalize().unwrap();
         let link = linked.path().join("resources");
         create_junction(&link, &actual_resources);
         let commands = OcrCommands::new(service, linked.path().to_path_buf());
-        assert_eq!(commands.capability(), OcrCapability { available: false, reason: Some(UNAVAILABLE_RESOURCES.into()), language: None });
+        assert_eq!(commands.capability(), unavailable_capability(UNAVAILABLE_RESOURCES));
         assert!(!commands.capability().reason.unwrap().contains(actual_resources.to_string_lossy().as_ref()));
         std::fs::remove_dir(&link).unwrap();
     }

@@ -1,4 +1,4 @@
-use std::{collections::{HashMap, HashSet, VecDeque}, io::Cursor, path::PathBuf, sync::{mpsc, OnceLock}};
+use std::{collections::{HashMap, HashSet, VecDeque}, io::{Cursor, Write}, path::PathBuf, sync::{mpsc, OnceLock}};
 use pdfium_render::prelude::*;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -30,6 +30,8 @@ pub struct SavedCopy { path: String, document: DocumentInfo }
 pub struct PageImagePreflight { pub suggested_name: String }
 #[derive(Debug)]
 pub struct RasterRedactionPreflight { pub suggested_name: String }
+#[derive(Debug)]
+pub struct SearchableOcrPreflight { pub suggested_name: String, pub page_count: usize }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PageImageReceipt { path: String, document_id: u64, revision: u64, page: u16, dpi: u16, width: u32, height: u32, format: PageImageFormat }
@@ -122,6 +124,10 @@ enum Request {
     ExportPageImage(u64, u64, u16, u16, PageImageFormat, PathBuf, Reply<PageImageReceipt>),
     PreflightRasterRedaction(u64, u64, u16, Vec<crate::raster_redaction::RasterRedactionRect>, Reply<RasterRedactionPreflight>),
     RasterRedact(u64, u64, u16, Vec<crate::raster_redaction::RasterRedactionRect>, PathBuf, Reply<ReplyLease<SavedCopy>>),
+    #[cfg(windows)]
+    PreflightSearchableOcr(u64, u64, Reply<SearchableOcrPreflight>),
+    #[cfg(windows)]
+    PublishSearchableOcr(u64, u64, PathBuf, crate::searchable_ocr_job::PreparedSearchableOcr, Reply<ReplyLease<SavedCopy>>),
     #[cfg(windows)]
     OcrRaster(crate::ocr::OcrPageRequest, crate::ocr_process::OcrCancellation, crate::ocr_process::OcrWorkerHold, Reply<crate::ocr::OcrPageRaster>),
     #[cfg(windows)]
@@ -426,6 +432,68 @@ impl PdfService {
                         if let Err(Ok(saved)) = reply.send(result) { documents.remove(&saved.document.id); sessions.remove(&saved.document.id); }
                     }
                     #[cfg(windows)]
+                    Request::PreflightSearchableOcr(id, revision, reply) => {
+                        if reply.is_closed() { continue; }
+                        let result = (|| {
+                            let (session, info) = sessions.get(&id).ok_or("Document is closed")?;
+                            let document = documents.get(&id).ok_or("Document is closed")?;
+                            let page_count = checked_searchable_ocr_request(session, document, revision)?;
+                            let source = PathBuf::from(&info.path);
+                            let stem = source.file_stem().filter(|stem| !stem.is_empty()).unwrap_or_default().to_string_lossy();
+                            Ok(SearchableOcrPreflight { suggested_name: format!("{}-searchable.pdf", if stem.is_empty() { "document" } else { &stem }), page_count })
+                        })();
+                        let _ = reply.send(result);
+                    }
+                    #[cfg(windows)]
+                    Request::PublishSearchableOcr(id, revision, path, prepared, reply) => {
+                        if reply.is_closed() { continue; }
+                        let result = (|| {
+                            let ensure_active = || -> Result<(), String> {
+                                prepared.cancellation.ensure_runnable().map_err(|error| error.to_string())?;
+                                if std::time::Instant::now() >= prepared.deadline { return Err("OCR exceeded its time limit.".into()); }
+                                Ok(())
+                            };
+                            ensure_active()?;
+                            let (session, _) = sessions.get(&id).ok_or("Document is closed")?;
+                            let original = documents.get(&id).ok_or("Document is closed")?;
+                            let page_count = checked_searchable_ocr_request(session, original, revision)?;
+                            if page_count != prepared.pages.len() || prepared.expected_text.len() != page_count { return Err("Searchable OCR output no longer matches the source document.".into()); }
+                            crate::searchable_pdf::verify_searchable_pdf(&prepared.bytes, &prepared.pages)?;
+                            ensure_active()?;
+                            let engine = pdfium.as_ref().map_err(Clone::clone)?;
+                            let check = engine.load_pdf_from_byte_vec(prepared.bytes.clone(), None).map_err(|error| format!("Searchable OCR output validation failed: {error}"))?;
+                            ensure_active()?;
+                            if check.pages().len() as usize != page_count { return Err("Searchable OCR output page count validation failed.".into()); }
+                            for (index, expected) in prepared.pages.iter().enumerate() {
+                                if std::time::Instant::now() >= prepared.deadline { return Err("OCR exceeded its time limit.".into()); }
+                                if reply.is_closed() { return Err("OCR was cancelled.".into()); }
+                                let page = check.pages().get(index as i32).map_err(|error| format!("Could not reopen searchable OCR page {}: {error}", index + 1))?;
+                                let bitmap = page.render_with_config(&PdfRenderConfig::new().set_fixed_size(expected.image_width as i32, expected.image_height as i32).set_format(PdfBitmapFormat::BGRA).set_reverse_byte_order(false).clear_before_rendering(true).set_clear_color(PdfColor::WHITE)).map_err(|error| format!("Could not render searchable OCR page {}: {error}", index + 1))?;
+                                ensure_active()?;
+                                let bgra = bitmap.as_raw_bytes();
+                                let expected_bgra = expected.rgb.len().checked_div(3).and_then(|pixels| pixels.checked_mul(4)).ok_or("Searchable OCR render length overflows.")?;
+                                if bgra.len() != expected_bgra || bgra.chunks_exact(4).any(|pixel| pixel[3] != 255) { return Err(format!("Searchable OCR page {} has an unexpected render layout.", index + 1)); }
+                                let rgb = bgra.chunks_exact(4).flat_map(|pixel| [pixel[2], pixel[1], pixel[0]]).collect::<Vec<_>>();
+                                if rgb != expected.rgb { return Err(format!("Searchable OCR page {} pixels changed after reopening.", index + 1)); }
+                                let text = page.text().map_err(|error| format!("Could not extract searchable OCR page {} text: {error}", index + 1))?;
+                                ensure_active()?;
+                                let visible = page.boundaries().bounding().map_err(|error| error.to_string())?.bounds;
+                                if text.inside_rect(visible) != prepared.expected_text[index] { return Err(format!("Searchable OCR page {} extraction differs from the OCR text.", index + 1)); }
+                            }
+                            ensure_active()?;
+                            if reply.is_closed() { return Err("OCR was cancelled.".into()); }
+                            publish_searchable_file(&path, &prepared.bytes, prepared.deadline, &prepared.cancellation, None, None)?;
+                            let pages = page_sizes(&check)?;
+                            let new_id = next_id; next_id += 1;
+                            let info = DocumentInfo { id: new_id, name: path.file_name().unwrap_or_default().to_string_lossy().into_owned(), path: path.to_string_lossy().into_owned(), pages, revision: 0, dirty: false, can_undo: false, can_redo: false };
+                            sessions.insert(new_id, (EditSession::new(prepared.bytes, info.pages.len()), info.clone()));
+                            documents.insert(new_id, std::rc::Rc::new(check));
+                            Ok(SavedCopy { path: path.to_string_lossy().into_owned(), document: info })
+                        })();
+                        let result = result.map(|saved| { let id = saved.document.id; ReplyLease::new(saved, UnclaimedReply::Document(id), resource_cleanup.clone()) });
+                        if let Err(Ok(saved)) = reply.send(result) { documents.remove(&saved.document.id); sessions.remove(&saved.document.id); }
+                    }
+                    #[cfg(windows)]
                     Request::OcrRaster(request, cancellation, admission, reply) => {
                         #[cfg(test)]
                         { ocr_work.entry(request.document_id).or_default().dequeued += 1; }
@@ -435,7 +503,7 @@ impl PdfService {
                             let (session, _) = sessions.get(&request.document_id).ok_or("Document is closed")?;
                             let original = documents.get(&request.document_id).ok_or("Document is closed")?;
                             session.text_extraction_permission()?;
-                            let (dimensions, spec) = checked_ocr_request(session, original, request)?;
+                            let (dimensions, spec, page_width, page_height) = checked_ocr_request(session, original, request)?;
                             #[cfg(test)]
                             { ocr_work.entry(request.document_id).or_default().preflighted += 1; }
                             cancellation.ensure_runnable().map_err(|error| error.to_string())?;
@@ -482,6 +550,8 @@ impl PdfService {
                                 request,
                                 width: dimensions.width,
                                 height: dimensions.height,
+                                page_width,
+                                page_height,
                                 p6,
                             })
                         })();
@@ -1012,6 +1082,14 @@ impl PdfService {
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::RasterRedact(id, revision, page, rectangles, path, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?.map(ReplyLease::accept)
     }
     #[cfg(windows)]
+    pub(crate) async fn preflight_searchable_ocr(&self, id: u64, revision: u64) -> Result<SearchableOcrPreflight, String> {
+        let (tx, rx) = oneshot::channel(); self.sender.send(Request::PreflightSearchableOcr(id, revision, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
+    }
+    #[cfg(windows)]
+    pub(crate) async fn publish_searchable_ocr(&self, id: u64, revision: u64, path: PathBuf, prepared: crate::searchable_ocr_job::PreparedSearchableOcr) -> Result<SavedCopy, String> {
+        let (tx, rx) = oneshot::channel(); self.sender.send(Request::PublishSearchableOcr(id, revision, path, prepared, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?.map(ReplyLease::accept)
+    }
+    #[cfg(windows)]
     pub(crate) async fn ocr_raster(&self, request: crate::ocr::OcrPageRequest, cancellation: crate::ocr_process::OcrCancellation, admission: crate::ocr_process::OcrWorkerHold) -> Result<crate::ocr::OcrPageRaster, String> {
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::OcrRaster(request, cancellation, admission, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
     }
@@ -1243,15 +1321,58 @@ fn checked_ocr_request(
     session: &EditSession,
     document: &PdfDocument<'_>,
     request: crate::ocr::OcrPageRequest,
-) -> Result<(crate::ocr::OcrRasterDimensions, PageSpec), String> {
+) -> Result<(crate::ocr::OcrRasterDimensions, PageSpec, f32, f32), String> {
     if session.revision != request.revision { return Err("Document changed. Start OCR again.".into()); }
     if !matches!(document.permissions().security_handler_revision(), Ok(PdfSecurityHandlerRevision::Unprotected)) {
         return Err("OCR of encrypted or restricted PDFs is not supported in this build.".into());
     }
     session.page_image_export_guard()?;
     let spec = session.plan.get(usize::from(request.page)).ok_or("OCR page is out of range")?.clone();
-    let dimensions = with_planned_page(document, &spec, |page| crate::ocr::raster_dimensions(page.width().value, page.height().value))?;
-    Ok((dimensions, spec))
+    let (dimensions, width, height) = with_planned_page(document, &spec, |page| {
+        let width = page.width().value;
+        let height = page.height().value;
+        Ok((crate::ocr::raster_dimensions(width, height)?, width, height))
+    })?;
+    Ok((dimensions, spec, width, height))
+}
+
+#[cfg(windows)]
+fn checked_searchable_ocr_request(session: &EditSession, document: &PdfDocument<'_>, revision: u64) -> Result<usize, String> {
+    if session.revision != revision { return Err("Document changed. Start searchable OCR again.".into()); }
+    if !matches!(document.permissions().security_handler_revision(), Ok(PdfSecurityHandlerRevision::Unprotected)) { return Err("Searchable OCR of encrypted or restricted PDFs is not supported in this build.".into()); }
+    session.page_image_export_guard()?;
+    session.text_extraction_permission()?;
+    if session.plan.is_empty() || session.plan.len() > crate::searchable_ocr_job::MAX_DOCUMENT_PAGES { return Err("Searchable OCR supports 1 to 32 current pages.".into()); }
+    let mut pixels = 0_u64;
+    for spec in &session.plan {
+        let dimensions = with_planned_page(document, spec, |page| crate::ocr::raster_dimensions(page.width().value, page.height().value))?;
+        pixels = pixels.checked_add(u64::from(dimensions.width).checked_mul(u64::from(dimensions.height)).ok_or("Searchable OCR pixel count overflows.")?).ok_or("Searchable OCR pixel count overflows.")?;
+        if pixels > crate::searchable_pdf::MAX_SEARCHABLE_PIXELS { return Err("The searchable OCR copy exceeds the 32 MiPixel aggregate limit at 150 DPI.".into()); }
+    }
+    Ok(session.plan.len())
+}
+
+#[cfg(windows)]
+fn publish_searchable_file(
+    path: &PathBuf,
+    bytes: &[u8],
+    deadline: std::time::Instant,
+    cancellation: &crate::ocr_process::OcrCancellation,
+    before_commit: Option<&dyn Fn()>,
+    after_commit: Option<&dyn Fn()>,
+) -> Result<(), String> {
+    if path.exists() { return Err("That file already exists. Choose a new filename; Save a Copy never overwrites an existing file.".into()); }
+    if !path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("pdf")) { return Err("The output filename must end in .pdf.".into()); }
+    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty()).ok_or("Choose an output folder.")?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
+    temporary.write_all(bytes).map_err(|error| error.to_string())?;
+    temporary.as_file().sync_all().map_err(|error| error.to_string())?;
+    if let Some(hook) = before_commit { hook(); }
+    if std::time::Instant::now() >= deadline { return Err("OCR exceeded its time limit.".into()); }
+    cancellation.commit().map_err(|error| error.to_string())?;
+    if let Some(hook) = after_commit { hook(); }
+    temporary.persist_noclobber(path).map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1436,7 +1557,7 @@ mod tests {
     macro_rules! accepted_reply_values {
         ($($value:ty),* $(,)?) => { $(impl TestReplyValue for $value { type Accepted = Self; fn accept(self) -> Self { self } })* };
     }
-    accepted_reply_values!((), Vec<u8>, Vec<u64>, Vec<Option<String>>, String, DocumentInfo, SavedCopy, OpenResult, PrintSnapshotInfo, PrintBitmap, PageImagePreflight, RasterRedactionPreflight, PageImageReceipt, BookmarkList, RenderWork, BookmarkWork, OcrWork, OcrWorkerState, crate::ocr::OcrPageRaster, crate::page_labels::DocumentPageLabels, crate::document_properties::DocumentProperties, crate::text_geometry::PageTextGeometry, crate::split::SplitOutput, crate::comments::CommentList, crate::comments::AnnotationList, crate::forms::FormFields);
+    accepted_reply_values!((), Vec<u8>, Vec<u64>, Vec<Option<String>>, String, DocumentInfo, SavedCopy, OpenResult, PrintSnapshotInfo, PrintBitmap, PageImagePreflight, RasterRedactionPreflight, SearchableOcrPreflight, PageImageReceipt, BookmarkList, RenderWork, BookmarkWork, OcrWork, OcrWorkerState, crate::ocr::OcrPageRaster, crate::page_labels::DocumentPageLabels, crate::document_properties::DocumentProperties, crate::text_geometry::PageTextGeometry, crate::split::SplitOutput, crate::comments::CommentList, crate::comments::AnnotationList, crate::forms::FormFields);
     fn call<T: TestReplyValue>(service: &PdfService, request: impl FnOnce(Reply<T>) -> Request) -> Result<T::Accepted, String> {
         let (tx, rx) = oneshot::channel(); service.sender.send(request(tx)).unwrap(); rx.blocking_recv().unwrap().map(TestReplyValue::accept)
     }
@@ -4218,6 +4339,84 @@ mod tests {
         assert_eq!(std::fs::read(&output).unwrap(), existing);
         call(&service, |reply| Request::Close(saved.document.id, reply)).unwrap();
         call(&service, |reply| Request::Close(info.id, reply)).unwrap();
+    }
+    #[test]
+    fn searchable_ocr_publication_reopens_pixels_and_exact_pdfium_text() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let service = PdfService::start(root.join("resources/pdfium/bin/pdfium.dll"));
+        let folder = tempfile::tempdir().unwrap();
+        let page = crate::searchable_pdf::SearchableRasterPage {
+            page_width: 100.0, page_height: 100.0, image_width: 10, image_height: 10,
+            rgb: vec![255; 300],
+            words: vec![crate::searchable_pdf::SearchableWord { x: 10.0, y: 10.0, width: 50.0, height: 12.0, text: "Hello".into() }],
+        };
+        let bytes = crate::searchable_pdf::write_searchable_pdf(&[page.clone()]).unwrap();
+        let source_path = folder.path().join("source.pdf");
+        std::fs::write(&source_path, &bytes).unwrap();
+        let source = call(&service, |reply| Request::Open(source_path.clone(), reply)).unwrap();
+        let preflight = call(&service, |reply| Request::PreflightSearchableOcr(source.id, source.revision, reply)).unwrap();
+        assert_eq!(preflight.page_count, 1);
+        let output_path = folder.path().join("searchable.pdf");
+        let prepared = crate::searchable_ocr_job::PreparedSearchableOcr {
+            bytes: bytes.clone(), pages: vec![page.clone()], expected_text: vec!["Hello".into()],
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
+            cancellation: crate::ocr_process::OcrCancellation::default(),
+        };
+        let saved = call(&service, |reply| Request::PublishSearchableOcr(source.id, source.revision, output_path.clone(), prepared, reply)).unwrap();
+        assert_eq!(std::fs::read(&output_path).unwrap(), bytes);
+        assert_eq!(std::fs::read(&source_path).unwrap(), bytes);
+        assert_eq!(saved.document.revision, 0);
+        assert!(!saved.document.dirty);
+        let cancelled_path = folder.path().join("cancelled.pdf");
+        let cancellation = crate::ocr_process::OcrCancellation::default();
+        assert!(cancellation.cancel());
+        let cancelled = crate::searchable_ocr_job::PreparedSearchableOcr {
+            bytes: bytes.clone(), pages: vec![page.clone()], expected_text: vec!["Hello".into()],
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(30), cancellation,
+        };
+        assert!(call(&service, |reply| Request::PublishSearchableOcr(source.id, source.revision, cancelled_path.clone(), cancelled, reply)).err().unwrap().contains("cancelled"));
+        assert!(!cancelled_path.exists());
+        let expired_path = folder.path().join("expired.pdf");
+        let expired = crate::searchable_ocr_job::PreparedSearchableOcr {
+            bytes, pages: vec![page], expected_text: vec!["Hello".into()],
+            deadline: std::time::Instant::now() - std::time::Duration::from_secs(1),
+            cancellation: crate::ocr_process::OcrCancellation::default(),
+        };
+        assert!(call(&service, |reply| Request::PublishSearchableOcr(source.id, source.revision, expired_path.clone(), expired, reply)).err().unwrap().contains("time limit"));
+        assert!(!expired_path.exists());
+        for id in [source.id, saved.document.id] { call(&service, |reply| Request::Close(id, reply)).unwrap(); }
+    }
+
+    #[test]
+    fn searchable_publication_commit_arbitrates_cancel_and_expiry() {
+        let folder = tempfile::tempdir().unwrap();
+        let cancelled_path = folder.path().join("cancel-before-commit.pdf");
+        let cancelled = crate::ocr_process::OcrCancellation::default();
+        let cancel_at_boundary = || { assert!(cancelled.cancel()); };
+        assert!(publish_searchable_file(
+            &cancelled_path, b"candidate", std::time::Instant::now() + std::time::Duration::from_secs(30),
+            &cancelled, Some(&cancel_at_boundary), None,
+        ).unwrap_err().contains("cancelled"));
+        assert!(!cancelled_path.exists());
+
+        let committed_path = folder.path().join("commit-wins.pdf");
+        let committed = crate::ocr_process::OcrCancellation::default();
+        let cancel_after_commit = || { assert!(!committed.cancel()); assert!(committed.is_completed()); };
+        publish_searchable_file(
+            &committed_path, b"candidate", std::time::Instant::now() + std::time::Duration::from_secs(30),
+            &committed, None, Some(&cancel_after_commit),
+        ).unwrap();
+        assert_eq!(std::fs::read(&committed_path).unwrap(), b"candidate");
+
+        let expired_path = folder.path().join("expired-during-staging.pdf");
+        let expired = crate::ocr_process::OcrCancellation::default();
+        let expire_at_boundary = || { std::thread::sleep(std::time::Duration::from_millis(2)); };
+        assert!(publish_searchable_file(
+            &expired_path, b"candidate", std::time::Instant::now() + std::time::Duration::from_millis(1),
+            &expired, Some(&expire_at_boundary), None,
+        ).unwrap_err().contains("time limit"));
+        assert!(!expired_path.exists());
+        assert!(!expired.is_completed());
     }
 
     #[test]

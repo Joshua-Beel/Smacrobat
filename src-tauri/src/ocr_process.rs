@@ -104,6 +104,20 @@ impl OcrCancellation {
         }
     }
 
+    pub(crate) fn commit(&self) -> Result<(), OcrProcessError> {
+        match self.0.compare_exchange(
+            RUN_STATE_RUNNING,
+            RUN_STATE_COMPLETED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            Err(RUN_STATE_CANCELLED) => Err(OcrProcessError::Cancelled),
+            Err(RUN_STATE_COMPLETED) => Err(OcrProcessError::System("OCR cancellation token was already completed".into())),
+            Err(_) => Err(OcrProcessError::System("OCR cancellation state is invalid".into())),
+        }
+    }
+
     fn finish<T>(&self, result: Result<T, OcrProcessError>) -> Result<T, OcrProcessError> {
         match self.0.compare_exchange(
             RUN_STATE_RUNNING,
@@ -224,7 +238,7 @@ impl OcrProcessRunner {
             Ok(operation) => operation,
             Err(error) => return cancellation.finish(Err(error)),
         };
-        let result = self.recognize_inner_admitted(input, options, &operation);
+        let result = self.recognize_inner_admitted(input, options, OcrOutputProfile::Text, &operation);
         if let Some(hook) = options.before_finish {
             hook();
         }
@@ -236,7 +250,26 @@ impl OcrProcessRunner {
         input: &[u8],
         operation: &OcrOperation,
     ) -> Result<OcrProcessOutput, OcrProcessError> {
-        self.recognize_inner_admitted(input, RunOptions::production(), operation)
+        self.recognize_inner_admitted(input, RunOptions::production(), OcrOutputProfile::Text, operation)
+    }
+
+    pub(crate) fn recognize_p6_tsv_admitted(
+        &self,
+        input: &[u8],
+        operation: &OcrOperation,
+    ) -> Result<OcrProcessOutput, OcrProcessError> {
+        self.recognize_inner_admitted(input, RunOptions::production(), OcrOutputProfile::Tsv, operation)
+    }
+
+    pub(crate) fn recognize_p6_tsv_admitted_with_timeout(
+        &self,
+        input: &[u8],
+        operation: &OcrOperation,
+        timeout: Duration,
+    ) -> Result<OcrProcessOutput, OcrProcessError> {
+        let mut options = RunOptions::production();
+        options.timeout = timeout.min(OCR_TIMEOUT);
+        self.recognize_inner_admitted(input, options, OcrOutputProfile::Tsv, operation)
     }
 
     #[cfg(test)]
@@ -250,6 +283,7 @@ impl OcrProcessRunner {
         self.recognize_inner_admitted(
             input,
             RunOptions { before_resume, after_resume, ..RunOptions::production() },
+            OcrOutputProfile::Text,
             operation,
         )
     }
@@ -258,6 +292,7 @@ impl OcrProcessRunner {
         &self,
         input: &[u8],
         options: RunOptions<'_>,
+        output_profile: OcrOutputProfile,
         operation: &OcrOperation,
     ) -> Result<OcrProcessOutput, OcrProcessError> {
         let cancellation = &operation.cancellation;
@@ -269,9 +304,13 @@ impl OcrProcessRunner {
             input,
             cancellation,
             options,
+            output_profile,
         )
     }
 }
+
+#[derive(Clone, Copy)]
+enum OcrOutputProfile { Text, Tsv }
 
 #[derive(Clone, Copy)]
 struct RunOptions<'a> {
@@ -328,6 +367,10 @@ impl OcrOperation {
         result: Result<T, OcrProcessError>,
     ) -> Result<T, OcrProcessError> {
         self.cancellation.finish(result)
+    }
+
+    pub(crate) fn finish_committed<T>(self, result: Result<T, OcrProcessError>) -> Result<T, OcrProcessError> {
+        if self.cancellation.is_completed() { result } else { self.cancellation.finish(result) }
     }
 }
 
@@ -508,6 +551,7 @@ fn run_child(
     input: &[u8],
     cancellation: &OcrCancellation,
     options: RunOptions<'_>,
+    output_profile: OcrOutputProfile,
 ) -> Result<OcrProcessOutput, OcrProcessError> {
     cancellation.ensure_runnable()?;
     let job = create_job()?;
@@ -526,7 +570,7 @@ fn run_child(
     let mut process_info = PROCESS_INFORMATION::default();
     let application = wide_null(engine.as_os_str())?;
     let current_directory = wide_null(engine.parent().ok_or_else(|| OcrProcessError::InvalidAsset("OCR executable has no parent directory".into()))?.as_os_str())?;
-    let mut command_line = build_command_line(engine, tessdata)?;
+    let mut command_line = build_command_line(engine, tessdata, output_profile)?;
     let creation_flags = CREATE_SUSPENDED | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT;
     cancellation.ensure_runnable()?;
     unsafe {
@@ -839,8 +883,8 @@ impl Drop for ProcThreadAttributes {
     }
 }
 
-fn build_command_line(engine: &Path, tessdata: &Path) -> Result<Vec<u16>, OcrProcessError> {
-    let arguments = [
+fn build_command_line(engine: &Path, tessdata: &Path, output_profile: OcrOutputProfile) -> Result<Vec<u16>, OcrProcessError> {
+    let mut arguments = vec![
         engine.as_os_str().to_os_string(),
         OsString::from("stdin"),
         OsString::from("stdout"),
@@ -857,6 +901,7 @@ fn build_command_line(engine: &Path, tessdata: &Path) -> Result<Vec<u16>, OcrPro
         OsString::from("--loglevel"),
         OsString::from("ERROR"),
     ];
+    if matches!(output_profile, OcrOutputProfile::Tsv) { arguments.push(OsString::from("tsv")); }
     let mut command = Vec::new();
     for (index, argument) in arguments.iter().enumerate() {
         if index != 0 {
@@ -1103,9 +1148,12 @@ fn main() {
 
     #[test]
     fn command_line_quotes_paths_without_using_a_shell() {
-        let command = build_command_line(Path::new(r"C:\OCR engine\tesseract.exe"), Path::new(r"C:\model space\tessdata")).unwrap();
+        let command = build_command_line(Path::new(r"C:\OCR engine\tesseract.exe"), Path::new(r"C:\model space\tessdata"), OcrOutputProfile::Text).unwrap();
         let text = String::from_utf16(&command[..command.len() - 1]).unwrap();
         assert_eq!(text, r#""C:\OCR engine\tesseract.exe" "stdin" "stdout" "--tessdata-dir" "C:\model space\tessdata" "-l" "eng" "--oem" "1" "--psm" "6" "--dpi" "150" "--loglevel" "ERROR""#);
+        let tsv = build_command_line(Path::new(r"C:\OCR engine\tesseract.exe"), Path::new(r"C:\model space\tessdata"), OcrOutputProfile::Tsv).unwrap();
+        let tsv = String::from_utf16(&tsv[..tsv.len() - 1]).unwrap();
+        assert_eq!(tsv, format!("{text} \"tsv\""));
     }
 
     #[test]
