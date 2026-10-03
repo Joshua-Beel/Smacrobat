@@ -28,6 +28,7 @@ impl DocumentInfo {
 #[derive(Serialize)]
 pub struct SavedCopy { path: String, document: DocumentInfo }
 #[allow(dead_code)]
+#[derive(Serialize)]
 pub struct RecoveredDocument { pub document: DocumentInfo, pub current_page: u32 }
 #[derive(Debug)]
 pub struct PageImagePreflight { pub suggested_name: String }
@@ -5051,5 +5052,120 @@ mod tests {
             assert!(preview.as_raw() == saved.as_raw(), "Preview differs from saved copy for {fixture}");
             assert_eq!(std::fs::read(source_path).unwrap(), source_bytes);
         }
+    }
+
+    #[test]
+    #[ignore = "writes controlled native outputs only when SMACROBAT_CROSS_VIEWER_OUTPUT_DIR names an existing empty target directory"]
+    fn export_controlled_cross_viewer_outputs() {
+        use lopdf::{content::{Content, Operation}, dictionary, Dictionary, Document, Object, Stream};
+        use std::{fs::OpenOptions, io::Write as _, path::Path};
+
+        fn sha256(path: &Path) -> String { format!("{:x}", Sha256::digest(std::fs::read(path).unwrap())) }
+        fn create_new(path: &Path, bytes: &[u8]) {
+            let mut file = OpenOptions::new().write(true).create_new(true).open(path).unwrap();
+            file.write_all(bytes).unwrap(); file.sync_all().unwrap();
+        }
+        fn render_rgb(service: &PdfService, id: u64, page: u16, width: u32) -> image::RgbImage {
+            image::load_from_memory(&call(service, |reply| Request::Render(id, page, width as i32, reply)).unwrap()).unwrap().into_rgb8()
+        }
+        fn sample(image: &image::RgbImage, region: [u32; 4]) -> serde_json::Value {
+            let [left, top, right, bottom] = region;
+            assert!(left < right && top < bottom && right <= image.width() && bottom <= image.height());
+            let mut total = [0u64; 3]; let count = u64::from((right - left) * (bottom - top));
+            for y in top..bottom { for x in left..right { for channel in 0..3 { total[channel] += u64::from(image.get_pixel(x, y)[channel]); } } }
+            let mean = total.map(|value| ((value + count / 2) / count) as i64);
+            serde_json::json!({"name":"feature-region native-PDFium reference","region":region,"minimum":mean.map(|value|(value-48).max(0)),"maximum":mean.map(|value|(value+48).min(255))})
+        }
+        fn darkest_region(image: &image::RgbImage) -> [u32; 4] {
+            let (x,y,_)=image.enumerate_pixels().min_by_key(|(_,_,pixel)|u16::from(pixel[0])+u16::from(pixel[1])+u16::from(pixel[2])).unwrap();
+            let left=x.saturating_sub(6).min(image.width()-12); let top=y.saturating_sub(6).min(image.height()-12); [left,top,left+12,top+12]
+        }
+        fn case(
+            id: &str, profile: &str, root: &Path, source: &Path, output: &Path, page: u16,
+            points: [f32; 2], rendered: &image::RgbImage, region: [u32; 4],
+        ) -> serde_json::Value {
+            serde_json::json!({
+                "id":id,"profile":profile,"source":source.file_name().unwrap().to_str().unwrap(),
+                "sourceSha256":sha256(source),"output":output.file_name().unwrap().to_str().unwrap(),
+                "outputSha256":sha256(output),"page":u32::from(page)+1,"dpi":72,
+                "pagePoints":[points[0],points[1]],"nativePixelSize":[rendered.width(),rendered.height()],
+                "pixelSize":[points[0].ceil() as u32,points[1].ceil() as u32],
+                "samples":[sample(rendered,region)],"directory":root.file_name().unwrap().to_str().unwrap(),
+            })
+        }
+        fn text_pdf(text: &str) -> Vec<u8> {
+            let mut pdf = Document::with_version("1.7"); let pages = pdf.new_object_id();
+            let font = pdf.add_object(dictionary!{"Type"=>"Font","Subtype"=>"Type1","BaseFont"=>"Helvetica","Encoding"=>"WinAnsiEncoding"});
+            let content = Content { operations: vec![Operation::new("BT",vec![]),Operation::new("Tf",vec![Object::Name(b"F1".to_vec()),24.into()]),Operation::new("Tm",vec![1.into(),0.into(),0.into(),1.into(),40.into(),80.into()]),Operation::new("Tj",vec![Object::string_literal(text)]),Operation::new("ET",vec![])] }.encode().unwrap();
+            let stream = pdf.add_object(Stream::new(Dictionary::new(),content));
+            let page = pdf.add_object(dictionary!{"Type"=>"Page","Parent"=>pages,"MediaBox"=>vec![0.into(),0.into(),200.into(),120.into()],"Resources"=>dictionary!{"Font"=>dictionary!{"F1"=>font}},"Contents"=>stream});
+            pdf.objects.insert(pages,dictionary!{"Type"=>"Pages","Count"=>1,"Kids"=>vec![Object::Reference(page)]}.into());
+            let catalog=pdf.add_object(dictionary!{"Type"=>"Catalog","Pages"=>pages}); pdf.trailer.set("Root",catalog);
+            pdf.reference_table.cross_reference_type=lopdf::xref::XrefType::CrossReferenceTable; pdf.trailer.remove(b"Type");
+            let mut bytes=Vec::new(); pdf.save_to(&mut bytes).unwrap(); bytes
+        }
+
+        let requested = PathBuf::from(std::env::var_os("SMACROBAT_CROSS_VIEWER_OUTPUT_DIR").expect("set SMACROBAT_CROSS_VIEWER_OUTPUT_DIR"));
+        let root = std::fs::canonicalize(&requested).unwrap();
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let target = std::fs::canonicalize(repo.join("target")).unwrap();
+        assert!(root.starts_with(&target) && root != target, "output must be an owned directory below target");
+        for ancestor in root.ancestors().take_while(|path| path.starts_with(&target)) {
+            let metadata = std::fs::symlink_metadata(ancestor).unwrap(); assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+            #[cfg(windows)] { use std::os::windows::fs::MetadataExt; assert_eq!(metadata.file_attributes() & 0x400, 0, "output path contains a reparse point"); }
+        }
+        assert!(std::fs::read_dir(&root).unwrap().next().is_none(), "output directory must be empty");
+
+        let service = PdfService::start(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/pdfium/bin/pdfium.dll"));
+        let mut cases = Vec::new();
+
+        let comments_source = root.join("comments-source.pdf"); let comments_bytes = text_pdf("ABC"); create_new(&comments_source,&comments_bytes);
+        let mut comments = call(&service,|reply|Request::Open(comments_source.clone(),reply)).unwrap();
+        comments=call(&service,|reply|Request::Comment(comments.id,comments.revision,CommentMutation::Create(0,CropRect{x:0.05,y:0.05,width:0.12,height:0.12},"Controlled note".into()),reply)).unwrap();
+        comments=call(&service,|reply|Request::Comment(comments.id,comments.revision,CommentMutation::CreateHighlight(0,CropRect{x:0.20,y:0.20,width:0.25,height:0.18},Some("Controlled area".into())),reply)).unwrap();
+        comments=call(&service,|reply|Request::Comment(comments.id,comments.revision,CommentMutation::CreateTextHighlight(0,0,3,Some("Controlled text".into())),reply)).unwrap();
+        let comments_output=root.join("comments-output.pdf"); comments=call(&service,|reply|Request::Save(comments.id,None,comments_output.clone(),reply)).unwrap().document;
+        let annotations=call(&service,|reply|Request::Annotations(comments.id,comments.revision,reply)).unwrap();
+        assert_eq!(annotations.annotations.iter().filter(|value|value.kind==crate::comments::AnnotationKind::Highlight).count(),2);
+        assert_eq!(call(&service,|reply|Request::Comments(comments.id,comments.revision,reply)).unwrap().notes.len(),1);
+        assert_eq!(std::fs::read(&comments_source).unwrap(),comments_bytes);
+        let image=render_rgb(&service,comments.id,0,comments.pages[0].width.ceil() as u32);
+        cases.push(case("native-comments","comments",&root,&comments_source,&comments_output,0,[comments.pages[0].width,comments.pages[0].height],&image,[45,28,85,50]));
+        call(&service,|reply|Request::Close(comments.id,reply)).unwrap();
+
+        let forms_source=root.join("forms-source.pdf"); let forms_bytes=include_bytes!("../tests/fixtures/reportlab-mixed-fields.pdf"); create_new(&forms_source,forms_bytes);
+        let forms=call(&service,|reply|Request::Open(forms_source.clone(),reply)).unwrap(); let fields=call(&service,|reply|Request::FormFields(forms.id,0,reply)).unwrap();
+        let patches=fields.fields.iter().map(|field|if field.checked.is_some(){crate::forms::FieldValue::Checkbox{field_id:field.field_id.clone(),checked:true}}else{crate::forms::FieldValue::Text{field_id:field.field_id.clone(),value:"Controlled form".into()}}).collect();
+        let forms_output=root.join("forms-output.pdf"); let forms_saved=call(&service,|reply|Request::FillFormCopy(forms.id,0,patches,forms_output.clone(),reply)).unwrap();
+        let filled=call(&service,|reply|Request::FormFields(forms_saved.document.id,0,reply)).unwrap(); assert!(filled.fields.iter().any(|field|field.checked==Some(true))); assert!(filled.fields.iter().any(|field|field.value=="Controlled form"));
+        assert_eq!(std::fs::read(&forms_source).unwrap(),forms_bytes); let image=render_rgb(&service,forms_saved.document.id,0,forms_saved.document.pages[0].width.ceil() as u32);
+        cases.push(case("native-forms","forms",&root,&forms_source,&forms_output,0,[forms_saved.document.pages[0].width,forms_saved.document.pages[0].height],&image,[58,114,82,138]));
+        for id in [forms.id,forms_saved.document.id]{call(&service,|reply|Request::Close(id,reply)).unwrap();}
+
+        let redaction_source=root.join("redaction-source.pdf"); let redaction_bytes=include_bytes!("../resources/welcome.pdf"); create_new(&redaction_source,redaction_bytes);
+        let redaction=call(&service,|reply|Request::Open(redaction_source.clone(),reply)).unwrap(); let rectangles=vec![crate::raster_redaction::RasterRedactionRect{x:0.0,y:0.0,width:72.0,height:72.0}];
+        let redaction_output=root.join("redaction-output.pdf"); let redacted=call(&service,|reply|Request::RasterRedact(redaction.id,0,0,rectangles,redaction_output.clone(),reply)).unwrap();
+        let redacted_bytes=std::fs::read(&redaction_output).unwrap(); crate::sanitization::verify_clean_raster_pdf(&redacted_bytes,redaction.pages.len()).unwrap(); assert_eq!(std::fs::read(&redaction_source).unwrap(),redaction_bytes);
+        let image=render_rgb(&service,redacted.document.id,0,redacted.document.pages[0].width.ceil() as u32);
+        assert!((8..32).all(|y|(8..32).all(|x|image.get_pixel(x,y).0.iter().all(|channel|*channel<8))), "redacted interior must render black in PDFium");
+        cases.push(case("native-redaction","raster-copy",&root,&redaction_source,&redaction_output,0,[redacted.document.pages[0].width,redacted.document.pages[0].height],&image,[8,8,32,32]));
+        for id in [redaction.id,redacted.document.id]{call(&service,|reply|Request::Close(id,reply)).unwrap();}
+
+        let fixture_root=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/searchable-ocr"); let image_sources=["single-line.png","two-column.png","mixed-lines.png"].map(|name|std::fs::read(fixture_root.join(name)).unwrap());
+        let mut bundle=Vec::new(); for bytes in &image_sources{bundle.extend_from_slice(&(bytes.len() as u64).to_le_bytes());bundle.extend_from_slice(bytes);} let multi_source=root.join("multiimage-sources.bin"); create_new(&multi_source,&bundle);
+        let options=crate::image_pdf::ImagePdfOptions{page_size:crate::image_pdf::ImagePdfPageSize::A4,orientation:crate::image_pdf::ImagePdfOrientation::Auto,margin_points:12.0};
+        let prepared=crate::image_pdf::prepare_many_bytes(image_sources.to_vec(),options).unwrap(); let multi_output=root.join("multiimage-output.pdf"); let multi=call(&service,|reply|Request::CreateMultiImagePdf(prepared,multi_output.clone(),reply)).unwrap(); assert_eq!(multi.document.pages.len(),3); assert_eq!(std::fs::read(&multi_source).unwrap(),bundle);
+        let image=render_rgb(&service,multi.document.id,2,multi.document.pages[2].width.ceil() as u32); let region=darkest_region(&image); assert!(image.get_pixel((region[0]+region[2])/2,(region[1]+region[3])/2).0.iter().any(|channel|*channel<64));
+        cases.push(case("native-multiimage","image-pdf",&root,&multi_source,&multi_output,2,[multi.document.pages[2].width,multi.document.pages[2].height],&image,region)); call(&service,|reply|Request::Close(multi.document.id,reply)).unwrap();
+
+        let text_source=root.join("text-source.pdf"); let text_bytes=text_pdf("123"); create_new(&text_source,&text_bytes); let text=call(&service,|reply|Request::Open(text_source.clone(),reply)).unwrap();
+        let target=call(&service,|reply|Request::InspectTextReplacement(text.id,0,0,reply)).unwrap(); let text_output=root.join("text-output.pdf"); let replaced=call(&service,|reply|Request::ReplaceTextCopy(text.id,0,0,target,"789".into(),text_output.clone(),reply)).unwrap();
+        assert_eq!(crate::text_edit::inspect_text_run(&std::fs::read(&text_output).unwrap(),1).unwrap().text,"789"); assert_eq!(std::fs::read(&text_source).unwrap(),text_bytes);
+        let image=render_rgb(&service,replaced.document.id,0,replaced.document.pages[0].width.ceil() as u32);
+        cases.push(case("native-text-replacement","page-operations",&root,&text_source,&text_output,0,[replaced.document.pages[0].width,replaced.document.pages[0].height],&image,[38,20,100,52]));
+        for id in [text.id,replaced.document.id]{call(&service,|reply|Request::Close(id,reply)).unwrap();}
+
+        let manifest=serde_json::json!({"schema":1,"scope":"Five exact synthetic native saved outputs; PDFium semantic/pixel checks plus independent Poppler rendering. No Adobe, arbitrary-PDF, or general cross-viewer claim.","cases":cases});
+        create_new(&root.join("manifest.json"),format!("{}\n",serde_json::to_string_pretty(&manifest).unwrap()).as_bytes());
     }
 }
