@@ -1,10 +1,12 @@
-type FocusTarget = Pick<HTMLElement, 'focus' | 'isConnected'> & Partial<Pick<HTMLElement, 'matches'>>;
+type FocusTarget = Pick<HTMLElement, 'focus' | 'isConnected'> & Partial<Pick<HTMLElement, 'matches' | 'closest'>>;
 
-function available(target: FocusTarget | null): target is FocusTarget {
-  return !!target?.isConnected && !target.matches?.(':disabled');
+function focus(target: FocusTarget | null): boolean {
+  if (!target?.isConnected || target.matches?.(':disabled,[hidden]') || target.closest?.('[inert]')) return false;
+  try { target.focus(); }
+  catch { return false; }
+  return typeof document === 'undefined' || document.activeElement === target as unknown as Element;
 }
 
 export function restoreModalFocus(preferred: FocusTarget | null, fallback: FocusTarget | null): void {
-  const target = available(preferred) ? preferred : available(fallback) ? fallback : null;
-  target?.focus();
+  if (!focus(preferred)) focus(fallback);
 }

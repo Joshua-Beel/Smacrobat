@@ -2,7 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { Undo2, Redo2 } from 'lucide-react';
 import { ArrowDownToLine, ArrowUpRight, Bookmark, ChevronDown, ChevronLeft, ChevronRight, ChevronsUpDown, CircleHelp, Combine, File, FileCheck2, FileImage, FileOutput, FilePenLine, FilePlus2, Files, FolderOpen, Hand, Highlighter, Home, LayoutGrid, List, Maximize, Menu, MessageSquare, Minimize2, Minus, MoreHorizontal, MousePointer2, PanelLeftClose, Pencil, Plus, Printer, RotateCw, Save, ScanLine, Search, ShieldCheck, Signature, SlidersHorizontal, Star, Sun, Type, X, ZoomIn, ZoomOut, type LucideIcon } from 'lucide-react';
-import { closeDocument, cancelPasswordRequest, native, openDocument, reopenDocument, checkpointRecovery, restoreRecovery, editPages, saveCopy, splitDocument, cropPages, resetCrops, combineDocuments, insertPagesCopy, replacePagesCopy, documentFormFields, fillFormCopy, documentAnnotations, documentPageLabels, createPdfFromImage, chooseImagePdfSources, createPdfFromImages, cancelImagePdfSources, inspectImageReplacementTarget, replacePdfImageCopy, cancelImageReplacement, inspectTextReplacementTarget, replacePdfTextCopy, cancelTextReplacement, exportPageImage, redactDocument, createComment, updateComment, deleteComment, createHighlight, createTextHighlight, updateHighlight, deleteHighlight, createSearchableOcrCopy, cancelPageOcr, ocrCapability as getOcrCapability, type Annotation, type CommentRect, type CropInsets, type CreatePdfOptions, type DocumentAnnotations, type DocumentFormFields, type FormPatch, type ImageReplacementTarget, type TextReplacementTarget, type OcrCapability, type OpenResult, type PageImageExport, type PageImageExportRequest, type RasterRedactionRect, type SplitOutput, type SavedCopy } from './bridge';
+import { closeDocument, cancelPasswordRequest, native, openDocument, reopenDocument, checkpointRecovery, restoreRecovery, keepRecoveredEdits, openOriginal, editPages, saveCopy, splitDocument, cropPages, resetCrops, combineDocuments, insertPagesCopy, replacePagesCopy, documentFormFields, fillFormCopy, documentAnnotations, documentPageLabels, createPdfFromImage, chooseImagePdfSources, createPdfFromImages, cancelImagePdfSources, inspectImageReplacementTarget, replacePdfImageCopy, cancelImageReplacement, inspectTextReplacementTarget, replacePdfTextCopy, cancelTextReplacement, exportPageImage, redactDocument, createComment, updateComment, deleteComment, createHighlight, createTextHighlight, updateHighlight, deleteHighlight, createSearchableOcrCopy, cancelPageOcr, ocrCapability as getOcrCapability, type Annotation, type CommentRect, type CropInsets, type CreatePdfOptions, type DocumentAnnotations, type DocumentFormFields, type FormPatch, type ImageReplacementTarget, type TextReplacementTarget, type OcrCapability, type OpenResult, type PageImageExport, type PageImageExportRequest, type RasterRedactionRect, type SplitOutput, type SavedCopy, type RecoveryOffer } from './bridge';
 import { clampPage, toolGroups, type DocumentInfo, type PageEdit } from './model';
 import { pageLabelDescription, pageLabelFor, validatePageLabels, type DocumentPageLabels } from './pageLabels';
 import Viewer from './Viewer';
@@ -32,6 +32,7 @@ import PageList from './PageList';
 import CommentsPanel from './CommentsPanel';
 import RedactPanel from './RedactPanel';
 import CommentEditor, { type AnnotationDraft } from './CommentEditor';
+import RecoveryOfferDialog from './RecoveryOfferDialog';
 import type { TextHighlightSelection, TextHighlightSelectionSource } from './textHighlightSelection';
 import { appendRedaction, type RedactionDraft } from './redaction';
 import { readPreferences, savePreferences, type FitMode } from './preferences';
@@ -121,6 +122,8 @@ export default function App() {
   const retainedTextHighlightSelection = useRef<TextHighlightSelection | null>(null);
   const pointerTextHighlightSelection = useRef<TextHighlightSelection | null>(null);
   const [pendingClose, setPendingClose] = useState<number | 'window' | null>(null);
+  const [recoveryOffer, setRecoveryOffer] = useState<{ document: DocumentInfo; offer: RecoveryOffer } | null>(null);
+  const [recoveryChoiceError, setRecoveryChoiceError] = useState('');
   const menuButton = useRef<HTMLButtonElement | null>(null);
   const lastWorkspaceFocus = useRef<HTMLElement | null>(null);
   const modalReturnFocus = useRef<HTMLElement | null>(null);
@@ -128,7 +131,7 @@ export default function App() {
   const closingDocument = useRef<number | null>(null);
   const mounted = useRef(true);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
-  const modalOpen = updatesOpen || pageTextOpen || pageOcrTarget !== null || searchableOcrTarget !== null || newCopyModalOpen || printOpen || propertiesOpen || noticesOpen || passwordRequest !== null || pendingClose !== null || createOpen || pageImageTarget !== null || combineOpen || insertOpen || replaceOpen || formsOpen || commentEditor !== null;
+  const modalOpen = recoveryOffer !== null || updatesOpen || pageTextOpen || pageOcrTarget !== null || searchableOcrTarget !== null || newCopyModalOpen || printOpen || propertiesOpen || noticesOpen || passwordRequest !== null || pendingClose !== null || createOpen || pageImageTarget !== null || combineOpen || insertOpen || replaceOpen || formsOpen || commentEditor !== null;
   useLayoutEffect(() => {
     if (modalOpen && !modalWasOpen.current) {
       modalReturnFocus.current = lastWorkspaceFocus.current;
@@ -159,12 +162,12 @@ export default function App() {
   const latest = useRef({ documents, busy, active, dialogOpen: false });
   latest.current = {
     documents, busy, active,
-    dialogOpen: updatesOpen || pageTextOpen || pageOcrTarget !== null || searchableOcrTarget !== null || multiImageOpen || imageReplacementTarget !== null || textReplacementTarget !== null || printOpen || propertiesOpen || noticesOpen || passwordRequest !== null || pendingClose !== null || createOpen || pageImageTarget !== null || combineOpen || insertOpen || replaceOpen || formsOpen || commentEditor !== null,
+    dialogOpen: recoveryOffer !== null || updatesOpen || pageTextOpen || pageOcrTarget !== null || searchableOcrTarget !== null || multiImageOpen || imageReplacementTarget !== null || textReplacementTarget !== null || printOpen || propertiesOpen || noticesOpen || passwordRequest !== null || pendingClose !== null || createOpen || pageImageTarget !== null || combineOpen || insertOpen || replaceOpen || formsOpen || commentEditor !== null,
   };
   useEffect(() => {
     if (!native) return;
     const unlisten = getCurrentWindow().onCloseRequested(event => {
-      if (latest.current.busy || closingDocument.current !== null) { event.preventDefault(); setNotice('Wait for the current operation to finish before closing.'); }
+      if (latest.current.busy || closingDocument.current !== null || latest.current.dialogOpen) { event.preventDefault(); setNotice('Finish the current operation or dialog before closing.'); }
       else if (latest.current.documents.some(document => document.dirty)) { event.preventDefault(); setPendingClose('window'); }
     });
     return () => { void unlisten.then(stop => stop()); };
@@ -217,7 +220,7 @@ export default function App() {
   }, [doc?.id, doc?.revision, doc?.pages.length, pageLabelsRequest]);
   const pageLabels = pageLabelsLoad.request === pageLabelsRequest ? pageLabelsLoad.labels : null;
   const activate = (id: number) => {
-    if (busy || redactionDraft || searchableOcrTarget || newCopyModalOpen || closingDocument.current !== null) return;
+    if (busy || recoveryOffer || redactionDraft || searchableOcrTarget || newCopyModalOpen || closingDocument.current !== null) return;
     const document = documents.find(item => item.id === id);
     if (!document) return;
     if (pageOcrTarget && pageOcrTarget.id !== id) setPageOcrTarget(null);
@@ -237,18 +240,24 @@ export default function App() {
       else if (result?.status === 'password_required') void cancelPasswordRequest(result.request_id).catch(() => {});
       return;
     }
-    if (result?.status === 'opened') opened(result.document, organize);
+    if (result?.status === 'opened') {
+      const offer = result.recovery;
+      const coherentOffer = !offer || result.document.revision === 0 && !result.document.dirty && Number.isSafeInteger(offer.revision) && offer.revision > 0 && Number.isSafeInteger(offer.currentPage) && offer.currentPage >= 0 && offer.currentPage < result.document.pages.length;
+      if (!coherentOffer) { void closeDocument(result.document.id).catch(() => {}); setError('Recovery offered invalid state for this PDF.'); return; }
+      opened(result.document, organize);
+      if (offer) { setRecoveryChoiceError(''); setRecoveryOffer({ document: result.document, offer }); }
+    }
     else if (result?.status === 'password_required') { passwordBlocking.current = true; setPasswordRequest({ challenge: result, organize }); }
   };
   const open = useCallback(async (example = false, organize = false) => {
-    if (busy || searchableOcrTarget || newCopyModalOpen || closingDocument.current !== null) return;
+    if (busy || recoveryOffer || searchableOcrTarget || newCopyModalOpen || closingDocument.current !== null) return;
     setBusy(true); setError(''); setMenu(false);
     try {
       acceptOpen(await openDocument(example), organize);
     } catch (e) { setError(String(e)); } finally { setBusy(false); }
-  }, [busy, searchableOcrTarget, newCopyModalOpen]);
+  }, [busy, recoveryOffer, searchableOcrTarget, newCopyModalOpen]);
   const reopen = async (path: string) => {
-    if (busy || searchableOcrTarget || newCopyModalOpen || closingDocument.current !== null) return;
+    if (busy || recoveryOffer || searchableOcrTarget || newCopyModalOpen || closingDocument.current !== null) return;
     const existing = documents.find(document => document.path === path);
     if (existing) { activate(existing.id); return; }
     setBusy(true); setError('');
@@ -257,7 +266,31 @@ export default function App() {
     } catch (e) { if (mounted.current) setError(`Could not reopen this file. It may have moved or been deleted. ${String(e)}`); }
     finally { if (mounted.current) setBusy(false); }
   };
-  const recoveryBlocked = busy || redactionDraft !== null || searchableOcrTarget !== null || newCopyModalOpen || updatesOpen || pageTextOpen || pageOcrTarget !== null || printOpen || propertiesOpen || noticesOpen || passwordRequest !== null || pendingClose !== null || createOpen || pageImageTarget !== null || combineOpen || insertOpen || replaceOpen || formsOpen || commentEditor !== null || closingDocument.current !== null;
+  const recoveryBlocked = busy || recoveryOffer !== null || redactionDraft !== null || searchableOcrTarget !== null || newCopyModalOpen || updatesOpen || pageTextOpen || pageOcrTarget !== null || printOpen || propertiesOpen || noticesOpen || passwordRequest !== null || pendingClose !== null || createOpen || pageImageTarget !== null || combineOpen || insertOpen || replaceOpen || formsOpen || commentEditor !== null || closingDocument.current !== null;
+  const chooseRecovery = async (keep: boolean) => {
+    const pending = recoveryOffer;
+    if (!pending || busy) return;
+    setBusy(true); setError(''); setNotice(''); setRecoveryChoiceError('');
+    try {
+      if (keep) {
+        const result = await keepRecoveredEdits(pending.document.id, pending.document.revision);
+        if (!mounted.current) return;
+        const coherent = result.document.id === pending.document.id && result.document.dirty === true && result.document.revision === pending.offer.revision && result.currentPage === pending.offer.currentPage && result.currentPage >= 0 && result.currentPage < result.document.pages.length;
+        if (!coherent) throw new Error('Recovered edits did not match the offered document revision.');
+        setDocuments(list => list.map(document => document.id === result.document.id ? result.document : document));
+        readingPages.current.set(result.document.id, result.currentPage); setPage(result.currentPage); setTarget(value => ({ page: result.currentPage, token: value.token + 1 }));
+        setNotice('Recovered edits are open. The source PDF was not changed.');
+      } else {
+        const result = await openOriginal(pending.document.id, pending.document.revision);
+        if (!mounted.current) return;
+        if (result.id !== pending.document.id || result.revision !== pending.document.revision || result.dirty || result.pages.length !== pending.document.pages.length) throw new Error('Open original did not return the unchanged source session.');
+        setDocuments(list => list.map(document => document.id === result.id ? result : document));
+        setNotice('Opened the original PDF and marked the offered recovery edits as discarded.');
+      }
+      setRecoveryOffer(null);
+    } catch (reason) { if (mounted.current) setRecoveryChoiceError(String(reason)); }
+    finally { if (mounted.current) setBusy(false); }
+  };
   const checkpoint = async () => {
     if (!doc?.dirty || recoveryBlocked) return;
     const captured = { id: doc.id, revision: doc.revision, currentPage: clampPage(page, doc.pages.length) };
@@ -285,7 +318,7 @@ export default function App() {
     } catch (e) { if (mounted.current) setError(String(e)); } finally { if (mounted.current) setBusy(false); }
   };
   const close = async (id: number, discard = false) => {
-    if (busy || redactionDraft || searchableOcrTarget || newCopyModalOpen || closingDocument.current !== null) return;
+    if (busy || recoveryOffer || redactionDraft || searchableOcrTarget || newCopyModalOpen || closingDocument.current !== null) return;
     if (!discard && documents.find(document => document.id === id)?.dirty) { setPendingClose(id); return; }
     if (pageOcrTarget?.id === id) setPageOcrTarget(null);
     closingDocument.current = id; setBusy(true); setError('');
@@ -302,7 +335,7 @@ export default function App() {
   const edit = async (action: PageEdit): Promise<boolean> => {
     if (!doc || busy || searchableOcrTarget || newCopyModalOpen || closingDocument.current !== null) return false;
     setBusy(true); setError(''); setNotice('');
-    try { updateDocument(await editPages(doc.id, action)); return true; }
+    try { updateDocument(await editPages(doc.id, action, clampPage(page, doc.pages.length))); return true; }
     catch (e) { setError(String(e)); return false; } finally { setBusy(false); }
   };
   const save = async (pages?: number[]) => {
@@ -322,7 +355,7 @@ export default function App() {
   const crop = async (target: { id: number; revision: number; pages: number[] }, insets: CropInsets): Promise<void> => {
     if (!doc || doc.id !== target.id || busy || closingDocument.current !== null) throw new Error('The document is no longer ready to crop.');
     setBusy(true); setError(''); setNotice('');
-    try { updateDocument(await cropPages(target.id, target.revision, target.pages, insets)); }
+    try { updateDocument(await cropPages(target.id, target.revision, target.pages, insets, clampPage(page, doc.pages.length))); }
     finally { setBusy(false); }
   };
   const reopenRef = useRef(reopen);
@@ -365,20 +398,20 @@ export default function App() {
     if (!doc || doc.id !== target.id || doc.revision !== target.revision || busy || closingDocument.current !== null) { setError('The document changed. Reset crop again.'); return; }
     setBusy(true); setError(''); setNotice('');
     try {
-      const result = await resetCrops(target.id, target.revision, target.pages);
+      const result = await resetCrops(target.id, target.revision, target.pages, clampPage(page, doc.pages.length));
       if (result.id !== target.id || !Number.isSafeInteger(result.revision) || (result.revision !== target.revision && result.revision !== target.revision + 1)) throw new Error('The crop reset returned an unexpected document.');
       if (result.revision === target.revision) setNotice('The selected pages have no crop edits from this session.');
       else updateDocument(result);
     } catch (reason) { setError(String(reason)); }
     finally { setBusy(false); }
   };
-  const mutateAnnotation = async (operation: (document: DocumentInfo) => Promise<DocumentInfo>) => {
+  const mutateAnnotation = async (operation: (document: DocumentInfo, currentPage: number) => Promise<DocumentInfo>) => {
     const current = doc;
     if (!current || busy || closingDocument.current !== null) throw new Error('The document is no longer ready for comments.');
     const latestDocument = latest.current.documents.find(document => document.id === current.id);
     if (!latestDocument || latestDocument.revision !== current.revision) throw new Error('The document changed. Reload its comments and try again.');
     setBusy(true); setError(''); setNotice('');
-    try { updateDocument(await operation(current)); }
+    try { updateDocument(await operation(current, clampPage(page, current.pages.length))); }
     finally { setBusy(false); }
   };
   const receiveTextHighlightSelection = useCallback((selection: TextHighlightSelection | null, source: TextHighlightSelectionSource) => {
@@ -600,7 +633,7 @@ export default function App() {
   };
   useEffect(() => {
     const listener = (event: KeyboardEvent) => {
-      if (updatesOpen || pageTextOpen || pageOcrTarget || searchableOcrTarget || newCopyModalOpen || printOpen || propertiesOpen || noticesOpen || passwordRequest || pendingClose !== null || createOpen || pageImageTarget || combineOpen || insertOpen || replaceOpen || commentEditor) return;
+      if (recoveryOffer || updatesOpen || pageTextOpen || pageOcrTarget || searchableOcrTarget || newCopyModalOpen || printOpen || propertiesOpen || noticesOpen || passwordRequest || pendingClose !== null || createOpen || pageImageTarget || combineOpen || insertOpen || replaceOpen || commentEditor) return;
       if ((event.target as HTMLElement | null)?.closest?.('dialog')) return;
       if (redactionDraft && event.ctrlKey) { event.preventDefault(); return; }
       if (event.ctrlKey && event.key.toLowerCase() === 'o') { event.preventDefault(); void open(); }
@@ -671,6 +704,7 @@ export default function App() {
       <button onClick={() => { setNotice(`PDF viewing, embedded-text search, Create a PDF from a PNG or JPEG image, Combine Files, Organize Pages, and filling a strict subset of existing plain text fields are available. Rotate, reorder, delete, extract, undo/redo, and save a new copy.${ocr.available ? ' Current-page English OCR is enabled in this opt-in source build.' : ' OCR is not enabled in this build.'} Text editing and signatures are not implemented yet.`); setMenu(false); }}>About this build</button>
     </div>}
     {updatesOpen && <Updates dirty={documents.some(document => document.dirty)} busy={busy} setBusy={setBusy} close={() => setUpdatesOpen(false)} />}
+    {recoveryOffer && <RecoveryOfferDialog name={recoveryOffer.document.name} revision={recoveryOffer.offer.revision} busy={busy} error={recoveryChoiceError} keep={() => void chooseRecovery(true)} original={() => void chooseRecovery(false)} />}
     {pageTextOpen && doc && <PageText key={`${doc.id}-${doc.revision}-${page}`} document={doc} page={page} close={() => setPageTextOpen(false)} />}
     {pageOcrTarget && <PageOcrDialog key={`${pageOcrTarget.id}-${pageOcrTarget.revision}-${pageOcrTarget.page}`} target={pageOcrTarget} setBusy={setBusy} close={() => setPageOcrTarget(null)} />}
     {searchableOcrTarget && <SearchableOcrDialog key={`${searchableOcrTarget.documentId}-${searchableOcrTarget.revision}`} capability={searchableCapability} target={searchableOcrTarget} createRequestId={() => crypto.randomUUID()} create={createSearchableCopy} cancel={cancelPageOcr} opened={copy => opened(copy.document, false)} close={() => setSearchableOcrTarget(null)} />}
@@ -688,10 +722,10 @@ export default function App() {
     {replaceOpen && <ReplacePagesDialog documents={documents} activeId={active} initialRange={replaceRange} busy={busy} replace={replace} close={() => setReplaceOpen(false)} />}
     {formsOpen && doc && <FillFormsDialog key={`${doc.id}:${doc.revision}`} document={doc} formFields={formFields} error={formsLoad.request === formsRequest ? formsLoad.error : ''} busy={busy} fill={fillForms} close={() => setFormsOpen(false)} />}
     {commentEditor && doc && <CommentEditor key={`${doc.id}:${doc.revision}:${commentEditor.kind === 'edit' ? commentEditor.annotation.id : 'new'}`} draft={commentEditor} busy={busy} save={contents => commentEditor.kind === 'create-text-highlight'
-      ? mutateAnnotation(current => createTextHighlight(current.id, current.revision, commentEditor.page, commentEditor.start, commentEditor.end, contents))
-      : commentEditor.kind === 'create' ? commentEditor.type === 'note' ? mutateAnnotation(current => createComment(current.id, current.revision, commentEditor.page, commentEditor.rect, contents || '')) : mutateAnnotation(current => createHighlight(current.id, current.revision, commentEditor.page, commentEditor.rect, contents))
-      : commentEditor.annotation.kind === 'note' ? mutateAnnotation(current => updateComment(current.id, current.revision, commentEditor.annotation.id, contents || '')) : mutateAnnotation(current => updateHighlight(current.id, current.revision, commentEditor.annotation.id, contents))}
-      remove={commentEditor.kind === 'edit' ? () => commentEditor.annotation.kind === 'note' ? mutateAnnotation(current => deleteComment(current.id, current.revision, commentEditor.annotation.id)) : mutateAnnotation(current => deleteHighlight(current.id, current.revision, commentEditor.annotation.id)) : undefined} close={() => setCommentEditor(null)} />}
+      ? mutateAnnotation((current, currentPage) => createTextHighlight(current.id, current.revision, commentEditor.page, commentEditor.start, commentEditor.end, contents, currentPage))
+      : commentEditor.kind === 'create' ? commentEditor.type === 'note' ? mutateAnnotation((current, currentPage) => createComment(current.id, current.revision, commentEditor.page, commentEditor.rect, contents || '', currentPage)) : mutateAnnotation((current, currentPage) => createHighlight(current.id, current.revision, commentEditor.page, commentEditor.rect, contents, currentPage))
+      : commentEditor.annotation.kind === 'note' ? mutateAnnotation((current, currentPage) => updateComment(current.id, current.revision, commentEditor.annotation.id, contents || '', currentPage)) : mutateAnnotation((current, currentPage) => updateHighlight(current.id, current.revision, commentEditor.annotation.id, contents, currentPage))}
+      remove={commentEditor.kind === 'edit' ? () => commentEditor.annotation.kind === 'note' ? mutateAnnotation((current, currentPage) => deleteComment(current.id, current.revision, commentEditor.annotation.id, currentPage)) : mutateAnnotation((current, currentPage) => deleteHighlight(current.id, current.revision, commentEditor.annotation.id, currentPage)) : undefined} close={() => setCommentEditor(null)} />}
     <div className={s.globalbar}>
       <nav className={s.primaryNav}><button className={toolsOpen && view !== 'home' ? s.selectedNav : ''} disabled={!!redactionDraft || newCopyModalOpen} onClick={() => { if (!newCopyModalOpen) view === 'document' ? setToolsOpen(v => !v) : setView('tools'); }}>All tools</button><button disabled>Edit</button><button disabled>Convert</button><button disabled>E-sign</button></nav>
       <div className={s.globalActions}><IconButton icon={Search} label="Find text" disabled={!doc || busy || !!redactionDraft || !!searchableOcrTarget || newCopyModalOpen} active={searchOpen} onClick={() => { if (!newCopyModalOpen) { setView('document'); setOrganizing(false); searchOpen ? closeSearch() : setSearchOpen(true); } }} /><span className={s.divider} /><IconButton icon={Undo2} label="Undo" disabled={busy || !!redactionDraft || !!searchableOcrTarget || newCopyModalOpen || !doc?.can_undo} onClick={() => void edit({ kind: 'undo' })} /><IconButton icon={Redo2} label="Redo" disabled={busy || !!redactionDraft || !!searchableOcrTarget || newCopyModalOpen || !doc?.can_redo} onClick={() => void edit({ kind: 'redo' })} /><IconButton icon={Save} label="Save a copy" disabled={busy || !!redactionDraft || !!searchableOcrTarget || newCopyModalOpen || !doc} onClick={() => void save()} /><IconButton icon={Printer} label="Print" disabled={busy || !!redactionDraft || !!searchableOcrTarget || newCopyModalOpen || !doc} onClick={() => { if (!searchableOcrTarget && !newCopyModalOpen) setPrintOpen(true); }} /><IconButton icon={Sun} label="Toggle theme" onClick={() => setDark(v => !v)} /><IconButton icon={CircleHelp} label="Build information" onClick={() => setNotice('Organize Pages and document search are available. Other tools marked unavailable are planned for later milestones. Save a Copy writes a new file and preserves your original.')} /><button className={s.openButton} onClick={() => void open()} disabled={busy || !!redactionDraft || !!searchableOcrTarget || newCopyModalOpen}><FolderOpen size={16} /> {busy ? 'Working…' : 'Open a file'}</button></div>

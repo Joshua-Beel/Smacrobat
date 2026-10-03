@@ -38,6 +38,7 @@ it('clamps the remembered position when page edits shorten a document', async ()
   act(() => ui.root.findByType(Viewer).props.onPage(5));
   vi.mocked(editPages).mockResolvedValue({ ...document(1), pages: document(1).pages.slice(0, 2), revision: 1 });
   await act(async () => ui.root.findByProps({ 'aria-label': 'Undo' }).props.onClick());
+  expect(editPages).toHaveBeenLastCalledWith(1, { kind: 'undo' }, 5);
   await open(ui, 2);
   act(() => tab(ui, 'file-1.pdf').props.onClick());
   expect(ui.root.findByType(Viewer).props.target.page).toBe(1);
@@ -66,7 +67,7 @@ it('keeps reset-crop no-ops neutral and allows a stale failure to retry without 
   const reset = () => ui.root.findByProps({ 'aria-label': 'Reset crop on selected pages' });
   vi.mocked(resetCrops).mockResolvedValueOnce(document(1));
   await act(async () => reset().props.onClick());
-  expect(resetCrops).toHaveBeenLastCalledWith(1, 0, [3]);
+  expect(resetCrops).toHaveBeenLastCalledWith(1, 0, [3], 3);
   expect(text(ui.toJSON())).toContain('no crop edits from this session');
   expect(ui.root.findByProps({ 'aria-label': 'Select page 4' }).props['aria-pressed']).toBe(true);
   expect(text(ui.toJSON())).not.toContain('Unsaved changes');
@@ -83,7 +84,7 @@ it('keeps reset-crop no-ops neutral and allows a stale failure to retry without 
   expect(text(ui.toJSON())).toContain('Document changed. Reset crop again.');
   expect(ui.root.findByProps({ 'aria-label': 'Organize pages workspace' })).toBeTruthy();
   await act(async () => reset().props.onClick());
-  expect(resetCrops).toHaveBeenLastCalledWith(1, 0, [3]);
+  expect(resetCrops).toHaveBeenLastCalledWith(1, 0, [3], 3);
   expect(ui.root.findByProps({ 'aria-label': 'Select page 4' }).props['aria-pressed']).toBe(true);
   expect(text(ui.toJSON())).toContain('Unsaved changes');
   act(() => ui.unmount());

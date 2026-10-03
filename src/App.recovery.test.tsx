@@ -1,18 +1,19 @@
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import App from './App';
-import { checkpointRecovery, closeDocument, openDocument, restoreRecovery, saveCopy } from './bridge';
+import { checkpointRecovery, closeDocument, keepRecoveredEdits, openDocument, openOriginal, restoreRecovery, saveCopy } from './bridge';
 import type { DocumentInfo } from './model';
 
 vi.mock('./bridge', () => ({
   native: false,
   openDocument: vi.fn(), reopenDocument: vi.fn(), closeDocument: vi.fn(), cancelPasswordRequest: vi.fn(),
-  checkpointRecovery: vi.fn(), restoreRecovery: vi.fn(), editPages: vi.fn(), saveCopy: vi.fn(),
+  checkpointRecovery: vi.fn(), restoreRecovery: vi.fn(), keepRecoveredEdits: vi.fn(), openOriginal: vi.fn(), editPages: vi.fn(), saveCopy: vi.fn(),
   createPdfFromImage: vi.fn(), documentPageLabels: vi.fn(),
 }));
 vi.mock('./Viewer', () => ({ default: ({ document, onPage }: { document: DocumentInfo; onPage: (page: number) => void }) => <div data-viewed-document={document.id}><button onClick={() => onPage(1)}>Go to page 2</button>{document.name}</div> }));
 
 const source: DocumentInfo = { id: 7, name: 'source.pdf', path: 'C:/docs/source.pdf', pages: [{ width: 612, height: 792 }, { width: 612, height: 792 }], revision: 4, dirty: true, can_undo: true, can_redo: false };
+const cleanSource: DocumentInfo = { ...source, revision: 0, dirty: false, can_undo: false };
 const recovered: DocumentInfo = { ...source, id: 8, revision: 4, dirty: true };
 let ui: ReactTestRenderer;
 
@@ -106,4 +107,48 @@ it('closes a recovered native session whose reply arrives after unmount', async 
   act(() => ui.unmount());
   await act(async () => finish({ document: recovered, currentPage: 1 }));
   expect(closeDocument).toHaveBeenCalledExactlyOnceWith(8);
+});
+
+it('keeps an automatic recovery offer explicit until the recovered revision is accepted', async () => {
+  vi.mocked(openDocument).mockResolvedValue({ status: 'opened', document: cleanSource, recovery: { revision: 4, currentPage: 1 } });
+  vi.mocked(keepRecoveredEdits).mockResolvedValue({ document: source, currentPage: 1 });
+  await mount();
+  expect(ui.root.findAllByProps({ 'data-viewed-document': 7 })).toHaveLength(1);
+  expect(JSON.stringify(ui.toJSON())).toContain('Recovered edits are available');
+  expect(ui.root.findByProps({ 'aria-label': 'Page number' }).props.defaultValue).toBe(1);
+  await act(async () => button('Keep recovered edits').props.onClick());
+  expect(keepRecoveredEdits).toHaveBeenCalledExactlyOnceWith(7, 0);
+  expect(ui.root.findByProps({ 'aria-label': 'Page number' }).props.defaultValue).toBe(2);
+  expect(JSON.stringify(ui.toJSON())).toContain('source PDF was not changed');
+  expect(JSON.stringify(ui.toJSON())).not.toContain('Recovered edits are available');
+});
+
+it('opens the original only through the explicit recovery choice', async () => {
+  vi.mocked(openDocument).mockResolvedValue({ status: 'opened', document: cleanSource, recovery: { revision: 4, currentPage: 1 } });
+  vi.mocked(openOriginal).mockResolvedValue(cleanSource);
+  await mount();
+  await act(async () => button('Open original').props.onClick());
+  expect(openOriginal).toHaveBeenCalledExactlyOnceWith(7, 0);
+  expect(keepRecoveredEdits).not.toHaveBeenCalled();
+  expect(JSON.stringify(ui.toJSON())).toContain('marked the offered recovery edits as discarded');
+  expect(JSON.stringify(ui.toJSON())).not.toContain('Recovered edits are available');
+});
+
+it('retains the recovery choice and clean session when a choice fails', async () => {
+  vi.mocked(openDocument).mockResolvedValue({ status: 'opened', document: cleanSource, recovery: { revision: 4, currentPage: 1 } });
+  vi.mocked(keepRecoveredEdits).mockRejectedValue(new Error('journal unavailable'));
+  await mount();
+  await act(async () => button('Keep recovered edits').props.onClick());
+  expect(JSON.stringify(ui.toJSON())).toContain('journal unavailable');
+  expect(JSON.stringify(ui.toJSON())).toContain('Recovered edits are available');
+  expect(ui.root.findByProps({ 'aria-label': 'Page number' }).props.defaultValue).toBe(1);
+  expect(openOriginal).not.toHaveBeenCalled();
+});
+
+it('rejects an incoherent automatic recovery offer and closes its native session', async () => {
+  vi.mocked(openDocument).mockResolvedValue({ status: 'opened', document: cleanSource, recovery: { revision: 4, currentPage: 2 } });
+  await mount();
+  expect(closeDocument).toHaveBeenCalledExactlyOnceWith(7);
+  expect(ui.root.findAllByProps({ 'data-viewed-document': 7 })).toHaveLength(0);
+  expect(JSON.stringify(ui.toJSON())).toContain('Recovery offered invalid state');
 });

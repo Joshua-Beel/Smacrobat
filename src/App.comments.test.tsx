@@ -33,7 +33,7 @@ it('creates a note against the current revision and refreshes the active documen
   await act(async () => ui.root.findAllByType('button').find(item => item.children.includes('Place comment'))!.props.onClick());
   act(() => ui.root.findByProps({ 'aria-label': 'Comment text' }).props.onChange({ target: { value: 'Keep this' } }));
   await act(async () => ui.root.findAllByType('button').find(item => item.children.join('') === 'Save comment')!.props.onClick());
-  expect(createComment).toHaveBeenCalledWith(1, 0, 0, { x: .1, y: .2, width: .03, height: .03 }, 'Keep this');
+  expect(createComment).toHaveBeenCalledWith(1, 0, 0, { x: .1, y: .2, width: .03, height: .03 }, 'Keep this', 0);
   expect(ui.root.findByType(Viewer).props.document).toMatchObject({ id: 1, revision: 1, dirty: true });
   act(() => ui.unmount());
 });
@@ -124,7 +124,7 @@ it('creates an area highlight using the current revision and an optional body', 
   await act(async () => ui.root.findAllByType('button').find(item => item.children.includes('Place highlight'))!.props.onClick());
   expect(ui.root.findByProps({ 'aria-label': 'Highlight description' }).props.value).toBe('');
   await act(async () => ui.root.findAllByType('button').find(item => item.children.join('') === 'Save area highlight')!.props.onClick());
-  expect(createHighlight).toHaveBeenCalledWith(1, 0, 0, { x: .1, y: .2, width: .03, height: .03 }, '');
+  expect(createHighlight).toHaveBeenCalledWith(1, 0, 0, { x: .1, y: .2, width: .03, height: .03 }, '', 0);
   expect(ui.root.findByType(Viewer).props.document).toMatchObject({ id: 1, revision: 1, dirty: true });
   act(() => ui.unmount());
 });
@@ -145,7 +145,7 @@ it('creates a text highlight using the exact selected geometry range, without in
   expect(ui.root.findByType(Viewer).props.highlightMode).toBe(false);
   expect(ui.root.findAllByType('h2').some(item => item.children.join('') === 'New text highlight on page 1')).toBe(true);
   await act(async () => ui.root.findAllByType('button').find(item => item.children.join('') === 'Save text highlight')!.props.onClick());
-  expect(createTextHighlight).toHaveBeenCalledWith(1, 0, 0, 1, 4, '');
+  expect(createTextHighlight).toHaveBeenCalledWith(1, 0, 0, 1, 4, '', 0);
   expect(ui.root.findByType(Viewer).props.document).toMatchObject({ id: 1, revision: 1, dirty: true });
   act(() => ui.unmount());
 });
@@ -187,7 +187,7 @@ it('does not reuse a canceled pointer capture when keyboard activation follows a
   await act(async () => ui.root.findAllByType('button').find(item => item.children.includes('Select next text range'))!.props.onClick());
   await act(async () => button(ui, 'Highlight selected text').props.onClick());
   await act(async () => ui.root.findAllByType('button').find(item => item.children.join('') === 'Save text highlight')!.props.onClick());
-  expect(createTextHighlight).toHaveBeenCalledWith(1, 0, 0, 4, 6, '');
+  expect(createTextHighlight).toHaveBeenCalledWith(1, 0, 0, 4, 6, '', 0);
   act(() => ui.unmount());
 });
 

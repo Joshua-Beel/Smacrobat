@@ -1,0 +1,16 @@
+<!doctype html><html><head><meta charset="UTF-8" /><title>Modal focus browser test</title></head><body><div id="root"></div><output id="result">running</output><script type="module">
+window.IntersectionObserver=class{observe(){}disconnect(){}};
+const[{default:App},{default:Organizer},React,{createRoot}]=await Promise.all([import('./App.tsx'),import('./Organizer.tsx'),import('react'),import('react-dom/client')]);
+const pause=()=>new Promise(resolve=>setTimeout(resolve,40));
+const click=async button=>{button.focus();button.click();await pause()};
+const named=text=>[...document.querySelectorAll('button')].find(button=>button.textContent.includes(text));
+const results={};
+let root=createRoot(document.getElementById('root'));
+root.render(React.createElement(App));await pause();
+const create=named('Create');await click(create);await click(named('Cancel'));results.app=document.activeElement===create;
+root.unmount();document.getElementById('root').remove();const organizerRoot=document.createElement('div');organizerRoot.id='root';document.body.prepend(organizerRoot);root=createRoot(organizerRoot);
+const info={id:7,name:'focus.pdf',path:'C:/focus.pdf',pages:[{width:612,height:792}],revision:1,dirty:true,can_undo:true,can_redo:false};
+root.render(React.createElement(Organizer,{document:info,busy:false,edit:async()=>true,save:async()=>{},split:async()=>null,crop:async()=>{},close:()=>{}}));await pause();
+const remove=named('Delete');await click(remove);await click(named('Cancel'));results.organizer=document.activeElement===remove;
+const result=document.getElementById('result');result.textContent=JSON.stringify(results);document.body.dataset.pass=String(results.app&&results.organizer);
+</script></body></html>
