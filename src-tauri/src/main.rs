@@ -12,7 +12,11 @@ mod forms;
 mod page_labels;
 mod image_pdf;
 #[cfg(windows)]
+mod image_edit;
+#[cfg(windows)]
 mod image_pdf_commands;
+#[cfg(windows)]
+mod image_edit_commands;
 mod page_image;
 mod sanitization;
 mod raster_redaction;
@@ -221,6 +225,42 @@ async fn create_pdf_from_images(app: tauri::AppHandle, service: State<'_, PdfSer
 #[tauri::command]
 fn cancel_image_pdf_sources(selections: State<'_, image_pdf_commands::ImagePdfSelections>, selection_id: String) -> Result<(), String> { selections.cancel(&selection_id) }
 
+#[cfg(windows)]
+#[tauri::command]
+async fn inspect_image_replacement_target(service: State<'_, PdfService>, selections: State<'_, image_edit_commands::ImageReplacementSelections>, document_id: u64, revision: u64, page: u16) -> Result<image_edit_commands::ImageReplacementTarget, String> {
+    let info = service.inspect_image_replacement(document_id, revision, page).await?;
+    selections.register(document_id, revision, page, info)
+}
+
+#[cfg(windows)]
+#[tauri::command]
+async fn replace_pdf_image_copy(app: tauri::AppHandle, service: State<'_, PdfService>, selections: State<'_, image_edit_commands::ImageReplacementSelections>, selection_id: String, document_id: u64, revision: u64) -> Result<Option<service::SavedCopy>, String> {
+    let (target, attempt) = selections.begin(&selection_id, document_id, revision)?;
+    let result = async {
+        let window = app.get_webview_window("main").ok_or("Application window is unavailable")?;
+        let source_window = window.clone();
+        let source = tauri::async_runtime::spawn_blocking(move || rfd::FileDialog::new().set_parent(&source_window).set_title("Choose an exact-size replacement PNG or JPEG").add_filter("PNG and JPEG images", &["png", "jpg", "jpeg"]).pick_file()).await.map_err(|error| error.to_string())?;
+        let Some(source) = source else { return Ok(None); };
+        let pixel_width = target.pixel_width; let pixel_height = target.pixel_height;
+        let replacement = tauri::async_runtime::spawn_blocking(move || {
+            let bytes = image_pdf_commands::read_verified_source(&source)?;
+            image_pdf::replacement_rgb(bytes, pixel_width, pixel_height)
+        }).await.map_err(|error| error.to_string())??;
+        let current = service.inspect_image_replacement(document_id, revision, target.page).await?;
+        if current.pixel_width != target.pixel_width || current.pixel_height != target.pixel_height || current.page_width != target.display_width || current.page_height != target.display_height { return Err("The image replacement target changed. Inspect it again.".into()); }
+        let output = tauri::async_runtime::spawn_blocking(move || rfd::FileDialog::new().set_parent(&window).set_title("Save PDF with replaced image as a new file").add_filter("PDF documents", &["pdf"]).set_file_name("image-replaced.pdf").save_file()).await.map_err(|error| error.to_string())?;
+        let Some(output) = output else { return Ok(None); };
+        image_pdf_commands::validate_output_path(&output)?;
+        service.replace_image_copy(document_id, revision, target.page, current, replacement, output).await.map(Some)
+    }.await;
+    if matches!(&result, Ok(Some(_))) { attempt.commit_success()?; }
+    result
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn cancel_image_replacement(selections: State<'_, image_edit_commands::ImageReplacementSelections>, selection_id: String) -> Result<(), String> { selections.cancel(&selection_id) }
+
 #[tauri::command]
 async fn split_document(app: tauri::AppHandle, service: State<'_, PdfService>, id: u64, revision: u64, pages_per_file: usize) -> Result<Option<split::SplitOutput>, String> {
     let window = app.get_webview_window("main").ok_or("Application window is unavailable")?;
@@ -284,7 +324,9 @@ fn main() {
         app.manage(print_commands::PrintJobs::default());
         #[cfg(windows)]
         app.manage(image_pdf_commands::ImagePdfSelections::default());
+        #[cfg(windows)]
+        app.manage(image_edit_commands::ImageReplacementSelections::default());
         Ok(())
-    }).invoke_handler(tauri::generate_handler![read_update_attempt, write_update_attempt, clear_update_attempt, document_form_fields, fill_form_copy, open_document, reopen_document, open_example, render_page, export_page_image, close_document, edit_pages, crop_page, crop_pages, reset_crops, create_pdf_from_image, choose_image_pdf_sources, create_pdf_from_images, cancel_image_pdf_sources, create_comment, update_comment, delete_comment, document_comments, document_annotations, create_highlight, create_text_highlight, update_highlight, delete_highlight, save_copy, redact_document, split_document, combine_documents, insert_pages_copy, replace_pages_copy, page_text, page_text_geometry, document_bookmarks, document_page_labels, document_properties, dependency_notices, unlock_document, cancel_password_request, ocr_capability, recognize_page_ocr, create_searchable_ocr_copy, cancel_page_ocr, print_commands::print_document, print_commands::cancel_print])
+    }).invoke_handler(tauri::generate_handler![read_update_attempt, write_update_attempt, clear_update_attempt, document_form_fields, fill_form_copy, open_document, reopen_document, open_example, render_page, export_page_image, close_document, edit_pages, crop_page, crop_pages, reset_crops, create_pdf_from_image, choose_image_pdf_sources, create_pdf_from_images, cancel_image_pdf_sources, inspect_image_replacement_target, replace_pdf_image_copy, cancel_image_replacement, create_comment, update_comment, delete_comment, document_comments, document_annotations, create_highlight, create_text_highlight, update_highlight, delete_highlight, save_copy, redact_document, split_document, combine_documents, insert_pages_copy, replace_pages_copy, page_text, page_text_geometry, document_bookmarks, document_page_labels, document_properties, dependency_notices, unlock_document, cancel_password_request, ocr_capability, recognize_page_ocr, create_searchable_ocr_copy, cancel_page_ocr, print_commands::print_document, print_commands::cancel_print])
       .run(tauri::generate_context!()).expect("Desktop application failed");
 }

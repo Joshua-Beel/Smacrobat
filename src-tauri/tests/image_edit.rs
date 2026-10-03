@@ -1,7 +1,7 @@
 #[path = "../src/image_edit.rs"]
 mod image_edit;
 
-use image_edit::replace_flat_raster_image;
+use image_edit::{inspect_flat_raster_image, replace_flat_raster_image};
 use lopdf::{content::{Content, Operation}, dictionary, Dictionary, Document, Object, Stream};
 
 fn fixture() -> (Vec<u8>, lopdf::ObjectId) {
@@ -46,6 +46,15 @@ fn replaces_only_the_unique_rgb_image_object() {
     }
     let pixels = after.get_object(image_id).unwrap().as_stream().unwrap().decompressed_content().unwrap();
     assert_eq!(pixels, [0, 0, 255, 255, 255, 255]);
+}
+
+#[test]
+fn inspection_reports_exact_display_and_pixel_dimensions() {
+    let (source, _) = fixture();
+    let target = inspect_flat_raster_image(&source, 1).unwrap();
+    assert_eq!((target.page_width, target.page_height), (200.0, 100.0));
+    assert_eq!((target.pixel_width, target.pixel_height), (2, 1));
+    assert!(inspect_flat_raster_image(&source, 0).is_err());
 }
 
 #[test]

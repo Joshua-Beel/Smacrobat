@@ -178,6 +178,19 @@ fn read_stable(source: &ReservedSource) -> Result<Vec<u8>, String> {
     Ok(first)
 }
 
+pub(crate) fn read_verified_source(path: &Path) -> Result<Vec<u8>, String> {
+    reject_reparse_path(path)?;
+    let file = File::open(path).map_err(|error| format!("Could not reserve the replacement image: {error}"))?;
+    let metadata = file.metadata().map_err(|error| format!("Could not inspect the replacement image: {error}"))?;
+    if !metadata.is_file() || metadata.file_attributes() & REPARSE_POINT != 0 { return Err("The replacement image must be a regular non-reparse file.".into()); }
+    let source = ReservedSource {
+        id: "replacement".into(), name: path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+        identity: file_identity(&file)?, length: metadata.file_size(), modified: metadata.last_write_time(), file,
+    };
+    if source.length == 0 || source.length > MAX_SOURCE_BYTES { return Err("The replacement image is empty or exceeds the 64 MiB input limit.".into()); }
+    read_stable(&source)
+}
+
 fn file_identity(file: &File) -> Result<(u32, u64), String> {
     let mut information = BY_HANDLE_FILE_INFORMATION::default();
     unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut information) }

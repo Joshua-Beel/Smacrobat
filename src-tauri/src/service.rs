@@ -143,6 +143,8 @@ enum Request {
     FillFormCopy(u64, u64, Vec<crate::forms::FieldValue>, PathBuf, Reply<ReplyLease<SavedCopy>>),
     CreateImagePdf(PathBuf, PathBuf, crate::image_pdf::ImagePdfOptions, Reply<ReplyLease<SavedCopy>>),
     CreateMultiImagePdf(crate::image_pdf::PreparedMultiImagePdf, PathBuf, Reply<ReplyLease<SavedCopy>>),
+    InspectImageReplacement(u64, u64, u16, Reply<crate::image_edit::ImageEditTargetInfo>),
+    ReplaceImageCopy(u64, u64, u16, crate::image_edit::ImageEditTargetInfo, Vec<u8>, PathBuf, Reply<ReplyLease<SavedCopy>>),
     Close(u64, Reply<()>),
     Edit(u64, PageEdit, Reply<DocumentInfo>),
     Crop(u64, u16, u64, CropRect, Reply<DocumentInfo>),
@@ -1062,6 +1064,50 @@ impl PdfService {
                         let result = result.map(|saved| { let cleanup = UnclaimedReply::Document(saved.document.id); ReplyLease::new(saved, cleanup, resource_cleanup.clone()) });
                         if let Err(Ok(saved)) = reply.send(result) { documents.remove(&saved.document.id); sessions.remove(&saved.document.id); }
                     }
+                    Request::InspectImageReplacement(id, revision, page, reply) => {
+                        let result = (|| {
+                            let (session, _) = sessions.get(&id).ok_or("Document is closed")?;
+                            let original = documents.get(&id).ok_or("Document is closed")?;
+                            checked_image_replacement(session, original, revision, page)
+                        })();
+                        let _ = reply.send(result);
+                    }
+                    Request::ReplaceImageCopy(id, revision, page, expected, replacement_rgb, path, reply) => {
+                        if reply.is_closed() { continue; }
+                        let result = (|| {
+                            let (session, _) = sessions.get(&id).ok_or("Document is closed")?;
+                            let original = documents.get(&id).ok_or("Document is closed")?;
+                            let current = checked_image_replacement(session, original, revision, page)?;
+                            if current != expected { return Err("The image replacement target changed. Inspect it again.".into()); }
+                            let output_bytes = crate::image_edit::replace_flat_raster_image(&session.source, u32::from(page) + 1, &replacement_rgb)?;
+                            let engine = pdfium.as_ref().map_err(Clone::clone)?;
+                            let output = engine.load_pdf_from_byte_vec(output_bytes.clone(), None).map_err(|error| format!("Image replacement output could not be opened: {error}"))?;
+                            if output.pages().len() != original.pages().len() { return Err("Image replacement output page count changed.".into()); }
+                            for index in 0..output.pages().len() {
+                                let target = crate::image_edit::inspect_flat_raster_image(&session.source, u32::from(index as u16) + 1)?;
+                                let render = |document: &PdfDocument<'_>| -> Result<Vec<u8>, String> {
+                                    let page = document.pages().get(index).map_err(|error| error.to_string())?;
+                                    let bitmap = page.render_with_config(&PdfRenderConfig::new().set_fixed_size(target.pixel_width as i32, target.pixel_height as i32).set_format(PdfBitmapFormat::BGRA).set_reverse_byte_order(false).clear_before_rendering(true).set_clear_color(PdfColor::WHITE)).map_err(|error| error.to_string())?;
+                                    let bytes = bitmap.as_raw_bytes();
+                                    if bytes.chunks_exact(4).any(|pixel| pixel[3] != 255) { return Err("Image replacement render has unexpected alpha.".into()); }
+                                    Ok(bytes.chunks_exact(4).flat_map(|pixel| [pixel[2], pixel[1], pixel[0]]).collect())
+                                };
+                                let actual = render(&output)?;
+                                if index == page as i32 { if actual != replacement_rgb { return Err("Image replacement pixels differ after reopening.".into()); } }
+                                else if actual != render(original)? { return Err(format!("Image replacement changed unselected page {}.", index + 1)); }
+                            }
+                            if reply.is_closed() { return Err("Image replacement was canceled.".into()); }
+                            write_new_file(&path, &output_bytes)?;
+                            let pages = page_sizes(&output)?;
+                            let new_id = next_id; next_id += 1;
+                            let info = DocumentInfo { id: new_id, name: path.file_name().unwrap_or_default().to_string_lossy().into_owned(), path: path.to_string_lossy().into_owned(), pages, revision: 0, dirty: false, can_undo: false, can_redo: false };
+                            sessions.insert(new_id, (EditSession::new(output_bytes, info.pages.len()), info.clone()));
+                            documents.insert(new_id, std::rc::Rc::new(output));
+                            Ok(SavedCopy { path: path.to_string_lossy().into_owned(), document: info })
+                        })();
+                        let result = result.map(|saved| { let saved_id = saved.document.id; ReplyLease::new(saved, UnclaimedReply::Document(saved_id), resource_cleanup.clone()) });
+                        if let Err(Ok(saved)) = reply.send(result) { documents.remove(&saved.document.id); sessions.remove(&saved.document.id); }
+                    }
                     Request::Save(id, pages, path, reply) => {
                         let result = (|| {
                             let (session, original) = sessions.get_mut(&id).ok_or("Document is closed")?;
@@ -1173,6 +1219,12 @@ impl PdfService {
     }
     pub async fn create_multi_image_pdf(&self, prepared: crate::image_pdf::PreparedMultiImagePdf, path: PathBuf) -> Result<SavedCopy, String> {
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::CreateMultiImagePdf(prepared, path, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?.map(ReplyLease::accept)
+    }
+    pub async fn inspect_image_replacement(&self, id: u64, revision: u64, page: u16) -> Result<crate::image_edit::ImageEditTargetInfo, String> {
+        let (tx, rx) = oneshot::channel(); self.sender.send(Request::InspectImageReplacement(id, revision, page, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
+    }
+    pub async fn replace_image_copy(&self, id: u64, revision: u64, page: u16, expected: crate::image_edit::ImageEditTargetInfo, replacement_rgb: Vec<u8>, path: PathBuf) -> Result<SavedCopy, String> {
+        let (tx, rx) = oneshot::channel(); self.sender.send(Request::ReplaceImageCopy(id, revision, page, expected, replacement_rgb, path, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?.map(ReplyLease::accept)
     }
     pub async fn crop_pages(&self, id: u64, pages: Vec<u16>, revision: u64, insets: CropInsets) -> Result<DocumentInfo, String> {
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::CropPages(id, pages, revision, insets, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
@@ -1382,6 +1434,18 @@ fn checked_searchable_ocr_request(session: &EditSession, document: &PdfDocument<
 }
 
 #[cfg(windows)]
+fn checked_image_replacement(session: &EditSession, document: &PdfDocument<'_>, revision: u64, page: u16) -> Result<crate::image_edit::ImageEditTargetInfo, String> {
+    if session.revision != revision { return Err("Document changed. Inspect the image again.".into()); }
+    if !matches!(document.permissions().security_handler_revision(), Ok(PdfSecurityHandlerRevision::Unprotected)) { return Err("Image replacement does not support encrypted or restricted PDFs.".into()); }
+    session.page_image_export_guard()?;
+    if session.plan.len() != document.pages().len() as usize || session.plan.iter().enumerate().any(|(index, spec)| spec.source != index || spec.turns != 0 || spec.crop.is_some() || !spec.notes.is_empty()) {
+        return Err("Image replacement requires the original unedited page order, geometry, and annotations.".into());
+    }
+    if usize::from(page) >= session.plan.len() { return Err("Image replacement page is out of range.".into()); }
+    crate::image_edit::inspect_flat_raster_image(&session.source, u32::from(page) + 1)
+}
+
+#[cfg(windows)]
 fn publish_searchable_file(
     path: &PathBuf,
     bytes: &[u8],
@@ -1586,7 +1650,7 @@ mod tests {
     macro_rules! accepted_reply_values {
         ($($value:ty),* $(,)?) => { $(impl TestReplyValue for $value { type Accepted = Self; fn accept(self) -> Self { self } })* };
     }
-    accepted_reply_values!((), Vec<u8>, Vec<u64>, Vec<Option<String>>, String, DocumentInfo, SavedCopy, OpenResult, PrintSnapshotInfo, PrintBitmap, PageImagePreflight, RasterRedactionPreflight, SearchableOcrPreflight, PageImageReceipt, BookmarkList, RenderWork, BookmarkWork, OcrWork, OcrWorkerState, crate::ocr::OcrPageRaster, crate::page_labels::DocumentPageLabels, crate::document_properties::DocumentProperties, crate::text_geometry::PageTextGeometry, crate::split::SplitOutput, crate::comments::CommentList, crate::comments::AnnotationList, crate::forms::FormFields);
+    accepted_reply_values!((), Vec<u8>, Vec<u64>, Vec<Option<String>>, String, DocumentInfo, SavedCopy, OpenResult, PrintSnapshotInfo, PrintBitmap, PageImagePreflight, RasterRedactionPreflight, SearchableOcrPreflight, PageImageReceipt, BookmarkList, RenderWork, BookmarkWork, OcrWork, OcrWorkerState, crate::ocr::OcrPageRaster, crate::image_edit::ImageEditTargetInfo, crate::page_labels::DocumentPageLabels, crate::document_properties::DocumentProperties, crate::text_geometry::PageTextGeometry, crate::split::SplitOutput, crate::comments::CommentList, crate::comments::AnnotationList, crate::forms::FormFields);
     fn call<T: TestReplyValue>(service: &PdfService, request: impl FnOnce(Reply<T>) -> Request) -> Result<T::Accepted, String> {
         let (tx, rx) = oneshot::channel(); service.sender.send(request(tx)).unwrap(); rx.blocking_recv().unwrap().map(TestReplyValue::accept)
     }
@@ -4442,6 +4506,49 @@ mod tests {
         let second = crate::image_pdf::prepare_many_bytes(sources, options).unwrap();
         assert!(call(&service, |reply| Request::CreateMultiImagePdf(second, output.clone(), reply)).err().unwrap().contains("never overwrites"));
         for id in [saved.document.id, open.id] { call(&service, |reply| Request::Close(id, reply)).unwrap(); }
+    }
+
+    #[test]
+    fn strict_image_replacement_publishes_new_copy_and_preserves_source_session() {
+        use lopdf::{content::{Content, Operation}, dictionary, Dictionary, Document, Object, Stream};
+        let mut pdf = Document::with_version("1.7");
+        let pages = pdf.new_object_id();
+        let mut image = Stream::new(dictionary! { "Type" => "XObject", "Subtype" => "Image", "Width" => 2, "Height" => 1, "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8 }, vec![255, 0, 0, 0, 255, 0]);
+        image.compress().unwrap();
+        let image_id = pdf.add_object(image);
+        let content = Content { operations: vec![Operation::new("q", vec![]), Operation::new("cm", vec![200.into(), 0.into(), 0.into(), 100.into(), 0.into(), 0.into()]), Operation::new("Do", vec![Object::Name(b"Image".to_vec())]), Operation::new("Q", vec![])] }.encode().unwrap();
+        let contents = pdf.add_object(Stream::new(Dictionary::new(), content));
+        let page_id = pdf.add_object(dictionary! { "Type" => "Page", "Parent" => pages, "MediaBox" => vec![0.into(), 0.into(), 200.into(), 100.into()], "Resources" => dictionary! { "XObject" => dictionary! { "Image" => image_id } }, "Contents" => contents });
+        let mut image_two = Stream::new(dictionary! { "Type" => "XObject", "Subtype" => "Image", "Width" => 1, "Height" => 2, "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8 }, vec![10, 20, 30, 40, 50, 60]);
+        image_two.compress().unwrap();
+        let image_two_id = pdf.add_object(image_two);
+        let content_two = Content { operations: vec![Operation::new("q", vec![]), Operation::new("cm", vec![100.into(), 0.into(), 0.into(), 200.into(), 0.into(), 0.into()]), Operation::new("Do", vec![Object::Name(b"Image".to_vec())]), Operation::new("Q", vec![])] }.encode().unwrap();
+        let contents_two = pdf.add_object(Stream::new(Dictionary::new(), content_two));
+        let page_two_id = pdf.add_object(dictionary! { "Type" => "Page", "Parent" => pages, "MediaBox" => vec![0.into(), 0.into(), 100.into(), 200.into()], "Resources" => dictionary! { "XObject" => dictionary! { "Image" => image_two_id } }, "Contents" => contents_two });
+        pdf.objects.insert(pages, dictionary! { "Type" => "Pages", "Count" => 2, "Kids" => vec![Object::Reference(page_id), Object::Reference(page_two_id)] }.into());
+        let catalog = pdf.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages }); pdf.trailer.set("Root", catalog);
+        let mut source_bytes = Vec::new(); pdf.save_to(&mut source_bytes).unwrap();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let service = PdfService::start(root.join("resources/pdfium/bin/pdfium.dll"));
+        let folder = tempfile::tempdir().unwrap(); let source_path = folder.path().join("source.pdf"); std::fs::write(&source_path, &source_bytes).unwrap();
+        let source = call(&service, |reply| Request::Open(source_path.clone(), reply)).unwrap();
+        let deleted = call(&service, |reply| Request::Edit(source.id, PageEdit::Delete { pages: vec![1] }, reply)).unwrap();
+        assert!(call(&service, |reply| Request::InspectImageReplacement(source.id, deleted.revision, 0, reply)).is_err());
+        let restored = call(&service, |reply| Request::Edit(source.id, PageEdit::Undo, reply)).unwrap();
+        assert!(restored.can_redo);
+        let target = call(&service, |reply| Request::InspectImageReplacement(source.id, restored.revision, 0, reply)).unwrap();
+        assert_eq!((target.pixel_width, target.pixel_height), (2, 1));
+        let output_path = folder.path().join("replaced.pdf");
+        let replacement = vec![0, 0, 255, 255, 255, 255];
+        let saved = call(&service, |reply| Request::ReplaceImageCopy(source.id, restored.revision, 0, target, replacement.clone(), output_path.clone(), reply)).unwrap();
+        assert_eq!(std::fs::read(&source_path).unwrap(), source_bytes);
+        let redone = call(&service, |reply| Request::Edit(source.id, PageEdit::Redo, reply)).unwrap();
+        assert!(redone.dirty); assert!(redone.can_undo); assert_eq!(redone.pages.len(), 1);
+        let output = lopdf::Document::load(&output_path).unwrap();
+        assert_eq!(saved.document.pages.len(), 2);
+        assert_eq!(output.get_object(image_id).unwrap().as_stream().unwrap().decompressed_content().unwrap(), replacement);
+        assert_eq!(saved.document.revision, 0); assert!(!saved.document.dirty);
+        for id in [source.id, saved.document.id] { call(&service, |reply| Request::Close(id, reply)).unwrap(); }
     }
 
     #[test]

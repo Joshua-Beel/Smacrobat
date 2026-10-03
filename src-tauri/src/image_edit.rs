@@ -9,6 +9,23 @@ pub const MAX_IMAGE_EDIT_PAGES: usize = 4_096;
 pub const MAX_IMAGE_EDIT_CONTENT: usize = 4_096;
 pub const MAX_IMAGE_EDIT_PIXELS: u64 = 32 * 1024 * 1024;
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImageEditTargetInfo {
+    pub page_width: f32,
+    pub page_height: f32,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+}
+
+pub fn inspect_flat_raster_image(source: &[u8], physical_page: u32) -> Result<ImageEditTargetInfo, String> {
+    if source.len() > MAX_IMAGE_EDIT_INPUT { return Err("image-edit source exceeds the input limit".into()); }
+    require_exact_eof(source)?;
+    let document = Document::load_mem(source).map_err(|error| format!("image-edit source is malformed: {error}"))?;
+    let profile = validate_profile(&document)?;
+    let target = profile.pages.get(usize::try_from(physical_page).unwrap_or(usize::MAX).wrapping_sub(1)).ok_or("image-edit page is outside the document")?;
+    Ok(ImageEditTargetInfo { page_width: target.page_width, page_height: target.page_height, pixel_width: target.width, pixel_height: target.height })
+}
+
 pub fn replace_flat_raster_image(
     source: &[u8],
     physical_page: u32,
@@ -90,11 +107,13 @@ pub fn replace_flat_raster_image(
     Ok(output)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 struct ImageTarget {
     image_id: ObjectId,
     width: u32,
     height: u32,
+    page_width: f32,
+    page_height: f32,
 }
 
 struct Profile {
@@ -198,7 +217,7 @@ fn validate_profile(document: &Document) -> Result<Profile, String> {
         if pixels > MAX_IMAGE_EDIT_PIXELS {
             return Err("image-edit source exceeds the aggregate pixel limit".into());
         }
-        result.push(ImageTarget { image_id, width, height });
+        result.push(ImageTarget { image_id, width, height, page_width, page_height });
     }
     let xref_ids: BTreeSet<_> = document.objects.iter().filter_map(|(id, object)| {
         let stream = object.as_stream().ok()?;

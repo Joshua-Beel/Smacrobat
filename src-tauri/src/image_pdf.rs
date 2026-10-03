@@ -281,6 +281,13 @@ pub fn prepare_many_bytes(sources: Vec<Vec<u8>>, options: ImagePdfOptions) -> Re
     assemble_many(sources.into_iter().map(decode), options)
 }
 
+pub(crate) fn replacement_rgb(bytes: Vec<u8>, expected_width: u32, expected_height: u32) -> Result<Vec<u8>, String> {
+    inspect(&bytes)?;
+    let (width, height, rgb) = composite_on_white(decode(bytes)?)?;
+    if width != expected_width || height != expected_height { return Err(format!("The replacement image must be exactly {expected_width} × {expected_height} pixels after EXIF orientation.")); }
+    Ok(rgb)
+}
+
 pub fn prepare_and_write(source: &Path, output: &Path, options: ImagePdfOptions, validate: impl FnOnce(&PreparedImagePdf) -> Result<(), String>) -> Result<PreparedImagePdf, String> {
     validate_output_path(output)?;
     let prepared = assemble(decode(read_source(source)?)?, options)?;
