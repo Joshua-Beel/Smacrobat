@@ -5,7 +5,7 @@ use lopdf::{
     content::{Content, Operation},
     dictionary, Document, Object, Stream,
 };
-use sanitization::verify_clean_raster_pdf;
+use sanitization::{build_clean_raster_pdf, verify_clean_raster_pdf, CleanRasterPage};
 
 fn raster_pdf(extra: impl FnOnce(&mut Document, lopdf::ObjectId)) -> Vec<u8> {
     let mut document = Document::with_version("1.7");
@@ -117,6 +117,15 @@ fn accepts_only_complete_bounded_raster_pages() {
     let result = verify_clean_raster_pdf(&raster_pdf(|_, _| {}), 1).unwrap();
     assert_eq!(result.pages, 1);
     assert_eq!(result.total_pixels, 2);
+    let written = build_clean_raster_pdf(vec![CleanRasterPage {
+        page_width: 612.0,
+        page_height: 792.0,
+        image_width: 2,
+        image_height: 1,
+        rgb: vec![255, 255, 255, 0, 0, 0],
+    }])
+    .unwrap();
+    assert_eq!(verify_clean_raster_pdf(&written, 1).unwrap(), result);
     assert!(verify_clean_raster_pdf(&raster_pdf(|_, _| {}), 2)
         .unwrap_err()
         .contains("expected 2"));

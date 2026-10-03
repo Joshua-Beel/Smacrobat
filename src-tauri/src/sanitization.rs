@@ -15,6 +15,59 @@ pub struct CleanRasterSummary {
     pub total_pixels: u64,
 }
 
+#[derive(Debug)]
+pub struct CleanRasterPage {
+    pub page_width: f32,
+    pub page_height: f32,
+    pub image_width: u32,
+    pub image_height: u32,
+    pub rgb: Vec<u8>,
+}
+
+pub fn build_clean_raster_pdf(pages: Vec<CleanRasterPage>) -> Result<Vec<u8>, String> {
+    if pages.is_empty() || pages.len() > MAX_PAGES {
+        return Err("A clean raster PDF requires 1 to 4,096 pages.".into());
+    }
+    let mut total_pixels = 0u64;
+    for (index, page) in pages.iter().enumerate() {
+        let label = format!("page {}", index + 1);
+        if !page.page_width.is_finite()
+            || !page.page_height.is_finite()
+            || page.page_width <= 0.0
+            || page.page_height <= 0.0
+        {
+            return Err(format!("{label} has invalid displayed-page dimensions."));
+        }
+        let pixels = u64::from(page.image_width)
+            .checked_mul(u64::from(page.image_height))
+            .ok_or_else(|| format!("{label}'s image dimensions are out of range."))?;
+        if pixels == 0 || pixels > MAX_IMAGE_PIXELS_PER_PAGE {
+            return Err(format!(
+                "{label}'s image exceeds the 32 megapixel page limit."
+            ));
+        }
+        total_pixels = total_pixels
+            .checked_add(pixels)
+            .ok_or("The clean raster PDF pixel count is out of range.")?;
+        if total_pixels > MAX_TOTAL_IMAGE_PIXELS {
+            return Err("The clean raster PDF exceeds the 32 megapixel aggregate limit.".into());
+        }
+        let expected_bytes = pixels
+            .checked_mul(3)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| format!("{label}'s RGB byte count is out of range."))?;
+        if page.rgb.len() != expected_bytes {
+            return Err(format!(
+                "{label}'s RGB byte count does not match its dimensions."
+            ));
+        }
+    }
+    let expected_pages = pages.len();
+    let bytes = assemble_canonical(pages)?;
+    verify_clean_raster_pdf(&bytes, expected_pages)?;
+    Ok(bytes)
+}
+
 /// Verifies the deliberately small PDF profile used for sanitized raster copies.
 ///
 /// Passing this check proves that the serialized PDF has no accepted non-raster
@@ -188,7 +241,13 @@ pub fn verify_clean_raster_pdf(
     let mut raster_pages = Vec::with_capacity(expected_pages);
     for (image, page_label, page_width, page_height, image_width, image_height, pixels) in images {
         let rgb = validate_image_payload(image, &page_label, pixels)?;
-        raster_pages.push((page_width, page_height, image_width, image_height, rgb));
+        raster_pages.push(CleanRasterPage {
+            page_width,
+            page_height,
+            image_width,
+            image_height,
+            rgb,
+        });
     }
 
     let mut xref_streams = 0usize;
@@ -206,7 +265,7 @@ pub fn verify_clean_raster_pdf(
     if xref_streams != usize::from(has_xref_trailer) {
         return Err("The candidate PDF's trailer and cross-reference objects disagree.".into());
     }
-    let canonical_bytes = assemble_canonical(&raster_pages)?;
+    let canonical_bytes = assemble_canonical(raster_pages)?;
     if canonical_bytes != bytes {
         return Err(
             "The candidate PDF is not the exact canonical output of the trusted raster writer."
@@ -506,17 +565,17 @@ fn validate_canonical_flate_payload(
     Ok(())
 }
 
-fn assemble_canonical(pages_data: &[(f32, f32, u32, u32, Vec<u8>)]) -> Result<Vec<u8>, String> {
+fn assemble_canonical(pages_data: Vec<CleanRasterPage>) -> Result<Vec<u8>, String> {
     let mut document = Document::with_version("1.7");
     let pages_id = document.new_object_id();
     let mut kids = Vec::with_capacity(pages_data.len());
-    for (page_width, page_height, image_width, image_height, rgb) in pages_data {
+    for page in pages_data {
         let mut image = Stream::new(
             dictionary! {
-                "Type" => "XObject", "Subtype" => "Image", "Width" => i64::from(*image_width),
-                "Height" => i64::from(*image_height), "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8,
+                "Type" => "XObject", "Subtype" => "Image", "Width" => i64::from(page.image_width),
+                "Height" => i64::from(page.image_height), "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8,
             },
-            rgb.clone(),
+            page.rgb,
         );
         image.compress().map_err(|error| {
             format!("The raster image cannot be canonically compressed: {error}")
@@ -528,10 +587,10 @@ fn assemble_canonical(pages_data: &[(f32, f32, u32, u32, Vec<u8>)]) -> Result<Ve
                 Operation::new(
                     "cm",
                     vec![
-                        Object::Real(*page_width),
+                        Object::Real(page.page_width),
                         0.into(),
                         0.into(),
-                        Object::Real(*page_height),
+                        Object::Real(page.page_height),
                         0.into(),
                         0.into(),
                     ],
@@ -545,7 +604,7 @@ fn assemble_canonical(pages_data: &[(f32, f32, u32, u32, Vec<u8>)]) -> Result<Ve
         let content_id = document.add_object(Stream::new(dictionary! {}, content));
         let page_id = document.add_object(dictionary! {
             "Type" => "Page", "Parent" => pages_id,
-            "MediaBox" => vec![0.into(), 0.into(), Object::Real(*page_width), Object::Real(*page_height)],
+            "MediaBox" => vec![0.into(), 0.into(), Object::Real(page.page_width), Object::Real(page.page_height)],
             "Resources" => dictionary! { "XObject" => dictionary! { "Image" => image_id } },
             "Contents" => content_id,
         });
@@ -553,8 +612,7 @@ fn assemble_canonical(pages_data: &[(f32, f32, u32, u32, Vec<u8>)]) -> Result<Ve
     }
     document.objects.insert(
         pages_id,
-        dictionary! { "Type" => "Pages", "Count" => pages_data.len() as i64, "Kids" => kids }
-            .into(),
+        dictionary! { "Type" => "Pages", "Count" => kids.len() as i64, "Kids" => kids }.into(),
     );
     let catalog = document.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
     document.trailer.set("Root", catalog);
