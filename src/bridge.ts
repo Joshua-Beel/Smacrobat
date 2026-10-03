@@ -63,6 +63,10 @@ export type ImageReplacementTarget = { selectionId:string;documentId:number;revi
 export const inspectImageReplacementTarget=(documentId:number,revision:number,page:number)=>invoke<ImageReplacementTarget>('inspect_image_replacement_target',{documentId,revision,page});
 export const replacePdfImageCopy=(selectionId:string,documentId:number,revision:number)=>invoke<SavedCopy|null>('replace_pdf_image_copy',{selectionId,documentId,revision});
 export const cancelImageReplacement=(selectionId:string)=>invoke<void>('cancel_image_replacement',{selectionId});
+export type TextReplacementTarget={selectionId:string;documentId:number;revision:number;page:number;runId:'run-0';text:string;bounds:{x:number;y:number;width:number;height:number};maxBytes:number;mode:'newCopy'};
+export const inspectTextReplacementTarget=(documentId:number,revision:number,page:number)=>invoke<TextReplacementTarget>('inspect_text_replacement_target',{documentId,revision,page});
+export const replacePdfTextCopy=(selectionId:string,documentId:number,revision:number,runId:string,replacement:string)=>invoke<SavedCopy|null>('replace_pdf_text_copy',{selectionId,documentId,revision,runId,replacement});
+export const cancelTextReplacement=(selectionId:string)=>invoke<void>('cancel_text_replacement',{selectionId});
 export type PageImageFormat = 'png' | 'jpeg';
 export type PageImageExportRequest = { id: number; revision: number; page: number; dpi: 72 | 150 | 300; format?: PageImageFormat };
 export type PageImageExport = { path: string; documentId: number; revision: number; page: number; dpi: number; width: number; height: number; format: PageImageFormat };
