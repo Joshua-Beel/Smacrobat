@@ -5,6 +5,7 @@ mod printing;
 mod print_commands;
 mod document_properties;
 mod text_geometry;
+mod text_edit;
 mod split;
 mod combine;
 mod comments;

@@ -296,7 +296,7 @@ fn validate_image(document: &Document, id: ObjectId) -> Result<(u32, u32), Strin
     Ok((width, height))
 }
 
-fn validate_xref_stream(document: &Document, id: ObjectId, root_id: ObjectId) -> Result<(), String> {
+pub(crate) fn validate_xref_stream(document: &Document, id: ObjectId, root_id: ObjectId) -> Result<(), String> {
     let stream = document.get_object(id).and_then(Object::as_stream)
         .map_err(|_| "image-edit cross-reference object is malformed".to_string())?;
     require_keys(&stream.dict, &[b"Root", b"Type", b"Size", b"W", b"Index", b"Length"])?;
