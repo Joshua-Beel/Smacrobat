@@ -124,6 +124,7 @@ enum Request {
     RestoreRecovery(PathBuf, PathBuf, Reply<Option<ReplyLease<RecoveredDocument>>>),
     KeepRecoveredEdits(u64, u64, Reply<RecoveredDocument>),
     OpenOriginal(u64, u64, Reply<DocumentInfo>),
+    DiscardRecovery(u64, u64, Reply<()>),
     BeginOpen(PathBuf, Reply<ReplyLease<OpenResult>>),
     Unlock(u64, String, Reply<ReplyLease<OpenResult>>),
     CancelPassword(u64, Reply<()>),
@@ -257,6 +258,7 @@ impl PdfService {
             let mut recovery_offers = HashMap::<u64, crate::recovery_journal::RecoveryRecord>::new();
             let mut recovery_heads = HashMap::<u64, (crate::recovery_journal::SourceIdentity, u64)>::new();
             let mut recovery_floors = HashMap::<crate::recovery_journal::SourceIdentity, crate::recovery_journal::RecoveryRecord>::new();
+            let mut recovery_locked = HashMap::<u64, RecoveryLock>::new();
             let mut recovery_pages = HashMap::<u64, u32>::new();
             let mut next_request = 1;
             let mut print_snapshots = HashMap::<u64, (std::rc::Rc<PdfDocument<'_>>, Vec<crate::editor::PageSpec>)>::new();
@@ -656,8 +658,9 @@ impl PdfService {
                     },
                     Request::CheckpointRecovery(root, id, revision, current_page, reply) => {
                         if reply.is_closed() { continue; }
-                        let result = (|| {
+                        let mut result = (|| {
                             let (session, original) = sessions.get(&id).ok_or("Document is closed")?;
+                            if recovery_locked.contains_key(&id) { return Err(format!("{RECOVERY_COMMITTED_REOPEN_REQUIRED}: Close and reopen this PDF before updating recovery.")); }
                             if session.revision != revision { return Err("Document changed. Save recovery again.".into()); }
                             if !session.dirty() { return Err("Only unsaved edits can be stored for recovery.".into()); }
                             if current_page as usize >= session.plan.len() { return Err("Current page is out of range.".into()); }
@@ -666,6 +669,9 @@ impl PdfService {
                             recovery_heads.insert(id, (record.source, record.generation));
                             Ok(())
                         })();
+                        if matches!(&result, Err(error) if error.starts_with(RECOVERY_COMMITTED_REOPEN_REQUIRED)) {
+                            if let Some((session, _)) = sessions.get(&id) { if let Some(lock) = record_recovery_lock(Some(&root), &mut recovery_locked, id, revision, session) { result=Err(format!("{RECOVERY_COMMITTED_REOPEN_REQUIRED}:{id}:{}:{}",lock.requested_revision,lock.committed_revision)); } }
+                        }
                         let _ = reply.send(result);
                     }
                     Request::RestoreRecovery(root, path, reply) => {
@@ -728,11 +734,52 @@ impl PdfService {
                             let current=crate::recovery_store::read_recovery(root,record.source,None,0)?.ok_or("Recovery choice is no longer available.")?;
                             if current!=record || !current.active { return Err("Recovery choice is stale. Reopen the PDF.".into()); }
                             let tombstone = crate::recovery_journal::RecoveryRecord { active: false, generation: record.generation.checked_add(1).ok_or("Recovery generation is exhausted.")?, revision: record.revision, current_page: 0, source_pages: record.source_pages, source: record.source, edit_state: crate::recovery_journal::RecoveryEditState { pages: Vec::new() } };
-                            crate::recovery_store::write_recovery(root, &tombstone)?;
-                            let verified = crate::recovery_store::read_recovery(root, record.source, None, tombstone.revision)?.ok_or("Recovery verification failed.")?;
-                            if verified != tombstone { return Err("Recovery verification failed.".into()); }
+                            if let Err(error)=write_recovery_verified(root, &tombstone){if error.starts_with(RECOVERY_COMMITTED_REOPEN_REQUIRED){return Err(format!("{RECOVERY_COMMITTED_REOPEN_REQUIRED}:{id}:{revision}:{}",tombstone.revision));}return Err(error);}
+                            accept_recovery_record(&mut recovery_floors, &tombstone)?;
                             recovery_offers.retain(|_,offer|offer.source!=record.source);
                             current_info(session, original, documents.get(&id).ok_or("Document is closed")?)
+                        })();
+                        let _ = reply.send(result);
+                    }
+                    Request::DiscardRecovery(id, revision, reply) => {
+                        if reply.is_closed() { continue; }
+                        let result = (|| {
+                            let (session, original) = sessions.get(&id).ok_or("Document is closed")?;
+                            if let Some(lock) = recovery_locked.get(&id).cloned() {
+                                if revision != lock.requested_revision { return Err(format!("Recovery discard is stale ({revision} != {}).", lock.requested_revision)); }
+                                let root = recovery_root.as_deref().ok_or("Recovery is unavailable.")?;
+                                let current = crate::recovery_store::read_recovery(root, lock.source, None, 0)?.ok_or("Recovery edits are no longer available.")?;
+                                if !current.active {
+                                    if current.revision == lock.committed_revision && current.generation >= lock.generation { return Ok(()); }
+                                    return Err("Recovery discard is stale.".into());
+                                }
+                                if current.source != lock.source || current.revision != lock.committed_revision || current.generation != lock.generation { return Err(format!("Recovery discard is stale (record {}:{} != {}:{}).", current.revision, current.generation, lock.committed_revision, lock.generation)); }
+                                let tombstone = crate::recovery_journal::RecoveryRecord { active: false, generation: current.generation.checked_add(1).ok_or("Recovery generation is exhausted.")?, revision: lock.committed_revision, current_page: 0, source_pages: current.source_pages, source: current.source, edit_state: crate::recovery_journal::RecoveryEditState { pages: Vec::new() } };
+                                if let Err(error)=write_recovery_verified(root, &tombstone){if error.starts_with(RECOVERY_COMMITTED_REOPEN_REQUIRED){return Err(format!("{RECOVERY_COMMITTED_REOPEN_REQUIRED}:{id}:{}:{}",lock.requested_revision,lock.committed_revision));}return Err(error);}
+                                accept_recovery_record(&mut recovery_floors, &tombstone)?;
+                                recovery_heads.remove(&id);
+                                return Ok(());
+                            }
+                            if session.revision != revision { return Err("Document changed. Discard again.".into()); }
+                            if !session.dirty() { return Err("Only unsaved edits can be discarded.".into()); }
+                            let root = recovery_root.as_deref().ok_or("Recovery is unavailable.")?;
+                            let source = recovery_source_identity(&session.source)?;
+                            if recovery_heads.iter().any(|(owner, (identity, _))| *owner != id && *identity == source) { return Err("Another open tab owns recovery for this PDF.".into()); }
+                            let current = crate::recovery_store::read_recovery(root, source, None, 0)?.ok_or("Recovery edits are no longer available.")?;
+                            accept_recovery_record(&mut recovery_floors, &current)?;
+                            if !current.active {
+                                if current.revision != revision { return Err("Recovery discard is stale.".into()); }
+                                return Ok(());
+                            }
+                            let disk = std::fs::read(&original.path).map_err(|_| "The source PDF changed or became unavailable; recovery was not discarded.".to_owned())?;
+                            if disk != session.source { return Err("The source PDF changed outside the app; recovery was not discarded.".into()); }
+                            if recovery_heads.get(&id) != Some(&(source, current.generation)) { return Err("Recovery edits are owned by another session.".into()); }
+                            let tombstone = crate::recovery_journal::RecoveryRecord { active: false, generation: current.generation.checked_add(1).ok_or("Recovery generation is exhausted.")?, revision, current_page: 0, source_pages: u32::try_from(original.pages.len()).map_err(|_| "Recovery source has too many pages.")?, source, edit_state: crate::recovery_journal::RecoveryEditState { pages: Vec::new() } };
+                            if let Err(error)=write_recovery_verified(root, &tombstone){if error.starts_with(RECOVERY_COMMITTED_REOPEN_REQUIRED){return Err(format!("{RECOVERY_COMMITTED_REOPEN_REQUIRED}:{id}:{revision}:{revision}"));}return Err(error);}
+                            accept_recovery_record(&mut recovery_floors, &tombstone)?;
+                            recovery_heads.remove(&id);
+                            recovery_offers.retain(|_, offer| offer.source != source);
+                            Ok(())
                         })();
                         let _ = reply.send(result);
                     }
@@ -854,13 +901,15 @@ impl PdfService {
                         if reply.is_closed() { continue; }
                         let result = (|| {
                             let (session, original) = sessions.get_mut(&id).ok_or("Document is closed")?;
+                            if recovery_locked.contains_key(&id) { return Err(format!("{RECOVERY_COMMITTED_REOPEN_REQUIRED}: Close and reopen this PDF before making more edits.")); }
                             if recovery_offers.contains_key(&id) { return Err("Choose whether to keep the recovered edits before editing this PDF.".into()); }
                             if durable_page.is_some_and(|page|page as usize>=session.plan.len()){return Err("Current page is out of range.".into());}
                             ensure_recovery_owner(recovery_root.as_deref(),&recovery_heads,&mut recovery_floors,id,session)?;
+                            let requested_revision = session.revision;
                             let snapshot = session.snapshot();
                             session.apply(edit)?;
                             let info=match documents.get(&id).ok_or_else(||"Document is closed".to_owned()).and_then(|document|current_info(session,original,document)){Ok(info)=>info,Err(error)=>{session.restore(snapshot);return Err(error);}};
-                            let current_page=durable_page.map_or(0,|page|page.min(session.plan.len().saturating_sub(1) as u32));match persist_recovery_state(recovery_root.as_deref(), &mut recovery_floors, session, original, current_page) { Ok(Some(record)) if record.active => { recovery_heads.insert(id,(record.source,record.generation)); }, Ok(Some(_)) => { recovery_heads.remove(&id); }, Ok(None) => {}, Err(error) => { session.restore(snapshot); return Err(error); } }
+                            let current_page=durable_page.map_or(0,|page|page.min(session.plan.len().saturating_sub(1) as u32));match persist_recovery_state(recovery_root.as_deref(), &mut recovery_floors, session, original, current_page) { Ok(Some(record)) if record.active => { recovery_heads.insert(id,(record.source,record.generation)); }, Ok(Some(_)) => { recovery_heads.remove(&id); }, Ok(None) => {}, Err(error) => { if error.starts_with(RECOVERY_COMMITTED_REOPEN_REQUIRED) { if let Some(lock)=record_recovery_lock(recovery_root.as_deref(), &mut recovery_locked, id, requested_revision, session){return Err(format!("{RECOVERY_COMMITTED_REOPEN_REQUIRED}:{id}:{}:{}",lock.requested_revision,lock.committed_revision));} } else { session.restore(snapshot); } return Err(error); } }
                             note_documents.remove(&id);
                             cache.close(id);
                             Ok(info)
@@ -872,6 +921,7 @@ impl PdfService {
                         if reply.is_closed() { continue; }
                         let result = (|| {
                             let (session, original) = sessions.get_mut(&id).ok_or("Document is closed")?;
+                            if recovery_locked.contains_key(&id) { return Err(format!("{RECOVERY_COMMITTED_REOPEN_REQUIRED}: Close and reopen this PDF before making more edits.")); }
                             if recovery_offers.contains_key(&id) { return Err("Choose whether to keep the recovered edits before editing this PDF.".into()); }
                             if durable_page.is_some_and(|page|page as usize>=session.plan.len()){return Err("Current page is out of range.".into());}
                             ensure_recovery_owner(recovery_root.as_deref(),&recovery_heads,&mut recovery_floors,id,session)?;
@@ -882,7 +932,7 @@ impl PdfService {
                             let crop = checked_displayed_crop(document, spec, rect)?;
                             session.apply(PageEdit::Crop { page: index as usize, crop })?;
                             let info=match current_info(session,original,document){Ok(info)=>info,Err(error)=>{session.restore(snapshot);return Err(error);}};
-                            let current_page=durable_page.unwrap_or(u32::from(index)).min(session.plan.len().saturating_sub(1) as u32);match persist_recovery_state(recovery_root.as_deref(), &mut recovery_floors, session, original, current_page) { Ok(Some(record)) if record.active => { recovery_heads.insert(id,(record.source,record.generation)); }, Ok(Some(_)) => { recovery_heads.remove(&id); }, Ok(None) => {}, Err(error) => { session.restore(snapshot); return Err(error); } }
+                            let current_page=durable_page.unwrap_or(u32::from(index)).min(session.plan.len().saturating_sub(1) as u32);match persist_recovery_state(recovery_root.as_deref(), &mut recovery_floors, session, original, current_page) { Ok(Some(record)) if record.active => { recovery_heads.insert(id,(record.source,record.generation)); }, Ok(Some(_)) => { recovery_heads.remove(&id); }, Ok(None) => {}, Err(error) => { if error.starts_with(RECOVERY_COMMITTED_REOPEN_REQUIRED) { if let Some(lock)=record_recovery_lock(recovery_root.as_deref(), &mut recovery_locked, id, revision, session){return Err(format!("{RECOVERY_COMMITTED_REOPEN_REQUIRED}:{id}:{}:{}",lock.requested_revision,lock.committed_revision));} } else { session.restore(snapshot); } return Err(error); } }
                             note_documents.remove(&id);
                             cache.close(id);
                             Ok(info)
@@ -898,6 +948,7 @@ impl PdfService {
                                 return Err("Select one or more pages in ascending order without duplicates.".into());
                             }
                             let (session, original) = sessions.get_mut(&id).ok_or("Document is closed")?;
+                            if recovery_locked.contains_key(&id) { return Err(format!("{RECOVERY_COMMITTED_REOPEN_REQUIRED}: Close and reopen this PDF before making more edits.")); }
                             if recovery_offers.contains_key(&id) { return Err("Choose whether to keep the recovered edits before editing this PDF.".into()); }
                             if durable_page.is_some_and(|page|page as usize>=session.plan.len()){return Err("Current page is out of range.".into());}
                             ensure_recovery_owner(recovery_root.as_deref(),&recovery_heads,&mut recovery_floors,id,session)?;
@@ -912,7 +963,7 @@ impl PdfService {
                             }
                             session.apply(PageEdit::CropMany { crops })?;
                             let info=match current_info(session,original,document){Ok(info)=>info,Err(error)=>{session.restore(snapshot);return Err(error);}};
-                            let current_page=durable_page.map_or(0,|page|page.min(session.plan.len().saturating_sub(1) as u32));match persist_recovery_state(recovery_root.as_deref(), &mut recovery_floors, session, original, current_page) { Ok(Some(record)) if record.active => { recovery_heads.insert(id,(record.source,record.generation)); }, Ok(Some(_)) => { recovery_heads.remove(&id); }, Ok(None) => {}, Err(error) => { session.restore(snapshot); return Err(error); } }
+                            let current_page=durable_page.map_or(0,|page|page.min(session.plan.len().saturating_sub(1) as u32));match persist_recovery_state(recovery_root.as_deref(), &mut recovery_floors, session, original, current_page) { Ok(Some(record)) if record.active => { recovery_heads.insert(id,(record.source,record.generation)); }, Ok(Some(_)) => { recovery_heads.remove(&id); }, Ok(None) => {}, Err(error) => { if error.starts_with(RECOVERY_COMMITTED_REOPEN_REQUIRED) { if let Some(lock)=record_recovery_lock(recovery_root.as_deref(), &mut recovery_locked, id, revision, session){return Err(format!("{RECOVERY_COMMITTED_REOPEN_REQUIRED}:{id}:{}:{}",lock.requested_revision,lock.committed_revision));} } else { session.restore(snapshot); } return Err(error); } }
                             note_documents.remove(&id);
                             cache.close(id);
                             Ok(info)
@@ -927,6 +978,7 @@ impl PdfService {
                                 return Err("Select one or more pages in ascending order without duplicates.".into());
                             }
                             let (session, original) = sessions.get_mut(&id).ok_or("Document is closed")?;
+                            if recovery_locked.contains_key(&id) { return Err(format!("{RECOVERY_COMMITTED_REOPEN_REQUIRED}: Close and reopen this PDF before making more edits.")); }
                             if recovery_offers.contains_key(&id) { return Err("Choose whether to keep the recovered edits before editing this PDF.".into()); }
                             if durable_page.is_some_and(|page|page as usize>=session.plan.len()){return Err("Current page is out of range.".into());}
                             ensure_recovery_owner(recovery_root.as_deref(),&recovery_heads,&mut recovery_floors,id,session)?;
@@ -936,7 +988,7 @@ impl PdfService {
                             let before = session.revision;
                             session.apply(PageEdit::ResetCropMany { pages: pages.into_iter().map(usize::from).collect() })?;
                             let info=match current_info(session,original,document){Ok(info)=>info,Err(error)=>{session.restore(snapshot);return Err(error);}};
-                            let current_page=durable_page.map_or(0,|page|page.min(session.plan.len().saturating_sub(1) as u32));match persist_recovery_state(recovery_root.as_deref(), &mut recovery_floors, session, original, current_page) { Ok(Some(record)) if record.active => { recovery_heads.insert(id,(record.source,record.generation)); }, Ok(Some(_)) => { recovery_heads.remove(&id); }, Ok(None) => {}, Err(error) => { session.restore(snapshot); return Err(error); } }
+                            let current_page=durable_page.map_or(0,|page|page.min(session.plan.len().saturating_sub(1) as u32));match persist_recovery_state(recovery_root.as_deref(), &mut recovery_floors, session, original, current_page) { Ok(Some(record)) if record.active => { recovery_heads.insert(id,(record.source,record.generation)); }, Ok(Some(_)) => { recovery_heads.remove(&id); }, Ok(None) => {}, Err(error) => { if error.starts_with(RECOVERY_COMMITTED_REOPEN_REQUIRED) { if let Some(lock)=record_recovery_lock(recovery_root.as_deref(), &mut recovery_locked, id, revision, session){return Err(format!("{RECOVERY_COMMITTED_REOPEN_REQUIRED}:{id}:{}:{}",lock.requested_revision,lock.committed_revision));} } else { session.restore(snapshot); } return Err(error); } }
                             if session.revision != before {
                                 note_documents.remove(&id);
                                 cache.close(id);
@@ -996,6 +1048,7 @@ impl PdfService {
                         if reply.is_closed() { continue; }
                         let result = (|| {
                             let (session, original) = sessions.get_mut(&id).ok_or("Document is closed")?;
+                            if recovery_locked.contains_key(&id) { return Err(format!("{RECOVERY_COMMITTED_REOPEN_REQUIRED}: Close and reopen this PDF before making more edits.")); }
                             if recovery_offers.contains_key(&id) { return Err("Choose whether to keep the recovered edits before editing this PDF.".into()); }
                             if durable_page.is_some_and(|page|page as usize>=session.plan.len()){return Err("Current page is out of range.".into());}
                             ensure_recovery_owner(recovery_root.as_deref(),&recovery_heads,&mut recovery_floors,id,session)?;
@@ -1028,7 +1081,7 @@ impl PdfService {
                             let rendered = load_note_document(pdfium.as_ref().map_err(Clone::clone)?, document, session, &next)?;
                             session.commit_comments(next);
                             let info=match current_info(session,original,document){Ok(info)=>info,Err(error)=>{session.restore(snapshot);return Err(error);}};
-                            let current_page=durable_page.map_or(0,|page|page.min(session.plan.len().saturating_sub(1) as u32));match persist_recovery_state(recovery_root.as_deref(), &mut recovery_floors, session, original, current_page) { Ok(Some(record)) if record.active => { recovery_heads.insert(id,(record.source,record.generation)); }, Ok(Some(_)) => { recovery_heads.remove(&id); }, Ok(None) => {}, Err(error) => { session.restore(snapshot); return Err(error); } }
+                            let current_page=durable_page.map_or(0,|page|page.min(session.plan.len().saturating_sub(1) as u32));match persist_recovery_state(recovery_root.as_deref(), &mut recovery_floors, session, original, current_page) { Ok(Some(record)) if record.active => { recovery_heads.insert(id,(record.source,record.generation)); }, Ok(Some(_)) => { recovery_heads.remove(&id); }, Ok(None) => {}, Err(error) => { if error.starts_with(RECOVERY_COMMITTED_REOPEN_REQUIRED) { if let Some(lock)=record_recovery_lock(recovery_root.as_deref(), &mut recovery_locked, id, revision, session){return Err(format!("{RECOVERY_COMMITTED_REOPEN_REQUIRED}:{id}:{}:{}",lock.requested_revision,lock.committed_revision));} } else { session.restore(snapshot); } return Err(error); } }
                             note_documents.insert(id, (session.revision, rendered)); cache.close(id);
                             Ok(info)
                         })();
@@ -1298,7 +1351,7 @@ impl PdfService {
                             if let Some((session, original)) = sessions.get(&id) {
                                 if !session.dirty() && recovery_heads.contains_key(&id) { persist_recovery_state(recovery_root.as_deref(), &mut recovery_floors, session, original, 0)?; }
                             }
-                            documents.remove(&id); sessions.remove(&id); recovery_offers.remove(&id); recovery_heads.remove(&id);
+                            documents.remove(&id); sessions.remove(&id); recovery_offers.remove(&id); recovery_heads.remove(&id); recovery_locked.remove(&id);
                             note_documents.remove(&id); cache.close(id); page_labels.close(id); Ok(())
                         })();
                         let _ = reply.send(result);
@@ -1327,6 +1380,9 @@ impl PdfService {
     }
     pub async fn open_original(&self, id: u64, revision: u64) -> Result<DocumentInfo, String> {
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::OpenOriginal(id, revision, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
+    }
+    pub async fn discard_recovery(&self, id: u64, revision: u64) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel(); self.sender.send(Request::DiscardRecovery(id, revision, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
     }
     pub async fn begin_print(&self, id: u64, revision: u64) -> Result<PrintSnapshotInfo, String> {
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::BeginPrint(id, revision, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
@@ -1646,6 +1702,22 @@ fn accept_recovery_record(floors: &mut HashMap<crate::recovery_journal::SourceId
     floors.insert(record.source, record.clone());
     Ok(())
 }
+const RECOVERY_COMMITTED_REOPEN_REQUIRED: &str = "RECOVERY_COMMITTED_REOPEN_REQUIRED";
+#[derive(Clone)]
+struct RecoveryLock { requested_revision: u64, committed_revision: u64, source: crate::recovery_journal::SourceIdentity, generation: u64 }
+fn record_recovery_lock(root: Option<&std::path::Path>, locks: &mut HashMap<u64, RecoveryLock>, id: u64, requested_revision: u64, session: &EditSession) -> Option<RecoveryLock> {
+    let root = root?;
+    let source = recovery_source_identity(&session.source).ok()?;
+    let record = crate::recovery_store::read_recovery(root, source, None, 0).ok()??;
+    let lock = RecoveryLock { requested_revision, committed_revision: record.revision, source, generation: record.generation };
+    locks.insert(id, lock.clone());
+    Some(lock)
+}
+fn write_recovery_verified(root: &std::path::Path, record: &crate::recovery_journal::RecoveryRecord) -> Result<(), String> {
+    crate::recovery_store::write_recovery_detailed(root, record).map(|_| ()).map_err(|error| {
+        if error.published { format!("{RECOVERY_COMMITTED_REOPEN_REQUIRED}: Recovery was published but could not be verified. Close and reopen this PDF.") } else { error.message }
+    })
+}
 fn persist_recovery_state(root: Option<&std::path::Path>, floors: &mut HashMap<crate::recovery_journal::SourceIdentity, crate::recovery_journal::RecoveryRecord>, session: &EditSession, original: &DocumentInfo, current_page: u32) -> Result<Option<crate::recovery_journal::RecoveryRecord>, String> {
     let Some(root) = root else { return Ok(None); };
     let disk = std::fs::read(&original.path).map_err(|_| "The source PDF changed or became unavailable; recovery was not updated.".to_owned())?;
@@ -1660,9 +1732,9 @@ fn persist_recovery_state(root: Option<&std::path::Path>, floors: &mut HashMap<c
     } else {
         crate::recovery_journal::RecoveryRecord { active: false, generation, revision: session.revision, current_page: 0, source_pages: u32::try_from(original.pages.len()).map_err(|_| "Recovery source has too many pages.")?, source, edit_state: crate::recovery_journal::RecoveryEditState { pages: Vec::new() } }
     };
-    crate::recovery_store::write_recovery(root, &record)?;
-    let verified = crate::recovery_store::read_recovery(root, source, None, record.revision)?.ok_or("Recovery verification failed.")?;
-    if verified != record { return Err("Recovery verification failed.".into()); }
+    write_recovery_verified(root, &record)?;
+    let verified = crate::recovery_store::read_recovery(root, source, None, record.revision).map_err(|_| format!("{RECOVERY_COMMITTED_REOPEN_REQUIRED}: Recovery was verified when published but its confirmation could not be repeated. Close and reopen this PDF."))?.ok_or_else(|| format!("{RECOVERY_COMMITTED_REOPEN_REQUIRED}: Recovery was verified when published but is no longer readable. Close and reopen this PDF."))?;
+    if verified != record { return Err(format!("{RECOVERY_COMMITTED_REOPEN_REQUIRED}: Recovery changed after publication. Close and reopen this PDF.")); }
     accept_recovery_record(floors, &verified)?;
     Ok(Some(record))
 }
@@ -4795,6 +4867,14 @@ mod tests {
 
     #[test]
     #[ignore = "uses an isolated recovery-root worker and must run alone because PDFium binding is process-global"]
+    fn explicit_discard_is_idempotent_and_resolves_post_publish_lock() {
+        let manifest=PathBuf::from(env!("CARGO_MANIFEST_DIR"));let folder=tempfile::tempdir().unwrap();let recovery=folder.path().join("recovery");std::fs::create_dir(&recovery).unwrap();let source_path=folder.path().join("source.pdf");let source=std::fs::read(manifest.join("resources/welcome.pdf")).unwrap();std::fs::write(&source_path,&source).unwrap();
+        let service=PdfService::start_worker(manifest.join("resources/pdfium/bin/pdfium.dll"),4096,Some(recovery.clone()));let opened=call(&service,|reply|Request::Open(source_path.clone(),reply)).unwrap();let edited=call(&service,|reply|Request::DurableEdit(opened.id,PageEdit::Rotate{pages:vec![0],clockwise:true},0,reply)).unwrap();call(&service,|reply|Request::DiscardRecovery(edited.id,edited.revision,reply)).unwrap();let identity=recovery_source_identity(&source).unwrap();let tombstone=crate::recovery_store::read_recovery(&recovery,identity,None,0).unwrap().unwrap();assert!(!tombstone.active&&tombstone.generation==2);std::fs::write(&source_path,b"changed").unwrap();call(&service,|reply|Request::DiscardRecovery(edited.id,edited.revision,reply)).unwrap();std::fs::write(&source_path,&source).unwrap();
+        let renewed=call(&service,|reply|Request::DurableEdit(edited.id,PageEdit::Rotate{pages:vec![0],clockwise:true},0,reply)).unwrap();let active=crate::recovery_store::read_recovery(&recovery,identity,None,renewed.revision).unwrap().unwrap();assert!(active.active&&active.generation==3);assert!(call(&service,|reply|Request::DiscardRecovery(renewed.id,edited.revision,reply)).is_err());crate::recovery_store::fail_next_verification_after_publish();let error=call(&service,|reply|Request::DurableEdit(renewed.id,PageEdit::Rotate{pages:vec![0],clockwise:true},0,reply)).err().unwrap();assert!(error.starts_with(RECOVERY_COMMITTED_REOPEN_REQUIRED));assert!(call(&service,|reply|Request::DurableEdit(renewed.id,PageEdit::Rotate{pages:vec![0],clockwise:true},0,reply)).err().unwrap().starts_with(RECOVERY_COMMITTED_REOPEN_REQUIRED));call(&service,|reply|Request::Close(renewed.id,reply)).unwrap();let reopened=call(&service,|reply|Request::BeginOpen(source_path.clone(),reply)).unwrap().accept();let clean=match reopened{OpenResult::Opened{document,recovery:Some(_)}=>document,_=>panic!("committed edit must be offered after locked close")};let kept=call(&service,|reply|Request::KeepRecoveredEdits(clean.id,clean.revision,reply)).unwrap();let requested=kept.document.revision;crate::recovery_store::fail_next_verification_after_publish();let error=call(&service,|reply|Request::DurableEdit(clean.id,PageEdit::Rotate{pages:vec![0],clockwise:true},0,reply)).err().unwrap();assert!(error.starts_with(RECOVERY_COMMITTED_REOPEN_REQUIRED));call(&service,|reply|Request::DiscardRecovery(clean.id,requested,reply)).expect("locked discard");call(&service,|reply|Request::DiscardRecovery(clean.id,requested,reply)).expect("idempotent locked discard");let inactive=crate::recovery_store::read_recovery(&recovery,identity,None,0).unwrap().unwrap();assert!(!inactive.active&&inactive.generation==5);assert_eq!(std::fs::read(&source_path).unwrap(),source);call(&service,|reply|Request::Close(clean.id,reply)).unwrap();
+    }
+
+    #[test]
+    #[ignore = "uses an isolated recovery-root worker and must run alone because PDFium binding is process-global"]
     fn normal_open_offers_active_recovery_and_explicit_choices_are_monotonic() {
         let manifest=PathBuf::from(env!("CARGO_MANIFEST_DIR"));let folder=tempfile::tempdir().unwrap();let recovery=folder.path().join("recovery");std::fs::create_dir(&recovery).unwrap();let source_path=folder.path().join("source.pdf");std::fs::copy(manifest.join("resources/welcome.pdf"),&source_path).unwrap();let service=PdfService::start_worker(manifest.join("resources/pdfium/bin/pdfium.dll"),4096,Some(recovery.clone()));
         let first=call(&service,|reply|Request::Open(source_path.clone(),reply)).unwrap();let shadow=call(&service,|reply|Request::Open(source_path.clone(),reply)).unwrap();let edited=call(&service,|reply|Request::Edit(first.id,PageEdit::Rotate{pages:vec![0],clockwise:true},reply)).unwrap();assert!(call(&service,|reply|Request::Edit(shadow.id,PageEdit::Rotate{pages:vec![0],clockwise:true},reply)).is_err());call(&service,|reply|Request::Close(edited.id,reply)).unwrap();assert!(call(&service,|reply|Request::Edit(shadow.id,PageEdit::Rotate{pages:vec![0],clockwise:true},reply)).is_err());
@@ -4804,6 +4884,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "uses an isolated recovery-root worker and must run alone because PDFium binding is process-global"]
     fn recovery_checkpoint_ack_is_durable_and_explicit_restore_replays_exact_state(){
         let manifest=PathBuf::from(env!("CARGO_MANIFEST_DIR"));let folder=tempfile::tempdir().unwrap();let recovery=folder.path().join("recovery");std::fs::create_dir(&recovery).unwrap();let service=PdfService::start_worker(manifest.join("resources/pdfium/bin/pdfium.dll"),4096,Some(recovery.clone()));let source_path=folder.path().join("source.pdf");let source=std::fs::read(manifest.join("resources/welcome.pdf")).unwrap();std::fs::write(&source_path,&source).unwrap();
         let opened=call(&service,|reply|Request::Open(source_path.clone(),reply)).unwrap();assert!(call(&service,|reply|Request::CheckpointRecovery(recovery.clone(),opened.id,opened.revision,0,reply)).unwrap_err().contains("unsaved"));

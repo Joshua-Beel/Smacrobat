@@ -6,6 +6,31 @@ use tauri::{Manager, State};
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RecoveryCheckpointReceipt { document_id: u64, revision: u64, current_page: u32 }
 
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RecoveryDiscardReceipt { document_id: u64, revision: u64 }
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub(crate) enum MutationCommandError {
+    Message(String),
+    RecoveryCommitted { code: &'static str, #[serde(rename = "documentId")] document_id: u64, #[serde(rename = "requestedRevision")] requested_revision: u64, #[serde(rename = "committedRevision")] committed_revision: u64 },
+}
+
+impl From<String> for MutationCommandError {
+    fn from(message: String) -> Self {
+        let mut parts = message.split(':');
+        if parts.next() == Some("RECOVERY_COMMITTED_REOPEN_REQUIRED") {
+            if let (Some(id), Some(requested), Some(committed), None) = (parts.next(), parts.next(), parts.next(), parts.next()) {
+                if let (Ok(document_id), Ok(requested_revision), Ok(committed_revision)) = (id.parse(), requested.parse(), committed.parse()) {
+                    return Self::RecoveryCommitted { code: "recoveryCommittedReopenRequired", document_id, requested_revision, committed_revision };
+                }
+            }
+        }
+        Self::Message(message)
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RecoveryRestoreResult { document: crate::service::DocumentInfo, current_page: u32 }
@@ -35,9 +60,10 @@ fn recovery_root(app_data: &Path) -> Result<PathBuf, String> {
 }
 
 #[tauri::command]
-pub(crate) async fn checkpoint_recovery(app: tauri::AppHandle, service: State<'_, crate::service::PdfService>, id: u64, revision: u64, current_page: u32) -> Result<RecoveryCheckpointReceipt, String> {
-    let root = recovery_root(&app.path().app_data_dir().map_err(|_| "The recovery folder is unavailable.")?)?;
-    service.checkpoint_recovery(root, id, revision, current_page).await?;
+pub(crate) async fn checkpoint_recovery(app: tauri::AppHandle, service: State<'_, crate::service::PdfService>, id: u64, revision: u64, current_page: u32) -> Result<RecoveryCheckpointReceipt, MutationCommandError> {
+    let app_data = app.path().app_data_dir().map_err(|_| MutationCommandError::from("The recovery folder is unavailable.".to_owned()))?;
+    let root = recovery_root(&app_data).map_err(MutationCommandError::from)?;
+    service.checkpoint_recovery(root, id, revision, current_page).await.map_err(MutationCommandError::from)?;
     Ok(RecoveryCheckpointReceipt { document_id: id, revision, current_page })
 }
 
@@ -57,8 +83,14 @@ pub(crate) async fn keep_recovered_edits(service: State<'_, crate::service::PdfS
 }
 
 #[tauri::command]
-pub(crate) async fn open_original(service: State<'_, crate::service::PdfService>, id: u64, revision: u64) -> Result<crate::service::DocumentInfo, String> {
-    service.open_original(id, revision).await
+pub(crate) async fn open_original(service: State<'_, crate::service::PdfService>, id: u64, revision: u64) -> Result<crate::service::DocumentInfo, MutationCommandError> {
+    service.open_original(id, revision).await.map_err(MutationCommandError::from)
+}
+
+#[tauri::command]
+pub(crate) async fn discard_recovery(service: State<'_, crate::service::PdfService>, id: u64, revision: u64) -> Result<RecoveryDiscardReceipt, MutationCommandError> {
+    service.discard_recovery(id, revision).await.map_err(MutationCommandError::from)?;
+    Ok(RecoveryDiscardReceipt { document_id: id, revision })
 }
 
 #[cfg(test)]
@@ -69,6 +101,19 @@ mod tests {
     fn checkpoint_receipt_is_exact_and_contains_no_storage_identity() {
         let value = serde_json::to_value(RecoveryCheckpointReceipt { document_id: 4, revision: 7, current_page: 2 }).unwrap();
         assert_eq!(value, serde_json::json!({ "documentId": 4, "revision": 7, "currentPage": 2 }));
+    }
+
+    #[test]
+    fn discard_receipt_is_exact_and_contains_no_storage_identity() {
+        let value = serde_json::to_value(RecoveryDiscardReceipt { document_id: 4, revision: 7 }).unwrap();
+        assert_eq!(value, serde_json::json!({ "documentId": 4, "revision": 7 }));
+    }
+
+    #[test]
+    fn committed_recovery_error_is_a_strict_typed_boundary() {
+        let value = serde_json::to_value(MutationCommandError::from("RECOVERY_COMMITTED_REOPEN_REQUIRED:4:7:8".to_owned())).unwrap();
+        assert_eq!(value, serde_json::json!({ "code": "recoveryCommittedReopenRequired", "documentId": 4, "requestedRevision": 7, "committedRevision": 8 }));
+        assert_eq!(serde_json::to_value(MutationCommandError::from("RECOVERY_COMMITTED_REOPEN_REQUIRED:4:7:8:extra".to_owned())).unwrap(), serde_json::json!("RECOVERY_COMMITTED_REOPEN_REQUIRED:4:7:8:extra"));
     }
 
     #[test]

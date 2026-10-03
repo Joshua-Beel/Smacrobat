@@ -135,19 +135,19 @@ async fn document_comments(service: State<'_, PdfService>, id: u64, revision: u6
 #[tauri::command]
 async fn document_annotations(service: State<'_, PdfService>, id: u64, revision: u64) -> Result<comments::AnnotationList, String> { service.annotations(id, revision).await }
 #[tauri::command]
-async fn create_highlight(service: State<'_, PdfService>, id: u64, revision: u64, page: u16, rect: service::CropRect, contents: Option<String>, current_page: u32) -> Result<DocumentInfo, String> { service.create_highlight(id, revision, page, rect, contents, current_page).await }
+async fn create_highlight(service: State<'_, PdfService>, id: u64, revision: u64, page: u16, rect: service::CropRect, contents: Option<String>, current_page: u32) -> Result<DocumentInfo, recovery_commands::MutationCommandError> { service.create_highlight(id, revision, page, rect, contents, current_page).await.map_err(Into::into) }
 #[tauri::command]
-async fn create_text_highlight(service: State<'_, PdfService>, id: u64, revision: u64, page: u16, start: usize, end: usize, contents: Option<String>, current_page: u32) -> Result<DocumentInfo, String> { service.create_text_highlight(id, revision, page, start, end, contents, current_page).await }
+async fn create_text_highlight(service: State<'_, PdfService>, id: u64, revision: u64, page: u16, start: usize, end: usize, contents: Option<String>, current_page: u32) -> Result<DocumentInfo, recovery_commands::MutationCommandError> { service.create_text_highlight(id, revision, page, start, end, contents, current_page).await.map_err(Into::into) }
 #[tauri::command]
-async fn update_highlight(service: State<'_, PdfService>, id: u64, revision: u64, annotation_id: String, contents: Option<String>, current_page: u32) -> Result<DocumentInfo, String> { service.update_highlight(id, revision, annotation_id, contents, current_page).await }
+async fn update_highlight(service: State<'_, PdfService>, id: u64, revision: u64, annotation_id: String, contents: Option<String>, current_page: u32) -> Result<DocumentInfo, recovery_commands::MutationCommandError> { service.update_highlight(id, revision, annotation_id, contents, current_page).await.map_err(Into::into) }
 #[tauri::command]
-async fn delete_highlight(service: State<'_, PdfService>, id: u64, revision: u64, annotation_id: String, current_page: u32) -> Result<DocumentInfo, String> { service.delete_highlight(id, revision, annotation_id, current_page).await }
+async fn delete_highlight(service: State<'_, PdfService>, id: u64, revision: u64, annotation_id: String, current_page: u32) -> Result<DocumentInfo, recovery_commands::MutationCommandError> { service.delete_highlight(id, revision, annotation_id, current_page).await.map_err(Into::into) }
 #[tauri::command]
-async fn create_comment(service: State<'_, PdfService>, id: u64, revision: u64, page: u16, rect: service::CropRect, contents: String, current_page: u32) -> Result<DocumentInfo, String> { service.create_comment(id, revision, page, rect, contents, current_page).await }
+async fn create_comment(service: State<'_, PdfService>, id: u64, revision: u64, page: u16, rect: service::CropRect, contents: String, current_page: u32) -> Result<DocumentInfo, recovery_commands::MutationCommandError> { service.create_comment(id, revision, page, rect, contents, current_page).await.map_err(Into::into) }
 #[tauri::command]
-async fn update_comment(service: State<'_, PdfService>, id: u64, revision: u64, note_id: String, contents: String, current_page: u32) -> Result<DocumentInfo, String> { service.update_comment(id, revision, note_id, contents, current_page).await }
+async fn update_comment(service: State<'_, PdfService>, id: u64, revision: u64, note_id: String, contents: String, current_page: u32) -> Result<DocumentInfo, recovery_commands::MutationCommandError> { service.update_comment(id, revision, note_id, contents, current_page).await.map_err(Into::into) }
 #[tauri::command]
-async fn delete_comment(service: State<'_, PdfService>, id: u64, revision: u64, note_id: String, current_page: u32) -> Result<DocumentInfo, String> { service.delete_comment(id, revision, note_id, current_page).await }
+async fn delete_comment(service: State<'_, PdfService>, id: u64, revision: u64, note_id: String, current_page: u32) -> Result<DocumentInfo, recovery_commands::MutationCommandError> { service.delete_comment(id, revision, note_id, current_page).await.map_err(Into::into) }
 
 #[tauri::command]
 async fn dependency_notices(app: tauri::AppHandle) -> Result<String, String> {
@@ -162,20 +162,20 @@ async fn dependency_notices(app: tauri::AppHandle) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn edit_pages(service: State<'_, PdfService>, id: u64, edit: editor::PageEdit, current_page: u32) -> Result<DocumentInfo, String> {
-    service.edit(id, edit, current_page).await
+async fn edit_pages(service: State<'_, PdfService>, id: u64, edit: editor::PageEdit, current_page: u32) -> Result<DocumentInfo, recovery_commands::MutationCommandError> {
+    service.edit(id, edit, current_page).await.map_err(Into::into)
 }
 #[tauri::command]
-async fn crop_page(service: State<'_, PdfService>, id: u64, page: u16, revision: u64, rect: service::CropRect, current_page: u32) -> Result<DocumentInfo, String> {
-    service.crop(id, page, revision, rect, current_page).await
+async fn crop_page(service: State<'_, PdfService>, id: u64, page: u16, revision: u64, rect: service::CropRect, current_page: u32) -> Result<DocumentInfo, recovery_commands::MutationCommandError> {
+    service.crop(id, page, revision, rect, current_page).await.map_err(Into::into)
 }
 #[tauri::command]
-async fn crop_pages(service: State<'_, PdfService>, id: u64, pages: Vec<u16>, revision: u64, insets: service::CropInsets, current_page: u32) -> Result<DocumentInfo, String> {
-    service.crop_pages(id, pages, revision, insets, current_page).await
+async fn crop_pages(service: State<'_, PdfService>, id: u64, pages: Vec<u16>, revision: u64, insets: service::CropInsets, current_page: u32) -> Result<DocumentInfo, recovery_commands::MutationCommandError> {
+    service.crop_pages(id, pages, revision, insets, current_page).await.map_err(Into::into)
 }
 #[tauri::command]
-async fn reset_crops(service: State<'_, PdfService>, id: u64, revision: u64, pages: Vec<u16>, current_page: u32) -> Result<DocumentInfo, String> {
-    service.reset_crops(id, pages, revision, current_page).await
+async fn reset_crops(service: State<'_, PdfService>, id: u64, revision: u64, pages: Vec<u16>, current_page: u32) -> Result<DocumentInfo, recovery_commands::MutationCommandError> {
+    service.reset_crops(id, pages, revision, current_page).await.map_err(Into::into)
 }
 #[tauri::command]
 async fn save_copy(app: tauri::AppHandle, service: State<'_, PdfService>, id: u64, pages: Option<Vec<usize>>) -> Result<Option<service::SavedCopy>, String> {
@@ -348,6 +348,6 @@ fn main() {
         app.manage(text_edit_commands::TextReplacementSelections::default());
         app.manage(recovery_commands::RecoveryCommands::default());
         Ok(())
-    }).invoke_handler(tauri::generate_handler![recovery_commands::checkpoint_recovery, recovery_commands::restore_recovery, recovery_commands::keep_recovered_edits, recovery_commands::open_original, read_update_attempt, write_update_attempt, clear_update_attempt, document_form_fields, fill_form_copy, open_document, reopen_document, open_example, render_page, export_page_image, close_document, edit_pages, crop_page, crop_pages, reset_crops, create_pdf_from_image, choose_image_pdf_sources, create_pdf_from_images, cancel_image_pdf_sources, inspect_image_replacement_target, replace_pdf_image_copy, cancel_image_replacement, inspect_text_replacement_target, replace_pdf_text_copy, cancel_text_replacement, create_comment, update_comment, delete_comment, document_comments, document_annotations, create_highlight, create_text_highlight, update_highlight, delete_highlight, save_copy, redact_document, split_document, combine_documents, insert_pages_copy, replace_pages_copy, page_text, page_text_geometry, document_bookmarks, document_page_labels, document_properties, dependency_notices, unlock_document, cancel_password_request, ocr_capability, recognize_page_ocr, create_searchable_ocr_copy, cancel_page_ocr, print_commands::print_document, print_commands::cancel_print])
+    }).invoke_handler(tauri::generate_handler![recovery_commands::checkpoint_recovery, recovery_commands::restore_recovery, recovery_commands::keep_recovered_edits, recovery_commands::open_original, recovery_commands::discard_recovery, read_update_attempt, write_update_attempt, clear_update_attempt, document_form_fields, fill_form_copy, open_document, reopen_document, open_example, render_page, export_page_image, close_document, edit_pages, crop_page, crop_pages, reset_crops, create_pdf_from_image, choose_image_pdf_sources, create_pdf_from_images, cancel_image_pdf_sources, inspect_image_replacement_target, replace_pdf_image_copy, cancel_image_replacement, inspect_text_replacement_target, replace_pdf_text_copy, cancel_text_replacement, create_comment, update_comment, delete_comment, document_comments, document_annotations, create_highlight, create_text_highlight, update_highlight, delete_highlight, save_copy, redact_document, split_document, combine_documents, insert_pages_copy, replace_pages_copy, page_text, page_text_geometry, document_bookmarks, document_page_labels, document_properties, dependency_notices, unlock_document, cancel_password_request, ocr_capability, recognize_page_ocr, create_searchable_ocr_copy, cancel_page_ocr, print_commands::print_document, print_commands::cancel_print])
       .run(tauri::generate_context!()).expect("Desktop application failed");
 }

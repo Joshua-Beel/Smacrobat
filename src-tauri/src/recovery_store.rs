@@ -10,6 +10,8 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 use tempfile::Builder;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use windows::{
     core::PCWSTR,
     Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH},
@@ -20,6 +22,11 @@ const MAX_RETAINED_TEMPS: usize = 4;
 const REPARSE_POINT: u32 = 0x400;
 const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 static WRITER: OnceLock<Mutex<()>> = OnceLock::new();
+#[cfg(test)]
+static FAIL_AFTER_PUBLISH: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn fail_next_verification_after_publish() { FAIL_AFTER_PUBLISH.store(true, Ordering::Release); }
 
 fn writer() -> &'static Mutex<()> {
     WRITER.get_or_init(|| Mutex::new(()))
@@ -121,7 +128,18 @@ fn publish(source: &Path, destination: &Path, replace: bool) -> Result<(), Strin
         .map_err(|_| "Recovery record could not be published.".into())
 }
 
+pub(crate) struct RecoveryWriteError { pub message: String, pub published: bool }
+
+pub(crate) fn write_recovery_detailed(root: &Path, record: &RecoveryRecord) -> Result<PathBuf, RecoveryWriteError> {
+    let mut published = false;
+    write_recovery_inner(root, record, &mut published).map_err(|message| RecoveryWriteError { message, published })
+}
+
 pub fn write_recovery(root: &Path, record: &RecoveryRecord) -> Result<PathBuf, String> {
+    write_recovery_detailed(root, record).map_err(|error| error.message)
+}
+
+fn write_recovery_inner(root: &Path, record: &RecoveryRecord, published: &mut bool) -> Result<PathBuf, String> {
     let _guard = writer()
         .lock()
         .map_err(|_| "Recovery writer is unavailable.")?;
@@ -153,9 +171,8 @@ pub fn write_recovery(root: &Path, record: &RecoveryRecord) -> Result<PathBuf, S
     temp.sync_all()
         .map_err(|_| "Recovery record could not be synchronized.")?;
     drop(temp);
-    publish(&temp_path, &destination, replacing)?;
     let verified = decode_recovery(
-        &read_bounded(&destination)?,
+        &read_bounded(&temp_path)?,
         record.source,
         None,
         record.revision,
@@ -163,6 +180,12 @@ pub fn write_recovery(root: &Path, record: &RecoveryRecord) -> Result<PathBuf, S
     if &verified != record {
         return Err("Recovery record verification failed.".into());
     }
+    publish(&temp_path, &destination, replacing)?;
+    *published = true;
+    #[cfg(test)]
+    if FAIL_AFTER_PUBLISH.swap(false, Ordering::AcqRel) { return Err("Injected recovery verification failure.".into()); }
+    let verified = decode_recovery(&read_bounded(&destination)?, record.source, None, record.revision)?;
+    if &verified != record { return Err("Recovery record verification failed.".into()); }
     Ok(destination)
 }
 
