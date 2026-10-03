@@ -73,7 +73,7 @@ pub fn pixels_per_meter(dpi: u16) -> Result<u32, String> {
     }
 }
 
-fn bgra_to_rgb(dimensions: RasterDimensions, bgra: &[u8], format: PageImageFormat) -> Result<Vec<u8>, String> {
+pub(crate) fn bgra_to_rgb(dimensions: RasterDimensions, bgra: &[u8], format: PageImageFormat) -> Result<Vec<u8>, String> {
     if bgra.len() != dimensions.bgra_bytes { return Err(format!("Unexpected {} export bitmap layout.", format.label())); }
     let mut rgb = Vec::with_capacity(dimensions.rgb_bytes);
     for pixel in bgra.chunks_exact(4) {

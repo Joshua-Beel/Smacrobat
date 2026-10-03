@@ -1,11 +1,13 @@
 use crate::sanitization::{build_clean_raster_pdf, CleanRasterPage};
+use serde::Deserialize;
 
 const MAX_PAGES: usize = 4_096;
 const MAX_PAGE_PIXELS: u64 = 32_000_000;
 const MAX_TOTAL_PIXELS: u64 = 32_000_000;
 const MAX_RECTS: usize = 4_096;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RasterRedactionRect {
     pub x: f32,
     pub y: f32,
@@ -119,6 +121,30 @@ pub fn redact_raster_pages(
         rectangles: total_rectangles,
         covered_pixels,
     })
+}
+
+pub fn validate_displayed_rectangles(
+    page_width: f32,
+    page_height: f32,
+    image_width: u32,
+    image_height: u32,
+    rectangles: &[RasterRedactionRect],
+) -> Result<(), String> {
+    if rectangles.is_empty() || rectangles.len() > 256 {
+        return Err("Choose 1 to 256 redaction rectangles on one page.".into());
+    }
+    let page = RasterRedactionPage {
+        page_width,
+        page_height,
+        image_width,
+        image_height,
+        rgb: Vec::new(),
+        rectangles: Vec::new(),
+    };
+    for rect in rectangles {
+        map_rect(&page, *rect, "The selected page")?;
+    }
+    Ok(())
 }
 
 fn validate_page(page: &RasterRedactionPage, label: &str) -> Result<(), String> {

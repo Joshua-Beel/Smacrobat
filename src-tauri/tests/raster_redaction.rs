@@ -4,7 +4,7 @@ mod raster_redaction;
 mod sanitization;
 
 use lopdf::Document;
-use raster_redaction::{redact_raster_pages, RasterRedactionPage, RasterRedactionRect};
+use raster_redaction::{redact_raster_pages, validate_displayed_rectangles, RasterRedactionPage, RasterRedactionRect};
 use sanitization::{build_clean_raster_pdf, verify_clean_raster_pdf, CleanRasterPage};
 
 fn page(rectangles: Vec<RasterRedactionRect>) -> RasterRedactionPage {
@@ -112,6 +112,7 @@ fn redaction_conservatively_blacks_only_mapped_pixels_and_counts_union() {
 
 #[test]
 fn invalid_rectangles_and_unredacted_requests_fail_without_output() {
+    assert!(validate_displayed_rectangles(4.0, 4.0, 4, 4, &[]).is_err());
     assert!(redact_raster_pages(vec![page(vec![])])
         .unwrap_err()
         .contains("at least one"));

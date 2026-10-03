@@ -28,6 +28,8 @@ impl DocumentInfo {
 pub struct SavedCopy { path: String, document: DocumentInfo }
 #[derive(Debug)]
 pub struct PageImagePreflight { pub suggested_name: String }
+#[derive(Debug)]
+pub struct RasterRedactionPreflight { pub suggested_name: String }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PageImageReceipt { path: String, document_id: u64, revision: u64, page: u16, dpi: u16, width: u32, height: u32, format: PageImageFormat }
@@ -118,6 +120,8 @@ enum Request {
     EndPrint(u64, Reply<()>),
     PreflightPageImage(u64, u64, u16, u16, PageImageFormat, Reply<PageImagePreflight>),
     ExportPageImage(u64, u64, u16, u16, PageImageFormat, PathBuf, Reply<PageImageReceipt>),
+    PreflightRasterRedaction(u64, u64, u16, Vec<crate::raster_redaction::RasterRedactionRect>, Reply<RasterRedactionPreflight>),
+    RasterRedact(u64, u64, u16, Vec<crate::raster_redaction::RasterRedactionRect>, PathBuf, Reply<ReplyLease<SavedCopy>>),
     #[cfg(windows)]
     OcrRaster(crate::ocr::OcrPageRequest, crate::ocr_process::OcrCancellation, crate::ocr_process::OcrWorkerHold, Reply<crate::ocr::OcrPageRaster>),
     #[cfg(windows)]
@@ -352,6 +356,74 @@ impl PdfService {
                             Ok(PageImageReceipt { path: path.to_string_lossy().into_owned(), document_id: id, revision, page, dpi, width: dimensions.width, height: dimensions.height, format })
                         })();
                         let _ = reply.send(result);
+                    }
+                    Request::PreflightRasterRedaction(id, revision, page, rectangles, reply) => {
+                        if reply.is_closed() { continue; }
+                        let result = (|| {
+                            let (session, info) = sessions.get(&id).ok_or("Document is closed")?;
+                            let document = documents.get(&id).ok_or("Document is closed")?;
+                            let _ = checked_raster_redaction_request(session, document, revision, page, &rectangles)?;
+                            let source_path = PathBuf::from(&info.path);
+                            let stem = source_path.file_stem().filter(|stem| !stem.is_empty()).unwrap_or_default().to_string_lossy().into_owned();
+                            let stem = if stem.is_empty() { "document".to_owned() } else { stem };
+                            Ok(RasterRedactionPreflight { suggested_name: format!("{stem}-redacted.pdf") })
+                        })();
+                        let _ = reply.send(result);
+                    }
+                    Request::RasterRedact(id, revision, page, rectangles, path, reply) => {
+                        if reply.is_closed() { continue; }
+                        let result = (|| {
+                            let (session, _) = sessions.get(&id).ok_or("Document is closed")?;
+                            let original = documents.get(&id).ok_or("Document is closed")?;
+                            let plan = checked_raster_redaction_request(session, original, revision, page, &rectangles)?;
+                            if reply.is_closed() { return Err("Redaction was canceled.".into()); }
+                            let engine = pdfium.as_ref().map_err(Clone::clone)?;
+                            let mut redaction_note_documents = HashMap::new();
+                            let document = note_document(engine, original, session, &mut redaction_note_documents, id)?;
+                            let mut raster_pages = Vec::with_capacity(plan.pages.len());
+                            for (index, raster) in plan.pages.iter().enumerate() {
+                                if reply.is_closed() { return Err("Redaction was canceled.".into()); }
+                                let bgra = with_planned_page(&document, &raster.spec, |page| {
+                                    let bitmap = page.render_with_config(&PdfRenderConfig::new().set_fixed_size(raster.dimensions.width as i32, raster.dimensions.height as i32).set_format(PdfBitmapFormat::BGRA).set_reverse_byte_order(false).clear_before_rendering(true).set_clear_color(PdfColor::WHITE).render_annotations(true).render_form_data(true).use_print_quality(true)).map_err(|error| format!("Could not render redaction page {}: {error}", index + 1))?;
+                                    let bgra = bitmap.as_raw_bytes();
+                                    let expected = usize::try_from(u64::from(raster.dimensions.width) * u64::from(raster.dimensions.height) * 4).map_err(|_| "The redaction bitmap size is out of range.")?;
+                                    if bitmap.width() != raster.dimensions.width as i32 || bitmap.height() != raster.dimensions.height as i32 || bitmap.format().map_err(|error| format!("Could not inspect the redaction bitmap: {error}"))? != PdfBitmapFormat::BGRA || bgra.len() != expected { return Err("Unexpected redaction bitmap layout.".into()); }
+                                    Ok(bgra)
+                                })?;
+                                let rgb = crate::page_image::bgra_to_rgb(raster.dimensions, &bgra, PageImageFormat::Png)?;
+                                raster_pages.push(crate::raster_redaction::RasterRedactionPage {
+                                    page_width: raster.page_width,
+                                    page_height: raster.page_height,
+                                    image_width: raster.dimensions.width,
+                                    image_height: raster.dimensions.height,
+                                    rgb,
+                                    rectangles: if index == usize::from(page) { rectangles.clone() } else { Vec::new() },
+                                });
+                            }
+                            let prepared = crate::raster_redaction::redact_raster_pages(raster_pages)?;
+                            crate::sanitization::verify_clean_raster_pdf(&prepared.bytes, plan.pages.len())?;
+                            let check = engine.load_pdf_from_byte_vec(prepared.bytes.clone(), None).map_err(|error| format!("Redacted output validation failed: {error}"))?;
+                            if check.pages().len() as usize != plan.pages.len() { return Err("Redacted output page count validation failed.".into()); }
+                            for (index, raster) in plan.pages.iter().enumerate() {
+                                let output_page = check.pages().get(index as i32).map_err(|error| format!("Could not reopen redacted page {}: {error}", index + 1))?;
+                                let bitmap = output_page.render_with_config(&PdfRenderConfig::new().set_fixed_size(raster.dimensions.width as i32, raster.dimensions.height as i32).set_format(PdfBitmapFormat::BGRA).set_reverse_byte_order(false).clear_before_rendering(true).set_clear_color(PdfColor::WHITE)).map_err(|error| format!("Could not render reopened redacted page {}: {error}", index + 1))?;
+                                if bitmap.width() != raster.dimensions.width as i32 || bitmap.height() != raster.dimensions.height as i32 { return Err("Reopened redaction render dimensions differ from the plan.".into()); }
+                            }
+                            let parsed = lopdf::Document::load_mem(&prepared.bytes).map_err(|error| format!("Could not inspect redacted output text: {error}"))?;
+                            for page_number in 1..=plan.pages.len() as u32 {
+                                if !parsed.extract_text(&[page_number]).map_err(|error| format!("Could not inspect redacted page text: {error}"))?.is_empty() { return Err("Redacted output unexpectedly retains extractable text.".into()); }
+                            }
+                            if reply.is_closed() { return Err("Redaction was canceled.".into()); }
+                            write_new_file(&path, &prepared.bytes)?;
+                            let pages = page_sizes(&check)?;
+                            let new_id = next_id; next_id += 1;
+                            let info = DocumentInfo { id: new_id, name: path.file_name().unwrap_or_default().to_string_lossy().into_owned(), path: path.to_string_lossy().into_owned(), pages, revision: 0, dirty: false, can_undo: false, can_redo: false };
+                            sessions.insert(new_id, (EditSession::new(prepared.bytes, info.pages.len()), info.clone()));
+                            documents.insert(new_id, std::rc::Rc::new(check));
+                            Ok(SavedCopy { path: path.to_string_lossy().into_owned(), document: info })
+                        })();
+                        let result = result.map(|saved| { let cleanup = UnclaimedReply::Document(saved.document.id); ReplyLease::new(saved, cleanup, resource_cleanup.clone()) });
+                        if let Err(Ok(saved)) = reply.send(result) { documents.remove(&saved.document.id); sessions.remove(&saved.document.id); }
                     }
                     #[cfg(windows)]
                     Request::OcrRaster(request, cancellation, admission, reply) => {
@@ -933,6 +1005,12 @@ impl PdfService {
     pub async fn export_page_image(&self, id: u64, revision: u64, page: u16, dpi: u16, format: PageImageFormat, path: PathBuf) -> Result<PageImageReceipt, String> {
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::ExportPageImage(id, revision, page, dpi, format, path, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
     }
+    pub async fn preflight_raster_redaction(&self, id: u64, revision: u64, page: u16, rectangles: Vec<crate::raster_redaction::RasterRedactionRect>) -> Result<RasterRedactionPreflight, String> {
+        let (tx, rx) = oneshot::channel(); self.sender.send(Request::PreflightRasterRedaction(id, revision, page, rectangles, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
+    }
+    pub async fn raster_redact(&self, id: u64, revision: u64, page: u16, rectangles: Vec<crate::raster_redaction::RasterRedactionRect>, path: PathBuf) -> Result<SavedCopy, String> {
+        let (tx, rx) = oneshot::channel(); self.sender.send(Request::RasterRedact(id, revision, page, rectangles, path, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?.map(ReplyLease::accept)
+    }
     #[cfg(windows)]
     pub(crate) async fn ocr_raster(&self, request: crate::ocr::OcrPageRequest, cancellation: crate::ocr_process::OcrCancellation, admission: crate::ocr_process::OcrWorkerHold) -> Result<crate::ocr::OcrPageRaster, String> {
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::OcrRaster(request, cancellation, admission, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
@@ -1115,6 +1193,49 @@ fn checked_page_image_request(session: &EditSession, document: &PdfDocument<'_>,
     let spec = session.plan.get(usize::from(page)).ok_or_else(|| format!("{} export page is out of range", format.label()))?.clone();
     let dimensions = with_planned_page(document, &spec, |page| crate::page_image::dimensions(page.width().value, page.height().value, dpi, format))?;
     Ok((dimensions, spec))
+}
+
+struct RasterRedactionPagePlan {
+    spec: PageSpec,
+    dimensions: crate::page_image::RasterDimensions,
+    page_width: f32,
+    page_height: f32,
+}
+
+struct RasterRedactionPlan {
+    pages: Vec<RasterRedactionPagePlan>,
+}
+
+fn checked_raster_redaction_request(
+    session: &EditSession,
+    document: &PdfDocument<'_>,
+    revision: u64,
+    selected_page: u16,
+    rectangles: &[crate::raster_redaction::RasterRedactionRect],
+) -> Result<RasterRedactionPlan, String> {
+    if session.revision != revision { return Err("Document changed. Start redaction again.".into()); }
+    if !matches!(document.permissions().security_handler_revision(), Ok(PdfSecurityHandlerRevision::Unprotected)) {
+        return Err("Redaction of encrypted or restricted PDFs is not supported in this build.".into());
+    }
+    session.page_image_export_guard()?;
+    if session.plan.is_empty() || session.plan.len() > 4_096 { return Err("Raster redaction supports 1 to 4,096 current pages.".into()); }
+    if usize::from(selected_page) >= session.plan.len() { return Err("Redaction page is out of range.".into()); }
+    let mut pages = Vec::with_capacity(session.plan.len());
+    let mut total_pixels = 0u64;
+    for spec in &session.plan {
+        let (dimensions, page_width, page_height) = with_planned_page(document, spec, |page| {
+            let page_width = page.width().value;
+            let page_height = page.height().value;
+            let dimensions = crate::page_image::dimensions(page_width, page_height, 150, PageImageFormat::Png)?;
+            Ok((dimensions, page_width, page_height))
+        })?;
+        total_pixels = total_pixels.checked_add(u64::from(dimensions.width) * u64::from(dimensions.height)).ok_or("The redaction pixel count is out of range.")?;
+        if total_pixels > 32_000_000 { return Err("The redacted copy exceeds the 32 megapixel aggregate limit at 150 DPI.".into()); }
+        pages.push(RasterRedactionPagePlan { spec: spec.clone(), dimensions, page_width, page_height });
+    }
+    let selected = &pages[usize::from(selected_page)];
+    crate::raster_redaction::validate_displayed_rectangles(selected.page_width, selected.page_height, selected.dimensions.width, selected.dimensions.height, rectangles)?;
+    Ok(RasterRedactionPlan { pages })
 }
 
 #[cfg(windows)]
@@ -1315,7 +1436,7 @@ mod tests {
     macro_rules! accepted_reply_values {
         ($($value:ty),* $(,)?) => { $(impl TestReplyValue for $value { type Accepted = Self; fn accept(self) -> Self { self } })* };
     }
-    accepted_reply_values!((), Vec<u8>, Vec<u64>, Vec<Option<String>>, String, DocumentInfo, SavedCopy, OpenResult, PrintSnapshotInfo, PrintBitmap, PageImagePreflight, PageImageReceipt, BookmarkList, RenderWork, BookmarkWork, OcrWork, OcrWorkerState, crate::ocr::OcrPageRaster, crate::page_labels::DocumentPageLabels, crate::document_properties::DocumentProperties, crate::text_geometry::PageTextGeometry, crate::split::SplitOutput, crate::comments::CommentList, crate::comments::AnnotationList, crate::forms::FormFields);
+    accepted_reply_values!((), Vec<u8>, Vec<u64>, Vec<Option<String>>, String, DocumentInfo, SavedCopy, OpenResult, PrintSnapshotInfo, PrintBitmap, PageImagePreflight, RasterRedactionPreflight, PageImageReceipt, BookmarkList, RenderWork, BookmarkWork, OcrWork, OcrWorkerState, crate::ocr::OcrPageRaster, crate::page_labels::DocumentPageLabels, crate::document_properties::DocumentProperties, crate::text_geometry::PageTextGeometry, crate::split::SplitOutput, crate::comments::CommentList, crate::comments::AnnotationList, crate::forms::FormFields);
     fn call<T: TestReplyValue>(service: &PdfService, request: impl FnOnce(Reply<T>) -> Request) -> Result<T::Accepted, String> {
         let (tx, rx) = oneshot::channel(); service.sender.send(request(tx)).unwrap(); rx.blocking_recv().unwrap().map(TestReplyValue::accept)
     }
@@ -4030,6 +4151,109 @@ mod tests {
             next.finish(Ok(())).unwrap();
         }
         call(&service, |reply| Request::Close(info.id, reply)).unwrap();
+    }
+
+    #[test]
+    fn raster_redaction_renders_all_pages_removes_selected_pixels_and_preserves_source() {
+        let _print_guard = print_test_lock();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let source_path = root.join("resources/welcome.pdf");
+        let source_bytes = std::fs::read(&source_path).unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        let service = PdfService::start(root.join("resources/pdfium/bin/pdfium.dll"));
+        let info = call(&service, |reply| Request::Open(source_path.clone(), reply)).unwrap();
+        let rectangles = vec![crate::raster_redaction::RasterRedactionRect { x: 0.0, y: 0.0, width: 72.0, height: 72.0 }];
+        let preflight = call(&service, |reply| Request::PreflightRasterRedaction(info.id, info.revision, 0, rectangles.clone(), reply)).unwrap();
+        assert_eq!(preflight.suggested_name, "welcome-redacted.pdf");
+        assert!(call(&service, |reply| Request::PreflightRasterRedaction(info.id, info.revision + 1, 0, rectangles.clone(), reply)).unwrap_err().contains("changed"));
+        assert!(call(&service, |reply| Request::PreflightRasterRedaction(info.id, info.revision, 6, rectangles.clone(), reply)).is_err());
+        assert!(call(&service, |reply| Request::PreflightRasterRedaction(info.id, info.revision, 0, Vec::new(), reply)).is_err());
+
+        let output = folder.path().join("redacted.pdf");
+        let saved = call(&service, |reply| Request::RasterRedact(info.id, info.revision, 0, rectangles.clone(), output.clone(), reply)).unwrap();
+        assert_eq!(saved.document.pages.len(), info.pages.len());
+        assert_eq!(PathBuf::from(&saved.path), output);
+        let output_bytes = std::fs::read(&output).unwrap();
+        crate::sanitization::verify_clean_raster_pdf(&output_bytes, info.pages.len()).unwrap();
+        let parsed = lopdf::Document::load_mem(&output_bytes).unwrap();
+        for page_number in 1..=info.pages.len() as u32 { assert_eq!(parsed.extract_text(&[page_number]).unwrap(), ""); }
+
+        let page_ids = parsed.get_pages();
+        let image_rgb = |page_number: u32| {
+            let page = parsed.get_dictionary(page_ids[&page_number]).unwrap();
+            let image_id = page.get(b"Resources").unwrap().as_dict().unwrap().get(b"XObject").unwrap().as_dict().unwrap().get(b"Image").unwrap().as_reference().unwrap();
+            let image = parsed.get_object(image_id).unwrap().as_stream().unwrap();
+            let width = image.dict.get(b"Width").unwrap().as_i64().unwrap() as u32;
+            let height = image.dict.get(b"Height").unwrap().as_i64().unwrap() as u32;
+            (width, height, image.decompressed_content().unwrap())
+        };
+        let (width, height, first_rgb) = image_rgb(1);
+        let source_rgb = |physical_page: u16, path: PathBuf| {
+            let receipt = call(&service, |reply| Request::ExportPageImage(info.id, info.revision, physical_page, 150, PageImageFormat::Png, path.clone(), reply)).unwrap();
+            let decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(path).unwrap()));
+            let mut reader = decoder.read_info().unwrap();
+            let mut rgb = vec![0; reader.output_buffer_size().unwrap()];
+            let frame = reader.next_frame(&mut rgb).unwrap();
+            rgb.truncate(frame.buffer_size());
+            (receipt.width, receipt.height, rgb)
+        };
+        let (first_width, first_height, first_source_rgb) = source_rgb(0, folder.path().join("redaction-source-page-1.png"));
+        assert_eq!((first_width, first_height), (width, height));
+        let black_width = (72.0f64 * f64::from(width) / f64::from(info.pages[0].width)).ceil() as usize;
+        let black_height = (72.0f64 * f64::from(height) / f64::from(info.pages[0].height)).ceil() as usize;
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let offset = (y * width as usize + x) * 3;
+                if x < black_width && y < black_height { assert_eq!(&first_rgb[offset..offset + 3], &[0, 0, 0]); }
+                else { assert_eq!(&first_rgb[offset..offset + 3], &first_source_rgb[offset..offset + 3]); }
+            }
+        }
+        let (second_width, second_height, second_rgb) = image_rgb(2);
+        let (source_width, source_height, second_source_rgb) = source_rgb(1, folder.path().join("redaction-source-page-2.png"));
+        assert_eq!((source_width, source_height), (second_width, second_height));
+        assert_eq!(second_rgb, second_source_rgb, "unselected pages must retain their complete rendered pixels");
+        assert_eq!(std::fs::read(source_path).unwrap(), source_bytes);
+        let existing = output_bytes.clone();
+        assert!(call(&service, |reply| Request::RasterRedact(info.id, info.revision, 0, rectangles, output.clone(), reply)).is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), existing);
+        call(&service, |reply| Request::Close(saved.document.id, reply)).unwrap();
+        call(&service, |reply| Request::Close(info.id, reply)).unwrap();
+    }
+
+    #[test]
+    fn raster_redaction_preflight_refuses_protected_and_aggregate_oversize_sources() {
+        use lopdf::dictionary;
+        let _print_guard = print_test_lock();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let folder = tempfile::tempdir().unwrap();
+        let service = PdfService::start(root.join("resources/pdfium/bin/pdfium.dll"));
+        let rectangles = vec![crate::raster_redaction::RasterRedactionRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 }];
+        let large = call(&service, |reply| Request::Open(root.join("../test-corpus/synthetic-scan-98.pdf"), reply)).unwrap();
+        assert!(call(&service, |reply| Request::PreflightRasterRedaction(large.id, 0, 0, rectangles.clone(), reply)).unwrap_err().contains("aggregate"));
+        call(&service, |reply| Request::Close(large.id, reply)).unwrap();
+        for kind in ["certified", "signature"] {
+            let mut pdf = lopdf::Document::load(root.join("resources/welcome.pdf")).unwrap();
+            if kind == "certified" { pdf.catalog_mut().unwrap().set("Perms", dictionary! {}); }
+            else { pdf.add_object(dictionary! { "Type" => "Sig" }); }
+            let path = folder.path().join(format!("redaction-{kind}.pdf")); pdf.save(&path).unwrap();
+            let protected = call(&service, |reply| Request::Open(path, reply)).unwrap();
+            assert!(call(&service, |reply| Request::PreflightRasterRedaction(protected.id, 0, 0, rectangles.clone(), reply)).unwrap_err().contains("Signed or certified"));
+            call(&service, |reply| Request::Close(protected.id, reply)).unwrap();
+        }
+        for (kind, user_password, permissions) in [("encrypted", "reader", lopdf::Permissions::all()), ("restricted", "", lopdf::Permissions::empty())] {
+            let mut pdf = lopdf::Document::load(root.join("resources/welcome.pdf")).unwrap();
+            pdf.trailer.set("ID", vec![lopdf::Object::string_literal(format!("redaction-{kind}")), lopdf::Object::string_literal(format!("redaction-{kind}"))]);
+            let encryption = lopdf::EncryptionVersion::V2 { document: &pdf, owner_password: "owner", user_password, key_length: 128, permissions };
+            pdf.encrypt(&lopdf::EncryptionState::try_from(encryption).unwrap()).unwrap();
+            let path = folder.path().join(format!("redaction-{kind}.pdf")); pdf.save(&path).unwrap();
+            let opened = call(&service, |reply| Request::BeginOpen(path, reply)).unwrap();
+            let protected = match opened {
+                OpenResult::Opened { document } => document,
+                OpenResult::PasswordRequired { request_id, .. } => match call(&service, |reply| Request::Unlock(request_id, user_password.to_owned(), reply)).unwrap() { OpenResult::Opened { document } => document, _ => panic!("{kind} did not unlock") },
+            };
+            assert!(call(&service, |reply| Request::PreflightRasterRedaction(protected.id, 0, 0, rectangles.clone(), reply)).unwrap_err().contains("encrypted or restricted"));
+            call(&service, |reply| Request::Close(protected.id, reply)).unwrap();
+        }
     }
 
     #[test]
