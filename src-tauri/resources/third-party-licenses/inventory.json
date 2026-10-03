@@ -4,7 +4,7 @@
   "coverage": "Conservative resolved Cargo Windows graph, including build/auxiliary packages, plus non-development npm lock entries. Runtime-candidate is not proof of linked code. PDFium notices are packaged separately. Five exact MPL-2.0 crate source archives are packaged with verified locations and hashes; this collection does not determine the app license or complete release licensing review.",
   "inputHashes": {
     "src-tauri/Cargo.lock": "a8597d8de93062f5d192a2fdac14f8dc76a19baddcb0c29787c31cab3bfb6c3a",
-    "src-tauri/Cargo.toml": "dd8bb5fabe94334d0ecfe26544a22772f8e8aa07db978cbcf29f6ef6c9597372",
+    "src-tauri/Cargo.toml": "5d48fb317d4fac6944fd513300de6dba8c305fa55a5ad8865d34d08761fd9558",
     "package-lock.json": "a1f1fbe3a2da3dc5ba90e7c44e41ad345e43f126a5f06e6e52fb408b0dfbdcde",
     "package.json": "cd977b6ef4c878781c31668f6c3e4209b559130e044e5285d67f9d2f5b93c320",
     "scripts/notice-supplements/manifest.json": "f0700cbb9d20d43f42d709852e7961194d22937a41bf1fad5063e27f5fae2121",
@@ -275,7 +275,7 @@
       "version": "0.10.4",
       "license": "MIT OR Apache-2.0",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "scope": "build-or-auxiliary",
+      "scope": "runtime-candidate",
       "notices": [
         {
           "path": "LICENSE-APACHE",
@@ -701,7 +701,7 @@
       "version": "0.2.17",
       "license": "MIT OR Apache-2.0",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "scope": "build-or-auxiliary",
+      "scope": "runtime-candidate",
       "notices": [
         {
           "path": "LICENSE-APACHE",
@@ -831,7 +831,7 @@
       "version": "0.1.7",
       "license": "MIT OR Apache-2.0",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "scope": "build-or-auxiliary",
+      "scope": "runtime-candidate",
       "notices": [
         {
           "path": "LICENSE-APACHE",
@@ -1099,7 +1099,7 @@
       "version": "0.10.7",
       "license": "MIT OR Apache-2.0",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "scope": "build-or-auxiliary",
+      "scope": "runtime-candidate",
       "notices": [
         {
           "path": "LICENSE-APACHE",
@@ -1689,7 +1689,7 @@
       "version": "0.14.7",
       "license": "MIT",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "scope": "build-or-auxiliary",
+      "scope": "runtime-candidate",
       "notices": [
         {
           "path": "LICENSE",
@@ -4004,7 +4004,7 @@
       "version": "0.10.9",
       "license": "MIT OR Apache-2.0",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "scope": "build-or-auxiliary",
+      "scope": "runtime-candidate",
       "notices": [
         {
           "path": "LICENSE-APACHE",

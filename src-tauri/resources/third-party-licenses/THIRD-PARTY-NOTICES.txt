@@ -2732,7 +2732,7 @@ DEALINGS IN THE SOFTWARE.
 ==============================================================================
 cargo: block-buffer 0.10.4
 Declared license: MIT OR Apache-2.0
-Scope: build-or-auxiliary
+Scope: runtime-candidate
 Source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE (SHA-256 a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5) ---
@@ -7078,7 +7078,7 @@ DEALINGS IN THE SOFTWARE.
 ==============================================================================
 cargo: cpufeatures 0.2.17
 Declared license: MIT OR Apache-2.0
-Scope: build-or-auxiliary
+Scope: runtime-candidate
 Source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE (SHA-256 a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5) ---
@@ -9345,7 +9345,7 @@ DEALINGS IN THE SOFTWARE.
 ==============================================================================
 cargo: crypto-common 0.1.7
 Declared license: MIT OR Apache-2.0
-Scope: build-or-auxiliary
+Scope: runtime-candidate
 Source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE (SHA-256 a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5) ---
@@ -12129,7 +12129,7 @@ SOFTWARE.
 ==============================================================================
 cargo: digest 0.10.7
 Declared license: MIT OR Apache-2.0
-Scope: build-or-auxiliary
+Scope: runtime-candidate
 Source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE (SHA-256 a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5) ---
@@ -19275,7 +19275,7 @@ DEALINGS IN THE SOFTWARE.
 ==============================================================================
 cargo: generic-array 0.14.7
 Declared license: MIT
-Scope: build-or-auxiliary
+Scope: runtime-candidate
 Source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE (SHA-256 c09aae9d3c77b531f56351a9947bc7446511d6b025b3255312d3e3442a9a7583) ---
@@ -41960,7 +41960,7 @@ DEALINGS IN THE SOFTWARE.
 ==============================================================================
 cargo: sha2 0.10.9
 Declared license: MIT OR Apache-2.0
-Scope: build-or-auxiliary
+Scope: runtime-candidate
 Source: registry+https://github.com/rust-lang/crates.io-index
 
 --- LICENSE-APACHE (SHA-256 a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5) ---
