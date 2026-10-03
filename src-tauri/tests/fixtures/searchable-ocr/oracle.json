@@ -1,0 +1,216 @@
+{
+  "schemaVersion": 1,
+  "scope": "Deterministic synthetic ASCII raster geometry only; no OCR accuracy or real-scan claim.",
+  "fixtures": [
+    {
+      "name": "single-line",
+      "dpi": 150,
+      "width": 640,
+      "height": 180,
+      "rawRgbBytes": 345600,
+      "rawRgbSha256": "8C8FB42982716682C8E4C2BD0529C5C6CA9AA0170898C62DFFD663344593CDD0",
+      "pngBytes": 345873,
+      "pngSha256": "C69FCF449FB6F5D988A0A7A49856765A7AE52CF0719C27D38B7AE572139B019E",
+      "text": "ALPHA 123",
+      "tsv": "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n1\t1\t0\t0\t0\t0\t0\t0\t640\t180\t-1\t\n2\t1\t1\t0\t0\t0\t56\t54\t490\t70\t-1\t\n3\t1\t1\t1\t0\t0\t56\t54\t490\t70\t-1\t\n4\t1\t1\t1\t1\t0\t56\t54\t490\t70\t-1\t\n5\t1\t1\t1\t1\t1\t56\t54\t290\t70\t95\tALPHA\n5\t1\t1\t1\t1\t2\t376\t54\t170\t70\t95\t123\n",
+      "tsvBytes": 265,
+      "tsvSha256": "EACD44EE46D1A01B8E6DE320EF8AB6E40FB4C1E005642CBD585BEFFF2B797FCF",
+      "pointScale": {
+        "numerator": 12,
+        "denominator": 25
+      },
+      "words": [
+        {
+          "text": "ALPHA",
+          "pixels": {
+            "x": 56,
+            "y": 54,
+            "width": 290,
+            "height": 70
+          },
+          "pointNumerators": {
+            "x": 672,
+            "y": 648,
+            "width": 3480,
+            "height": 840
+          }
+        },
+        {
+          "text": "123",
+          "pixels": {
+            "x": 376,
+            "y": 54,
+            "width": 170,
+            "height": 70
+          },
+          "pointNumerators": {
+            "x": 4512,
+            "y": 648,
+            "width": 2040,
+            "height": 840
+          }
+        }
+      ]
+    },
+    {
+      "name": "two-column",
+      "dpi": 150,
+      "width": 720,
+      "height": 300,
+      "rawRgbBytes": 648000,
+      "rawRgbSha256": "D276B8A6482054D339AF5B83CAEBAF2E02402611EA207D770C147885838868A5",
+      "pngBytes": 648413,
+      "pngSha256": "260EB37736AE5053C337E8E670AD765E3106922AB83655A570D962F98FCBB8A7",
+      "text": "LEFT RIGHT BOTTOM TOP",
+      "tsv": "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n1\t1\t0\t0\t0\t0\t0\t0\t720\t300\t-1\t\n2\t1\t1\t0\t0\t0\t48\t45\t551\t49\t-1\t\n3\t1\t1\t1\t0\t0\t48\t45\t551\t49\t-1\t\n4\t1\t1\t1\t1\t0\t48\t45\t551\t49\t-1\t\n5\t1\t1\t1\t1\t1\t48\t45\t161\t49\t95\tLEFT\n5\t1\t1\t1\t1\t2\t396\t45\t203\t49\t95\tRIGHT\n2\t1\t2\t0\t0\t0\t48\t178\t492\t42\t-1\t\n3\t1\t2\t1\t0\t0\t48\t178\t492\t42\t-1\t\n4\t1\t2\t1\t1\t0\t48\t178\t492\t42\t-1\t\n5\t1\t2\t1\t1\t1\t48\t178\t210\t42\t95\tBOTTOM\n5\t1\t2\t1\t1\t2\t438\t178\t102\t42\t95\tTOP\n",
+      "tsvBytes": 426,
+      "tsvSha256": "43EA5115958A1B7A001ADCDA8177ECE8C228166263FEAC7A651BD84795831C06",
+      "pointScale": {
+        "numerator": 12,
+        "denominator": 25
+      },
+      "words": [
+        {
+          "text": "LEFT",
+          "pixels": {
+            "x": 48,
+            "y": 45,
+            "width": 161,
+            "height": 49
+          },
+          "pointNumerators": {
+            "x": 576,
+            "y": 540,
+            "width": 1932,
+            "height": 588
+          }
+        },
+        {
+          "text": "RIGHT",
+          "pixels": {
+            "x": 396,
+            "y": 45,
+            "width": 203,
+            "height": 49
+          },
+          "pointNumerators": {
+            "x": 4752,
+            "y": 540,
+            "width": 2436,
+            "height": 588
+          }
+        },
+        {
+          "text": "BOTTOM",
+          "pixels": {
+            "x": 48,
+            "y": 178,
+            "width": 210,
+            "height": 42
+          },
+          "pointNumerators": {
+            "x": 576,
+            "y": 2136,
+            "width": 2520,
+            "height": 504
+          }
+        },
+        {
+          "text": "TOP",
+          "pixels": {
+            "x": 438,
+            "y": 178,
+            "width": 102,
+            "height": 42
+          },
+          "pointNumerators": {
+            "x": 5256,
+            "y": 2136,
+            "width": 1224,
+            "height": 504
+          }
+        }
+      ]
+    },
+    {
+      "name": "mixed-lines",
+      "dpi": 150,
+      "width": 660,
+      "height": 300,
+      "rawRgbBytes": 594000,
+      "rawRgbSha256": "BF5A825B1D6DA9DE9B002ACC5831C2E3BCAA4F4F5874E4D48F56D0C51504C1BE",
+      "pngBytes": 594413,
+      "pngSha256": "64F34A2F8984D8487783CCACA6C055F7821AAA32446F5CD48B5A8E1F12429677",
+      "text": "ONE TWO ALPHA 90",
+      "tsv": "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n1\t1\t0\t0\t0\t0\t0\t0\t660\t300\t-1\t\n2\t1\t1\t0\t0\t0\t54\t38\t504\t84\t-1\t\n3\t1\t1\t1\t0\t0\t54\t38\t504\t84\t-1\t\n4\t1\t1\t1\t1\t0\t54\t38\t504\t84\t-1\t\n5\t1\t1\t1\t1\t1\t54\t38\t204\t84\t95\tONE\n5\t1\t1\t1\t1\t2\t354\t38\t204\t84\t95\tTWO\n2\t1\t2\t0\t0\t0\t80\t194\t456\t42\t-1\t\n3\t1\t2\t1\t0\t0\t80\t194\t456\t42\t-1\t\n4\t1\t2\t1\t1\t0\t80\t194\t456\t42\t-1\t\n5\t1\t2\t1\t1\t1\t80\t194\t174\t42\t95\tALPHA\n5\t1\t2\t1\t1\t2\t470\t194\t66\t42\t95\t90\n",
+      "tsvBytes": 420,
+      "tsvSha256": "FF760100EEDB46B8C2FA00D7CDB47995C2C173856E96C76519327AE1A5669393",
+      "pointScale": {
+        "numerator": 12,
+        "denominator": 25
+      },
+      "words": [
+        {
+          "text": "ONE",
+          "pixels": {
+            "x": 54,
+            "y": 38,
+            "width": 204,
+            "height": 84
+          },
+          "pointNumerators": {
+            "x": 648,
+            "y": 456,
+            "width": 2448,
+            "height": 1008
+          }
+        },
+        {
+          "text": "TWO",
+          "pixels": {
+            "x": 354,
+            "y": 38,
+            "width": 204,
+            "height": 84
+          },
+          "pointNumerators": {
+            "x": 4248,
+            "y": 456,
+            "width": 2448,
+            "height": 1008
+          }
+        },
+        {
+          "text": "ALPHA",
+          "pixels": {
+            "x": 80,
+            "y": 194,
+            "width": 174,
+            "height": 42
+          },
+          "pointNumerators": {
+            "x": 960,
+            "y": 2328,
+            "width": 2088,
+            "height": 504
+          }
+        },
+        {
+          "text": "90",
+          "pixels": {
+            "x": 470,
+            "y": 194,
+            "width": 66,
+            "height": 42
+          },
+          "pointNumerators": {
+            "x": 5640,
+            "y": 2328,
+            "width": 792,
+            "height": 504
+          }
+        }
+      ]
+    }
+  ]
+}
