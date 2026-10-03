@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { Undo2, Redo2 } from 'lucide-react';
 import { ArrowDownToLine, ArrowUpRight, Bookmark, ChevronDown, ChevronLeft, ChevronRight, ChevronsUpDown, CircleHelp, Combine, File, FileCheck2, FileImage, FileOutput, FilePenLine, FilePlus2, Files, FolderOpen, Hand, Highlighter, Home, LayoutGrid, List, Maximize, Menu, MessageSquare, Minimize2, Minus, MoreHorizontal, MousePointer2, PanelLeftClose, Pencil, Plus, Printer, RotateCw, Save, ScanLine, Search, ShieldCheck, Signature, SlidersHorizontal, Star, Sun, Type, X, ZoomIn, ZoomOut, type LucideIcon } from 'lucide-react';
-import { closeDocument, cancelPasswordRequest, native, openDocument, reopenDocument, editPages, saveCopy, splitDocument, cropPages, resetCrops, combineDocuments, insertPagesCopy, replacePagesCopy, documentFormFields, fillFormCopy, documentAnnotations, documentPageLabels, createPdfFromImage, exportPageImage, redactDocument, createComment, updateComment, deleteComment, createHighlight, createTextHighlight, updateHighlight, deleteHighlight, createSearchableOcrCopy, cancelPageOcr, ocrCapability as getOcrCapability, type Annotation, type CommentRect, type CropInsets, type CreatePdfOptions, type DocumentAnnotations, type DocumentFormFields, type FormPatch, type OcrCapability, type OpenResult, type PageImageExport, type PageImageExportRequest, type RasterRedactionRect, type SplitOutput, type SavedCopy } from './bridge';
+import { closeDocument, cancelPasswordRequest, native, openDocument, reopenDocument, editPages, saveCopy, splitDocument, cropPages, resetCrops, combineDocuments, insertPagesCopy, replacePagesCopy, documentFormFields, fillFormCopy, documentAnnotations, documentPageLabels, createPdfFromImage, chooseImagePdfSources, createPdfFromImages, cancelImagePdfSources, inspectImageReplacementTarget, replacePdfImageCopy, cancelImageReplacement, exportPageImage, redactDocument, createComment, updateComment, deleteComment, createHighlight, createTextHighlight, updateHighlight, deleteHighlight, createSearchableOcrCopy, cancelPageOcr, ocrCapability as getOcrCapability, type Annotation, type CommentRect, type CropInsets, type CreatePdfOptions, type DocumentAnnotations, type DocumentFormFields, type FormPatch, type ImageReplacementTarget, type OcrCapability, type OpenResult, type PageImageExport, type PageImageExportRequest, type RasterRedactionRect, type SplitOutput, type SavedCopy } from './bridge';
 import { clampPage, toolGroups, type DocumentInfo, type PageEdit } from './model';
 import { pageLabelDescription, pageLabelFor, validatePageLabels, type DocumentPageLabels } from './pageLabels';
 import Viewer from './Viewer';
@@ -24,6 +24,8 @@ import InsertPagesDialog from './InsertPagesDialog';
 import ReplacePagesDialog from './ReplacePagesDialog';
 import FillFormsDialog from './FillFormsDialog';
 import CreatePdfDialog from './CreatePdfDialog';
+import MultiImagePdfDialog from './MultiImagePdfDialog';
+import ImageReplacementDialog from './ImageReplacementDialog';
 import ExportPageImageDialog, { type PageImageTarget } from './ExportPageImageDialog';
 import PageList from './PageList';
 import CommentsPanel from './CommentsPanel';
@@ -96,6 +98,8 @@ export default function App() {
   const [organizing, setOrganizing] = useState(false);
   const [combineOpen, setCombineOpen] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
+  const [multiImageOpen, setMultiImageOpen] = useState(false);
+  const [imageReplacementTarget,setImageReplacementTarget]=useState<ImageReplacementTarget|null>(null);
   const [insertOpen, setInsertOpen] = useState(false);
   const [replaceOpen, setReplaceOpen] = useState(false);
   const [formsOpen, setFormsOpen] = useState(false);
@@ -137,7 +141,7 @@ export default function App() {
   const latest = useRef({ documents, busy, active, dialogOpen: false });
   latest.current = {
     documents, busy, active,
-    dialogOpen: updatesOpen || pageTextOpen || pageOcrTarget !== null || searchableOcrTarget !== null || printOpen || propertiesOpen || noticesOpen || passwordRequest !== null || pendingClose !== null || createOpen || pageImageTarget !== null || combineOpen || insertOpen || replaceOpen || formsOpen || commentEditor !== null,
+    dialogOpen: updatesOpen || pageTextOpen || pageOcrTarget !== null || searchableOcrTarget !== null || multiImageOpen || imageReplacementTarget !== null || printOpen || propertiesOpen || noticesOpen || passwordRequest !== null || pendingClose !== null || createOpen || pageImageTarget !== null || combineOpen || insertOpen || replaceOpen || formsOpen || commentEditor !== null,
   };
   useEffect(() => {
     if (!native) return;
@@ -195,7 +199,7 @@ export default function App() {
   }, [doc?.id, doc?.revision, doc?.pages.length, pageLabelsRequest]);
   const pageLabels = pageLabelsLoad.request === pageLabelsRequest ? pageLabelsLoad.labels : null;
   const activate = (id: number) => {
-    if (busy || redactionDraft || searchableOcrTarget || closingDocument.current !== null) return;
+    if (busy || redactionDraft || searchableOcrTarget || multiImageOpen || imageReplacementTarget || closingDocument.current !== null) return;
     const document = documents.find(item => item.id === id);
     if (!document) return;
     if (pageOcrTarget && pageOcrTarget.id !== id) setPageOcrTarget(null);
@@ -217,14 +221,14 @@ export default function App() {
     else if (result?.status === 'password_required') { passwordBlocking.current = true; setPasswordRequest({ challenge: result, organize }); }
   };
   const open = useCallback(async (example = false, organize = false) => {
-    if (busy || searchableOcrTarget || closingDocument.current !== null) return;
+    if (busy || searchableOcrTarget || multiImageOpen || imageReplacementTarget || closingDocument.current !== null) return;
     setBusy(true); setError(''); setMenu(false);
     try {
       acceptOpen(await openDocument(example), organize);
     } catch (e) { setError(String(e)); } finally { setBusy(false); }
-  }, [busy, searchableOcrTarget]);
+  }, [busy, searchableOcrTarget, multiImageOpen, imageReplacementTarget]);
   const reopen = async (path: string) => {
-    if (busy || searchableOcrTarget || closingDocument.current !== null) return;
+    if (busy || searchableOcrTarget || multiImageOpen || imageReplacementTarget || closingDocument.current !== null) return;
     const existing = documents.find(document => document.path === path);
     if (existing) { activate(existing.id); return; }
     setBusy(true); setError('');
@@ -234,7 +238,7 @@ export default function App() {
     finally { if (mounted.current) setBusy(false); }
   };
   const close = async (id: number, discard = false) => {
-    if (busy || redactionDraft || searchableOcrTarget || closingDocument.current !== null) return;
+    if (busy || redactionDraft || searchableOcrTarget || multiImageOpen || imageReplacementTarget || closingDocument.current !== null) return;
     if (!discard && documents.find(document => document.id === id)?.dirty) { setPendingClose(id); return; }
     if (pageOcrTarget?.id === id) setPageOcrTarget(null);
     closingDocument.current = id; setBusy(true); setError('');
@@ -249,13 +253,13 @@ export default function App() {
     const next = clampPage(page, info.pages.length); readingPages.current.set(info.id, next); setPage(next); setTarget(value => ({ page: next, token: value.token + 1 }));
   };
   const edit = async (action: PageEdit): Promise<boolean> => {
-    if (!doc || busy || searchableOcrTarget || closingDocument.current !== null) return false;
+    if (!doc || busy || searchableOcrTarget || multiImageOpen || imageReplacementTarget || closingDocument.current !== null) return false;
     setBusy(true); setError(''); setNotice('');
     try { updateDocument(await editPages(doc.id, action)); return true; }
     catch (e) { setError(String(e)); return false; } finally { setBusy(false); }
   };
   const save = async (pages?: number[]) => {
-    if (!doc || busy || searchableOcrTarget || closingDocument.current !== null) return;
+    if (!doc || busy || searchableOcrTarget || multiImageOpen || imageReplacementTarget || closingDocument.current !== null) return;
     setBusy(true); setError(''); setNotice('');
     try {
       const result = await saveCopy(doc.id, pages);
@@ -344,44 +348,46 @@ export default function App() {
   const beginTextHighlight = () => {
     const selection = pointerTextHighlightSelection.current || retainedTextHighlightSelection.current;
     pointerTextHighlightSelection.current = null;
-    if (!doc || busy || hand || commentMode || highlightMode || annotations?.status !== 'supported' || !selection || selection.id !== doc.id || selection.revision !== doc.revision || selection.page < 0 || selection.page >= doc.pages.length || !Number.isSafeInteger(selection.start) || !Number.isSafeInteger(selection.end) || selection.start < 0 || selection.end <= selection.start) return;
+    if (!doc || busy || multiImageOpen || imageReplacementTarget || hand || commentMode || highlightMode || annotations?.status !== 'supported' || !selection || selection.id !== doc.id || selection.revision !== doc.revision || selection.page < 0 || selection.page >= doc.pages.length || !Number.isSafeInteger(selection.start) || !Number.isSafeInteger(selection.end) || selection.start < 0 || selection.end <= selection.start) return;
     retainedTextHighlightSelection.current = null;
     setTextHighlightSelection(null);
     setCommentsOpen(true);
     setCommentEditor({ kind: 'create-text-highlight', page: selection.page, start: selection.start, end: selection.end });
   };
   const beginComment = (commentPage: number, rect: CommentRect) => {
-    if (!doc || busy || annotations?.status !== 'supported') return;
+    if (!doc || busy || multiImageOpen || imageReplacementTarget || annotations?.status !== 'supported') return;
     setHighlightMode(false); setCommentsOpen(true); setCommentEditor({ kind: 'create', type: 'note', page: commentPage, rect });
   };
   const beginHighlight = (highlightPage: number, rect: CommentRect) => {
-    if (!doc || busy || annotations?.status !== 'supported') return;
+    if (!doc || busy || multiImageOpen || imageReplacementTarget || annotations?.status !== 'supported') return;
     setCommentMode(false); setCommentsOpen(true); setCommentEditor({ kind: 'create', type: 'area-highlight', page: highlightPage, rect });
   };
   const selectAnnotation = (annotation: Annotation) => {
-    if (!doc || busy) return;
+    if (!doc || busy || multiImageOpen || imageReplacementTarget) return;
     go(annotation.page); setCommentsOpen(true); setCommentEditor({ kind: 'edit', annotation });
   };
   const addCommentOnCurrentPage = () => {
-    if (!doc || busy || annotations?.status !== 'supported') return;
+    if (!doc || busy || multiImageOpen || imageReplacementTarget || annotations?.status !== 'supported') return;
     setHand(false); setHighlightMode(false); setCommentMode(true); setCommentsOpen(false);
   };
   const addHighlightOnCurrentPage = () => {
-    if (!doc || busy || annotations?.status !== 'supported') return;
+    if (!doc || busy || multiImageOpen || imageReplacementTarget || annotations?.status !== 'supported') return;
     setHand(false); setCommentMode(false); setHighlightMode(true); setCommentsOpen(false);
   };
   const launchComments = () => {
-    if (!doc || busy || redactionDraft || closingDocument.current !== null) return;
+    if (!doc || busy || redactionDraft || multiImageOpen || imageReplacementTarget || closingDocument.current !== null) return;
     closeSearch(); setBookmarksOpen(false); setOrganizing(false); setView('document'); setCommentsOpen(true);
   };
   const launchCommentMode = () => {
+    if (multiImageOpen || imageReplacementTarget) return;
     launchComments(); setRedactionDraft(null); setHand(false); setHighlightMode(false); setCommentMode(true);
   };
   const launchHighlightMode = () => {
+    if (multiImageOpen || imageReplacementTarget) return;
     launchComments(); setRedactionDraft(null); setHand(false); setCommentMode(false); setHighlightMode(true);
   };
   const launchRedaction = () => {
-    if (!doc || busy || searchableOcrTarget || closingDocument.current !== null) return;
+    if (!doc || busy || searchableOcrTarget || multiImageOpen || imageReplacementTarget || closingDocument.current !== null) return;
     const currentPage = clampPage(page, doc.pages.length);
     retainedTextHighlightSelection.current=null; pointerTextHighlightSelection.current=null; setTextHighlightSelection(null);
     setMenu(false); setOrganizing(false); setView('document'); closeSearch(); setBookmarksOpen(false); setCommentsOpen(false); setCommentEditor(null); setCommentMode(false); setHighlightMode(false); setHand(false);
@@ -471,6 +477,12 @@ export default function App() {
       return result;
     } finally { setBusy(false); }
   };
+  const createMultiImagePdf = async ({ selectionId, sourceIds, options }: { selectionId: string; sourceIds: string[]; options: CreatePdfOptions }): Promise<SavedCopy | null> => {
+    if (busy || closingDocument.current !== null) throw new Error('The workspace is not ready to create a PDF.');
+    setBusy(true); setError(''); setNotice('');
+    try { const result = await createPdfFromImages(selectionId, sourceIds, options); if (result) opened(result.document, false); return result; }
+    finally { setBusy(false); }
+  };
   const exportCurrentPageImage = async (request: PageImageExportRequest): Promise<PageImageExport | null> => {
     if (busy || closingDocument.current !== null) throw new Error('The workspace is not ready to export an image.');
     const source = documents.find(document => document.id === request.id);
@@ -479,25 +491,28 @@ export default function App() {
     try { return await exportPageImage(request); }
     finally { setBusy(false); }
   };
-  const launchCreate = () => { if (busy || redactionDraft || searchableOcrTarget || closingDocument.current !== null) return; setMenu(false); setCreateOpen(true); };
+  const launchCreate = () => { if (busy || redactionDraft || searchableOcrTarget || multiImageOpen || imageReplacementTarget || closingDocument.current !== null) return; setMenu(false); setCreateOpen(true); };
+  const launchMultiImageCreate = () => { if (busy || redactionDraft || searchableOcrTarget || multiImageOpen || imageReplacementTarget || closingDocument.current !== null) return; setMenu(false); setMultiImageOpen(true); };
+  const launchImageReplacement=async()=>{if(!doc||busy||redactionDraft||searchableOcrTarget||multiImageOpen||imageReplacementTarget||closingDocument.current!==null)return;const captured={id:doc.id,revision:doc.revision,page:clampPage(page,doc.pages.length)};setMenu(false);setBusy(true);setError('');try{const target=await inspectImageReplacementTarget(captured.id,captured.revision,captured.page);if(target.documentId!==captured.id||target.revision!==captured.revision||target.page!==captured.page)throw new Error('Image replacement inspection returned the wrong document revision.');setImageReplacementTarget(target);}catch(reason){setError(reason instanceof Error?reason.message:String(reason));}finally{setBusy(false);}};
+  const applyImageReplacement=async(target:ImageReplacementTarget):Promise<SavedCopy|null>=>{const source=documents.find(document=>document.id===target.documentId);if(!source||source.revision!==target.revision||busy||closingDocument.current!==null)throw new Error('This document changed. Inspect the image again.');setBusy(true);setError('');setNotice('');try{return await replacePdfImageCopy(target.selectionId,target.documentId,target.revision);}finally{setBusy(false);}};
   const launchPageImageExport = () => {
-    if (!doc || busy || redactionDraft || searchableOcrTarget || closingDocument.current !== null) return;
+    if (!doc || busy || redactionDraft || searchableOcrTarget || multiImageOpen || imageReplacementTarget || closingDocument.current !== null) return;
     const currentPage = clampPage(page, doc.pages.length), size = doc.pages[clampPage(page, doc.pages.length)];
     if (!size) return;
     setMenu(false); setPageImageTarget({ id: doc.id, revision: doc.revision, page: currentPage, size });
   };
-  const launchOrganizer = () => { if (busy || redactionDraft || searchableOcrTarget || closingDocument.current !== null) return; if (doc) { setOrganizing(true); setView('document'); } else void open(false, true); };
+  const launchOrganizer = () => { if (busy || redactionDraft || searchableOcrTarget || multiImageOpen || imageReplacementTarget || closingDocument.current !== null) return; if (doc) { setOrganizing(true); setView('document'); } else void open(false, true); };
   const launchCombine = () => {
-    if (busy || redactionDraft || searchableOcrTarget || closingDocument.current !== null) return;
+    if (busy || redactionDraft || searchableOcrTarget || multiImageOpen || imageReplacementTarget || closingDocument.current !== null) return;
     if (documents.length < 2) { setNotice('Open two PDFs to combine them.'); return; }
     setMenu(false); setOrganizing(false); setView('document'); setCombineOpen(true);
   };
   const launchForms = () => {
-    if (!doc || busy || redactionDraft || searchableOcrTarget || closingDocument.current !== null) return;
+    if (!doc || busy || redactionDraft || searchableOcrTarget || multiImageOpen || imageReplacementTarget || closingDocument.current !== null) return;
     setMenu(false); setOrganizing(false); closeSearch(); setBookmarksOpen(false); setFormsOpen(true);
   };
   const launchPageOcr = () => {
-    if (!doc || busy || redactionDraft || searchableOcrTarget || closingDocument.current !== null || !ocr.available) return;
+    if (!doc || busy || redactionDraft || searchableOcrTarget || multiImageOpen || imageReplacementTarget || closingDocument.current !== null || !ocr.available) return;
     const currentPage = clampPage(page, doc.pages.length);
     setMenu(false); setOrganizing(false); closeSearch(); setBookmarksOpen(false);
     setPageOcrTarget({ id: doc.id, revision: doc.revision, page: currentPage, name: doc.name });
@@ -505,7 +520,7 @@ export default function App() {
   const searchableCapability = { searchablePdfAvailable: ocr.searchablePdfAvailable, searchablePdfReason: ocr.searchablePdfReason, searchablePdfDpi: ocr.searchablePdfDpi, searchablePdfMaxPages: ocr.searchablePdfMaxPages, searchablePdfMaxPixels: ocr.searchablePdfMaxPixels, searchablePdfMaxWords: ocr.searchablePdfMaxWords, searchablePdfMaxTextBytes: ocr.searchablePdfMaxTextBytes, searchablePdfCharacters: ocr.searchablePdfCharacters };
   const searchableCapabilityError = validateSearchableOcrCapability(searchableCapability);
   const launchSearchableOcr = () => {
-    if (!doc || busy || redactionDraft || pageOcrTarget || closingDocument.current !== null || searchableCapabilityError || doc.pages.length > ocr.searchablePdfMaxPages) return;
+    if (!doc || busy || redactionDraft || pageOcrTarget || multiImageOpen || imageReplacementTarget || closingDocument.current !== null || searchableCapabilityError || doc.pages.length > ocr.searchablePdfMaxPages) return;
     setMenu(false); setOrganizing(false); closeSearch(); setBookmarksOpen(false);
     setSearchableOcrTarget({ documentId: doc.id, revision: doc.revision });
   };
@@ -517,12 +532,12 @@ export default function App() {
     finally { setBusy(false); }
   };
   const launchInsert = () => {
-    if (busy || closingDocument.current !== null) return;
+    if (busy || multiImageOpen || imageReplacementTarget || closingDocument.current !== null) return;
     if (documents.length < 2) { setNotice('Open two PDFs to insert pages into a new copy.'); return; }
     setMenu(false); setInsertOpen(true);
   };
   const launchReplace = (selected: number[]) => {
-    if (busy || closingDocument.current !== null) return;
+    if (busy || multiImageOpen || imageReplacementTarget || closingDocument.current !== null) return;
     if (documents.length < 2) { setNotice('Open two PDFs to replace pages in a new copy.'); return; }
     if (!selected.length || selected.some((pageNumber, index) => pageNumber !== selected[0] + index)) { setNotice('Select one contiguous target page range to replace.'); return; }
     setReplaceRange({ start: selected[0], count: selected.length }); setMenu(false); setReplaceOpen(true);
@@ -536,7 +551,7 @@ export default function App() {
   };
   useEffect(() => {
     const listener = (event: KeyboardEvent) => {
-      if (updatesOpen || pageTextOpen || pageOcrTarget || searchableOcrTarget || printOpen || propertiesOpen || noticesOpen || passwordRequest || pendingClose !== null || createOpen || pageImageTarget || combineOpen || insertOpen || replaceOpen || commentEditor) return;
+      if (updatesOpen || pageTextOpen || pageOcrTarget || searchableOcrTarget || multiImageOpen || imageReplacementTarget || printOpen || propertiesOpen || noticesOpen || passwordRequest || pendingClose !== null || createOpen || pageImageTarget || combineOpen || insertOpen || replaceOpen || commentEditor) return;
       if ((event.target as HTMLElement | null)?.closest?.('dialog')) return;
       if (redactionDraft && event.ctrlKey) { event.preventDefault(); return; }
       if (event.ctrlKey && event.key.toLowerCase() === 'o') { event.preventDefault(); void open(); }
@@ -576,29 +591,31 @@ export default function App() {
     const combine = name === 'Combine files';
     const comment = name === 'Comment';
     const forms = name === 'Fill forms';
-    const disabled = busy || !!redactionDraft || !available || (combine && documents.length < 2) || ((comment || forms || imageExport || redaction || pageOcr) && !doc);
+    const disabled = busy || !!redactionDraft || multiImageOpen || !!imageReplacementTarget || !available || (combine && documents.length < 2) || ((comment || forms || imageExport || redaction || pageOcr) && !doc);
     return <button key={name} className={s.toolRow} disabled={disabled} onClick={create ? launchCreate : imageExport ? launchPageImageExport : pageOcr ? launchPageOcr : combine ? launchCombine : comment ? launchCommentMode : forms ? launchForms : redaction ? launchRedaction : launchOrganizer} title={combine && documents.length < 2 ? 'Open two PDFs to combine them' : (comment || forms || imageExport || redaction || pageOcr) && !doc ? 'Open a PDF first' : imageExport ? 'Export the current page as image' : redaction ? 'Permanently blank marked areas in a rasterized copy' : pageOcr ? (ocr.available ? 'Recognize text on the current page in English' : ocr.reason || 'OCR is unavailable in this build.') : forms ? 'Fill existing fields' : available ? name : `${name} — planned, not implemented yet`}><span className={s.toolIcon} style={{ color: ['#7361b3', '#277bb4', '#239576', '#bc6b25'][index % 4] }}><Icon size={21} strokeWidth={1.7} /></span><span>{imageExport ? 'Export page as image' : name}</span></button>;
   };
   return <div className={`${s.app} ${dark ? s.dark : ''}`}>
     <header className={s.tabbar}>
       <div className={s.appMark}><Files size={21} /></div>
       <button className={s.menuButton} onClick={() => setMenu(v => !v)} aria-expanded={menu}><Menu size={17} /> Menu</button>
-      <button className={`${s.homeTab} ${view === 'home' ? s.selectedTab : ''}`} aria-label="Home" disabled={!!redactionDraft} onClick={() => setView('home')}><Home size={19} /></button>
-      <div className={s.documentTabs}>{documents.map(document => <div key={document.id} className={`${s.documentTab} ${view === 'document' && active === document.id ? s.selectedTab : ''}`}><button disabled={busy || !!redactionDraft} onClick={() => activate(document.id)}><File size={15} /><span>{document.name}{document.dirty ? ' *' : ''}</span></button><IconButton icon={X} label={`Close ${document.name}`} disabled={busy || !!redactionDraft} onClick={() => void close(document.id)} /></div>)}</div>
-      <button className={s.createButton} disabled={busy || !!redactionDraft} onClick={launchCreate} title="Create a PDF from an image"><Plus size={17} /> Create</button>
+      <button className={`${s.homeTab} ${view === 'home' ? s.selectedTab : ''}`} aria-label="Home" disabled={!!redactionDraft || multiImageOpen || !!imageReplacementTarget} onClick={() => { if (!multiImageOpen && !imageReplacementTarget) setView('home'); }}><Home size={19} /></button>
+      <div className={s.documentTabs}>{documents.map(document => <div key={document.id} className={`${s.documentTab} ${view === 'document' && active === document.id ? s.selectedTab : ''}`}><button disabled={busy || !!redactionDraft || multiImageOpen || !!imageReplacementTarget} onClick={() => activate(document.id)}><File size={15} /><span>{document.name}{document.dirty ? ' *' : ''}</span></button><IconButton icon={X} label={`Close ${document.name}`} disabled={busy || !!redactionDraft || multiImageOpen || !!imageReplacementTarget} onClick={() => void close(document.id)} /></div>)}</div>
+      <button className={s.createButton} disabled={busy || !!redactionDraft || multiImageOpen || !!imageReplacementTarget} onClick={launchCreate} title="Create a PDF from an image"><Plus size={17} /> Create</button>
       <span className={s.windowTitle}>PDF Workstation</span>
     </header>
     {menu && <div className={s.menuPopover}>
-      <button disabled={!!redactionDraft} onClick={() => void open()}>Open… <kbd>Ctrl+O</kbd></button><button disabled={!!redactionDraft} onClick={() => void open(true)}>Open sample PDF</button>
-      <button disabled={!doc || busy || !!redactionDraft || !!searchableOcrTarget} onClick={() => { setMenu(false); void save(); }}>Save a copy… <kbd>Ctrl+S</kbd></button>
-      <button disabled={!doc || busy || !!redactionDraft} onClick={launchPageImageExport}>Export page as image…</button>
-      <button disabled={!doc || busy || !!redactionDraft || !ocr.available} onClick={launchPageOcr} title={ocr.available ? 'Recognize text on the current page in English' : ocr.reason || 'OCR is unavailable in this build.'}>Recognize current page…</button>
-      <button disabled={!doc || busy || !!redactionDraft || !!searchableCapabilityError || (doc?.pages.length ?? 0) > ocr.searchablePdfMaxPages} onClick={launchSearchableOcr} title={searchableCapabilityError || ((doc?.pages.length ?? 0) > ocr.searchablePdfMaxPages ? `Searchable OCR is limited to ${ocr.searchablePdfMaxPages} pages.` : 'Create a fixed-150-DPI searchable copy in this verified opt-in build.')}>Create searchable OCR copy…</button>
-      <button disabled={!!redactionDraft} onClick={() => { setMenu(false); launchOrganizer(); }}>Organize pages</button>
-      <button disabled={!doc || busy || !!redactionDraft} onClick={() => { setMenu(false); setPropertiesOpen(true); }}>Document properties… <kbd>Ctrl+D</kbd></button><hr />
+      <button disabled={!!redactionDraft || multiImageOpen || !!imageReplacementTarget} onClick={() => void open()}>Open… <kbd>Ctrl+O</kbd></button><button disabled={!!redactionDraft || multiImageOpen || !!imageReplacementTarget} onClick={() => void open(true)}>Open sample PDF</button>
+      <button disabled={!doc || busy || !!redactionDraft || !!searchableOcrTarget || multiImageOpen || !!imageReplacementTarget} onClick={() => { setMenu(false); void save(); }}>Save a copy… <kbd>Ctrl+S</kbd></button>
+      <button disabled={!doc || busy || !!redactionDraft || multiImageOpen || !!imageReplacementTarget} onClick={launchPageImageExport}>Export page as image…</button>
+      <button disabled={busy || !!redactionDraft || !!searchableOcrTarget || multiImageOpen} onClick={launchMultiImageCreate}>Create PDF from images…</button>
+      <button disabled={!doc || busy || !!redactionDraft || !!searchableOcrTarget || multiImageOpen || !!imageReplacementTarget} onClick={() => void launchImageReplacement()}>Replace full-page image in a new copy…</button>
+      <button disabled={!doc || busy || !!redactionDraft || multiImageOpen || !!imageReplacementTarget || !ocr.available} onClick={launchPageOcr} title={ocr.available ? 'Recognize text on the current page in English' : ocr.reason || 'OCR is unavailable in this build.'}>Recognize current page…</button>
+      <button disabled={!doc || busy || !!redactionDraft || multiImageOpen || !!imageReplacementTarget || !!searchableCapabilityError || (doc?.pages.length ?? 0) > ocr.searchablePdfMaxPages} onClick={launchSearchableOcr} title={searchableCapabilityError || ((doc?.pages.length ?? 0) > ocr.searchablePdfMaxPages ? `Searchable OCR is limited to ${ocr.searchablePdfMaxPages} pages.` : 'Create a fixed-150-DPI searchable copy in this verified opt-in build.')}>Create searchable OCR copy…</button>
+      <button disabled={!!redactionDraft || multiImageOpen || !!imageReplacementTarget} onClick={() => { setMenu(false); launchOrganizer(); }}>Organize pages</button>
+      <button disabled={!doc || busy || !!redactionDraft || multiImageOpen || !!imageReplacementTarget} onClick={() => { if (!multiImageOpen && !imageReplacementTarget) { setMenu(false); setPropertiesOpen(true); } }}>Document properties… <kbd>Ctrl+D</kbd></button><hr />
       <button onClick={() => { setDark(v => !v); setMenu(false); }}>Switch to {dark ? 'light' : 'dark'} theme</button>
-      <button disabled={busy} onClick={() => { setMenu(false); setUpdatesOpen(true); }}>Check for updates…</button>
-      <button disabled={busy} onClick={() => { setMenu(false); setNoticesOpen(true); }}>Third-party notices…</button>
+      <button disabled={busy || multiImageOpen || !!imageReplacementTarget} onClick={() => { if (!multiImageOpen && !imageReplacementTarget) { setMenu(false); setUpdatesOpen(true); } }}>Check for updates…</button>
+      <button disabled={busy || multiImageOpen || !!imageReplacementTarget} onClick={() => { if (!multiImageOpen && !imageReplacementTarget) { setMenu(false); setNoticesOpen(true); } }}>Third-party notices…</button>
       <button onClick={() => { setNotice(`PDF viewing, embedded-text search, Create a PDF from a PNG or JPEG image, Combine Files, Organize Pages, and filling a strict subset of existing plain text fields are available. Rotate, reorder, delete, extract, undo/redo, and save a new copy.${ocr.available ? ' Current-page English OCR is enabled in this opt-in source build.' : ' OCR is not enabled in this build.'} Text editing and signatures are not implemented yet.`); setMenu(false); }}>About this build</button>
     </div>}
     {updatesOpen && <Updates dirty={documents.some(document => document.dirty)} busy={busy} setBusy={setBusy} close={() => setUpdatesOpen(false)} />}
@@ -610,6 +627,8 @@ export default function App() {
     {propertiesOpen && doc && <DocumentProperties key={`${doc.id}-${doc.revision}`} document={doc} close={() => setPropertiesOpen(false)} />}
     {noticesOpen && <DependencyNotices close={() => setNoticesOpen(false)} />}
     {createOpen && <CreatePdfDialog busy={busy} create={createPdf} close={() => setCreateOpen(false)} />}
+    {multiImageOpen && <MultiImagePdfDialog busy={busy} choose={chooseImagePdfSources} create={createMultiImagePdf} cancel={cancelImagePdfSources} close={() => setMultiImageOpen(false)} />}
+    {imageReplacementTarget&&<ImageReplacementDialog target={imageReplacementTarget} replace={applyImageReplacement} cancel={cancelImageReplacement} opened={copy=>opened(copy.document,false)} close={()=>setImageReplacementTarget(null)}/>}
     {pageImageTarget && <ExportPageImageDialog key={`${pageImageTarget.id}:${pageImageTarget.revision}:${pageImageTarget.page}`} target={pageImageTarget} busy={busy} exportPage={exportCurrentPageImage} close={() => setPageImageTarget(null)} />}
     {combineOpen && <CombineDialog documents={documents} activeId={active} busy={busy} combine={combine} close={() => setCombineOpen(false)} />}
     {insertOpen && <InsertPagesDialog documents={documents} activeId={active} busy={busy} insert={insert} close={() => setInsertOpen(false)} />}
@@ -621,14 +640,14 @@ export default function App() {
       : commentEditor.annotation.kind === 'note' ? mutateAnnotation(current => updateComment(current.id, current.revision, commentEditor.annotation.id, contents || '')) : mutateAnnotation(current => updateHighlight(current.id, current.revision, commentEditor.annotation.id, contents))}
       remove={commentEditor.kind === 'edit' ? () => commentEditor.annotation.kind === 'note' ? mutateAnnotation(current => deleteComment(current.id, current.revision, commentEditor.annotation.id)) : mutateAnnotation(current => deleteHighlight(current.id, current.revision, commentEditor.annotation.id)) : undefined} close={() => setCommentEditor(null)} />}
     <div className={s.globalbar}>
-      <nav className={s.primaryNav}><button className={toolsOpen && view !== 'home' ? s.selectedNav : ''} disabled={!!redactionDraft} onClick={() => view === 'document' ? setToolsOpen(v => !v) : setView('tools')}>All tools</button><button disabled>Edit</button><button disabled>Convert</button><button disabled>E-sign</button></nav>
-      <div className={s.globalActions}><IconButton icon={Search} label="Find text" disabled={!doc || busy || !!redactionDraft || !!searchableOcrTarget} active={searchOpen} onClick={() => { setView('document'); setOrganizing(false); searchOpen ? closeSearch() : setSearchOpen(true); }} /><span className={s.divider} /><IconButton icon={Undo2} label="Undo" disabled={busy || !!redactionDraft || !!searchableOcrTarget || !doc?.can_undo} onClick={() => void edit({ kind: 'undo' })} /><IconButton icon={Redo2} label="Redo" disabled={busy || !!redactionDraft || !!searchableOcrTarget || !doc?.can_redo} onClick={() => void edit({ kind: 'redo' })} /><IconButton icon={Save} label="Save a copy" disabled={busy || !!redactionDraft || !!searchableOcrTarget || !doc} onClick={() => void save()} /><IconButton icon={Printer} label="Print" disabled={busy || !!redactionDraft || !!searchableOcrTarget || !doc} onClick={() => { if (!searchableOcrTarget) setPrintOpen(true); }} /><IconButton icon={Sun} label="Toggle theme" onClick={() => setDark(v => !v)} /><IconButton icon={CircleHelp} label="Build information" onClick={() => setNotice('Organize Pages and document search are available. Other tools marked unavailable are planned for later milestones. Save a Copy writes a new file and preserves your original.')} /><button className={s.openButton} onClick={() => void open()} disabled={busy || !!redactionDraft || !!searchableOcrTarget}><FolderOpen size={16} /> {busy ? 'Working…' : 'Open a file'}</button></div>
+      <nav className={s.primaryNav}><button className={toolsOpen && view !== 'home' ? s.selectedNav : ''} disabled={!!redactionDraft || multiImageOpen || !!imageReplacementTarget} onClick={() => { if (!multiImageOpen && !imageReplacementTarget) view === 'document' ? setToolsOpen(v => !v) : setView('tools'); }}>All tools</button><button disabled>Edit</button><button disabled>Convert</button><button disabled>E-sign</button></nav>
+      <div className={s.globalActions}><IconButton icon={Search} label="Find text" disabled={!doc || busy || !!redactionDraft || !!searchableOcrTarget || multiImageOpen || !!imageReplacementTarget} active={searchOpen} onClick={() => { if (!multiImageOpen && !imageReplacementTarget) { setView('document'); setOrganizing(false); searchOpen ? closeSearch() : setSearchOpen(true); } }} /><span className={s.divider} /><IconButton icon={Undo2} label="Undo" disabled={busy || !!redactionDraft || !!searchableOcrTarget || multiImageOpen || !!imageReplacementTarget || !doc?.can_undo} onClick={() => void edit({ kind: 'undo' })} /><IconButton icon={Redo2} label="Redo" disabled={busy || !!redactionDraft || !!searchableOcrTarget || multiImageOpen || !!imageReplacementTarget || !doc?.can_redo} onClick={() => void edit({ kind: 'redo' })} /><IconButton icon={Save} label="Save a copy" disabled={busy || !!redactionDraft || !!searchableOcrTarget || multiImageOpen || !!imageReplacementTarget || !doc} onClick={() => void save()} /><IconButton icon={Printer} label="Print" disabled={busy || !!redactionDraft || !!searchableOcrTarget || multiImageOpen || !!imageReplacementTarget || !doc} onClick={() => { if (!searchableOcrTarget && !multiImageOpen && !imageReplacementTarget) setPrintOpen(true); }} /><IconButton icon={Sun} label="Toggle theme" onClick={() => setDark(v => !v)} /><IconButton icon={CircleHelp} label="Build information" onClick={() => setNotice('Organize Pages and document search are available. Other tools marked unavailable are planned for later milestones. Save a Copy writes a new file and preserves your original.')} /><button className={s.openButton} onClick={() => void open()} disabled={busy || !!redactionDraft || !!searchableOcrTarget || multiImageOpen || !!imageReplacementTarget}><FolderOpen size={16} /> {busy ? 'Working…' : 'Open a file'}</button></div>
     </div>
     {(error || notice) && <div className={`${s.banner} ${error ? s.error : ''}`} role={error ? 'alert' : 'status'}><span>{error || notice}</span><IconButton icon={X} label="Dismiss message" onClick={() => { setError(''); setNotice(''); }} /></div>}
     <main className={s.main}>
       {view === 'home' ? <>
         <aside className={s.homeSidebar}><h2>Home</h2>{['Recent', 'Starred'].map(item => <button key={item} className={section === item ? s.sidebarSelected : ''} onClick={() => setSection(item)}>{item === 'Recent' ? <Home size={18} /> : <Star size={18} />}{item}</button>)}<div className={s.sidebarCaption}>FILES</div><button onClick={() => void open()}><FolderOpen size={18} /> Your computer</button><div className={s.sidebarBottom}><ShieldCheck size={16} /><span>Local files. Yours to keep.</span></div></aside>
-        <section className={s.homeContent}><div className={s.homeHeading}><div><p className={s.eyebrow}>YOUR WORKSPACE</p><h1>Work with your PDFs.</h1></div><button className={s.outlineButton} onClick={() => setView('tools')}>See all tools <ArrowUpRight size={16} /></button></div>
+        <section className={s.homeContent}><div className={s.homeHeading}><div><p className={s.eyebrow}>YOUR WORKSPACE</p><h1>Work with your PDFs.</h1></div><button className={s.outlineButton} disabled={multiImageOpen || !!imageReplacementTarget} onClick={() => { if (!multiImageOpen && !imageReplacementTarget) setView('tools'); }}>See all tools <ArrowUpRight size={16} /></button></div>
           <div className={s.quickCards}>{['Edit a PDF', 'Export a PDF', 'Combine files', 'Fill forms'].map((name, i) => { const Icon = icons[name]; return <div className={s.quickCard} key={name}><span style={{ color: ['#7260b4', '#2c80b2', '#25876b', '#b86a25'][i] }}><Icon size={29} strokeWidth={1.5} /></span><h3>{name === 'Export a PDF' ? 'Export page as image' : name}</h3><p>{['Update text and images.', 'Save the current page as an image.', 'Bring documents together.', 'Fill supported existing text fields.'][i]}</p><span className={s.planned}>{name === 'Combine files' ? 'Available with two open PDFs' : name === 'Fill forms' || name === 'Export a PDF' ? 'Available with an open PDF' : 'Planned'}</span></div>; })}</div>
           <div className={s.recentHeader}><h2>{section}</h2><div className={s.recentControls}><button className={s.textButton} disabled={!recentFiles.length} onClick={() => setRecentFiles([])}>Clear file history</button><label className={s.search}><Search size={16} /><input aria-label="Search recent files" placeholder="Search your files" value={query} onChange={e => setQuery(e.target.value)} /></label><IconButton icon={List} label="List view" active /></div></div>
           <div className={s.tableHeading}><span>NAME</span><span>LOCATION</span><span>PAGES</span><span /></div>
@@ -637,8 +656,8 @@ export default function App() {
           <p className={s.foundationNote}>Viewer + Organize Pages · More tools are in development{!native ? ' · Browser preview' : ''}</p>
         </section>
       </> : view === 'tools' ? <section className={s.toolsCatalog}><div className={s.catalogHeading}><div><p className={s.eyebrow}>THE COMPLETE WORKSPACE</p><h1>All tools</h1><p>Create a PDF, export a page as image, Combine Files, Organize Pages, Fill forms, and raster redaction are ready. OCR is available only when enabled in an opt-in source build. Other advanced tools are planned for later milestones.</p></div><label className={s.search}><Search size={16} /><input aria-label="Search tools" placeholder="Find a tool" value={query} onChange={e => setQuery(e.target.value)} /></label></div>{toolGroups.map(group => <section key={group.name}><h2>{group.name}</h2><div className={s.catalogGrid}>{group.tools.filter(name => name.toLowerCase().includes(query.toLowerCase())).map((name, i) => <div className={s.catalogCard} key={name}>{toolRow(name, i)}<span className={s.planned}>{name === 'Create a PDF' || name === 'Export a PDF' || name === 'Organize pages' || name === 'Combine files' || name === 'Fill forms' || name === 'Redact a PDF' || name === 'Scan & OCR' && ocr.available ? 'Available' : 'Not available yet'}</span></div>)}</div></section>)}</section> : doc ? <>
-        {toolsOpen && <aside className={s.toolsPanel}><div className={s.panelHeading}><h2>All tools</h2><IconButton icon={PanelLeftClose} label="Collapse all tools" onClick={() => setToolsOpen(false)} /></div>{['Export a PDF', 'Edit a PDF', 'Create a PDF', 'Combine files', 'Organize pages', 'Comment', 'Fill forms', 'Redact a PDF', 'Scan & OCR', 'Protect a PDF', 'Compress a PDF'].map(toolRow)}<button className={s.textButton} onClick={() => setView('tools')}>View all tools <ChevronRight size={15} /></button><div className={s.panelNote}>Export page as image, Create a PDF, Combine Files, Organize Pages, Fill forms, and raster redaction are available. More tools are in development.</div></aside>}
-        {organizing ? <Organizer key={doc.id} document={doc} currentPage={page} pageLabels={pageLabels} busy={busy} edit={edit} save={save} split={split} crop={crop} resetCrop={resetCrop} insert={launchInsert} replace={launchReplace} close={() => setOrganizing(false)} /> : <div className={s.documentArea}><Viewer key={`${doc.id}-${doc.revision}`} document={doc} zoom={zoom} fit={fit} target={target} onPage={trackPage} hand={hand} search={activeSearch} annotations={annotations?.status === 'supported' ? annotations.annotations : []} commentMode={commentMode} highlightMode={highlightMode} redactionPage={redactionDraft?.page ?? null} redactions={redactionDraft?.rectangles ?? []} annotationAvailable={annotations?.status === 'supported'} annotationInteractive={commentMode && !hand && !highlightMode && !redactionDraft} onCommentCreate={beginComment} onHighlightCreate={beginHighlight} onRedactionCreate={addRedaction} onAnnotationSelect={selectAnnotation} onTextSelection={receiveTextHighlightSelection} /><div className={s.quickToolbar}><IconButton icon={MousePointer2} label="Select text on page" active={!hand && !commentMode && !highlightMode && !redactionDraft} onClick={() => { setHand(false); setCommentMode(false); setHighlightMode(false); setRedactionDraft(null); }} /><IconButton icon={Highlighter} label="Highlight selected text" disabled={busy || !!redactionDraft || !textHighlightSelection || annotations?.status !== 'supported'} onPointerDown={captureTextHighlightSelection} onClick={beginTextHighlight} /><IconButton icon={Hand} label="Pan document" active={hand} onClick={() => { setHand(true); setCommentMode(false); setHighlightMode(false); setRedactionDraft(null); }} /><IconButton icon={Type} label="Read and copy page text" disabled={!!redactionDraft} onClick={() => setPageTextOpen(true)} /><span className={s.horizontalDivider} /><IconButton icon={MessageSquare} label="Add comment" active={commentMode} disabled={busy || !!redactionDraft} onClick={launchCommentMode} /><IconButton icon={Highlighter} label="Add area highlight" active={highlightMode} disabled={busy || !!redactionDraft} onClick={launchHighlightMode} /><IconButton icon={Pencil} label="Draw" disabled /><IconButton icon={Type} label="Fill existing fields" disabled={busy || !!redactionDraft} onClick={launchForms} /><IconButton icon={Signature} label="Add signature" disabled /><span className={s.horizontalDivider} /><IconButton icon={MoreHorizontal} label="Customize quick tools" disabled /></div></div>}
+        {toolsOpen && <aside className={s.toolsPanel}><div className={s.panelHeading}><h2>All tools</h2><IconButton icon={PanelLeftClose} label="Collapse all tools" onClick={() => setToolsOpen(false)} /></div>{['Export a PDF', 'Edit a PDF', 'Create a PDF', 'Combine files', 'Organize pages', 'Comment', 'Fill forms', 'Redact a PDF', 'Scan & OCR', 'Protect a PDF', 'Compress a PDF'].map(toolRow)}<button className={s.textButton} disabled={multiImageOpen || !!imageReplacementTarget} onClick={() => { if (!multiImageOpen && !imageReplacementTarget) setView('tools'); }}>View all tools <ChevronRight size={15} /></button><div className={s.panelNote}>Export page as image, Create a PDF, Combine Files, Organize Pages, Fill forms, and raster redaction are available. More tools are in development.</div></aside>}
+        {organizing ? <Organizer key={doc.id} document={doc} currentPage={page} pageLabels={pageLabels} busy={busy} edit={edit} save={save} split={split} crop={crop} resetCrop={resetCrop} insert={launchInsert} replace={launchReplace} close={() => setOrganizing(false)} /> : <div className={s.documentArea}><Viewer key={`${doc.id}-${doc.revision}`} document={doc} zoom={zoom} fit={fit} target={target} onPage={trackPage} hand={hand} search={activeSearch} annotations={annotations?.status === 'supported' ? annotations.annotations : []} commentMode={commentMode} highlightMode={highlightMode} redactionPage={redactionDraft?.page ?? null} redactions={redactionDraft?.rectangles ?? []} annotationAvailable={annotations?.status === 'supported'} annotationInteractive={commentMode && !hand && !highlightMode && !redactionDraft} onCommentCreate={beginComment} onHighlightCreate={beginHighlight} onRedactionCreate={addRedaction} onAnnotationSelect={selectAnnotation} onTextSelection={receiveTextHighlightSelection} /><div className={s.quickToolbar}><IconButton icon={MousePointer2} label="Select text on page" disabled={multiImageOpen || !!imageReplacementTarget} active={!hand && !commentMode && !highlightMode && !redactionDraft} onClick={() => { if (multiImageOpen || imageReplacementTarget) return; setHand(false); setCommentMode(false); setHighlightMode(false); setRedactionDraft(null); }} /><IconButton icon={Highlighter} label="Highlight selected text" disabled={busy || !!redactionDraft || multiImageOpen || !!imageReplacementTarget || !textHighlightSelection || annotations?.status !== 'supported'} onPointerDown={captureTextHighlightSelection} onClick={beginTextHighlight} /><IconButton icon={Hand} label="Pan document" disabled={multiImageOpen || !!imageReplacementTarget} active={hand} onClick={() => { if (multiImageOpen || imageReplacementTarget) return; setHand(true); setCommentMode(false); setHighlightMode(false); setRedactionDraft(null); }} /><IconButton icon={Type} label="Read and copy page text" disabled={!!redactionDraft || multiImageOpen || !!imageReplacementTarget} onClick={() => { if (!multiImageOpen && !imageReplacementTarget) setPageTextOpen(true); }} /><span className={s.horizontalDivider} /><IconButton icon={MessageSquare} label="Add comment" active={commentMode} disabled={busy || !!redactionDraft || multiImageOpen || !!imageReplacementTarget} onClick={launchCommentMode} /><IconButton icon={Highlighter} label="Add area highlight" active={highlightMode} disabled={busy || !!redactionDraft || multiImageOpen || !!imageReplacementTarget} onClick={launchHighlightMode} /><IconButton icon={Pencil} label="Draw" disabled /><IconButton icon={Type} label="Fill existing fields" disabled={busy || !!redactionDraft || multiImageOpen || !!imageReplacementTarget} onClick={launchForms} /><IconButton icon={Signature} label="Add signature" disabled /><span className={s.horizontalDivider} /><IconButton icon={MoreHorizontal} label="Customize quick tools" disabled /></div></div>}
         {!organizing && redactionDraft && doc && <RedactPanel page={redactionDraft.page} rectangles={redactionDraft.rectangles} busy={busy} remove={index => setRedactionDraft(draft => draft ? { ...draft, rectangles: draft.rectangles.filter((_, current) => current !== index) } : null)} clear={() => setRedactionDraft(draft => draft ? { ...draft, rectangles: [] } : null)} apply={() => void applyRedaction()} close={() => setRedactionDraft(null)} />}
         {!organizing && commentsOpen && doc && <CommentsPanel key={`${doc.id}-${doc.revision}`} document={doc} page={page} annotations={annotations} error={annotationsLoad.request === annotationsRequest ? annotationsLoad.error : ''} selectedId={commentEditor?.kind === 'edit' ? commentEditor.annotation.id : null} onAddComment={addCommentOnCurrentPage} onAddHighlight={addHighlightOnCurrentPage} onSelect={selectAnnotation} close={() => setCommentsOpen(false)} />}
         {!organizing && bookmarksOpen && <BookmarksPanel key={`${doc.id}-${doc.revision}`} document={doc} go={go} close={() => setBookmarksOpen(false)} />}
