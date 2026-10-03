@@ -11,6 +11,8 @@ mod comments;
 mod forms;
 mod page_labels;
 mod image_pdf;
+#[cfg(windows)]
+mod image_pdf_commands;
 mod page_image;
 mod sanitization;
 mod raster_redaction;
@@ -193,6 +195,32 @@ async fn create_pdf_from_image(app: tauri::AppHandle, service: State<'_, PdfServ
     match output { Some(output) => service.create_image_pdf(source, output, options).await.map(Some), None => Ok(None) }
 }
 
+#[cfg(windows)]
+#[tauri::command]
+async fn choose_image_pdf_sources(app: tauri::AppHandle, selections: State<'_, image_pdf_commands::ImagePdfSelections>) -> Result<Option<image_pdf_commands::ImagePdfSelection>, String> {
+    let window = app.get_webview_window("main").ok_or("Application window is unavailable")?;
+    let paths = tauri::async_runtime::spawn_blocking(move || rfd::FileDialog::new().set_parent(&window).set_title("Choose PNG or JPEG images").add_filter("PNG and JPEG images", &["png", "jpg", "jpeg"]).pick_files()).await.map_err(|error| error.to_string())?;
+    paths.map(|paths| selections.reserve(paths)).transpose()
+}
+
+#[cfg(windows)]
+#[tauri::command]
+async fn create_pdf_from_images(app: tauri::AppHandle, service: State<'_, PdfService>, selections: State<'_, image_pdf_commands::ImagePdfSelections>, selection_id: String, source_ids: Vec<String>, options: image_pdf::ImagePdfOptions) -> Result<Option<service::SavedCopy>, String> {
+    let (sources, attempt) = selections.begin_attempt(&selection_id, &source_ids)?;
+    let result = async {
+        let prepared = tauri::async_runtime::spawn_blocking(move || image_pdf::prepare_many_bytes(sources, options)).await.map_err(|error| error.to_string())??;
+        let window = app.get_webview_window("main").ok_or("Application window is unavailable")?;
+        let output = tauri::async_runtime::spawn_blocking(move || rfd::FileDialog::new().set_parent(&window).set_title("Save images as a new PDF").add_filter("PDF documents", &["pdf"]).set_file_name("images.pdf").save_file()).await.map_err(|error| error.to_string())?;
+        match output { Some(output) => { image_pdf_commands::validate_output_path(&output)?; service.create_multi_image_pdf(prepared, output).await.map(Some) }, None => Ok(None) }
+    }.await;
+    if matches!(&result, Ok(Some(_))) { attempt.commit_success()?; }
+    result
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn cancel_image_pdf_sources(selections: State<'_, image_pdf_commands::ImagePdfSelections>, selection_id: String) -> Result<(), String> { selections.cancel(&selection_id) }
+
 #[tauri::command]
 async fn split_document(app: tauri::AppHandle, service: State<'_, PdfService>, id: u64, revision: u64, pages_per_file: usize) -> Result<Option<split::SplitOutput>, String> {
     let window = app.get_webview_window("main").ok_or("Application window is unavailable")?;
@@ -254,7 +282,9 @@ fn main() {
         }
         app.manage(service);
         app.manage(print_commands::PrintJobs::default());
+        #[cfg(windows)]
+        app.manage(image_pdf_commands::ImagePdfSelections::default());
         Ok(())
-    }).invoke_handler(tauri::generate_handler![read_update_attempt, write_update_attempt, clear_update_attempt, document_form_fields, fill_form_copy, open_document, reopen_document, open_example, render_page, export_page_image, close_document, edit_pages, crop_page, crop_pages, reset_crops, create_pdf_from_image, create_comment, update_comment, delete_comment, document_comments, document_annotations, create_highlight, create_text_highlight, update_highlight, delete_highlight, save_copy, redact_document, split_document, combine_documents, insert_pages_copy, replace_pages_copy, page_text, page_text_geometry, document_bookmarks, document_page_labels, document_properties, dependency_notices, unlock_document, cancel_password_request, ocr_capability, recognize_page_ocr, create_searchable_ocr_copy, cancel_page_ocr, print_commands::print_document, print_commands::cancel_print])
+    }).invoke_handler(tauri::generate_handler![read_update_attempt, write_update_attempt, clear_update_attempt, document_form_fields, fill_form_copy, open_document, reopen_document, open_example, render_page, export_page_image, close_document, edit_pages, crop_page, crop_pages, reset_crops, create_pdf_from_image, choose_image_pdf_sources, create_pdf_from_images, cancel_image_pdf_sources, create_comment, update_comment, delete_comment, document_comments, document_annotations, create_highlight, create_text_highlight, update_highlight, delete_highlight, save_copy, redact_document, split_document, combine_documents, insert_pages_copy, replace_pages_copy, page_text, page_text_geometry, document_bookmarks, document_page_labels, document_properties, dependency_notices, unlock_document, cancel_password_request, ocr_capability, recognize_page_ocr, create_searchable_ocr_copy, cancel_page_ocr, print_commands::print_document, print_commands::cancel_print])
       .run(tauri::generate_context!()).expect("Desktop application failed");
 }

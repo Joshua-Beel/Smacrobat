@@ -142,6 +142,7 @@ enum Request {
     CheckFormCopy(u64, u64, Vec<crate::forms::FieldValue>, Reply<()>),
     FillFormCopy(u64, u64, Vec<crate::forms::FieldValue>, PathBuf, Reply<ReplyLease<SavedCopy>>),
     CreateImagePdf(PathBuf, PathBuf, crate::image_pdf::ImagePdfOptions, Reply<ReplyLease<SavedCopy>>),
+    CreateMultiImagePdf(crate::image_pdf::PreparedMultiImagePdf, PathBuf, Reply<ReplyLease<SavedCopy>>),
     Close(u64, Reply<()>),
     Edit(u64, PageEdit, Reply<DocumentInfo>),
     Crop(u64, u16, u64, CropRect, Reply<DocumentInfo>),
@@ -1036,6 +1037,31 @@ impl PdfService {
                         let result = result.map(|saved| { let cleanup = UnclaimedReply::Document(saved.document.id); ReplyLease::new(saved, cleanup, resource_cleanup.clone()) });
                         if let Err(Ok(saved)) = reply.send(result) { documents.remove(&saved.document.id); sessions.remove(&saved.document.id); }
                     }
+                    Request::CreateMultiImagePdf(prepared, path, reply) => {
+                        if reply.is_closed() { continue; }
+                        let result = (|| {
+                            if path.exists() || !path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("pdf")) { return Err("Choose a new .pdf filename; Create PDF never overwrites an existing file.".into()); }
+                            let engine = pdfium.as_ref().map_err(Clone::clone)?;
+                            let document = engine.load_pdf_from_byte_vec(prepared.bytes.clone(), None).map_err(|error| format!("Output could not be opened: {error}"))?;
+                            let pages = page_sizes(&document)?;
+                            if pages.len() != prepared.pages.len() { return Err("Output page count differs from the image conversion plan.".into()); }
+                            for (index, ((width, height), page_size)) in prepared.pages.iter().zip(&pages).enumerate() {
+                                if (page_size.width - width).abs() > 0.02 || (page_size.height - height).abs() > 0.02 { return Err(format!("Output page {} dimensions differ from the image conversion plan.", index + 1)); }
+                                let page = document.pages().get(index as i32).map_err(|error| format!("Output page {} could not be read: {error}", index + 1))?;
+                                let bitmap = page.render_with_config(&PdfRenderConfig::new().set_target_width(64).set_maximum_height(64)).map_err(|error| format!("Output page {} could not be rendered: {error}", index + 1))?;
+                                if bitmap.width() <= 0 || bitmap.height() <= 0 { return Err(format!("Output page {} has an invalid bitmap.", index + 1)); }
+                            }
+                            if reply.is_closed() { return Err("Create PDF was canceled.".into()); }
+                            write_new_file(&path, &prepared.bytes)?;
+                            let id = next_id; next_id += 1;
+                            let info = DocumentInfo { id, name: path.file_name().unwrap_or_default().to_string_lossy().into_owned(), path: path.to_string_lossy().into_owned(), pages, revision: 0, dirty: false, can_undo: false, can_redo: false };
+                            sessions.insert(id, (EditSession::new(prepared.bytes, info.pages.len()), info.clone()));
+                            documents.insert(id, std::rc::Rc::new(document));
+                            Ok(SavedCopy { path: path.to_string_lossy().into_owned(), document: info })
+                        })();
+                        let result = result.map(|saved| { let cleanup = UnclaimedReply::Document(saved.document.id); ReplyLease::new(saved, cleanup, resource_cleanup.clone()) });
+                        if let Err(Ok(saved)) = reply.send(result) { documents.remove(&saved.document.id); sessions.remove(&saved.document.id); }
+                    }
                     Request::Save(id, pages, path, reply) => {
                         let result = (|| {
                             let (session, original) = sessions.get_mut(&id).ok_or("Document is closed")?;
@@ -1144,6 +1170,9 @@ impl PdfService {
     }
     pub async fn create_image_pdf(&self, source: PathBuf, path: PathBuf, options: crate::image_pdf::ImagePdfOptions) -> Result<SavedCopy, String> {
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::CreateImagePdf(source, path, options, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?.map(ReplyLease::accept)
+    }
+    pub async fn create_multi_image_pdf(&self, prepared: crate::image_pdf::PreparedMultiImagePdf, path: PathBuf) -> Result<SavedCopy, String> {
+        let (tx, rx) = oneshot::channel(); self.sender.send(Request::CreateMultiImagePdf(prepared, path, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?.map(ReplyLease::accept)
     }
     pub async fn crop_pages(&self, id: u64, pages: Vec<u16>, revision: u64, insets: CropInsets) -> Result<DocumentInfo, String> {
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::CropPages(id, pages, revision, insets, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
@@ -4385,6 +4414,34 @@ mod tests {
         assert!(call(&service, |reply| Request::PublishSearchableOcr(source.id, source.revision, expired_path.clone(), expired, reply)).err().unwrap().contains("time limit"));
         assert!(!expired_path.exists());
         for id in [source.id, saved.document.id] { call(&service, |reply| Request::Close(id, reply)).unwrap(); }
+    }
+
+    #[test]
+    fn multi_image_pdf_reopens_every_page_and_preserves_existing_session() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let service = PdfService::start(root.join("resources/pdfium/bin/pdfium.dll"));
+        let open = call(&service, |reply| Request::Open(root.join("resources/welcome.pdf"), reply)).unwrap();
+        let fixture_root = root.join("tests/fixtures/searchable-ocr");
+        let sources = ["single-line.png", "two-column.png", "mixed-lines.png"]
+            .map(|name| std::fs::read(fixture_root.join(name)).unwrap()).to_vec();
+        let options = crate::image_pdf::ImagePdfOptions {
+            page_size: crate::image_pdf::ImagePdfPageSize::A4,
+            orientation: crate::image_pdf::ImagePdfOrientation::Auto,
+            margin_points: 12.0,
+        };
+        let prepared = crate::image_pdf::prepare_many_bytes(sources.clone(), options).unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        let output = folder.path().join("images.pdf");
+        let saved = call(&service, |reply| Request::CreateMultiImagePdf(prepared, output.clone(), reply)).unwrap();
+        assert_eq!(saved.document.pages.len(), 3);
+        assert_eq!(std::fs::read(&output).unwrap(), std::fs::read(&saved.path).unwrap());
+        let rendered = call(&service, |reply| Request::Render(saved.document.id, 2, 96, reply)).unwrap();
+        assert!(!rendered.is_empty());
+        let still_open = call(&service, |reply| Request::Properties(open.id, open.revision, reply)).unwrap();
+        assert_eq!(still_open.page_count, open.pages.len());
+        let second = crate::image_pdf::prepare_many_bytes(sources, options).unwrap();
+        assert!(call(&service, |reply| Request::CreateMultiImagePdf(second, output.clone(), reply)).err().unwrap().contains("never overwrites"));
+        for id in [saved.document.id, open.id] { call(&service, |reply| Request::Close(id, reply)).unwrap(); }
     }
 
     #[test]

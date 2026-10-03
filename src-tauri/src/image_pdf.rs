@@ -1,4 +1,4 @@
-use image::{DynamicImage, GenericImageView, ImageDecoder, ImageFormat, ImageReader, Limits};
+use image::{DynamicImage, GenericImageView, ImageDecoder, ImageFormat, ImageReader, Limits, metadata::Orientation};
 use lopdf::{content::{Content, Operation}, dictionary, Document, Object, Stream};
 use serde::Deserialize;
 use std::{fs::File, io::{Cursor, Read}, path::Path};
@@ -8,6 +8,10 @@ const MAX_EDGE_PIXELS: u32 = 16_384;
 const MAX_PIXELS: u64 = 32_000_000;
 const MAX_DECODED_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
+pub const MAX_MULTI_SOURCES: usize = 32;
+pub const MAX_MULTI_SOURCE_BYTES: u64 = 256 * 1024 * 1024;
+pub const MAX_MULTI_PIXELS: u64 = 128 * 1024 * 1024;
+pub const MAX_MULTI_DECODED_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -30,6 +34,12 @@ pub struct PreparedImagePdf {
     pub bytes: Vec<u8>,
     pub page_width: f32,
     pub page_height: f32,
+}
+
+#[derive(Debug)]
+pub struct PreparedMultiImagePdf {
+    pub bytes: Vec<u8>,
+    pub pages: Vec<(f32, f32)>,
 }
 
 fn read_source(path: &Path) -> Result<Vec<u8>, String> {
@@ -126,6 +136,34 @@ fn decode(bytes: Vec<u8>) -> Result<DynamicImage, String> {
     Ok(image)
 }
 
+fn inspect(bytes: &[u8]) -> Result<(u64, u64), String> {
+    let mut reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format().map_err(|error| format!("Could not identify the source image: {error}"))?;
+    let format = reader.format().ok_or("Only PNG and JPEG images are supported.")?;
+    match format {
+        ImageFormat::Png => png_is_single(bytes)?,
+        ImageFormat::Jpeg => jpeg_is_single(bytes)?,
+        _ => return Err("Only PNG and JPEG images are supported.".into()),
+    }
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_EDGE_PIXELS);
+    limits.max_image_height = Some(MAX_EDGE_PIXELS);
+    limits.max_alloc = Some(MAX_DECODED_BYTES);
+    reader.limits(limits);
+    let mut decoder = reader.into_decoder().map_err(|error| format!("Could not read the image header: {error}"))?;
+    let (width, height) = decoder.dimensions();
+    if width == 0 || height == 0 { return Err("The source image has invalid zero dimensions.".into()); }
+    let pixels = u64::from(width).checked_mul(u64::from(height)).ok_or("The source image dimensions are out of range.")?;
+    if pixels > MAX_PIXELS { return Err("The source image exceeds the 32 megapixel decoded-image limit.".into()); }
+    let orientation = decoder.orientation().map_err(|error| format!("Could not read JPEG orientation metadata: {error}"))?;
+    let (_oriented_width, _oriented_height) = match orientation {
+        Orientation::Rotate90 | Orientation::Rotate270 | Orientation::Rotate90FlipH | Orientation::Rotate270FlipH => (height, width),
+        _ => (width, height),
+    };
+    let decoded = decoder.total_bytes().max(pixels.checked_mul(4).ok_or("The decoded image size is out of range.")?);
+    if decoder.total_bytes() > MAX_DECODED_BYTES { return Err("The source image exceeds the 128 MiB decoded-image limit.".into()); }
+    Ok((pixels, decoded))
+}
+
 fn composite_on_white(image: DynamicImage) -> Result<(u32, u32, Vec<u8>), String> {
     let (width, height) = image.dimensions();
     let pixels = u64::from(width).checked_mul(u64::from(height)).ok_or("The oriented image dimensions are out of range.")?;
@@ -153,39 +191,44 @@ fn page_dimensions(options: ImagePdfOptions, image_width: u32, image_height: u32
     Ok((width, height, options.margin_points))
 }
 
-fn assemble(image: DynamicImage, options: ImagePdfOptions) -> Result<PreparedImagePdf, String> {
-    let (image_width, image_height, rgb) = composite_on_white(image)?;
-    let (page_width, page_height, margin) = page_dimensions(options, image_width, image_height)?;
-    let available_width = page_width - 2.0 * margin;
-    let available_height = page_height - 2.0 * margin;
-    let scale = (available_width / image_width as f32).min(available_height / image_height as f32);
-    let placed_width = image_width as f32 * scale;
-    let placed_height = image_height as f32 * scale;
-    let x = (page_width - placed_width) / 2.0;
-    let y = (page_height - placed_height) / 2.0;
-
+fn assemble_many(images: impl IntoIterator<Item = Result<DynamicImage, String>>, options: ImagePdfOptions) -> Result<PreparedMultiImagePdf, String> {
     let mut document = Document::with_version("1.7");
     let pages = document.new_object_id();
-    let mut image_stream = Stream::new(dictionary! {
-        "Type" => "XObject", "Subtype" => "Image", "Width" => image_width as i64,
-        "Height" => image_height as i64, "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8,
-    }, rgb);
-    image_stream.compress().map_err(|error| format!("Could not compress the converted image: {error}"))?;
-    let image_id = document.add_object(image_stream);
-    let content = Content { operations: vec![
-        Operation::new("q", vec![]),
-        Operation::new("cm", vec![placed_width.into(), 0.into(), 0.into(), placed_height.into(), x.into(), y.into()]),
-        Operation::new("Do", vec![Object::Name(b"Image".to_vec())]),
-        Operation::new("Q", vec![]),
-    ] }.encode().map_err(|error| format!("Could not encode the image page: {error}"))?;
-    let content_id = document.add_object(Stream::new(dictionary! {}, content));
-    let page = document.add_object(dictionary! {
-        "Type" => "Page", "Parent" => pages,
-        "MediaBox" => vec![0.into(), 0.into(), Object::Real(page_width), Object::Real(page_height)],
-        "Resources" => dictionary! { "XObject" => dictionary! { "Image" => image_id } },
-        "Contents" => content_id,
-    });
-    document.objects.insert(pages, dictionary! { "Type" => "Pages", "Count" => 1, "Kids" => vec![page.into()] }.into());
+    let mut page_ids = Vec::new();
+    let mut page_sizes = Vec::new();
+    let mut image_sizes = Vec::new();
+    for image in images {
+        let image = image?;
+        let (image_width, image_height, rgb) = composite_on_white(image)?;
+        let (page_width, page_height, margin) = page_dimensions(options, image_width, image_height)?;
+        let scale = ((page_width - 2.0 * margin) / image_width as f32).min((page_height - 2.0 * margin) / image_height as f32);
+        let placed_width = image_width as f32 * scale;
+        let placed_height = image_height as f32 * scale;
+        let x = (page_width - placed_width) / 2.0;
+        let y = (page_height - placed_height) / 2.0;
+        let mut image_stream = Stream::new(dictionary! {
+            "Type" => "XObject", "Subtype" => "Image", "Width" => image_width as i64,
+            "Height" => image_height as i64, "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8,
+        }, rgb);
+        image_stream.compress().map_err(|error| format!("Could not compress the converted image: {error}"))?;
+        let image_id = document.add_object(image_stream);
+        let content = Content { operations: vec![
+            Operation::new("q", vec![]),
+            Operation::new("cm", vec![placed_width.into(), 0.into(), 0.into(), placed_height.into(), x.into(), y.into()]),
+            Operation::new("Do", vec![Object::Name(b"Image".to_vec())]),
+            Operation::new("Q", vec![]),
+        ] }.encode().map_err(|error| format!("Could not encode the image page: {error}"))?;
+        let content_id = document.add_object(Stream::new(dictionary! {}, content));
+        page_ids.push(document.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages,
+            "MediaBox" => vec![0.into(), 0.into(), Object::Real(page_width), Object::Real(page_height)],
+            "Resources" => dictionary! { "XObject" => dictionary! { "Image" => image_id } },
+            "Contents" => content_id,
+        }));
+        page_sizes.push((page_width, page_height));
+        image_sizes.push((image_width, image_height));
+    }
+    document.objects.insert(pages, dictionary! { "Type" => "Pages", "Count" => page_ids.len() as i64, "Kids" => page_ids.iter().copied().map(Object::Reference).collect::<Vec<_>>() }.into());
     let catalog = document.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
     document.trailer.set("Root", catalog);
     let mut bytes = Vec::new();
@@ -193,18 +236,49 @@ fn assemble(image: DynamicImage, options: ImagePdfOptions) -> Result<PreparedIma
     if bytes.len() > MAX_OUTPUT_BYTES { return Err("The converted PDF exceeds the 256 MiB output limit.".into()); }
     let check = Document::load_mem(&bytes).map_err(|error| format!("The converted PDF is invalid: {error}"))?;
     let checked_pages = check.get_pages();
-    if check.is_encrypted() || checked_pages.len() != 1 { return Err("The converted PDF failed its one-page structure check.".into()); }
-    let checked_page = check.get_dictionary(*checked_pages.values().next().ok_or("The converted PDF has no page.")?).map_err(|_| "The converted PDF page is invalid.")?;
-    let xobjects = checked_page.get(b"Resources").and_then(Object::as_dict).and_then(|resources| resources.get(b"XObject")).and_then(Object::as_dict).map_err(|_| "The converted PDF image resources are invalid.")?;
-    if xobjects.len() != 1 { return Err("The converted PDF must contain exactly one image resource.".into()); }
-    let checked_image = xobjects.get(b"Image").and_then(Object::as_reference).and_then(|id| check.get_object(id)).and_then(Object::as_stream).map_err(|_| "The converted PDF image resource is invalid.")?;
-    if checked_image.dict.get(b"Subtype").and_then(Object::as_name).ok() != Some(b"Image")
-        || checked_image.dict.get(b"Width").and_then(Object::as_i64).ok() != Some(i64::from(image_width))
-        || checked_image.dict.get(b"Height").and_then(Object::as_i64).ok() != Some(i64::from(image_height))
-        || checked_image.dict.get(b"ColorSpace").and_then(Object::as_name).ok() != Some(b"DeviceRGB")
-        || checked_image.dict.get(b"BitsPerComponent").and_then(Object::as_i64).ok() != Some(8)
-    { return Err("The converted PDF image resource differs from the conversion plan.".into()); }
-    Ok(PreparedImagePdf { bytes, page_width, page_height })
+    if check.is_encrypted() || checked_pages.len() != page_sizes.len() { return Err("The converted PDF failed its page structure check.".into()); }
+    let mut checked_images = std::collections::HashSet::new();
+    let mut checked_contents = std::collections::HashSet::new();
+    for (page_id, (expected_width, expected_height)) in checked_pages.values().zip(&image_sizes) {
+        let checked_page = check.get_dictionary(*page_id).map_err(|_| "The converted PDF page is invalid.")?;
+        let xobjects = checked_page.get(b"Resources").and_then(Object::as_dict).and_then(|resources| resources.get(b"XObject")).and_then(Object::as_dict).map_err(|_| "The converted PDF image resources are invalid.")?;
+        if xobjects.len() != 1 { return Err("Each converted PDF page must contain exactly one image resource.".into()); }
+        let checked_image = xobjects.get(b"Image").and_then(Object::as_reference).and_then(|id| check.get_object(id)).and_then(Object::as_stream).map_err(|_| "The converted PDF image resource is invalid.")?;
+        let image_id = xobjects.get(b"Image").and_then(Object::as_reference).map_err(|_| "The converted PDF image reference is invalid.")?;
+        let content_id = checked_page.get(b"Contents").and_then(Object::as_reference).map_err(|_| "The converted PDF content reference is invalid.")?;
+        if !checked_images.insert(image_id) || !checked_contents.insert(content_id) { return Err("Converted PDF pages must use unique image and content objects.".into()); }
+        if checked_image.dict.get(b"Subtype").and_then(Object::as_name).ok() != Some(b"Image")
+            || checked_image.dict.get(b"Width").and_then(Object::as_i64).ok() != Some(i64::from(*expected_width))
+            || checked_image.dict.get(b"Height").and_then(Object::as_i64).ok() != Some(i64::from(*expected_height))
+            || checked_image.dict.get(b"ColorSpace").and_then(Object::as_name).ok() != Some(b"DeviceRGB")
+            || checked_image.dict.get(b"BitsPerComponent").and_then(Object::as_i64).ok() != Some(8)
+        { return Err("The converted PDF image resource differs from the conversion plan.".into()); }
+    }
+    Ok(PreparedMultiImagePdf { bytes, pages: page_sizes })
+}
+
+fn assemble(image: DynamicImage, options: ImagePdfOptions) -> Result<PreparedImagePdf, String> {
+    let prepared = assemble_many([Ok(image)], options)?;
+    let (page_width, page_height) = prepared.pages[0];
+    Ok(PreparedImagePdf { bytes: prepared.bytes, page_width, page_height })
+}
+
+pub fn prepare_many_bytes(sources: Vec<Vec<u8>>, options: ImagePdfOptions) -> Result<PreparedMultiImagePdf, String> {
+    if sources.is_empty() || sources.len() > MAX_MULTI_SOURCES { return Err("Choose 1 to 32 PNG or JPEG images.".into()); }
+    let mut source_bytes = 0_u64;
+    let mut pixels = 0_u64;
+    let mut decoded_bytes = 0_u64;
+    for bytes in &sources {
+        if bytes.is_empty() || bytes.len() as u64 > MAX_SOURCE_BYTES { return Err("A source image is empty or exceeds the 64 MiB input limit.".into()); }
+        source_bytes = source_bytes.checked_add(bytes.len() as u64).ok_or("The aggregate source image size overflows.")?;
+        if source_bytes > MAX_MULTI_SOURCE_BYTES { return Err("The selected images exceed the 256 MiB aggregate input limit.".into()); }
+        let (source_pixels, source_decoded) = inspect(bytes)?;
+        pixels = pixels.checked_add(source_pixels).ok_or("The aggregate pixel count overflows.")?;
+        decoded_bytes = decoded_bytes.checked_add(source_decoded).ok_or("The aggregate decoded size overflows.")?;
+        if pixels > MAX_MULTI_PIXELS { return Err("The selected images exceed the 128 megapixel aggregate limit.".into()); }
+        if decoded_bytes > MAX_MULTI_DECODED_BYTES { return Err("The selected images exceed the 512 MiB aggregate decoded limit.".into()); }
+    }
+    assemble_many(sources.into_iter().map(decode), options)
 }
 
 pub fn prepare_and_write(source: &Path, output: &Path, options: ImagePdfOptions, validate: impl FnOnce(&PreparedImagePdf) -> Result<(), String>) -> Result<PreparedImagePdf, String> {
@@ -399,5 +473,44 @@ mod tests {
         std::fs::write(&source, png(1, 1, vec![1, 2, 3], image::ExtendedColorType::Rgb8)).unwrap();
         assert!(prepare_and_write(&source, &output, options(ImagePdfPageSize::Letter, ImagePdfOrientation::Portrait, 0.0), |_| Err("probe refusal".into())).unwrap_err().contains("probe refusal"));
         assert!(!output.exists());
+    }
+
+    #[test]
+    fn multi_image_pdf_preserves_order_and_uses_unique_page_objects() {
+        let sources = [([255, 0, 0], (2, 1)), ([0, 255, 0], (1, 2)), ([0, 0, 255], (3, 1))]
+            .into_iter()
+            .map(|(color, (width, height))| png(width, height, color.repeat((width * height) as usize), image::ExtendedColorType::Rgb8))
+            .collect::<Vec<_>>();
+        let prepared = prepare_many_bytes(sources, options(ImagePdfPageSize::Letter, ImagePdfOrientation::Auto, 12.0)).unwrap();
+        assert_eq!(prepared.pages, vec![(792.0, 612.0), (612.0, 792.0), (792.0, 612.0)]);
+        let document = Document::load_mem(&prepared.bytes).unwrap();
+        let pages = document.get_pages();
+        assert_eq!(pages.len(), 3);
+        let mut image_ids = std::collections::HashSet::new();
+        let mut content_ids = std::collections::HashSet::new();
+        for (index, page_id) in pages.values().enumerate() {
+            let page = document.get_dictionary(*page_id).unwrap();
+            let image_id = page.get(b"Resources").unwrap().as_dict().unwrap().get(b"XObject").unwrap().as_dict().unwrap().get(b"Image").unwrap().as_reference().unwrap();
+            let content_id = page.get(b"Contents").unwrap().as_reference().unwrap();
+            assert!(image_ids.insert(image_id));
+            assert!(content_ids.insert(content_id));
+            let rgb = document.get_object(image_id).unwrap().as_stream().unwrap().decompressed_content().unwrap();
+            assert_eq!(&rgb[..3], &[[255, 0, 0], [0, 255, 0], [0, 0, 255]][index]);
+        }
+    }
+
+    #[test]
+    fn multi_image_aggregate_caps_are_checked_before_full_decode() {
+        let one = png(1, 1, vec![0, 0, 0, 255], image::ExtendedColorType::Rgba8);
+        assert!(prepare_many_bytes(vec![], options(ImagePdfPageSize::A4, ImagePdfOrientation::Portrait, 0.0)).unwrap_err().contains("1 to 32"));
+        assert!(prepare_many_bytes(vec![one.clone(); 33], options(ImagePdfPageSize::A4, ImagePdfOrientation::Portrait, 0.0)).unwrap_err().contains("1 to 32"));
+
+        let mut pixel_bomb = one.clone();
+        replace_png_header(&mut pixel_bomb, 2_049, 2_048, 8, 6);
+        assert!(prepare_many_bytes(vec![pixel_bomb; 32], options(ImagePdfPageSize::A4, ImagePdfOrientation::Portrait, 0.0)).unwrap_err().contains("128 megapixel"));
+
+        let mut decoded_bomb = one;
+        replace_png_header(&mut decoded_bomb, 4_000, 4_000, 16, 6);
+        assert!(prepare_many_bytes(vec![decoded_bomb; 5], options(ImagePdfPageSize::A4, ImagePdfOrientation::Portrait, 0.0)).unwrap_err().contains("512 MiB"));
     }
 }
