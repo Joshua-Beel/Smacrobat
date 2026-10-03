@@ -1,6 +1,7 @@
 import { beforeEach, expect, it, vi } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
 import { checkpointRecovery, createComment, createHighlight, createTextHighlight, cropPage, cropPages, deleteComment, deleteHighlight, editPages, resetCrops, restoreRecovery, updateComment, updateHighlight } from './bridge';
+import { discardRecovery, recoveryCommittedReopenRequired } from './bridge';
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn(), isTauri: () => true }));
 
@@ -16,6 +17,23 @@ it('starts restore without sending a source or journal path', async () => {
   vi.mocked(invoke).mockResolvedValue(null);
   await expect(restoreRecovery()).resolves.toBeNull();
   expect(invoke).toHaveBeenCalledExactlyOnceWith('restore_recovery');
+});
+
+it('discards only the exact open document revision without sending a path', async () => {
+  vi.mocked(invoke).mockResolvedValue({ documentId: 7, revision: 4 });
+  await expect(discardRecovery(7, 4)).resolves.toEqual({ documentId: 7, revision: 4 });
+  expect(invoke).toHaveBeenCalledExactlyOnceWith('discard_recovery', { id: 7, revision: 4 });
+});
+
+it('recognizes only the exact structured committed-recovery error for the captured revision', () => {
+  const fatal = { code: 'recoveryCommittedReopenRequired', documentId: 7, requestedRevision: 4, committedRevision: 5 };
+  expect(recoveryCommittedReopenRequired(fatal, 7, 4)).toBe(true);
+  expect(recoveryCommittedReopenRequired({ ...fatal, committedRevision: 4 }, 7, 4)).toBe(true);
+  expect(recoveryCommittedReopenRequired({ ...fatal, documentId: 8 }, 7, 4)).toBe(false);
+  expect(recoveryCommittedReopenRequired({ ...fatal, requestedRevision: 3 }, 7, 4)).toBe(false);
+  expect(recoveryCommittedReopenRequired({ ...fatal, committedRevision: 3 }, 7, 4)).toBe(false);
+  expect(recoveryCommittedReopenRequired({ ...fatal, path: 'C:/private.pdf' }, 7, 4)).toBe(false);
+  expect(recoveryCommittedReopenRequired('recoveryCommittedReopenRequired', 7, 4)).toBe(false);
 });
 
 it('sends the exact physical viewer page with every journaled mutation', async () => {

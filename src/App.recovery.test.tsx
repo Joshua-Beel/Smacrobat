@@ -59,6 +59,16 @@ it('refuses clean sessions and rejects a mismatched checkpoint acknowledgement',
   expect(JSON.stringify(ui.toJSON())).not.toContain('Recovery point saved');
 });
 
+it('closes and guides reopening after an equal-revision checkpoint was committed but not confirmed', async () => {
+  vi.mocked(checkpointRecovery).mockRejectedValue({ code: 'recoveryCommittedReopenRequired', documentId: 7, requestedRevision: 4, committedRevision: 4 });
+  await mount();
+  await act(async () => button('Create manual recovery point').props.onClick());
+  expect(closeDocument).toHaveBeenCalledExactlyOnceWith(7);
+  expect(ui.root.findAllByProps({ 'data-viewed-document': 7 })).toHaveLength(0);
+  expect(JSON.stringify(ui.toJSON())).toContain('edit may be saved in recovery');
+  expect(JSON.stringify(ui.toJSON())).toContain('Reopen this PDF');
+});
+
 it('keeps the workspace unchanged when the native restore picker is cancelled', async () => {
   vi.mocked(restoreRecovery).mockResolvedValue(null);
   await mount();
@@ -132,6 +142,18 @@ it('opens the original only through the explicit recovery choice', async () => {
   expect(keepRecoveredEdits).not.toHaveBeenCalled();
   expect(JSON.stringify(ui.toJSON())).toContain('marked the offered recovery edits as discarded');
   expect(JSON.stringify(ui.toJSON())).not.toContain('Recovered edits are available');
+});
+
+it('closes and guides reopening after an equal-revision open-original tombstone was committed but not confirmed', async () => {
+  vi.mocked(openDocument).mockResolvedValue({ status: 'opened', document: cleanSource, recovery: { revision: 4, currentPage: 1 } });
+  vi.mocked(openOriginal).mockRejectedValue({ code: 'recoveryCommittedReopenRequired', documentId: 7, requestedRevision: 0, committedRevision: 0 });
+  await mount();
+  await act(async () => button('Open original').props.onClick());
+  expect(closeDocument).toHaveBeenCalledExactlyOnceWith(7);
+  expect(ui.root.findAllByProps({ 'data-viewed-document': 7 })).toHaveLength(0);
+  expect(JSON.stringify(ui.toJSON())).not.toContain('Recovered edits are available');
+  expect(JSON.stringify(ui.toJSON())).toContain('edit may be saved in recovery');
+  expect(JSON.stringify(ui.toJSON())).toContain('Reopen this PDF');
 });
 
 it('retains the recovery choice and clean session when a choice fails', async () => {

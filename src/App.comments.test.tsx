@@ -99,6 +99,22 @@ it('drops a stale annotation query when the active tab changes', async () => {
   act(() => ui.unmount());
 });
 
+it('closes and guides reopening when annotation recovery was committed but not confirmed', async () => {
+  vi.mocked(documentAnnotations).mockResolvedValue(annotations());
+  vi.mocked(createComment).mockRejectedValue({ code: 'recoveryCommittedReopenRequired', documentId: 1, requestedRevision: 0, committedRevision: 1 });
+  vi.mocked(closeDocument).mockResolvedValue();
+  let ui!: ReactTestRenderer; act(() => { ui = create(<App />); });
+  await open(ui);
+  await act(async () => button(ui, 'Add comment').props.onClick());
+  await act(async () => ui.root.findAllByType('button').find(item => item.children.includes('Place comment'))!.props.onClick());
+  act(() => ui.root.findByProps({ 'aria-label': 'Comment text' }).props.onChange({ target: { value: 'May recover' } }));
+  await act(async () => ui.root.findAllByType('button').find(item => item.children.join('') === 'Save comment')!.props.onClick());
+  expect(closeDocument).toHaveBeenCalledExactlyOnceWith(1);
+  expect(ui.root.findAllByType(Viewer)).toHaveLength(0);
+  expect(JSON.stringify(ui.toJSON())).toContain('edit may be saved in recovery');
+  act(() => ui.unmount());
+});
+
 it('shares an in-flight annotation query when comments are closed and reopened', async () => {
   let resolve!: (value: ReturnType<typeof annotations>) => void;
   vi.mocked(documentAnnotations).mockImplementation(() => new Promise(done => { resolve = done; }));

@@ -1,4 +1,6 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
+export { recoveryCommittedReopenRequired } from './recoveryErrors';
+export type { RecoveryCommittedReopenRequired } from './recoveryErrors';
 import type { DocumentInfo, PageEdit } from './model';
 import type { DocumentPageLabels } from './pageLabels';
 export const native = isTauri();
@@ -12,8 +14,10 @@ export async function openDocument(example = false): Promise<OpenResult | null> 
 export const closeDocument = (id: number) => invoke<void>('close_document', { id });
 export const reopenDocument = (path: string) => invoke<OpenResult>('reopen_document', { path });
 export type RecoveryCheckpointReceipt = { documentId: number; revision: number; currentPage: number };
+export type RecoveryDiscardReceipt = { documentId: number; revision: number };
 export type RecoveryRestoreResult = { document: DocumentInfo; currentPage: number };
 export const checkpointRecovery = (id: number, revision: number, currentPage: number) => invoke<RecoveryCheckpointReceipt>('checkpoint_recovery', { id, revision, currentPage });
+export const discardRecovery = (id: number, revision: number) => invoke<RecoveryDiscardReceipt>('discard_recovery', { id, revision });
 export const restoreRecovery = () => invoke<RecoveryRestoreResult | null>('restore_recovery');
 export const keepRecoveredEdits = (id: number, revision: number) => invoke<RecoveryRestoreResult>('keep_recovered_edits', { id, revision });
 export const openOriginal = (id: number, revision: number) => invoke<DocumentInfo>('open_original', { id, revision });

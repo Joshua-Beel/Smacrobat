@@ -3,6 +3,8 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import { Undo2, Redo2 } from 'lucide-react';
 import { ArrowDownToLine, ArrowUpRight, Bookmark, ChevronDown, ChevronLeft, ChevronRight, ChevronsUpDown, CircleHelp, Combine, File, FileCheck2, FileImage, FileOutput, FilePenLine, FilePlus2, Files, FolderOpen, Hand, Highlighter, Home, LayoutGrid, List, Maximize, Menu, MessageSquare, Minimize2, Minus, MoreHorizontal, MousePointer2, PanelLeftClose, Pencil, Plus, Printer, RotateCw, Save, ScanLine, Search, ShieldCheck, Signature, SlidersHorizontal, Star, Sun, Type, X, ZoomIn, ZoomOut, type LucideIcon } from 'lucide-react';
 import { closeDocument, cancelPasswordRequest, native, openDocument, reopenDocument, checkpointRecovery, restoreRecovery, keepRecoveredEdits, openOriginal, editPages, saveCopy, splitDocument, cropPages, resetCrops, combineDocuments, insertPagesCopy, replacePagesCopy, documentFormFields, fillFormCopy, documentAnnotations, documentPageLabels, createPdfFromImage, chooseImagePdfSources, createPdfFromImages, cancelImagePdfSources, inspectImageReplacementTarget, replacePdfImageCopy, cancelImageReplacement, inspectTextReplacementTarget, replacePdfTextCopy, cancelTextReplacement, exportPageImage, redactDocument, createComment, updateComment, deleteComment, createHighlight, createTextHighlight, updateHighlight, deleteHighlight, createSearchableOcrCopy, cancelPageOcr, ocrCapability as getOcrCapability, type Annotation, type CommentRect, type CropInsets, type CreatePdfOptions, type DocumentAnnotations, type DocumentFormFields, type FormPatch, type ImageReplacementTarget, type TextReplacementTarget, type OcrCapability, type OpenResult, type PageImageExport, type PageImageExportRequest, type RasterRedactionRect, type SplitOutput, type SavedCopy, type RecoveryOffer } from './bridge';
+import { discardRecovery } from './bridge';
+import { recoveryCommittedReopenRequired } from './recoveryErrors';
 import { clampPage, toolGroups, type DocumentInfo, type PageEdit } from './model';
 import { pageLabelDescription, pageLabelFor, validatePageLabels, type DocumentPageLabels } from './pageLabels';
 import Viewer from './Viewer';
@@ -36,6 +38,7 @@ import RecoveryOfferDialog from './RecoveryOfferDialog';
 import type { TextHighlightSelection, TextHighlightSelectionSource } from './textHighlightSelection';
 import { appendRedaction, type RedactionDraft } from './redaction';
 import { readPreferences, savePreferences, type FitMode } from './preferences';
+
 import { readRecentFiles, saveRecentFiles, rememberFile } from './recentFiles';
 import { restoreModalFocus } from './modalFocus';
 import s from './Workspace.module.css';
@@ -124,14 +127,16 @@ export default function App() {
   const [pendingClose, setPendingClose] = useState<number | 'window' | null>(null);
   const [recoveryOffer, setRecoveryOffer] = useState<{ document: DocumentInfo; offer: RecoveryOffer } | null>(null);
   const [recoveryChoiceError, setRecoveryChoiceError] = useState('');
+  const [recoveryLocked, setRecoveryLocked] = useState<Set<number>>(() => new Set());
   const menuButton = useRef<HTMLButtonElement | null>(null);
   const lastWorkspaceFocus = useRef<HTMLElement | null>(null);
   const modalReturnFocus = useRef<HTMLElement | null>(null);
   const modalWasOpen = useRef(false);
   const closingDocument = useRef<number | null>(null);
+  const windowDiscarding = useRef(false);
   const mounted = useRef(true);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
-  const modalOpen = recoveryOffer !== null || updatesOpen || pageTextOpen || pageOcrTarget !== null || searchableOcrTarget !== null || newCopyModalOpen || printOpen || propertiesOpen || noticesOpen || passwordRequest !== null || pendingClose !== null || createOpen || pageImageTarget !== null || combineOpen || insertOpen || replaceOpen || formsOpen || commentEditor !== null;
+  const modalOpen = recoveryLocked.size > 0 || recoveryOffer !== null || updatesOpen || pageTextOpen || pageOcrTarget !== null || searchableOcrTarget !== null || newCopyModalOpen || printOpen || propertiesOpen || noticesOpen || passwordRequest !== null || pendingClose !== null || createOpen || pageImageTarget !== null || combineOpen || insertOpen || replaceOpen || formsOpen || commentEditor !== null;
   useLayoutEffect(() => {
     if (modalOpen && !modalWasOpen.current) {
       modalReturnFocus.current = lastWorkspaceFocus.current;
@@ -159,15 +164,16 @@ export default function App() {
     }).catch(() => { if (!disposed) setOcr(unavailableOcr('OCR is unavailable in this build.')); });
     return () => { disposed = true; };
   }, []);
-  const latest = useRef({ documents, busy, active, dialogOpen: false });
+  const latest = useRef({ documents, busy, active, dialogOpen: false, recoveryLocked: false });
   latest.current = {
     documents, busy, active,
-    dialogOpen: recoveryOffer !== null || updatesOpen || pageTextOpen || pageOcrTarget !== null || searchableOcrTarget !== null || multiImageOpen || imageReplacementTarget !== null || textReplacementTarget !== null || printOpen || propertiesOpen || noticesOpen || passwordRequest !== null || pendingClose !== null || createOpen || pageImageTarget !== null || combineOpen || insertOpen || replaceOpen || formsOpen || commentEditor !== null,
+    dialogOpen: recoveryLocked.size > 0 || recoveryOffer !== null || updatesOpen || pageTextOpen || pageOcrTarget !== null || searchableOcrTarget !== null || multiImageOpen || imageReplacementTarget !== null || textReplacementTarget !== null || printOpen || propertiesOpen || noticesOpen || passwordRequest !== null || pendingClose !== null || createOpen || pageImageTarget !== null || combineOpen || insertOpen || replaceOpen || formsOpen || commentEditor !== null,
+    recoveryLocked: recoveryLocked.size > 0,
   };
   useEffect(() => {
     if (!native) return;
     const unlisten = getCurrentWindow().onCloseRequested(event => {
-      if (latest.current.busy || closingDocument.current !== null || latest.current.dialogOpen) { event.preventDefault(); setNotice('Finish the current operation or dialog before closing.'); }
+      if (latest.current.busy || closingDocument.current !== null || latest.current.dialogOpen || latest.current.recoveryLocked) { event.preventDefault(); setNotice(latest.current.recoveryLocked ? 'Close the recovery-locked PDF before closing the window.' : 'Finish the current operation or dialog before closing.'); }
       else if (latest.current.documents.some(document => document.dirty)) { event.preventDefault(); setPendingClose('window'); }
     });
     return () => { void unlisten.then(stop => stop()); };
@@ -288,7 +294,9 @@ export default function App() {
         setNotice('Opened the original PDF and marked the offered recovery edits as discarded.');
       }
       setRecoveryOffer(null);
-    } catch (reason) { if (mounted.current) setRecoveryChoiceError(String(reason)); }
+    } catch (reason) {
+      if (!await handleCommittedRecoveryFailure(pending.document.id, pending.document.revision, reason) && mounted.current) setRecoveryChoiceError(String(reason));
+    }
     finally { if (mounted.current) setBusy(false); }
   };
   const checkpoint = async () => {
@@ -299,7 +307,9 @@ export default function App() {
       const receipt = await checkpointRecovery(captured.id, captured.revision, captured.currentPage);
       if (receipt.documentId !== captured.id || receipt.revision !== captured.revision || receipt.currentPage !== captured.currentPage) throw new Error('Recovery checkpoint acknowledgement did not match this document revision.');
       if (mounted.current) setNotice('Recovery point saved for this revision. Recovery is manual, not automatic; full power-loss durability is not proven.');
-    } catch (e) { if (mounted.current) setError(String(e)); } finally { if (mounted.current) setBusy(false); }
+    } catch (e) {
+      if (!await handleCommittedRecoveryFailure(captured.id, captured.revision, e) && mounted.current) setError(String(e));
+    } finally { if (mounted.current) setBusy(false); }
   };
   const restore = async () => {
     if (recoveryBlocked) return;
@@ -317,16 +327,64 @@ export default function App() {
       setNotice('Recovered unsaved edits from the selected source PDF. The source file was not changed.');
     } catch (e) { if (mounted.current) setError(String(e)); } finally { if (mounted.current) setBusy(false); }
   };
+  async function handleCommittedRecoveryFailure(id: number, revision: number, reason: unknown): Promise<boolean> {
+    if (!recoveryCommittedReopenRequired(reason, id, revision)) return false;
+    setRecoveryLocked(current => new Set(current).add(id));
+    try {
+      await closeDocument(id);
+      readingPages.current.delete(id); setDocuments(list => list.filter(document => document.id !== id));
+      setRecoveryLocked(current => { const next = new Set(current); next.delete(id); return next; });
+      if (latest.current.active === id) { setActive(null); setView('home'); }
+      setRecoveryOffer(current => current?.document.id === id ? null : current);
+      setError('The edit may be saved in recovery, but its final confirmation failed. Reopen this PDF and choose Keep recovered edits or Open original.');
+    } catch (closeReason) {
+      setError(`The edit may be saved in recovery, but its final confirmation failed and the locked PDF could not close. Retry closing this tab before continuing. ${String(closeReason)}`);
+    }
+    return true;
+  }
   const close = async (id: number, discard = false) => {
     if (busy || recoveryOffer || redactionDraft || searchableOcrTarget || newCopyModalOpen || closingDocument.current !== null) return;
-    if (!discard && documents.find(document => document.id === id)?.dirty) { setPendingClose(id); return; }
+    const locked = recoveryLocked.has(id);
+    if (!discard && !locked && documents.find(document => document.id === id)?.dirty) { setPendingClose(id); return; }
     if (pageOcrTarget?.id === id) setPageOcrTarget(null);
     closingDocument.current = id; setBusy(true); setError('');
     try {
+      if (discard) {
+        const current = documents.find(document => document.id === id);
+        if (!current?.dirty) throw new Error('The document changed before its recovery edits could be discarded.');
+        const receipt = await discardRecovery(current.id, current.revision);
+        if (receipt.documentId !== current.id || receipt.revision !== current.revision) throw new Error('Recovery discard acknowledgement did not match this document revision.');
+      }
       await closeDocument(id); readingPages.current.delete(id); setDocuments(list => list.filter(d => d.id !== id));
       if (latest.current.active === id) { setActive(null); setView('home'); }
-    } catch (e) { setError(String(e)); }
+    } catch (e) {
+      const revision = documents.find(document => document.id === id)?.revision;
+      if (revision === undefined || !await handleCommittedRecoveryFailure(id, revision, e)) setError(String(e));
+    }
     finally { closingDocument.current = null; setBusy(false); }
+  };
+  const discardAndCloseWindow = async () => {
+    if (busy || closingDocument.current !== null || windowDiscarding.current) return;
+    windowDiscarding.current = true;
+    const dirty = documents.filter(document => document.dirty).map(document => ({ id: document.id, revision: document.revision }));
+    let acknowledged = 0;
+    let currentId: number | null = null;
+    setPendingClose(null); setBusy(true); setError(''); setNotice('');
+    try {
+      for (const document of dirty) {
+        currentId = document.id;
+        const receipt = await discardRecovery(document.id, document.revision);
+        if (receipt.documentId !== document.id || receipt.revision !== document.revision) throw new Error('Recovery discard acknowledgement did not match this document revision.');
+        acknowledged += 1;
+      }
+      await getCurrentWindow().destroy();
+    } catch (reason) {
+      windowDiscarding.current = false;
+      const currentRevision = dirty.find(document => document.id === currentId)?.revision;
+      if (currentId !== null && currentRevision !== undefined && await handleCommittedRecoveryFailure(currentId, currentRevision, reason)) { if (mounted.current) setBusy(false); return; }
+      if (mounted.current) setError(`${acknowledged ? `Recovery was already discarded for ${acknowledged} open document${acknowledged === 1 ? '' : 's'}; those edits remain open and the next edit will create recovery again. ` : ''}${String(reason)}`);
+      if (mounted.current) setBusy(false);
+    }
   };
   const updateDocument = (info: DocumentInfo) => {
     setDocuments(list => list.map(document => document.id === info.id ? info : document));
@@ -336,7 +394,7 @@ export default function App() {
     if (!doc || busy || searchableOcrTarget || newCopyModalOpen || closingDocument.current !== null) return false;
     setBusy(true); setError(''); setNotice('');
     try { updateDocument(await editPages(doc.id, action, clampPage(page, doc.pages.length))); return true; }
-    catch (e) { setError(String(e)); return false; } finally { setBusy(false); }
+    catch (e) { if (!await handleCommittedRecoveryFailure(doc.id, doc.revision, e)) setError(String(e)); return false; } finally { setBusy(false); }
   };
   const save = async (pages?: number[]) => {
     if (!doc || busy || searchableOcrTarget || newCopyModalOpen || closingDocument.current !== null) return;
@@ -356,6 +414,7 @@ export default function App() {
     if (!doc || doc.id !== target.id || busy || closingDocument.current !== null) throw new Error('The document is no longer ready to crop.');
     setBusy(true); setError(''); setNotice('');
     try { updateDocument(await cropPages(target.id, target.revision, target.pages, insets, clampPage(page, doc.pages.length))); }
+    catch (reason) { if (!await handleCommittedRecoveryFailure(target.id, target.revision, reason)) throw reason; }
     finally { setBusy(false); }
   };
   const reopenRef = useRef(reopen);
@@ -402,7 +461,7 @@ export default function App() {
       if (result.id !== target.id || !Number.isSafeInteger(result.revision) || (result.revision !== target.revision && result.revision !== target.revision + 1)) throw new Error('The crop reset returned an unexpected document.');
       if (result.revision === target.revision) setNotice('The selected pages have no crop edits from this session.');
       else updateDocument(result);
-    } catch (reason) { setError(String(reason)); }
+    } catch (reason) { if (!await handleCommittedRecoveryFailure(target.id, target.revision, reason)) setError(String(reason)); }
     finally { setBusy(false); }
   };
   const mutateAnnotation = async (operation: (document: DocumentInfo, currentPage: number) => Promise<DocumentInfo>) => {
@@ -412,6 +471,7 @@ export default function App() {
     if (!latestDocument || latestDocument.revision !== current.revision) throw new Error('The document changed. Reload its comments and try again.');
     setBusy(true); setError(''); setNotice('');
     try { updateDocument(await operation(current, clampPage(page, current.pages.length))); }
+    catch (reason) { if (!await handleCommittedRecoveryFailure(current.id, current.revision, reason)) throw reason; }
     finally { setBusy(false); }
   };
   const receiveTextHighlightSelection = useCallback((selection: TextHighlightSelection | null, source: TextHighlightSelectionSource) => {
@@ -754,6 +814,6 @@ export default function App() {
       </> : null}
     </main>
     <footer className={s.statusbar}><span style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{view === 'document' && doc ? (() => { const currentPage = clampPage(page, doc.pages.length); const label = pageLabelFor(pageLabels, currentPage); return <>Page {currentPage + 1}{label !== null && <> · Label: {pageLabelDescription(label)}</>} · {(doc.pages[currentPage].width / 72).toFixed(2)} × {(doc.pages[currentPage].height / 72).toFixed(2)} in</>; })() : 'PDF Workstation'}</span><span>{busy ? 'Working…' : view === 'document' && doc ? `${doc.name} · ${doc.dirty ? 'Unsaved changes' : 'Source preserved'}` : 'Files stay on your computer'}</span>{view === 'document' ? <select aria-label="Zoom" value={fit === 'none' ? zoom : fit} onChange={e => e.target.value === 'width' ? setFit('width') : e.target.value === 'page' ? selectPageFit() : changeZoom(Number(e.target.value))}><option value="width">Fit width</option><option value="page">Fit page</option>{Array.from(new Set([10,25,50,75,100,125,150,200,300,400,zoom])).sort((a,b) => a-b).map(z => <option value={z} key={z}>{z}%</option>)}</select> : <span>Local workspace</span>}</footer>
-    {pendingClose !== null && <ConfirmDialog title="Discard unsaved page edits?" message="Save a copy before closing to keep your changes. Your original PDF has not been modified." confirmLabel="Discard and close" onCancel={() => setPendingClose(null)} onConfirm={() => { const pending = pendingClose; setPendingClose(null); if (pending === 'window') void getCurrentWindow().destroy(); else void close(pending, true); }} />}
+    {recoveryLocked.size > 0 ? (() => { const locked = documents.find(document => recoveryLocked.has(document.id)); return locked ? <ConfirmDialog title="Recovery confirmation failed" message="This PDF is locked because an edit may already be saved in recovery. Close it, then reopen the source PDF and choose Keep recovered edits or Open original." confirmLabel="Retry closing tab" onCancel={() => setError('Close this recovery-locked PDF before continuing.')} onConfirm={() => void close(locked.id)} /> : null; })() : pendingClose !== null && <ConfirmDialog title="Discard unsaved page edits?" message="Save a copy before closing to keep your changes. Your original PDF has not been modified." confirmLabel="Discard and close" onCancel={() => setPendingClose(null)} onConfirm={() => { const pending = pendingClose; if (pending === 'window') void discardAndCloseWindow(); else { setPendingClose(null); void close(pending, true); } }} />}
   </div>;
 }
