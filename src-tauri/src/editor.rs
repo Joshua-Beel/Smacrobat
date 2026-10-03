@@ -97,7 +97,20 @@ pub struct EditSession {
     next_note: u64,
 }
 
+pub(crate) struct EditSessionSnapshot {
+    plan: Vec<PageSpec>, undo: VecDeque<Vec<PageSpec>>, redo: VecDeque<Vec<PageSpec>>,
+    history_bytes: usize, saved: Vec<PageSpec>, revision: u64, next_note: u64,
+}
+
 impl EditSession {
+    pub(crate) fn snapshot(&self) -> EditSessionSnapshot {
+        EditSessionSnapshot { plan: self.plan.clone(), undo: self.undo.clone(), redo: self.redo.clone(), history_bytes: self.history_bytes, saved: self.saved.clone(), revision: self.revision, next_note: self.next_note }
+    }
+    pub(crate) fn restore(&mut self, snapshot: EditSessionSnapshot) {
+        self.plan = snapshot.plan; self.undo = snapshot.undo; self.redo = snapshot.redo;
+        self.history_bytes = snapshot.history_bytes; self.saved = snapshot.saved;
+        self.revision = snapshot.revision; self.next_note = snapshot.next_note;
+    }
     pub fn new(source: Vec<u8>, count: usize) -> Self {
         Self::new_with_open_password(source, count, None)
     }

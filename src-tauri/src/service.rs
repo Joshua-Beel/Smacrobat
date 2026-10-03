@@ -47,7 +47,7 @@ const MAX_READ_TEXT_BYTES: usize = 1_048_576;
 #[derive(Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum OpenResult {
-    Opened { document: DocumentInfo },
+    Opened { document: DocumentInfo, recovery: Option<RecoveryOffer> },
     PasswordRequired { request_id: u64, name: String, incorrect: bool },
 }
 pub struct PrintSnapshotInfo { pub token: u64, pub pages: usize, pub name: String, cleanup: mpsc::Sender<Request> }
@@ -122,6 +122,8 @@ enum Request {
     CheckpointRecovery(PathBuf, u64, u64, u32, Reply<()>),
     #[allow(dead_code)]
     RestoreRecovery(PathBuf, PathBuf, Reply<Option<ReplyLease<RecoveredDocument>>>),
+    KeepRecoveredEdits(u64, u64, Reply<RecoveredDocument>),
+    OpenOriginal(u64, u64, Reply<DocumentInfo>),
     BeginOpen(PathBuf, Reply<ReplyLease<OpenResult>>),
     Unlock(u64, String, Reply<ReplyLease<OpenResult>>),
     CancelPassword(u64, Reply<()>),
@@ -158,12 +160,17 @@ enum Request {
     ReplaceTextCopy(u64, u64, u16, TextReplacementInspection, String, PathBuf, Reply<ReplyLease<SavedCopy>>),
     Close(u64, Reply<()>),
     Edit(u64, PageEdit, Reply<DocumentInfo>),
+    DurableEdit(u64, PageEdit, u32, Reply<DocumentInfo>),
     Crop(u64, u16, u64, CropRect, Reply<DocumentInfo>),
+    DurableCrop(u64, u16, u64, CropRect, u32, Reply<DocumentInfo>),
     CropPages(u64, Vec<u16>, u64, CropInsets, Reply<DocumentInfo>),
+    DurableCropPages(u64, Vec<u16>, u64, CropInsets, u32, Reply<DocumentInfo>),
     ResetCrops(u64, Vec<u16>, u64, Reply<DocumentInfo>),
+    DurableResetCrops(u64, Vec<u16>, u64, u32, Reply<DocumentInfo>),
     Comments(u64, u64, Reply<crate::comments::CommentList>),
     Annotations(u64, u64, Reply<crate::comments::AnnotationList>),
     Comment(u64, u64, CommentMutation, Reply<DocumentInfo>),
+    DurableComment(u64, u64, CommentMutation, u32, Reply<DocumentInfo>),
     Save(u64, Option<Vec<usize>>, PathBuf, Reply<SavedCopy>),
     Split(u64, u64, usize, PathBuf, Reply<crate::split::SplitOutput>),
     CheckCombine(CombineSource, CombineSource, Reply<()>),
@@ -228,9 +235,12 @@ impl Cache {
 }
 impl PdfService {
     pub fn start(library: PathBuf) -> Self {
-        PDF_SERVICE.get_or_init(|| Self::start_worker(library,if cfg!(test){4096}else{32})).clone()
+        PDF_SERVICE.get_or_init(|| Self::start_worker(library,if cfg!(test){4096}else{32},None)).clone()
     }
-    fn start_worker(library: PathBuf,render_limit:usize) -> Self {
+    pub fn start_with_recovery(library: PathBuf, recovery_root: PathBuf) -> Self {
+        PDF_SERVICE.get_or_init(|| Self::start_worker(library,32,Some(recovery_root))).clone()
+    }
+    fn start_worker(library: PathBuf,render_limit:usize,recovery_root:Option<PathBuf>) -> Self {
         let (raw_sender, receiver) = mpsc::channel();
         let resource_cleanup = raw_sender.clone();
         let render_admission=Arc::new(Mutex::new(RenderAdmission::default()));
@@ -244,6 +254,10 @@ impl PdfService {
             let mut page_labels = crate::page_labels::PageLabelCache::default();
             let mut next_id = 1;
             let mut pending = HashMap::<u64, PathBuf>::new();
+            let mut recovery_offers = HashMap::<u64, crate::recovery_journal::RecoveryRecord>::new();
+            let mut recovery_heads = HashMap::<u64, (crate::recovery_journal::SourceIdentity, u64)>::new();
+            let mut recovery_floors = HashMap::<crate::recovery_journal::SourceIdentity, crate::recovery_journal::RecoveryRecord>::new();
+            let mut recovery_pages = HashMap::<u64, u32>::new();
             let mut next_request = 1;
             let mut print_snapshots = HashMap::<u64, (std::rc::Rc<PdfDocument<'_>>, Vec<crate::editor::PageSpec>)>::new();
             let mut next_print = 1;
@@ -256,6 +270,11 @@ impl PdfService {
             let mut requests = RequestQueue::default();
             while let Ok(request) = requests.next(&receiver) {
                 let request = match request {
+                    Request::DurableEdit(id,edit,page,reply)=>{recovery_pages.insert(id,page);Request::Edit(id,edit,reply)},
+                    Request::DurableCrop(id,index,revision,rect,page,reply)=>{recovery_pages.insert(id,page);Request::Crop(id,index,revision,rect,reply)},
+                    Request::DurableCropPages(id,pages,revision,insets,page,reply)=>{recovery_pages.insert(id,page);Request::CropPages(id,pages,revision,insets,reply)},
+                    Request::DurableResetCrops(id,pages,revision,page,reply)=>{recovery_pages.insert(id,page);Request::ResetCrops(id,pages,revision,reply)},
+                    Request::DurableComment(id,revision,mutation,page,reply)=>{recovery_pages.insert(id,page);Request::Comment(id,revision,mutation,reply)},
                     Request::Combine(first, second, path, reply) => Request::CreateCopy(first, second, CopyOperation::Combine, path, reply),
                     Request::InsertPages(target, donor, at, path, reply) => Request::CreateCopy(target, donor, CopyOperation::Insert { at }, path, reply),
                     Request::ReplacePages(target, donor, start, count, path, reply) => Request::CreateCopy(target, donor, CopyOperation::Replace { start, count }, path, reply),
@@ -581,7 +600,7 @@ impl PdfService {
                         drop(admission);
                         let _ = reply.send(result);
                     }
-                    Request::BeginOpen(_, _) => unreachable!(),
+                    Request::BeginOpen(_, _)|Request::DurableEdit(..)|Request::DurableCrop(..)|Request::DurableCropPages(..)|Request::DurableResetCrops(..)|Request::DurableComment(..) => unreachable!(),
                     Request::CancelPassword(id, reply) => { pending.remove(&id); let _ = reply.send(Ok(())); }
                     Request::Unlock(request_id, password, reply) => {
                         if reply.is_closed() { pending.remove(&request_id); continue; }
@@ -598,18 +617,26 @@ impl PdfService {
                             let pages = page_sizes(&document)?;
                             let id = next_id; next_id += 1;
                             let info = DocumentInfo { id, name: path.file_name().unwrap_or_default().to_string_lossy().into_owned(), path: path.to_string_lossy().into_owned(), pages, revision: 0, dirty: false, can_undo: false, can_redo: false };
+                            let recovery = if matches!(document.permissions().security_handler_revision(), Ok(PdfSecurityHandlerRevision::Unprotected)) {
+                                recovery_root.as_deref().map(|root| {
+                                    let source = recovery_source_identity(&bytes)?;
+                                    Ok::<_, String>(crate::recovery_store::read_recovery(root, source, None, 0)?.filter(|record| record.active))
+                                }).transpose()?.flatten()
+                            } else { None };
                             sessions.insert(id, (EditSession::new_with_password(bytes, info.pages.len(), &password), info.clone()));
                             documents.insert(id, std::rc::Rc::new(document));
-                            Ok(OpenResult::Opened { document: info })
+                            let offer = recovery.as_ref().map(|record| RecoveryOffer { revision: record.revision, current_page: record.current_page });
+                            if let Some(record) = recovery { recovery_offers.insert(id, record); }
+                            Ok(OpenResult::Opened { document: info, recovery: offer })
                         })();
                         if !matches!(&result, Ok(OpenResult::PasswordRequired { .. })) { pending.remove(&request_id); }
                         let result = result.map(|value| {
-                            let cleanup = match &value { OpenResult::Opened { document } => UnclaimedReply::Document(document.id), OpenResult::PasswordRequired { request_id, .. } => UnclaimedReply::Password(*request_id) };
+                            let cleanup = match &value { OpenResult::Opened { document, .. } => UnclaimedReply::Document(document.id), OpenResult::PasswordRequired { request_id, .. } => UnclaimedReply::Password(*request_id) };
                             ReplyLease::new(value, cleanup, resource_cleanup.clone())
                         });
                         if let Err(result) = reply.send(result) {
                             pending.remove(&request_id);
-                            if let Ok(value) = &result { if let OpenResult::Opened { document } = &**value { documents.remove(&document.id); sessions.remove(&document.id); } }
+                            if let Ok(value) = &result { if let OpenResult::Opened { document, .. } = &**value { documents.remove(&document.id); sessions.remove(&document.id); } }
                         }
                     }
                     Request::Open(path, reply) => {
@@ -633,13 +660,10 @@ impl PdfService {
                             let (session, original) = sessions.get(&id).ok_or("Document is closed")?;
                             if session.revision != revision { return Err("Document changed. Save recovery again.".into()); }
                             if !session.dirty() { return Err("Only unsaved edits can be stored for recovery.".into()); }
-                            let source = recovery_source_identity(&session.source)?;
-                            let generation = match crate::recovery_store::read_recovery(&root, source, None, 0)? {
-                                Some(record) => record.generation.checked_add(1).ok_or("Recovery generation is exhausted.")?,
-                                None => 1,
-                            };
-                            let record = recovery_record(session, source, generation, current_page, original.pages.len())?;
-                            crate::recovery_store::write_recovery(&root, &record)?;
+                            if current_page as usize >= session.plan.len() { return Err("Current page is out of range.".into()); }
+                            ensure_recovery_owner(Some(&root), &recovery_heads, &mut recovery_floors, id, session)?;
+                            let record = persist_recovery_state(Some(&root), &mut recovery_floors, session, original, current_page)?.ok_or("Recovery is unavailable.")?;
+                            recovery_heads.insert(id, (record.source, record.generation));
                             Ok(())
                         })();
                         let _ = reply.send(result);
@@ -651,6 +675,9 @@ impl PdfService {
                             let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
                             let source = recovery_source_identity(&bytes)?;
                             let Some(record) = crate::recovery_store::read_recovery(&root, source, None, 1)? else { return Ok(None); };
+                            if !record.active { return Ok(None); }
+                            accept_recovery_record(&mut recovery_floors, &record)?;
+                            if recovery_heads.values().any(|(identity, _)| *identity == source) { return Err("Another open tab already owns recovery for this PDF.".into()); }
                             let document = engine.load_pdf_from_byte_vec(bytes.clone(), None).map_err(|error| format!("Unable to open PDF: {error}"))?;
                             if !matches!(document.permissions().security_handler_revision(), Ok(PdfSecurityHandlerRevision::Unprotected)) { return Err("Encrypted or restricted PDFs cannot be restored from recovery.".into()); }
                             let pages = page_sizes(&document)?;
@@ -662,12 +689,52 @@ impl PdfService {
                             let info = current_info(&session, &original, &document)?;
                             sessions.insert(id, (session, original));
                             documents.insert(id, std::rc::Rc::new(document));
+                            recovery_offers.retain(|_, offer| offer.source != source);
+                            recovery_heads.insert(id, (source, record.generation));
                             let recovered = RecoveredDocument { document: info, current_page: record.current_page };
                             Ok(Some(ReplyLease::new(recovered, UnclaimedReply::Document(id), resource_cleanup.clone())))
                         })();
                         if let Err(Ok(Some(lease))) = reply.send(result) {
                             let id = lease.document.id; documents.remove(&id); sessions.remove(&id);
                         }
+                    }
+                    Request::KeepRecoveredEdits(id, revision, reply) => {
+                        if reply.is_closed() { continue; }
+                        let result = (|| {
+                            let record = recovery_offers.get(&id).ok_or("Recovery choice is no longer available.")?.clone();
+                            let (session, original) = sessions.get_mut(&id).ok_or("Document is closed")?;
+                            if session.revision != revision || revision != 0 { return Err("Document changed. Reopen it to choose recovery.".into()); }
+                            if recovery_heads.iter().any(|(owner,(source,_))| *owner!=id && *source==record.source) { return Err("Another open tab already owns recovery for this PDF.".into()); }
+                            let root=recovery_root.as_deref().ok_or("Recovery is unavailable.")?;let current=crate::recovery_store::read_recovery(root,record.source,None,0)?.ok_or("Recovery choice is no longer available.")?;
+                            if current!=record || !current.active { return Err("Recovery choice is stale. Reopen the PDF.".into()); }
+                            let snapshot = session.snapshot();
+                            if let Err(error) = restore_recovery_session(session, &record).and_then(|_| session.export(None).map(|_| ())) {
+                                session.restore(snapshot); return Err(error);
+                            }
+                            let info = match documents.get(&id).ok_or_else(||"Document is closed".to_owned()).and_then(|document| current_info(session, original, document)) { Ok(info) => info, Err(error) => { session.restore(snapshot); return Err(error); } };
+                            recovery_offers.retain(|_,offer|offer.source!=record.source);
+                            recovery_heads.insert(id, (record.source, record.generation));
+                            Ok(RecoveredDocument { document: info, current_page: record.current_page })
+                        })();
+                        let _ = reply.send(result);
+                    }
+                    Request::OpenOriginal(id, revision, reply) => {
+                        if reply.is_closed() { continue; }
+                        let result = (|| {
+                            let record = recovery_offers.get(&id).ok_or("Recovery choice is no longer available.")?.clone();
+                            let (session, original) = sessions.get(&id).ok_or("Document is closed")?;
+                            if session.revision != revision || revision != 0 { return Err("Document changed. Reopen it to choose recovery.".into()); }
+                            let root = recovery_root.as_deref().ok_or("Recovery is unavailable.")?;
+                            let current=crate::recovery_store::read_recovery(root,record.source,None,0)?.ok_or("Recovery choice is no longer available.")?;
+                            if current!=record || !current.active { return Err("Recovery choice is stale. Reopen the PDF.".into()); }
+                            let tombstone = crate::recovery_journal::RecoveryRecord { active: false, generation: record.generation.checked_add(1).ok_or("Recovery generation is exhausted.")?, revision: record.revision, current_page: 0, source_pages: record.source_pages, source: record.source, edit_state: crate::recovery_journal::RecoveryEditState { pages: Vec::new() } };
+                            crate::recovery_store::write_recovery(root, &tombstone)?;
+                            let verified = crate::recovery_store::read_recovery(root, record.source, None, tombstone.revision)?.ok_or("Recovery verification failed.")?;
+                            if verified != tombstone { return Err("Recovery verification failed.".into()); }
+                            recovery_offers.retain(|_,offer|offer.source!=record.source);
+                            current_info(session, original, documents.get(&id).ok_or("Document is closed")?)
+                        })();
+                        let _ = reply.send(result);
                     }
                     Request::AdmittedRender(id,page,width,token)=>{let reply={let mut a=render_admission.lock().expect("render admission mutex poisoned");let key=a.keys.iter().find_map(|(key,value)|(*value==token).then_some(*key));if let Some(key)=key{a.keys.remove(&key);}a.replies.remove(&token)};let Some(reply)=reply else{continue};
                         #[cfg(test)]
@@ -783,31 +850,47 @@ impl PdfService {
                         let _ = reply.send(result);
                     }
                     Request::Edit(id, edit, reply) => {
+                        let durable_page=recovery_pages.remove(&id);
+                        if reply.is_closed() { continue; }
                         let result = (|| {
                             let (session, original) = sessions.get_mut(&id).ok_or("Document is closed")?;
+                            if recovery_offers.contains_key(&id) { return Err("Choose whether to keep the recovered edits before editing this PDF.".into()); }
+                            if durable_page.is_some_and(|page|page as usize>=session.plan.len()){return Err("Current page is out of range.".into());}
+                            ensure_recovery_owner(recovery_root.as_deref(),&recovery_heads,&mut recovery_floors,id,session)?;
+                            let snapshot = session.snapshot();
                             session.apply(edit)?;
+                            let info=match documents.get(&id).ok_or_else(||"Document is closed".to_owned()).and_then(|document|current_info(session,original,document)){Ok(info)=>info,Err(error)=>{session.restore(snapshot);return Err(error);}};
+                            let current_page=durable_page.map_or(0,|page|page.min(session.plan.len().saturating_sub(1) as u32));match persist_recovery_state(recovery_root.as_deref(), &mut recovery_floors, session, original, current_page) { Ok(Some(record)) if record.active => { recovery_heads.insert(id,(record.source,record.generation)); }, Ok(Some(_)) => { recovery_heads.remove(&id); }, Ok(None) => {}, Err(error) => { session.restore(snapshot); return Err(error); } }
                             note_documents.remove(&id);
                             cache.close(id);
-                            current_info(session, original, documents.get(&id).ok_or("Document is closed")?)
+                            Ok(info)
                         })();
                         let _ = reply.send(result);
                     }
                     Request::Crop(id, index, revision, rect, reply) => {
+                        let durable_page=recovery_pages.remove(&id);
                         if reply.is_closed() { continue; }
                         let result = (|| {
                             let (session, original) = sessions.get_mut(&id).ok_or("Document is closed")?;
+                            if recovery_offers.contains_key(&id) { return Err("Choose whether to keep the recovered edits before editing this PDF.".into()); }
+                            if durable_page.is_some_and(|page|page as usize>=session.plan.len()){return Err("Current page is out of range.".into());}
+                            ensure_recovery_owner(recovery_root.as_deref(),&recovery_heads,&mut recovery_floors,id,session)?;
+                            let snapshot = session.snapshot();
                             if session.revision != revision { return Err("Document changed. Open the crop tool again.".into()); }
                             let spec = session.plan.get(index as usize).ok_or("Page is out of range")?;
                             let document = documents.get(&id).ok_or("Document is closed")?;
                             let crop = checked_displayed_crop(document, spec, rect)?;
                             session.apply(PageEdit::Crop { page: index as usize, crop })?;
+                            let info=match current_info(session,original,document){Ok(info)=>info,Err(error)=>{session.restore(snapshot);return Err(error);}};
+                            let current_page=durable_page.unwrap_or(u32::from(index)).min(session.plan.len().saturating_sub(1) as u32);match persist_recovery_state(recovery_root.as_deref(), &mut recovery_floors, session, original, current_page) { Ok(Some(record)) if record.active => { recovery_heads.insert(id,(record.source,record.generation)); }, Ok(Some(_)) => { recovery_heads.remove(&id); }, Ok(None) => {}, Err(error) => { session.restore(snapshot); return Err(error); } }
                             note_documents.remove(&id);
                             cache.close(id);
-                            current_info(session, original, document)
+                            Ok(info)
                         })();
                         let _ = reply.send(result);
                     }
                     Request::CropPages(id, pages, revision, insets, reply) => {
+                        let durable_page=recovery_pages.remove(&id);
                         if reply.is_closed() { continue; }
                         let result = (|| {
                             validate_crop_insets(insets)?;
@@ -815,6 +898,10 @@ impl PdfService {
                                 return Err("Select one or more pages in ascending order without duplicates.".into());
                             }
                             let (session, original) = sessions.get_mut(&id).ok_or("Document is closed")?;
+                            if recovery_offers.contains_key(&id) { return Err("Choose whether to keep the recovered edits before editing this PDF.".into()); }
+                            if durable_page.is_some_and(|page|page as usize>=session.plan.len()){return Err("Current page is out of range.".into());}
+                            ensure_recovery_owner(recovery_root.as_deref(),&recovery_heads,&mut recovery_floors,id,session)?;
+                            let snapshot = session.snapshot();
                             if session.revision != revision { return Err("Document changed. Open the crop tool again.".into()); }
                             let document = documents.get(&id).ok_or("Document is closed")?;
                             let mut crops = Vec::with_capacity(pages.len());
@@ -824,28 +911,37 @@ impl PdfService {
                                 crops.push((page as usize, checked_displayed_crop(document, spec, rect)?));
                             }
                             session.apply(PageEdit::CropMany { crops })?;
+                            let info=match current_info(session,original,document){Ok(info)=>info,Err(error)=>{session.restore(snapshot);return Err(error);}};
+                            let current_page=durable_page.map_or(0,|page|page.min(session.plan.len().saturating_sub(1) as u32));match persist_recovery_state(recovery_root.as_deref(), &mut recovery_floors, session, original, current_page) { Ok(Some(record)) if record.active => { recovery_heads.insert(id,(record.source,record.generation)); }, Ok(Some(_)) => { recovery_heads.remove(&id); }, Ok(None) => {}, Err(error) => { session.restore(snapshot); return Err(error); } }
                             note_documents.remove(&id);
                             cache.close(id);
-                            current_info(session, original, document)
+                            Ok(info)
                         })();
                         let _ = reply.send(result);
                     }
                     Request::ResetCrops(id, pages, revision, reply) => {
+                        let durable_page=recovery_pages.remove(&id);
                         if reply.is_closed() { continue; }
                         let result = (|| {
                             if pages.is_empty() || pages.windows(2).any(|pair| pair[0] >= pair[1]) {
                                 return Err("Select one or more pages in ascending order without duplicates.".into());
                             }
                             let (session, original) = sessions.get_mut(&id).ok_or("Document is closed")?;
+                            if recovery_offers.contains_key(&id) { return Err("Choose whether to keep the recovered edits before editing this PDF.".into()); }
+                            if durable_page.is_some_and(|page|page as usize>=session.plan.len()){return Err("Current page is out of range.".into());}
+                            ensure_recovery_owner(recovery_root.as_deref(),&recovery_heads,&mut recovery_floors,id,session)?;
+                            let snapshot = session.snapshot();
                             if session.revision != revision { return Err("Document changed. Select pages again.".into()); }
                             let document = documents.get(&id).ok_or("Document is closed")?;
                             let before = session.revision;
                             session.apply(PageEdit::ResetCropMany { pages: pages.into_iter().map(usize::from).collect() })?;
+                            let info=match current_info(session,original,document){Ok(info)=>info,Err(error)=>{session.restore(snapshot);return Err(error);}};
+                            let current_page=durable_page.map_or(0,|page|page.min(session.plan.len().saturating_sub(1) as u32));match persist_recovery_state(recovery_root.as_deref(), &mut recovery_floors, session, original, current_page) { Ok(Some(record)) if record.active => { recovery_heads.insert(id,(record.source,record.generation)); }, Ok(Some(_)) => { recovery_heads.remove(&id); }, Ok(None) => {}, Err(error) => { session.restore(snapshot); return Err(error); } }
                             if session.revision != before {
                                 note_documents.remove(&id);
                                 cache.close(id);
                             }
-                            current_info(session, original, document)
+                            Ok(info)
                         })();
                         let _ = reply.send(result);
                     }
@@ -896,9 +992,14 @@ impl PdfService {
                         let _ = reply.send(result);
                     }
                     Request::Comment(id, revision, mutation, reply) => {
+                        let durable_page=recovery_pages.remove(&id);
                         if reply.is_closed() { continue; }
                         let result = (|| {
                             let (session, original) = sessions.get_mut(&id).ok_or("Document is closed")?;
+                            if recovery_offers.contains_key(&id) { return Err("Choose whether to keep the recovered edits before editing this PDF.".into()); }
+                            if durable_page.is_some_and(|page|page as usize>=session.plan.len()){return Err("Current page is out of range.".into());}
+                            ensure_recovery_owner(recovery_root.as_deref(),&recovery_heads,&mut recovery_floors,id,session)?;
+                            let snapshot = session.snapshot();
                             if session.revision != revision { return Err("Document changed. Refresh comments.".into()); }
                             if let Some(reason) = session.comments_reason() { return Err(reason.to_owned()); }
                             let document = documents.get(&id).ok_or("Document is closed")?;
@@ -926,8 +1027,10 @@ impl PdfService {
                             if next == session.plan { return current_info(session, original, document); }
                             let rendered = load_note_document(pdfium.as_ref().map_err(Clone::clone)?, document, session, &next)?;
                             session.commit_comments(next);
+                            let info=match current_info(session,original,document){Ok(info)=>info,Err(error)=>{session.restore(snapshot);return Err(error);}};
+                            let current_page=durable_page.map_or(0,|page|page.min(session.plan.len().saturating_sub(1) as u32));match persist_recovery_state(recovery_root.as_deref(), &mut recovery_floors, session, original, current_page) { Ok(Some(record)) if record.active => { recovery_heads.insert(id,(record.source,record.generation)); }, Ok(Some(_)) => { recovery_heads.remove(&id); }, Ok(None) => {}, Err(error) => { session.restore(snapshot); return Err(error); } }
                             note_documents.insert(id, (session.revision, rendered)); cache.close(id);
-                            current_info(session, original, document)
+                            Ok(info)
                         })();
                         let _ = reply.send(result);
                     }
@@ -1186,12 +1289,20 @@ impl PdfService {
                             let expected = pages.as_ref().map_or(session.plan.len(), |p| p.iter().collect::<std::collections::HashSet<_>>().len());
                             if check.pages().len() as usize != expected { return Err("Output page count validation failed.".into()); }
                             write_new_file(&path, &bytes)?;
-                            if pages.is_none() { session.mark_saved(); }
                             Ok(SavedCopy { path: path.to_string_lossy().into_owned(), document: current_info(session, original, documents.get(&id).ok_or("Document is closed")?)? })
                         })();
                         let _ = reply.send(result);
                     }
-                    Request::Close(id, reply) => { documents.remove(&id); sessions.remove(&id); note_documents.remove(&id); cache.close(id); page_labels.close(id); let _ = reply.send(Ok(())); }
+                    Request::Close(id, reply) => {
+                        let result = (|| {
+                            if let Some((session, original)) = sessions.get(&id) {
+                                if !session.dirty() && recovery_heads.contains_key(&id) { persist_recovery_state(recovery_root.as_deref(), &mut recovery_floors, session, original, 0)?; }
+                            }
+                            documents.remove(&id); sessions.remove(&id); recovery_offers.remove(&id); recovery_heads.remove(&id);
+                            note_documents.remove(&id); cache.close(id); page_labels.close(id); Ok(())
+                        })();
+                        let _ = reply.send(result);
+                    }
                 }
             }
         }).expect("Could not start PDF worker");
@@ -1210,6 +1321,12 @@ impl PdfService {
     #[allow(dead_code)]
     pub async fn restore_recovery(&self, root: PathBuf, path: PathBuf) -> Result<Option<RecoveredDocument>, String> {
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::RestoreRecovery(root, path, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?.map(|value| value.map(ReplyLease::accept))
+    }
+    pub async fn keep_recovered_edits(&self, id: u64, revision: u64) -> Result<RecoveredDocument, String> {
+        let (tx, rx) = oneshot::channel(); self.sender.send(Request::KeepRecoveredEdits(id, revision, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
+    }
+    pub async fn open_original(&self, id: u64, revision: u64) -> Result<DocumentInfo, String> {
+        let (tx, rx) = oneshot::channel(); self.sender.send(Request::OpenOriginal(id, revision, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
     }
     pub async fn begin_print(&self, id: u64, revision: u64) -> Result<PrintSnapshotInfo, String> {
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::BeginPrint(id, revision, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
@@ -1284,11 +1401,11 @@ impl PdfService {
     pub async fn fill_form_copy(&self, id: u64, revision: u64, values: Vec<crate::forms::FieldValue>, path: PathBuf) -> Result<SavedCopy, String> {
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::FillFormCopy(id, revision, values, path, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?.map(ReplyLease::accept)
     }
-    pub async fn edit(&self, id: u64, edit: PageEdit) -> Result<DocumentInfo, String> {
-        let (tx, rx) = oneshot::channel(); self.sender.send(Request::Edit(id, edit, tx)).map_err(|e| e.to_string())?; rx.await.map_err(|e| e.to_string())?
+    pub async fn edit(&self, id: u64, edit: PageEdit, current_page: u32) -> Result<DocumentInfo, String> {
+        let (tx, rx) = oneshot::channel(); self.sender.send(Request::DurableEdit(id, edit, current_page, tx)).map_err(|e| e.to_string())?; rx.await.map_err(|e| e.to_string())?
     }
-    pub async fn crop(&self, id: u64, page: u16, revision: u64, rect: CropRect) -> Result<DocumentInfo, String> {
-        let (tx, rx) = oneshot::channel(); self.sender.send(Request::Crop(id, page, revision, rect, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
+    pub async fn crop(&self, id: u64, page: u16, revision: u64, rect: CropRect, current_page: u32) -> Result<DocumentInfo, String> {
+        let (tx, rx) = oneshot::channel(); self.sender.send(Request::DurableCrop(id, page, revision, rect, current_page, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
     }
     pub async fn create_image_pdf(&self, source: PathBuf, path: PathBuf, options: crate::image_pdf::ImagePdfOptions) -> Result<SavedCopy, String> {
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::CreateImagePdf(source, path, options, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?.map(ReplyLease::accept)
@@ -1304,11 +1421,11 @@ impl PdfService {
     }
     pub async fn inspect_text_replacement(&self,id:u64,revision:u64,page:u16)->Result<TextReplacementInspection,String>{let(tx,rx)=oneshot::channel();self.sender.send(Request::InspectTextReplacement(id,revision,page,tx)).map_err(|e|e.to_string())?;rx.await.map_err(|e|e.to_string())?}
     pub async fn replace_text_copy(&self,id:u64,revision:u64,page:u16,expected:TextReplacementInspection,replacement:String,path:PathBuf)->Result<SavedCopy,String>{let(tx,rx)=oneshot::channel();self.sender.send(Request::ReplaceTextCopy(id,revision,page,expected,replacement,path,tx)).map_err(|e|e.to_string())?;rx.await.map_err(|e|e.to_string())?.map(ReplyLease::accept)}
-    pub async fn crop_pages(&self, id: u64, pages: Vec<u16>, revision: u64, insets: CropInsets) -> Result<DocumentInfo, String> {
-        let (tx, rx) = oneshot::channel(); self.sender.send(Request::CropPages(id, pages, revision, insets, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
+    pub async fn crop_pages(&self, id: u64, pages: Vec<u16>, revision: u64, insets: CropInsets, current_page: u32) -> Result<DocumentInfo, String> {
+        let (tx, rx) = oneshot::channel(); self.sender.send(Request::DurableCropPages(id, pages, revision, insets, current_page, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
     }
-    pub async fn reset_crops(&self, id: u64, pages: Vec<u16>, revision: u64) -> Result<DocumentInfo, String> {
-        let (tx, rx) = oneshot::channel(); self.sender.send(Request::ResetCrops(id, pages, revision, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
+    pub async fn reset_crops(&self, id: u64, pages: Vec<u16>, revision: u64, current_page: u32) -> Result<DocumentInfo, String> {
+        let (tx, rx) = oneshot::channel(); self.sender.send(Request::DurableResetCrops(id, pages, revision, current_page, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
     }
     pub async fn comments(&self, id: u64, revision: u64) -> Result<crate::comments::CommentList, String> {
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::Comments(id, revision, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
@@ -1316,26 +1433,26 @@ impl PdfService {
     pub async fn annotations(&self, id: u64, revision: u64) -> Result<crate::comments::AnnotationList, String> {
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::Annotations(id, revision, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
     }
-    pub async fn create_text_highlight(&self, id: u64, revision: u64, page: u16, start: usize, end: usize, contents: Option<String>) -> Result<DocumentInfo, String> {
-        let (tx, rx) = oneshot::channel(); self.sender.send(Request::Comment(id, revision, CommentMutation::CreateTextHighlight(page, start, end, contents), tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
+    pub async fn create_text_highlight(&self, id: u64, revision: u64, page: u16, start: usize, end: usize, contents: Option<String>, current_page: u32) -> Result<DocumentInfo, String> {
+        let (tx, rx) = oneshot::channel(); self.sender.send(Request::DurableComment(id, revision, CommentMutation::CreateTextHighlight(page, start, end, contents), current_page, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
     }
-    pub async fn create_highlight(&self, id: u64, revision: u64, page: u16, rect: CropRect, contents: Option<String>) -> Result<DocumentInfo, String> {
-        let (tx, rx) = oneshot::channel(); self.sender.send(Request::Comment(id, revision, CommentMutation::CreateHighlight(page, rect, contents), tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
+    pub async fn create_highlight(&self, id: u64, revision: u64, page: u16, rect: CropRect, contents: Option<String>, current_page: u32) -> Result<DocumentInfo, String> {
+        let (tx, rx) = oneshot::channel(); self.sender.send(Request::DurableComment(id, revision, CommentMutation::CreateHighlight(page, rect, contents), current_page, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
     }
-    pub async fn update_highlight(&self, id: u64, revision: u64, annotation_id: String, contents: Option<String>) -> Result<DocumentInfo, String> {
-        let (tx, rx) = oneshot::channel(); self.sender.send(Request::Comment(id, revision, CommentMutation::UpdateHighlight(annotation_id, contents), tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
+    pub async fn update_highlight(&self, id: u64, revision: u64, annotation_id: String, contents: Option<String>, current_page: u32) -> Result<DocumentInfo, String> {
+        let (tx, rx) = oneshot::channel(); self.sender.send(Request::DurableComment(id, revision, CommentMutation::UpdateHighlight(annotation_id, contents), current_page, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
     }
-    pub async fn delete_highlight(&self, id: u64, revision: u64, annotation_id: String) -> Result<DocumentInfo, String> {
-        let (tx, rx) = oneshot::channel(); self.sender.send(Request::Comment(id, revision, CommentMutation::DeleteHighlight(annotation_id), tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
+    pub async fn delete_highlight(&self, id: u64, revision: u64, annotation_id: String, current_page: u32) -> Result<DocumentInfo, String> {
+        let (tx, rx) = oneshot::channel(); self.sender.send(Request::DurableComment(id, revision, CommentMutation::DeleteHighlight(annotation_id), current_page, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
     }
-    pub async fn create_comment(&self, id: u64, revision: u64, page: u16, rect: CropRect, contents: String) -> Result<DocumentInfo, String> {
-        let (tx, rx) = oneshot::channel(); self.sender.send(Request::Comment(id, revision, CommentMutation::Create(page, rect, contents), tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
+    pub async fn create_comment(&self, id: u64, revision: u64, page: u16, rect: CropRect, contents: String, current_page: u32) -> Result<DocumentInfo, String> {
+        let (tx, rx) = oneshot::channel(); self.sender.send(Request::DurableComment(id, revision, CommentMutation::Create(page, rect, contents), current_page, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
     }
-    pub async fn update_comment(&self, id: u64, revision: u64, note_id: String, contents: String) -> Result<DocumentInfo, String> {
-        let (tx, rx) = oneshot::channel(); self.sender.send(Request::Comment(id, revision, CommentMutation::Update(note_id, contents), tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
+    pub async fn update_comment(&self, id: u64, revision: u64, note_id: String, contents: String, current_page: u32) -> Result<DocumentInfo, String> {
+        let (tx, rx) = oneshot::channel(); self.sender.send(Request::DurableComment(id, revision, CommentMutation::Update(note_id, contents), current_page, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
     }
-    pub async fn delete_comment(&self, id: u64, revision: u64, note_id: String) -> Result<DocumentInfo, String> {
-        let (tx, rx) = oneshot::channel(); self.sender.send(Request::Comment(id, revision, CommentMutation::Delete(note_id), tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
+    pub async fn delete_comment(&self, id: u64, revision: u64, note_id: String, current_page: u32) -> Result<DocumentInfo, String> {
+        let (tx, rx) = oneshot::channel(); self.sender.send(Request::DurableComment(id, revision, CommentMutation::Delete(note_id), current_page, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
     }
     pub async fn save(&self, id: u64, pages: Option<Vec<usize>>, path: PathBuf) -> Result<SavedCopy, String> {
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::Save(id, pages, path, tx)).map_err(|e| e.to_string())?; rx.await.map_err(|e| e.to_string())?
@@ -1494,6 +1611,9 @@ fn checked_ocr_request(
     })?;
     Ok((dimensions, spec, width, height))
 }
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryOffer { revision: u64, current_page: u32 }
 fn recovery_source_identity(bytes: &[u8]) -> Result<crate::recovery_journal::SourceIdentity, String> {
     let bytes_count = u64::try_from(bytes.len()).map_err(|_| "Recovery source is too large.")?;
     if bytes_count == 0 { return Err("Recovery source is empty.".into()); }
@@ -1515,7 +1635,47 @@ fn recovery_record(session: &EditSession, source: crate::recovery_journal::Sourc
         }).collect::<Result<Vec<_>, String>>()?;
         Ok(crate::recovery_journal::RecoveryPage { source: u32::try_from(page.source).map_err(|_| "Recovery page mapping is too large.")?, turns: u8::try_from(page.turns).map_err(|_| "Recovery rotation is invalid.")?, crop: page.crop.map(recovery_rect), annotations })
     }).collect::<Result<Vec<_>, String>>()?;
-    Ok(crate::recovery_journal::RecoveryRecord { generation, revision: session.revision, current_page, source_pages: u32::try_from(source_pages).map_err(|_| "Recovery source has too many pages.")?, source, edit_state: crate::recovery_journal::RecoveryEditState { pages } })
+    Ok(crate::recovery_journal::RecoveryRecord { active: true, generation, revision: session.revision, current_page, source_pages: u32::try_from(source_pages).map_err(|_| "Recovery source has too many pages.")?, source, edit_state: crate::recovery_journal::RecoveryEditState { pages } })
+}
+fn accept_recovery_record(floors: &mut HashMap<crate::recovery_journal::SourceIdentity, crate::recovery_journal::RecoveryRecord>, record: &crate::recovery_journal::RecoveryRecord) -> Result<(), String> {
+    if let Some(previous) = floors.get(&record.source) {
+        if record.generation < previous.generation || (record.generation == previous.generation && record != previous) {
+            return Err("Recovery state moved backward or was replaced while the app was running.".into());
+        }
+    }
+    floors.insert(record.source, record.clone());
+    Ok(())
+}
+fn persist_recovery_state(root: Option<&std::path::Path>, floors: &mut HashMap<crate::recovery_journal::SourceIdentity, crate::recovery_journal::RecoveryRecord>, session: &EditSession, original: &DocumentInfo, current_page: u32) -> Result<Option<crate::recovery_journal::RecoveryRecord>, String> {
+    let Some(root) = root else { return Ok(None); };
+    let disk = std::fs::read(&original.path).map_err(|_| "The source PDF changed or became unavailable; recovery was not updated.".to_owned())?;
+    if disk != session.source { return Err("The source PDF changed outside the app; recovery was not updated.".into()); }
+    let source = recovery_source_identity(&session.source)?;
+    let current = crate::recovery_store::read_recovery(root, source, None, 0)?;
+    if let Some(record) = &current { accept_recovery_record(floors, record)?; }
+    if !session.dirty() && current.is_none() { return Ok(None); }
+    let generation = current.as_ref().map_or(Ok(1), |record| record.generation.checked_add(1).ok_or("Recovery generation is exhausted."))?;
+    let record = if session.dirty() {
+        recovery_record(session, source, generation, current_page, original.pages.len())?
+    } else {
+        crate::recovery_journal::RecoveryRecord { active: false, generation, revision: session.revision, current_page: 0, source_pages: u32::try_from(original.pages.len()).map_err(|_| "Recovery source has too many pages.")?, source, edit_state: crate::recovery_journal::RecoveryEditState { pages: Vec::new() } }
+    };
+    crate::recovery_store::write_recovery(root, &record)?;
+    let verified = crate::recovery_store::read_recovery(root, source, None, record.revision)?.ok_or("Recovery verification failed.")?;
+    if verified != record { return Err("Recovery verification failed.".into()); }
+    accept_recovery_record(floors, &verified)?;
+    Ok(Some(record))
+}
+fn ensure_recovery_owner(root: Option<&std::path::Path>, heads: &HashMap<u64, (crate::recovery_journal::SourceIdentity, u64)>, floors: &mut HashMap<crate::recovery_journal::SourceIdentity, crate::recovery_journal::RecoveryRecord>, id: u64, session: &EditSession) -> Result<(), String> {
+    let source = recovery_source_identity(&session.source)?;
+    if heads.iter().any(|(owner, (identity, _))| *owner != id && *identity == source) { return Err("Another open tab owns recovery for this PDF. Close or resolve it before editing this tab.".into()); }
+    if let Some(root) = root {
+        if let Some(record) = crate::recovery_store::read_recovery(root, source, None, 0)? {
+            accept_recovery_record(floors, &record)?;
+            if record.active && heads.get(&id) != Some(&(source, record.generation)) { return Err("Recovery edits already exist for this PDF. Reopen it and choose which version to keep before editing.".into()); }
+        }
+    }
+    Ok(())
 }
 fn restore_crop(rect: crate::recovery_journal::RecoveryRect) -> CropBox {
     CropBox { left: rect.left, bottom: rect.bottom, right: rect.right, top: rect.top }
@@ -2203,9 +2363,9 @@ mod tests {
             info = call(&service, |reply| Request::Comment(info.id, info.revision, CommentMutation::Create((count - 1) as u16, CropRect { x: 0.02, y: 0.02, width: 0.05, height: 0.05 }, "Legacy-compatible note é 😀".into()), reply)).unwrap();
             info = call(&service, |reply| Request::Crop(info.id, 0, info.revision, CropRect { x: 0.0, y: 0.0, width: 0.95, height: 0.99 }, reply)).unwrap(); info = call(&service, |reply| Request::Edit(info.id, PageEdit::Rotate { pages: vec![0], clockwise: true }, reply)).unwrap(); info = call(&service, |reply| Request::Edit(info.id, PageEdit::Move { from: 0, to: count - 1 }, reply)).unwrap(); info = call(&service, |reply| Request::Edit(info.id, PageEdit::Delete { pages: vec![1] }, reply)).unwrap();
             let expected = call(&service, |reply| Request::Annotations(info.id, info.revision, reply)).unwrap(); assert_eq!(expected.annotations.len(), 3); assert_eq!(expected.annotations.iter().find(|value| value.id == text_id).unwrap().page, count - 2); let pixels = comments_png(&service, info.id, (count - 2) as u16, 600);
-            let copy = folder.path().join(format!("text-mixed-corpus-{count}.pdf")); info = call(&service, |reply| Request::Save(info.id, None, copy.clone(), reply)).unwrap().document; assert!(!info.dirty); let reopened = call(&service, |reply| Request::Open(copy, reply)).unwrap(); assert_eq!(reopened.pages.len(), count - 1); assert_eq!(serde_json::to_value(call(&service, |reply| Request::Annotations(reopened.id, 0, reply)).unwrap().annotations).unwrap(), serde_json::to_value(&expected.annotations).unwrap()); assert_eq!(comments_png(&service, reopened.id, (count - 2) as u16, 600), pixels);
+            let copy = folder.path().join(format!("text-mixed-corpus-{count}.pdf")); info = call(&service, |reply| Request::Save(info.id, None, copy.clone(), reply)).unwrap().document; assert!(info.dirty); let reopened = call(&service, |reply| Request::Open(copy, reply)).unwrap(); assert_eq!(reopened.pages.len(), count - 1); assert_eq!(serde_json::to_value(call(&service, |reply| Request::Annotations(reopened.id, 0, reply)).unwrap().annotations).unwrap(), serde_json::to_value(&expected.annotations).unwrap()); assert_eq!(comments_png(&service, reopened.id, (count - 2) as u16, 600), pixels);
             let extracted = folder.path().join(format!("text-extracted-{count}.pdf")); call(&service, |reply| Request::Save(info.id, Some(vec![0, count - 2]), extracted.clone(), reply)).unwrap(); let extracted = call(&service, |reply| Request::Open(extracted, reply)).unwrap(); let annotations = call(&service, |reply| Request::Annotations(extracted.id, 0, reply)).unwrap(); assert_eq!(annotations.annotations.len(), 2); assert!(annotations.annotations.iter().any(|value| value.id == text_id && value.page == 1)); assert_eq!(comments_png(&service, extracted.id, 1, 600), pixels);
-            let split = call(&service, |reply| Request::Split(info.id, info.revision, count.div_ceil(3), folder.path().join(format!("text-split-{count}")), reply)).unwrap(); let mut ids = Vec::new(); for file in split.files { let part = call(&service, |reply| Request::Open(file.path, reply)).unwrap(); ids.extend(call(&service, |reply| Request::Annotations(part.id, 0, reply)).unwrap().annotations.into_iter().map(|value| value.id)); call(&service, |reply| Request::Close(part.id, reply)).unwrap(); } assert_eq!(ids.len(), 3); assert!(ids.contains(&text_id)); assert!(!call(&service, |reply| Request::Edit(info.id, PageEdit::Move { from: 0, to: 0 }, reply)).unwrap().dirty);
+            let split = call(&service, |reply| Request::Split(info.id, info.revision, count.div_ceil(3), folder.path().join(format!("text-split-{count}")), reply)).unwrap(); let mut ids = Vec::new(); for file in split.files { let part = call(&service, |reply| Request::Open(file.path, reply)).unwrap(); ids.extend(call(&service, |reply| Request::Annotations(part.id, 0, reply)).unwrap().annotations.into_iter().map(|value| value.id)); call(&service, |reply| Request::Close(part.id, reply)).unwrap(); } assert_eq!(ids.len(), 3); assert!(ids.contains(&text_id)); assert!(call(&service, |reply| Request::Edit(info.id, PageEdit::Move { from: 0, to: 0 }, reply)).unwrap().dirty);
             let donor = call(&service, |reply| Request::Open(root.join("resources/welcome.pdf"), reply)).unwrap(); for result in [call(&service, |reply| Request::CheckCombine(combine_source(&info), combine_source(&donor), reply)), call(&service, |reply| Request::CheckInsertion(combine_source(&info), combine_source(&donor), 0, reply)), call(&service, |reply| Request::CheckReplacement(combine_source(&info), combine_source(&donor), 0, 1, reply))] { assert!(result.unwrap_err().contains("Annots")); }
             info = call(&service, |reply| Request::Edit(info.id, PageEdit::Delete { pages: vec![count - 2] }, reply)).unwrap(); assert!(!call(&service, |reply| Request::Annotations(info.id, info.revision, reply)).unwrap().annotations.iter().any(|value| value.id == text_id)); info = call(&service, |reply| Request::Edit(info.id, PageEdit::Undo, reply)).unwrap(); assert_eq!(comments_png(&service, info.id, (count - 2) as u16, 600), pixels);
             for id in [info.id, reopened.id, extracted.id, donor.id] { call(&service, |reply| Request::Close(id, reply)).unwrap(); } assert_eq!(std::fs::read(path).unwrap(), source);
@@ -2271,12 +2431,12 @@ mod tests {
             info = call(&service, |reply| Request::Comment(info.id, info.revision, CommentMutation::UpdateHighlight(highlight.clone(), Some("  Corpus highlight 漢字 😀\n ".into())), reply)).unwrap();
             info = call(&service, |reply| Request::Crop(info.id, 0, info.revision, CropRect { x: 0.0, y: 0.0, width: 0.9, height: 0.9 }, reply)).unwrap(); info = call(&service, |reply| Request::Edit(info.id, PageEdit::Rotate { pages: vec![0], clockwise: true }, reply)).unwrap(); info = call(&service, |reply| Request::Edit(info.id, PageEdit::Move { from: 0, to: count - 1 }, reply)).unwrap(); info = call(&service, |reply| Request::Edit(info.id, PageEdit::Delete { pages: vec![1] }, reply)).unwrap();
             let expected = call(&service, |reply| Request::Annotations(info.id, info.revision, reply)).unwrap(); assert_eq!(expected.annotations.len(), 2); assert_eq!(expected.annotations.iter().find(|value| value.id == highlight).unwrap().page, count - 2); assert_eq!(expected.annotations.iter().find(|value| value.id == note).unwrap().page, count - 3);
-            let copy = folder.path().join(format!("mixed-corpus-{count}.pdf")); info = call(&service, |reply| Request::Save(info.id, None, copy.clone(), reply)).unwrap().document; assert!(!info.dirty); let reopened = call(&service, |reply| Request::Open(copy, reply)).unwrap(); assert_eq!(reopened.pages.len(), count - 1); assert_eq!(serde_json::to_value(call(&service, |reply| Request::Annotations(reopened.id, 0, reply)).unwrap().annotations).unwrap(), serde_json::to_value(&expected.annotations).unwrap());
+            let copy = folder.path().join(format!("mixed-corpus-{count}.pdf")); info = call(&service, |reply| Request::Save(info.id, None, copy.clone(), reply)).unwrap().document; assert!(info.dirty); let reopened = call(&service, |reply| Request::Open(copy, reply)).unwrap(); assert_eq!(reopened.pages.len(), count - 1); assert_eq!(serde_json::to_value(call(&service, |reply| Request::Annotations(reopened.id, 0, reply)).unwrap().annotations).unwrap(), serde_json::to_value(&expected.annotations).unwrap());
             for page in [count - 3, count - 2] { assert_eq!(comments_png(&service, info.id, page as u16, 400), comments_png(&service, reopened.id, page as u16, 400)); }
             let extracted = folder.path().join(format!("highlight-extracted-{count}.pdf")); call(&service, |reply| Request::Save(info.id, Some(vec![0, count - 2]), extracted.clone(), reply)).unwrap(); let extracted = call(&service, |reply| Request::Open(extracted, reply)).unwrap(); let annotations = call(&service, |reply| Request::Annotations(extracted.id, 0, reply)).unwrap(); assert_eq!(annotations.annotations.len(), 1); assert_eq!(annotations.annotations[0].kind, crate::comments::AnnotationKind::Highlight); assert_eq!(annotations.annotations[0].id, highlight); assert_eq!(annotations.annotations[0].page, 1); assert_eq!(comments_png(&service, extracted.id, 1, 400), comments_png(&service, info.id, (count - 2) as u16, 400));
             let split = call(&service, |reply| Request::Split(info.id, info.revision, count.div_ceil(3), folder.path().join(format!("mixed-split-{count}")), reply)).unwrap(); let mut ids = Vec::new();
             for file in split.files { let part = call(&service, |reply| Request::Open(file.path.clone(), reply)).unwrap(); for annotation in call(&service, |reply| Request::Annotations(part.id, 0, reply)).unwrap().annotations { ids.push(annotation.id); } call(&service, |reply| Request::Close(part.id, reply)).unwrap(); }
-            assert_eq!(ids.len(), 2); assert!(ids.contains(&highlight) && ids.contains(&note)); assert!(!call(&service, |reply| Request::Edit(info.id, PageEdit::Move { from: 0, to: 0 }, reply)).unwrap().dirty, "Split/extract must not change the saved baseline");
+            assert_eq!(ids.len(), 2); assert!(ids.contains(&highlight) && ids.contains(&note)); assert!(call(&service, |reply| Request::Edit(info.id, PageEdit::Move { from: 0, to: 0 }, reply)).unwrap().dirty, "Save a Copy must preserve the original dirty session");
             let donor = call(&service, |reply| Request::Open(root.join("resources/welcome.pdf"), reply)).unwrap(); assert!(call(&service, |reply| Request::CheckCombine(combine_source(&info), combine_source(&donor), reply)).unwrap_err().contains("Annots")); assert!(call(&service, |reply| Request::CheckInsertion(combine_source(&info), combine_source(&donor), 0, reply)).unwrap_err().contains("Annots")); assert!(call(&service, |reply| Request::CheckReplacement(combine_source(&info), combine_source(&donor), 0, 1, reply)).unwrap_err().contains("Annots"));
             info = call(&service, |reply| Request::Edit(info.id, PageEdit::Delete { pages: vec![count - 2] }, reply)).unwrap(); assert!(!call(&service, |reply| Request::Annotations(info.id, info.revision, reply)).unwrap().annotations.iter().any(|value| value.id == highlight)); info = call(&service, |reply| Request::Edit(info.id, PageEdit::Undo, reply)).unwrap(); assert!(call(&service, |reply| Request::Annotations(info.id, info.revision, reply)).unwrap().annotations.iter().any(|value| value.id == highlight));
             for id in [info.id, reopened.id, extracted.id, donor.id] { call(&service, |reply| Request::Close(id, reply)).unwrap(); } assert_eq!(std::fs::read(path).unwrap(), source);
@@ -2363,7 +2523,7 @@ mod tests {
             info = call(&service, |reply| Request::Edit(info.id, PageEdit::Move { from: 0, to: count - 1 }, reply)).unwrap();
             info = call(&service, |reply| Request::Edit(info.id, PageEdit::Delete { pages: vec![1] }, reply)).unwrap();
             let list = call(&service, |reply| Request::Comments(info.id, info.revision, reply)).unwrap(); assert_eq!(list.notes.len(), 2); assert_eq!(list.notes.iter().find(|note| note.id == first_id).unwrap().page, count - 2);
-            let output_path = folder.path().join(format!("corpus-notes-{count}.pdf")); let saved = call(&service, |reply| Request::Save(info.id, None, output_path.clone(), reply)).unwrap(); info = saved.document; assert!(!info.dirty);
+            let output_path = folder.path().join(format!("corpus-notes-{count}.pdf")); let saved = call(&service, |reply| Request::Save(info.id, None, output_path.clone(), reply)).unwrap(); info = saved.document; assert!(info.dirty);
             let reopened = call(&service, |reply| Request::Open(output_path, reply)).unwrap(); assert_eq!(reopened.pages.len(), count - 1);
             let reopened_list = call(&service, |reply| Request::Comments(reopened.id, 0, reply)).unwrap(); assert_eq!(serde_json::to_value(list.notes).unwrap(), serde_json::to_value(reopened_list.notes).unwrap());
             for page in [count - 3, count - 2] { assert_eq!(comments_png(&service, info.id, page as u16, 400), comments_png(&service, reopened.id, page as u16, 400)); }
@@ -2518,7 +2678,8 @@ mod tests {
         batch.push(Request::Close(info.id, close_tx));
         let (end_tx, end_rx) = oneshot::channel();
         batch.push(Request::EndPrint(snapshot.token, end_tx));
-        release.send(batch).unwrap();
+        for request in batch { service.sender.send(request).unwrap(); }
+        release.send(Vec::new()).unwrap();
         close_rx.blocking_recv().unwrap().unwrap();
         end_rx.blocking_recv().unwrap().unwrap();
         let results: Vec<_> = responses.into_iter().map(|rx| rx.blocking_recv().unwrap()).collect();
@@ -2757,13 +2918,13 @@ mod tests {
         let _cleanup = UnreadReplyCleanup { service: service.clone(), paths: vec![first_path.clone(), second_path.clone(), password_path.clone(), output.clone()] };
         let first = tauri::async_runtime::block_on(service.open(first_path)).unwrap(); let first_source = combine_source(&first); drop(first);
         let second = tauri::async_runtime::block_on(service.begin_open(second_path)).unwrap();
-        let second_source = match &second { OpenResult::Opened { document } => combine_source(document), _ => panic!("Ordinary PDF must open") }; drop(second);
+        let second_source = match &second { OpenResult::Opened { document, .. } => combine_source(document), _ => panic!("Ordinary PDF must open") }; drop(second);
         for id in [first_source.id, second_source.id] { assert_eq!(call(&service, |reply| Request::Properties(id, 0, reply)).unwrap().page_count, 6); }
         let challenge = tauri::async_runtime::block_on(service.begin_open(password_path.clone())).unwrap();
         let request_id = match &challenge { OpenResult::PasswordRequired { request_id, .. } => *request_id, _ => panic!("Expected password challenge") }; drop(challenge);
         let wrong = tauri::async_runtime::block_on(service.unlock(request_id, "wrong".into())).unwrap(); assert!(matches!(wrong, OpenResult::PasswordRequired { incorrect: true, .. })); drop(wrong);
         let opened = tauri::async_runtime::block_on(service.unlock(request_id, "test password".into())).unwrap();
-        let unlocked_id = match &opened { OpenResult::Opened { document } => document.id, _ => panic!("Correct password must open") }; drop(opened);
+        let unlocked_id = match &opened { OpenResult::Opened { document, .. } => document.id, _ => panic!("Correct password must open") }; drop(opened);
         assert_eq!(call(&service, |reply| Request::Properties(unlocked_id, 0, reply)).unwrap().page_count, 6);
         let text = call(&service, |reply| Request::Text(unlocked_id, 0, 0, reply)).unwrap(); assert!(text.contains("Page 1 of 6"));
         let challenge = tauri::async_runtime::block_on(service.begin_open(password_path.clone())).unwrap();
@@ -3388,7 +3549,7 @@ mod tests {
                     assert_eq!(prior_print.bgra, original_print.bgra, "Crop or failure changed an earlier print snapshot");
                     let copy = folder.path().join(format!("copy-{inherited}-{original_rotation}-{edited}.pdf"));
                     let saved = call(&service, |reply| Request::Save(info.id, None, copy.clone(), reply)).unwrap();
-                    assert!(!saved.document.dirty); assert_eq!(saved.document.revision, info.revision);
+                    assert!(saved.document.dirty); assert_eq!(saved.document.revision, info.revision);
                     let output = Document::load(&copy).unwrap();
                     assert_eq!(output.get_page_content(output.get_pages()[&1]), pdf.get_page_content(page));
                     assert!(output.extract_text(&[1]).unwrap().contains("OutsideBottom"), "Crop must hide content without deleting it");
@@ -3461,7 +3622,7 @@ mod tests {
             assert_eq!(call(&service, |reply| Request::Render(info.id, 0, 201, reply)).unwrap(), other_before, "Crop changed an unrelated current page");
             let preview = image::load_from_memory(&call(&service, |reply| Request::Render(info.id, 2, 200, reply)).unwrap()).unwrap().into_rgb8();
             let copy = folder.path().join(format!("fixture-{count}.pdf"));
-            let saved = call(&service, |reply| Request::Save(info.id, None, copy.clone(), reply)).unwrap(); assert!(!saved.document.dirty);
+            let saved = call(&service, |reply| Request::Save(info.id, None, copy.clone(), reply)).unwrap(); assert!(saved.document.dirty);
             let reopened = call(&service, |reply| Request::Open(copy, reply)).unwrap();
             assert_eq!(reopened.pages.len(), count);
             let after = image::load_from_memory(&call(&service, |reply| Request::Render(reopened.id, 2, 200, reply)).unwrap()).unwrap().into_rgb8();
@@ -3617,7 +3778,7 @@ mod tests {
         assert_eq!((info.pages[0].width, info.pages[0].height), (restored_sizes[0].width, restored_sizes[0].height));
 
         let output = folder.path().join("reset-output.pdf");
-        let saved = call(&service, |reply| Request::Save(info.id, None, output.clone(), reply)).unwrap(); assert!(!saved.document.dirty);
+        let saved = call(&service, |reply| Request::Save(info.id, None, output.clone(), reply)).unwrap(); assert!(saved.document.dirty);
         let saved_pdf = Document::load(&output).unwrap(); let saved_page = saved_pdf.get_pages()[&1];
         let raw_box = |key: &[u8]| saved_pdf.get_dictionary(saved_page).unwrap().get(key).unwrap().as_array().unwrap().iter().map(|value| value.as_float().unwrap()).collect::<Vec<_>>();
         assert_eq!(raw_box(b"MediaBox"), vec![0.0, 0.0, 612.0, 792.0]);
@@ -3662,8 +3823,8 @@ mod tests {
             let protected_path = folder.path().join(format!("reset-{kind}.pdf")); protected.save(&protected_path).unwrap(); let protected_source = std::fs::read(&protected_path).unwrap();
             let opened = call(&service, |reply| Request::BeginOpen(protected_path.clone(), reply)).unwrap();
             let protected_info = match opened {
-                OpenResult::Opened { document } => document,
-                OpenResult::PasswordRequired { request_id, .. } => match call(&service, |reply| Request::Unlock(request_id, user_password.to_owned(), reply)).unwrap() { OpenResult::Opened { document } => document, _ => panic!("{kind} did not unlock") },
+                OpenResult::Opened { document, .. } => document,
+                OpenResult::PasswordRequired { request_id, .. } => match call(&service, |reply| Request::Unlock(request_id, user_password.to_owned(), reply)).unwrap() { OpenResult::Opened { document, .. } => document, _ => panic!("{kind} did not unlock") },
             };
             let before = call(&service, |reply| Request::Render(protected_info.id, 0, 173, reply)).unwrap();
             assert!(call(&service, |reply| Request::ResetCrops(protected_info.id, vec![0], protected_info.revision, reply)).is_err(), "{kind}");
@@ -4116,7 +4277,7 @@ mod tests {
             let (tx, rx) = oneshot::channel(); service.sender.send(Request::BeginOpen(path.clone(), tx)).unwrap();
             let result = rx.blocking_recv().unwrap().unwrap().accept();
             let info = if user_password.is_empty() {
-                match result { OpenResult::Opened { document } => document, _ => panic!("Empty password should open") }
+                match result { OpenResult::Opened { document, .. } => document, _ => panic!("Empty password should open") }
             } else {
                 let request_id = match result { OpenResult::PasswordRequired { request_id, incorrect, .. } => { assert!(!incorrect); request_id }, _ => panic!("Expected password challenge") };
                 for wrong in ["wrong", ""] {
@@ -4124,7 +4285,7 @@ mod tests {
                     assert!(matches!(rx.blocking_recv().unwrap().unwrap().accept(), OpenResult::PasswordRequired { .. }));
                 }
                 let (tx, rx) = oneshot::channel(); service.sender.send(Request::Unlock(request_id, user_password.into(), tx)).unwrap();
-                let opened = match rx.blocking_recv().unwrap().unwrap().accept() { OpenResult::Opened { document } => document, _ => panic!("Correct password failed") };
+                let opened = match rx.blocking_recv().unwrap().unwrap().accept() { OpenResult::Opened { document, .. } => document, _ => panic!("Correct password failed") };
                 let (tx, rx) = oneshot::channel(); service.sender.send(Request::Unlock(request_id, user_password.into(), tx)).unwrap(); assert!(rx.blocking_recv().unwrap().is_err());
                 let (tx, rx) = oneshot::channel(); service.sender.send(Request::BeginOpen(path.clone(), tx)).unwrap();
                 let cancelled = match rx.blocking_recv().unwrap().unwrap().accept() { OpenResult::PasswordRequired { request_id, .. } => request_id, _ => panic!("Expected challenge") };
@@ -4316,8 +4477,8 @@ mod tests {
             let source = std::fs::read(&path).unwrap();
             let opened = call(&service, |reply| Request::BeginOpen(path.clone(), reply)).unwrap();
             let info = match opened {
-                OpenResult::Opened { document } => document,
-                OpenResult::PasswordRequired { request_id, .. } => match call(&service, |reply| Request::Unlock(request_id, user_password.into(), reply)).unwrap() { OpenResult::Opened { document } => document, _ => panic!("{kind} did not unlock") },
+                OpenResult::Opened { document, .. } => document,
+                OpenResult::PasswordRequired { request_id, .. } => match call(&service, |reply| Request::Unlock(request_id, user_password.into(), reply)).unwrap() { OpenResult::Opened { document, .. } => document, _ => panic!("{kind} did not unlock") },
             };
             if !allowed {
                 for error in [
@@ -4341,7 +4502,7 @@ mod tests {
         for (password, owner_access) in [("reader", false), ("owner", true)] {
             let opened = call(&service, |reply| Request::BeginOpen(path.clone(), reply)).unwrap();
             let request_id = match opened { OpenResult::PasswordRequired { request_id, .. } => request_id, _ => panic!("protected fixture opened without a password") };
-            let info = match call(&service, |reply| Request::Unlock(request_id, password.into(), reply)).unwrap() { OpenResult::Opened { document } => document, _ => panic!("{password} did not unlock") };
+            let info = match call(&service, |reply| Request::Unlock(request_id, password.into(), reply)).unwrap() { OpenResult::Opened { document, .. } => document, _ => panic!("{password} did not unlock") };
             let text = call(&service, |reply| Request::Text(info.id, 0, info.revision, reply));
             let geometry = call(&service, |reply| Request::TextGeometry(info.id, 0, info.revision, reply));
             if owner_access { assert!(text.is_ok() && geometry.is_ok()); } else { assert_eq!(text.unwrap_err(), "This PDF does not allow text and graphics extraction."); assert_eq!(geometry.unwrap_err(), "This PDF does not allow text and graphics extraction."); }
@@ -4482,8 +4643,8 @@ mod tests {
             let path = folder.path().join(format!("{kind}.pdf")); pdf.save(&path).unwrap();
             let opened = call(&service, |reply| Request::BeginOpen(path, reply)).unwrap();
             let info = match opened {
-                OpenResult::Opened { document } => document,
-                OpenResult::PasswordRequired { request_id, .. } => match call(&service, |reply| Request::Unlock(request_id, String::new(), reply)).unwrap() { OpenResult::Opened { document } => document, _ => panic!("{kind} did not unlock") },
+                OpenResult::Opened { document, .. } => document,
+                OpenResult::PasswordRequired { request_id, .. } => match call(&service, |reply| Request::Unlock(request_id, String::new(), reply)).unwrap() { OpenResult::Opened { document, .. } => document, _ => panic!("{kind} did not unlock") },
             };
             let error = ocr_raster(&service, crate::ocr::OcrPageRequest { document_id: info.id, revision: 0, page: 0 }, crate::ocr_process::OcrCancellation::default()).unwrap_err();
             match kind {
@@ -4615,12 +4776,40 @@ mod tests {
         drop(replies);assert_eq!(receiver.try_iter().filter(|r|matches!(r,Request::AdmittedRender(..))).count(),32);
     }
     #[test]
+    #[ignore = "uses an isolated recovery-root worker and must run alone because PDFium binding is process-global"]
+    fn acknowledged_edits_are_verified_and_undo_to_clean_publishes_tombstone() {
+        let manifest=PathBuf::from(env!("CARGO_MANIFEST_DIR"));let folder=tempfile::tempdir().unwrap();let recovery=folder.path().join("recovery");std::fs::create_dir(&recovery).unwrap();let source_path=folder.path().join("source.pdf");let source=std::fs::read(manifest.join("resources/welcome.pdf")).unwrap();std::fs::write(&source_path,&source).unwrap();
+        let service=PdfService::start_worker(manifest.join("resources/pdfium/bin/pdfium.dll"),4096,Some(recovery.clone()));let opened=call(&service,|reply|Request::Open(source_path.clone(),reply)).unwrap();
+        let edited=call(&service,|reply|Request::DurableEdit(opened.id,PageEdit::Rotate{pages:vec![0],clockwise:true},2,reply)).unwrap();let identity=recovery_source_identity(&source).unwrap();let active=crate::recovery_store::read_recovery(&recovery,identity,None,edited.revision).unwrap().unwrap();assert!(active.active);assert_eq!(active.current_page,2);assert_eq!(active.edit_state.pages[0].turns,1);let saved=call(&service,|reply|Request::Save(opened.id,None,folder.path().join("copy.pdf"),reply)).unwrap();assert!(saved.document.dirty);assert_eq!(crate::recovery_store::read_recovery(&recovery,identity,None,edited.revision).unwrap().unwrap(),active);let journal=std::fs::read_dir(&recovery).unwrap().map(|entry|entry.unwrap().path()).find(|path|path.extension().and_then(|value|value.to_str())==Some("smacrec")).unwrap();let mut replaced=active.clone();replaced.current_page=1;std::fs::write(&journal,crate::recovery_journal::encode_recovery(&replaced).unwrap()).unwrap();assert!(call(&service,|reply|Request::CheckpointRecovery(recovery.clone(),opened.id,edited.revision,2,reply)).err().unwrap().contains("replaced"));std::fs::write(&journal,crate::recovery_journal::encode_recovery(&active).unwrap()).unwrap();
+        let clean=call(&service,|reply|Request::DurableEdit(opened.id,PageEdit::Undo,2,reply)).unwrap();assert!(!clean.dirty&&clean.can_redo);let tombstone=crate::recovery_store::read_recovery(&recovery,identity,None,clean.revision).unwrap().unwrap();assert!(!tombstone.active);assert!(tombstone.generation>active.generation);assert!(tombstone.edit_state.pages.is_empty());
+        std::fs::write(&journal,crate::recovery_journal::encode_recovery(&active).unwrap()).unwrap();let rollback=call(&service,|reply|Request::DurableEdit(opened.id,PageEdit::Redo,0,reply)).err().unwrap();assert!(rollback.contains("moved backward"));let state=call(&service,|reply|Request::OcrWorkerState(opened.id,reply)).unwrap();assert!(!state.dirty&&state.can_redo);assert_eq!(state.revision,clean.revision);std::fs::write(&journal,crate::recovery_journal::encode_recovery(&tombstone).unwrap()).unwrap();
+        call(&service,|reply|Request::Close(opened.id,reply)).unwrap();let(tx,rx)=oneshot::channel();service.sender.send(Request::RestoreRecovery(recovery,source_path,tx)).unwrap();assert!(rx.blocking_recv().unwrap().unwrap().is_none());
+    }
+
+    #[test]
+    #[ignore = "uses an isolated recovery-root worker and must run alone because PDFium binding is process-global"]
+    fn journal_failure_and_external_source_change_roll_back_exact_session() {
+        let manifest=PathBuf::from(env!("CARGO_MANIFEST_DIR"));let folder=tempfile::tempdir().unwrap();let recovery=folder.path().join("recovery");std::fs::create_dir(&recovery).unwrap();let source_path=folder.path().join("source.pdf");let source=std::fs::read(manifest.join("resources/welcome.pdf")).unwrap();std::fs::write(&source_path,&source).unwrap();
+        let service=PdfService::start_worker(manifest.join("resources/pdfium/bin/pdfium.dll"),4096,Some(recovery.clone()));let opened=call(&service,|reply|Request::Open(source_path.clone(),reply)).unwrap();assert!(call(&service,|reply|Request::DurableEdit(opened.id,PageEdit::Rotate{pages:vec![0],clockwise:true},u32::MAX,reply)).err().unwrap().contains("Current page"));std::fs::write(&source_path,b"changed").unwrap();assert!(call(&service,|reply|Request::Edit(opened.id,PageEdit::Rotate{pages:vec![0],clockwise:true},reply)).err().unwrap().contains("changed outside"));assert!(call(&service,|reply|Request::CheckpointRecovery(recovery.clone(),opened.id,opened.revision,0,reply)).err().unwrap().contains("unsaved"));std::fs::write(&source_path,&source).unwrap();std::fs::rename(&recovery,folder.path().join("recovery-backup")).unwrap();std::fs::write(&recovery,b"not-a-directory").unwrap();assert!(call(&service,|reply|Request::DurableEdit(opened.id,PageEdit::Rotate{pages:vec![0],clockwise:true},0,reply)).is_err());let state=call(&service,|reply|Request::OcrWorkerState(opened.id,reply)).unwrap();assert_eq!(state.revision,0);assert!(!state.dirty&&!state.can_undo&&!state.can_redo);assert_eq!(state.plan[0].turns,0);
+    }
+
+    #[test]
+    #[ignore = "uses an isolated recovery-root worker and must run alone because PDFium binding is process-global"]
+    fn normal_open_offers_active_recovery_and_explicit_choices_are_monotonic() {
+        let manifest=PathBuf::from(env!("CARGO_MANIFEST_DIR"));let folder=tempfile::tempdir().unwrap();let recovery=folder.path().join("recovery");std::fs::create_dir(&recovery).unwrap();let source_path=folder.path().join("source.pdf");std::fs::copy(manifest.join("resources/welcome.pdf"),&source_path).unwrap();let service=PdfService::start_worker(manifest.join("resources/pdfium/bin/pdfium.dll"),4096,Some(recovery.clone()));
+        let first=call(&service,|reply|Request::Open(source_path.clone(),reply)).unwrap();let shadow=call(&service,|reply|Request::Open(source_path.clone(),reply)).unwrap();let edited=call(&service,|reply|Request::Edit(first.id,PageEdit::Rotate{pages:vec![0],clockwise:true},reply)).unwrap();assert!(call(&service,|reply|Request::Edit(shadow.id,PageEdit::Rotate{pages:vec![0],clockwise:true},reply)).is_err());call(&service,|reply|Request::Close(edited.id,reply)).unwrap();assert!(call(&service,|reply|Request::Edit(shadow.id,PageEdit::Rotate{pages:vec![0],clockwise:true},reply)).is_err());
+        let opened=call(&service,|reply|Request::BeginOpen(source_path.clone(),reply)).unwrap().accept();let (clean,offer)=match opened{OpenResult::Opened{document,recovery}=>(document,recovery.unwrap()),_=>panic!("ordinary source must open")};assert_eq!(clean.revision,0);assert_eq!(offer.revision,edited.revision);
+        let kept=call(&service,|reply|Request::KeepRecoveredEdits(clean.id,clean.revision,reply)).unwrap();assert!(kept.document.dirty);assert_eq!(kept.document.revision,edited.revision);call(&service,|reply|Request::Close(clean.id,reply)).unwrap();
+        let opened=call(&service,|reply|Request::BeginOpen(source_path.clone(),reply)).unwrap().accept();let clean=match opened{OpenResult::Opened{document,recovery:Some(_)}=>document,_=>panic!("active recovery must be offered")};let original=call(&service,|reply|Request::OpenOriginal(clean.id,clean.revision,reply)).unwrap();assert!(!original.dirty);let identity=recovery_source_identity(&std::fs::read(source_path).unwrap()).unwrap();let record=crate::recovery_store::read_recovery(&recovery,identity,None,0).unwrap().unwrap();assert!(!record.active);assert_eq!(record.generation,2);assert!(call(&service,|reply|Request::OpenOriginal(clean.id,clean.revision,reply)).is_err());
+    }
+
+    #[test]
     fn recovery_checkpoint_ack_is_durable_and_explicit_restore_replays_exact_state(){
-        let manifest=PathBuf::from(env!("CARGO_MANIFEST_DIR"));let service=PdfService::start(manifest.join("resources/pdfium/bin/pdfium.dll"));let folder=tempfile::tempdir().unwrap();let recovery=folder.path().join("recovery");std::fs::create_dir(&recovery).unwrap();let source_path=folder.path().join("source.pdf");let source=std::fs::read(manifest.join("resources/welcome.pdf")).unwrap();std::fs::write(&source_path,&source).unwrap();
+        let manifest=PathBuf::from(env!("CARGO_MANIFEST_DIR"));let folder=tempfile::tempdir().unwrap();let recovery=folder.path().join("recovery");std::fs::create_dir(&recovery).unwrap();let service=PdfService::start_worker(manifest.join("resources/pdfium/bin/pdfium.dll"),4096,Some(recovery.clone()));let source_path=folder.path().join("source.pdf");let source=std::fs::read(manifest.join("resources/welcome.pdf")).unwrap();std::fs::write(&source_path,&source).unwrap();
         let opened=call(&service,|reply|Request::Open(source_path.clone(),reply)).unwrap();assert!(call(&service,|reply|Request::CheckpointRecovery(recovery.clone(),opened.id,opened.revision,0,reply)).unwrap_err().contains("unsaved"));
         let edited=call(&service,|reply|Request::Edit(opened.id,PageEdit::Move{from:5,to:0},reply)).unwrap();let edited=call(&service,|reply|Request::Edit(edited.id,PageEdit::Rotate{pages:vec![0],clockwise:true},reply)).unwrap();let edited=call(&service,|reply|Request::Crop(edited.id,0,edited.revision,CropRect{x:0.05,y:0.1,width:0.8,height:0.75},reply)).unwrap();let edited=call(&service,|reply|Request::Comment(edited.id,edited.revision,CommentMutation::CreateHighlight(0,CropRect{x:0.1,y:0.1,width:0.2,height:0.2},Some("Recovered highlight".into())),reply)).unwrap();let expected=call(&service,|reply|Request::Render(edited.id,0,240,reply)).unwrap();
-        call(&service,|reply|Request::CheckpointRecovery(recovery.clone(),edited.id,edited.revision,2,reply)).unwrap();let identity=recovery_source_identity(&source).unwrap();let durable=crate::recovery_store::read_recovery(&recovery,identity,None,edited.revision).unwrap().unwrap();assert_eq!((durable.generation,durable.revision,durable.current_page),(1,edited.revision,2));assert_eq!(std::fs::read(&source_path).unwrap(),source);
-        call(&service,|reply|Request::Close(edited.id,reply)).unwrap();let(tx,rx)=oneshot::channel();service.sender.send(Request::RestoreRecovery(recovery.clone(),source_path.clone(),tx)).unwrap();let restored=rx.blocking_recv().unwrap().unwrap().unwrap().accept();assert_eq!(restored.current_page,2);assert_eq!(restored.document.revision,edited.revision);assert!(restored.document.dirty&&restored.document.can_undo&&!restored.document.can_redo);assert_eq!(call(&service,|reply|Request::Render(restored.document.id,0,240,reply)).unwrap(),expected);let annotations=call(&service,|reply|Request::Annotations(restored.document.id,restored.document.revision,reply)).unwrap();assert_eq!(annotations.annotations.len(),1);assert_eq!(annotations.annotations[0].contents.as_deref(),Some("Recovered highlight"));
+        std::fs::write(&source_path,b"changed").unwrap();assert!(call(&service,|reply|Request::CheckpointRecovery(recovery.clone(),edited.id,edited.revision,2,reply)).err().unwrap().contains("changed outside"));std::fs::write(&source_path,&source).unwrap();call(&service,|reply|Request::CheckpointRecovery(recovery.clone(),edited.id,edited.revision,2,reply)).unwrap();let identity=recovery_source_identity(&source).unwrap();let durable=crate::recovery_store::read_recovery(&recovery,identity,None,edited.revision).unwrap().unwrap();assert_eq!((durable.generation,durable.revision,durable.current_page),(5,edited.revision,2));assert_eq!(std::fs::read(&source_path).unwrap(),source);
+        call(&service,|reply|Request::Close(edited.id,reply)).unwrap();let(tx,rx)=oneshot::channel();service.sender.send(Request::RestoreRecovery(recovery.clone(),source_path.clone(),tx)).unwrap();let restored=rx.blocking_recv().unwrap().unwrap().unwrap().accept();assert_eq!(restored.current_page,2);assert_eq!(restored.document.revision,edited.revision);assert!(restored.document.dirty&&restored.document.can_undo&&!restored.document.can_redo);assert_eq!(call(&service,|reply|Request::Render(restored.document.id,0,240,reply)).unwrap(),expected);let annotations=call(&service,|reply|Request::Annotations(restored.document.id,restored.document.revision,reply)).unwrap();assert_eq!(annotations.annotations.len(),1);assert_eq!(annotations.annotations[0].contents.as_deref(),Some("Recovered highlight"));let advanced=call(&service,|reply|Request::DurableEdit(restored.document.id,PageEdit::Rotate{pages:vec![0],clockwise:true},2,reply)).unwrap();let durable=crate::recovery_store::read_recovery(&recovery,identity,None,advanced.revision).unwrap().unwrap();assert_eq!(durable.generation,6);assert_eq!(durable.current_page,2);
         let missing=folder.path().join("missing");std::fs::create_dir(&missing).unwrap();let(tx,rx)=oneshot::channel();service.sender.send(Request::RestoreRecovery(missing,source_path.clone(),tx)).unwrap();assert!(rx.blocking_recv().unwrap().unwrap().is_none());call(&service,|reply|Request::Close(restored.document.id,reply)).unwrap();assert_eq!(std::fs::read(source_path).unwrap(),source);
     }
     #[test]
@@ -4807,8 +4996,8 @@ mod tests {
             let path = folder.path().join(format!("redaction-{kind}.pdf")); pdf.save(&path).unwrap();
             let opened = call(&service, |reply| Request::BeginOpen(path, reply)).unwrap();
             let protected = match opened {
-                OpenResult::Opened { document } => document,
-                OpenResult::PasswordRequired { request_id, .. } => match call(&service, |reply| Request::Unlock(request_id, user_password.to_owned(), reply)).unwrap() { OpenResult::Opened { document } => document, _ => panic!("{kind} did not unlock") },
+                OpenResult::Opened { document, .. } => document,
+                OpenResult::PasswordRequired { request_id, .. } => match call(&service, |reply| Request::Unlock(request_id, user_password.to_owned(), reply)).unwrap() { OpenResult::Opened { document, .. } => document, _ => panic!("{kind} did not unlock") },
             };
             assert!(call(&service, |reply| Request::PreflightRasterRedaction(protected.id, 0, 0, rectangles.clone(), reply)).unwrap_err().contains("encrypted or restricted"));
             call(&service, |reply| Request::Close(protected.id, reply)).unwrap();
@@ -4965,8 +5154,8 @@ mod tests {
             let source = folder.path().join(format!("{kind}.pdf")); pdf.save(&source).unwrap();
             let opened = call(&service, |reply| Request::BeginOpen(source, reply)).unwrap();
             let info = match opened {
-                OpenResult::Opened { document } => document,
-                OpenResult::PasswordRequired { request_id, .. } => match call(&service, |reply| Request::Unlock(request_id, user_password.to_owned(), reply)).unwrap() { OpenResult::Opened { document } => document, _ => panic!("{kind} did not unlock") },
+                OpenResult::Opened { document, .. } => document,
+                OpenResult::PasswordRequired { request_id, .. } => match call(&service, |reply| Request::Unlock(request_id, user_password.to_owned(), reply)).unwrap() { OpenResult::Opened { document, .. } => document, _ => panic!("{kind} did not unlock") },
             };
             for format in [PageImageFormat::Png, PageImageFormat::Jpeg] {
                 assert!(call(&service, |reply| Request::PreflightPageImage(info.id, 0, 0, 72, format, reply)).is_err(), "{kind} {format:?}");
@@ -5043,7 +5232,7 @@ mod tests {
             let preview = image::load_from_memory(&rx.blocking_recv().unwrap().unwrap()).unwrap().into_rgba8();
             let path = output.path().join(format!("organized-{count}.pdf"));
             let (tx, rx) = oneshot::channel(); service.sender.send(Request::Save(info.id, None, path.clone(), tx)).unwrap();
-            assert!(!rx.blocking_recv().unwrap().unwrap().document.dirty);
+            assert!(rx.blocking_recv().unwrap().unwrap().document.dirty);
             let (tx, rx) = oneshot::channel(); service.sender.send(Request::Open(path, tx)).unwrap();
             let reopened = rx.blocking_recv().unwrap().unwrap(); assert_eq!(reopened.pages.len(), count);
             let (tx, rx) = oneshot::channel(); service.sender.send(Request::Render(reopened.id, 0, 260, tx)).unwrap();

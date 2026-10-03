@@ -51,6 +51,16 @@ pub(crate) async fn restore_recovery(app: tauri::AppHandle, service: State<'_, c
     service.restore_recovery(root, path).await.map(|result| result.map(|recovered| RecoveryRestoreResult { document: recovered.document, current_page: recovered.current_page }))
 }
 
+#[tauri::command]
+pub(crate) async fn keep_recovered_edits(service: State<'_, crate::service::PdfService>, id: u64, revision: u64) -> Result<RecoveryRestoreResult, String> {
+    service.keep_recovered_edits(id, revision).await.map(|recovered| RecoveryRestoreResult { document: recovered.document, current_page: recovered.current_page })
+}
+
+#[tauri::command]
+pub(crate) async fn open_original(service: State<'_, crate::service::PdfService>, id: u64, revision: u64) -> Result<crate::service::DocumentInfo, String> {
+    service.open_original(id, revision).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

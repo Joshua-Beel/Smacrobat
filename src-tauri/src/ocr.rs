@@ -282,10 +282,10 @@ mod tests {
         let source = std::fs::read(&source_path).unwrap();
         let mut info = service.open(source_path.clone()).await.unwrap();
         for _ in 0..3 {
-            info = service.edit(info.ocr_request(0).document_id, crate::editor::PageEdit::Rotate { pages: vec![0], clockwise: true }).await.unwrap();
+            info = service.edit(info.ocr_request(0).document_id, crate::editor::PageEdit::Rotate { pages: vec![0], clockwise: true }, 0).await.unwrap();
         }
-        info = service.crop(info.ocr_request(0).document_id, 0, info.ocr_request(0).revision, crate::service::CropRect { x: 0.01, y: 0.01, width: 0.98, height: 0.98 }).await.unwrap();
-        info = service.create_highlight(info.ocr_request(0).document_id, info.ocr_request(0).revision, 0, crate::service::CropRect { x: 0.02, y: 0.02, width: 0.03, height: 0.03 }, Some("Retained OCR note".into())).await.unwrap();
+        info = service.crop(info.ocr_request(0).document_id, 0, info.ocr_request(0).revision, crate::service::CropRect { x: 0.01, y: 0.01, width: 0.98, height: 0.98 }, 0).await.unwrap();
+        info = service.create_highlight(info.ocr_request(0).document_id, info.ocr_request(0).revision, 0, crate::service::CropRect { x: 0.02, y: 0.02, width: 0.03, height: 0.03 }, Some("Retained OCR note".into()), 0).await.unwrap();
         (info.ocr_request(0), source_path, source)
     }
 
@@ -358,7 +358,7 @@ mod tests {
         let coordinator = Arc::new(OcrCoordinator::with_hooks(service.clone(), verified_runner(), OcrCoordinatorHooks { after_process: Some(hook), ..Default::default() }));
         let task = tauri::async_runtime::spawn({ let coordinator = coordinator.clone(); async move { coordinator.recognize_page(request, OcrCancellation::default()).await } });
         ready.recv_timeout(Duration::from_secs(30)).unwrap();
-        tauri::async_runtime::block_on(service.edit(request.document_id, crate::editor::PageEdit::Rotate { pages: vec![0], clockwise: true })).unwrap();
+        tauri::async_runtime::block_on(service.edit(request.document_id, crate::editor::PageEdit::Rotate { pages: vec![0], clockwise: true }, 0)).unwrap();
         release.send(()).unwrap();
         let error = tauri::async_runtime::block_on(task).unwrap().unwrap_err();
         assert!(matches!(error, OcrProcessError::Document(ref message) if message.contains("changed")));

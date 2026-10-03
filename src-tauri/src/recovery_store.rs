@@ -141,7 +141,7 @@ pub fn write_recovery(root: &Path, record: &RecoveryRecord) -> Result<PathBuf, S
     };
     if replacing {
         let current = decode_recovery(&read_bounded(&destination)?, record.source, None, 0)?;
-        if record.generation <= current.generation || record.revision < current.revision {
+        if record.generation <= current.generation || (record.active && current.active && record.revision < current.revision) {
             return Err("Recovery record is stale.".into());
         }
     }

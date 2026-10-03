@@ -19,6 +19,7 @@ fn identity() -> SourceIdentity {
 }
 fn record(generation: u64, revision: u64) -> RecoveryRecord {
     RecoveryRecord {
+        active: true,
         generation,
         revision,
         current_page: 0,
@@ -33,6 +34,10 @@ fn record(generation: u64, revision: u64) -> RecoveryRecord {
             }],
         },
     }
+}
+
+fn tombstone(generation: u64, revision: u64) -> RecoveryRecord {
+    RecoveryRecord { active: false, generation, revision, current_page: 0, source_pages: 2, source: identity(), edit_state: RecoveryEditState { pages: Vec::new() } }
 }
 fn fresh_root(label: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!(
@@ -80,6 +85,16 @@ fn rejects_stale_or_regressed_writes_without_changing_the_record() {
         .unwrap_err()
         .contains("stale"));
     assert_eq!(fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn tombstone_allows_a_new_low_revision_lineage_but_not_generation_rollback() {
+    let folder = tempfile::tempdir().unwrap();
+    write_recovery(folder.path(), &record(5, 9)).unwrap();
+    write_recovery(folder.path(), &tombstone(6, 9)).unwrap();
+    write_recovery(folder.path(), &record(7, 1)).unwrap();
+    assert_eq!(read_recovery(folder.path(), identity(), None, 0).unwrap().unwrap(), record(7, 1));
+    assert!(write_recovery(folder.path(), &record(6, 10)).unwrap_err().contains("stale"));
 }
 #[test]
 fn rejects_corrupt_wrong_source_and_stale_reads() {

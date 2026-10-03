@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
 const MAGIC: &[u8; 8] = b"SMACREC\0";
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 const HEADER_BYTES: usize = 78;
 const DIGEST_BYTES: usize = 32;
 const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
@@ -14,7 +14,7 @@ const MAX_TOTAL_TEXT_BYTES: usize = 1024 * 1024;
 const MAX_QUADS: usize = 256;
 const MAX_TOTAL_QUADS: usize = 4_096;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SourceIdentity { pub bytes: u64, pub sha256: [u8; 32] }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
@@ -50,6 +50,7 @@ pub struct RecoveryEditState { pub pages: Vec<RecoveryPage> }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RecoveryRecord {
+    pub active: bool,
     pub generation: u64,
     pub revision: u64,
     pub current_page: u32,
@@ -84,8 +85,13 @@ fn union(quads: &[RecoveryRect]) -> Option<RecoveryRect> {
 }
 
 fn validate(record: &RecoveryRecord) -> Result<(), String> {
-    if record.generation == 0 || record.revision == 0 || record.source.bytes == 0 { return Err("Recovery identity is invalid.".into()); }
+    if record.generation == 0 || record.source.bytes == 0 { return Err("Recovery identity is invalid.".into()); }
     let source_pages = usize::try_from(record.source_pages).map_err(|_| "Recovery page count is invalid.")?;
+    if !record.active {
+        if source_pages == 0 || !record.edit_state.pages.is_empty() || record.current_page != 0 { return Err("Recovery tombstone is invalid.".into()); }
+        return Ok(());
+    }
+    if record.revision == 0 { return Err("Recovery identity is invalid.".into()); }
     if source_pages == 0 || source_pages > MAX_PAGES || record.edit_state.pages.is_empty() || record.edit_state.pages.len() > source_pages || record.current_page as usize >= record.edit_state.pages.len() { return Err("Recovery page count is invalid.".into()); }
     let mut sources = HashSet::new();
     let mut annotations = 0usize;
@@ -144,7 +150,8 @@ pub fn decode_recovery(bytes: &[u8], expected_source: SourceIdentity, prior_gene
     if bytes.len() < HEADER_BYTES + DIGEST_BYTES || bytes.len() > MAX_FRAME_BYTES { return Err("Recovery record length is invalid.".into()); }
     let mut offset = 0usize;
     if &take::<8>(bytes, &mut offset)? != MAGIC { return Err("Recovery record header is invalid.".into()); }
-    if u16::from_le_bytes(take(bytes, &mut offset)?) != VERSION { return Err("Recovery record version is unsupported.".into()); }
+    let version = u16::from_le_bytes(take(bytes, &mut offset)?);
+    if version != 1 && version != VERSION { return Err("Recovery record version is unsupported.".into()); }
     let generation = u64::from_le_bytes(take(bytes, &mut offset)?);
     let revision = u64::from_le_bytes(take(bytes, &mut offset)?);
     let current_page = u32::from_le_bytes(take(bytes, &mut offset)?);
@@ -160,7 +167,8 @@ pub fn decode_recovery(bytes: &[u8], expected_source: SourceIdentity, prior_gene
     if revision < minimum_revision { return Err("Recovery revision is stale.".into()); }
     let edit_state: RecoveryEditState = serde_json::from_slice(&bytes[HEADER_BYTES..payload_end]).map_err(|_| "Recovery state is malformed.")?;
     if serde_json::to_vec(&edit_state).map_err(|_| "Recovery state is malformed.")? != &bytes[HEADER_BYTES..payload_end] { return Err("Recovery state is not canonical.".into()); }
-    let record = RecoveryRecord { generation, revision, current_page, source_pages, source, edit_state };
+    let active = if version == 1 { true } else { !edit_state.pages.is_empty() };
+    let record = RecoveryRecord { active, generation, revision, current_page, source_pages, source, edit_state };
     validate(&record)?;
     Ok(record)
 }

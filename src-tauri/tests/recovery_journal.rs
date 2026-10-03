@@ -8,6 +8,7 @@ fn rect(left: f32) -> RecoveryRect { RecoveryRect { left, bottom: 20.0, right: l
 fn text_highlight_rect() -> RecoveryRect { RecoveryRect { left: 40.0, bottom: 20.0, right: 90.0, top: 50.0 } }
 fn record() -> RecoveryRecord {
     RecoveryRecord {
+        active: true,
         generation: 7, revision: 4, current_page: 1, source_pages: 3, source: identity(),
         edit_state: RecoveryEditState { pages: vec![
             RecoveryPage { source: 2, turns: 1, crop: Some(RecoveryRect { left: 1.0, bottom: 2.0, right: 611.0, top: 790.0 }), annotations: vec![RecoveryAnnotation { id: "pdf-workstation-note-1".into(), kind: RecoveryAnnotationKind::Note, rect: rect(10.0), contents: "Private note text".into(), quads: vec![] }] },
@@ -38,11 +39,29 @@ fn round_trips_only_source_identity_and_current_supported_edit_state() {
 #[test]
 fn rejects_wrong_version_truncation_trailing_bytes_and_integrity_failure() {
     let valid = encode_recovery(&record()).unwrap();
-    let mut version = valid.clone(); version[8..10].copy_from_slice(&2u16.to_le_bytes()); resign(&mut version);
+    let mut version = valid.clone(); version[8..10].copy_from_slice(&3u16.to_le_bytes()); resign(&mut version);
     assert!(decode_recovery(&version, identity(), None, 0).unwrap_err().contains("version"));
     assert!(decode_recovery(&valid[..valid.len() - 1], identity(), None, 0).unwrap_err().contains("length"));
     let mut trailing = valid.clone(); trailing.push(0); assert!(decode_recovery(&trailing, identity(), None, 0).unwrap_err().contains("length"));
     let mut corrupt = valid.clone(); corrupt[78] ^= 1; assert!(decode_recovery(&corrupt, identity(), None, 0).unwrap_err().contains("integrity"));
+}
+
+#[test]
+fn reads_existing_v1_active_snapshot_strictly() {
+    let expected = record();
+    let mut bytes = encode_recovery(&expected).unwrap();
+    bytes[8..10].copy_from_slice(&1u16.to_le_bytes());
+    resign(&mut bytes);
+    assert_eq!(decode_recovery(&bytes, identity(), None, 0).unwrap(), expected);
+}
+
+#[test]
+fn round_trips_v2_inactive_tombstone_without_edit_state() {
+    let tombstone = RecoveryRecord { active: false, generation: 8, revision: 4, current_page: 0, source_pages: 3, source: identity(), edit_state: RecoveryEditState { pages: Vec::new() } };
+    let bytes = encode_recovery(&tombstone).unwrap();
+    assert_eq!(decode_recovery(&bytes, identity(), Some(7), 4).unwrap(), tombstone);
+    let mut invalid = tombstone.clone(); invalid.current_page = 1;
+    assert!(encode_recovery(&invalid).unwrap_err().contains("tombstone"));
 }
 
 #[test]
