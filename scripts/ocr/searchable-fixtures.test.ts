@@ -15,7 +15,7 @@ describe('searchable OCR synthetic fixtures',()=>{
     const built=buildFixtures();const committed=JSON.parse(await readFile(resolve(root,'oracle.json'),'utf8'));
     expect(committed.scope).toContain('no OCR accuracy');
     expect(committed.fixtures).toEqual(built.map(item=>item.oracle));
-    for(const fixture of built){const bytes=await readFile(resolve(root,`${fixture.name}.png`));expect(bytes).toEqual(fixture.png);expect(bytes.length).toBe(fixture.oracle.pngBytes);expect(sha(bytes)).toBe(fixture.oracle.pngSha256);}
+    for(const fixture of built){const bytes=await readFile(resolve(root,`${fixture.name}.png`));expect(bytes.equals(fixture.png)).toBe(true);expect(bytes.length).toBe(fixture.oracle.pngBytes);expect(sha(bytes)).toBe(fixture.oracle.pngSha256);}
   });
   it('contains only structurally valid IHDR, IDAT, and IEND chunks with exact raw RGB',()=>{
     for(const fixture of buildFixtures()){const parsed=chunks(fixture.png);expect(parsed.map(item=>item.type)).toEqual(['IHDR','IDAT','IEND']);const header=parsed[0].data;expect(header.length).toBe(13);expect(header.readUInt32BE(0)).toBe(fixture.oracle.width);expect(header.readUInt32BE(4)).toBe(fixture.oracle.height);expect([...header.subarray(8)]).toEqual([8,2,0,0,0]);const scan=inflateSync(parsed[1].data),stride=fixture.oracle.width*3+1;expect(scan.length).toBe(stride*fixture.oracle.height);const rgb=Buffer.alloc(fixture.oracle.rawRgbBytes);for(let y=0;y<fixture.oracle.height;y++){expect(scan[y*stride]).toBe(0);scan.copy(rgb,y*fixture.oracle.width*3,y*stride+1,(y+1)*stride);}expect(sha(rgb)).toBe(fixture.oracle.rawRgbSha256);expect(parsed[2].data.length).toBe(0);}
