@@ -522,8 +522,8 @@ public static class PrintSpoolWriterFixture {
       }
       if(-not[object]::ReferenceEquals($items[1],$child)-or-not[object]::ReferenceEquals($items[2],$child2)){throw 'Rooted UIA enumeration did not merge bounded unique runtime identities.'}
       $script:lateRootedCallReturned=$false
-      $slowFinder={param($root,$scope,$condition)if([object]::ReferenceEquals($root,$desktop)){return @($top)};Start-Sleep -Milliseconds 80;$script:lateRootedCallReturned=$true;return @($child)}
-      $rejected=$false;try{Get-ProcessUiElements -ProcessId 7319 -Deadline ([datetime]::UtcNow.AddMilliseconds(20)) -DesktopProvider { $desktop } -FindAllProvider $slowFinder|Out-Null}catch{$rejected=$true}
+      $slowFinder={param($root,$scope,$condition)if([object]::ReferenceEquals($root,$desktop)){return @($top)};Start-Sleep -Milliseconds 350;$script:lateRootedCallReturned=$true;return @($child)}
+      $rejected=$false;try{Get-ProcessUiElements -ProcessId 7319 -Deadline ([datetime]::UtcNow.AddMilliseconds(250)) -DesktopProvider { $desktop } -FindAllProvider $slowFinder|Out-Null}catch{$rejected=$true}
       if(-not$rejected-or-not$script:lateRootedCallReturned){throw 'A rooted UIA call that returned after its deadline was accepted.'}
     `);
     expect(result.status, result.stderr || result.stdout).toBe(0);
@@ -938,8 +938,8 @@ public static class PrintSpoolWriterFixture {
       if(-not$rejected){throw 'A replacement HWND surface was accepted as close.'}
       $script:nativeState='closed'
       Wait-BoundProcessUiSurfaceClosed -ProcessId 7319 -Binding $binding -Stage 'first-print-dialog' -Deadline ([datetime]::UtcNow.AddSeconds(2)) -NativeWindowProvider $provider
-      $slowProvider={param($requestedProcessId,[long]$rootHandle,[bool]$topLevelOnly)Start-Sleep -Milliseconds 40;@((New-NativeProviderRecord 100 0 $main 'Chrome_WidgetWin_1'))}
-      $slowStage='not-started';$rejected=$false;try{Get-ProcessNativeWindowSnapshot -ProcessId 7319 -Deadline ([datetime]::UtcNow.AddMilliseconds(20)) -TopLevelOnly -WindowProvider $slowProvider -EnumerationStage ([ref]$slowStage)|Out-Null}catch{$rejected=$true}
+      $slowProvider={param($requestedProcessId,[long]$rootHandle,[bool]$topLevelOnly)Start-Sleep -Milliseconds 350;@((New-NativeProviderRecord 100 0 $main 'Chrome_WidgetWin_1'))}
+      $slowStage='not-started';$rejected=$false;try{Get-ProcessNativeWindowSnapshot -ProcessId 7319 -Deadline ([datetime]::UtcNow.AddMilliseconds(250)) -TopLevelOnly -WindowProvider $slowProvider -EnumerationStage ([ref]$slowStage)|Out-Null}catch{$rejected=$true}
       if(-not$rejected-or$slowStage-cne'native-enumeration-started'){throw 'A native HWND snapshot completed after its deadline or entered UIA conversion before native enumeration completed.'}
     `);
     expect(result.status, result.stderr || result.stdout).toBe(0);
