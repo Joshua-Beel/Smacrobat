@@ -17,8 +17,12 @@ use windows::{
     Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH},
 };
 
-const MAX_RECORD_BYTES: u64 = 32 * 1024 * 1024;
+pub(crate) const MAX_RECORD_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_RETAINED_TEMPS: usize = 4;
+pub(crate) const MAX_PERSISTENT_RECORDS: usize = 512;
+pub(crate) const MAX_PERSISTENT_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_DIRECTORY_ENTRIES: usize = 4096;
+const WRITER_LOCK_NAME: &str = ".smacrec-writer.lock";
 const REPARSE_POINT: u32 = 0x400;
 const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 static WRITER: OnceLock<Mutex<()>> = OnceLock::new();
@@ -41,6 +45,39 @@ fn record_name(source: SourceIdentity) -> String {
     }
     name.push_str(".smacrec");
     name
+}
+
+pub(crate) fn is_record_name(name: &str) -> bool {
+    name.len() == 72
+        && name.ends_with(".smacrec")
+        && name[..64].bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+pub(crate) fn admit_persistent(root: &Path, destination: &Path, candidate_bytes: u64) -> Result<(), String> {
+    let mut entries = 0usize;
+    let mut records = 0usize;
+    let mut bytes = 0u64;
+    let mut replaced_bytes = None;
+    for entry in fs::read_dir(root).map_err(|_| "Recovery directory is unavailable.")? {
+        entries = entries.checked_add(1).ok_or("Recovery directory entry limit was reached.")?;
+        if entries > MAX_DIRECTORY_ENTRIES { return Err("Recovery directory entry limit was reached.".into()); }
+        let entry = entry.map_err(|_| "Recovery directory is unavailable.")?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
+        if !is_record_name(&name) { continue; }
+        let path = entry.path();
+        ensure_plain_file(&path)?;
+        let file = OpenOptions::new().read(true).custom_flags(OPEN_REPARSE_POINT).open(&path).map_err(|_| "Recovery record could not be opened.")?;
+        let metadata = file.metadata().map_err(|_| "Recovery record is unsafe.")?;
+        if !metadata.is_file() || metadata.file_attributes() & REPARSE_POINT != 0 || metadata.len() > MAX_RECORD_BYTES { return Err("Recovery record is unsafe.".into()); }
+        records = records.checked_add(1).ok_or("Recovery storage limit was reached.")?;
+        bytes = bytes.checked_add(metadata.len()).ok_or("Recovery storage limit was reached.")?;
+        if path == destination { replaced_bytes = Some(metadata.len()); }
+    }
+    if records > MAX_PERSISTENT_RECORDS || bytes > MAX_PERSISTENT_BYTES { return Err("Recovery storage limit was reached.".into()); }
+    let projected_records = records.checked_add(usize::from(replaced_bytes.is_none())).ok_or("Recovery storage limit was reached.")?;
+    let projected_bytes = bytes.checked_sub(replaced_bytes.unwrap_or(0)).and_then(|value| value.checked_add(candidate_bytes)).ok_or("Recovery storage limit was reached.")?;
+    if projected_records > MAX_PERSISTENT_RECORDS || projected_bytes > MAX_PERSISTENT_BYTES { return Err("Recovery storage limit was reached.".into()); }
+    Ok(())
 }
 
 fn ensure_plain_directory(root: &Path) -> Result<(), String> {
@@ -69,6 +106,28 @@ fn ensure_plain_file(path: &Path) -> Result<(), String> {
         return Err("Recovery record is unsafe.".into());
     }
     Ok(())
+}
+fn acquire_writer_lock(root: &Path) -> Result<File, String> {
+    let path = root.join(WRITER_LOCK_NAME);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if !metadata.is_file() || metadata.file_attributes() & REPARSE_POINT != 0 => return Err("Recovery writer lock is unsafe.".into()),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err("Recovery writer lock is unavailable.".into()),
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .share_mode(0)
+        .custom_flags(OPEN_REPARSE_POINT)
+        .open(&path)
+        .map_err(|_| "Recovery storage is busy in another process.")?;
+    let metadata = file.metadata().map_err(|_| "Recovery writer lock is unsafe.")?;
+    if !metadata.is_file() || metadata.file_attributes() & REPARSE_POINT != 0 {
+        return Err("Recovery writer lock is unsafe.".into());
+    }
+    Ok(file)
 }
 fn read_bounded(path: &Path) -> Result<Vec<u8>, String> {
     ensure_plain_file(path)?;
@@ -144,6 +203,8 @@ fn write_recovery_inner(root: &Path, record: &RecoveryRecord, published: &mut bo
         .lock()
         .map_err(|_| "Recovery writer is unavailable.")?;
     ensure_plain_directory(root)?;
+    let _process_guard = acquire_writer_lock(root)?;
+    ensure_plain_directory(root)?;
     let encoded = encode_recovery(record)?;
     if encoded.len() as u64 > MAX_RECORD_BYTES {
         return Err("Recovery record is too large.".into());
@@ -163,6 +224,7 @@ fn write_recovery_inner(root: &Path, record: &RecoveryRecord, published: &mut bo
             return Err("Recovery record is stale.".into());
         }
     }
+    admit_persistent(root, &destination, encoded.len() as u64)?;
     let (temp_path, mut temp) = create_temp(root)?;
     temp.write_all(&encoded)
         .map_err(|_| "Recovery record could not be written.")?;
@@ -205,3 +267,7 @@ pub fn read_recovery(
     let bytes = read_bounded(&path)?;
     decode_recovery(&bytes, source, prior_generation, minimum_revision).map(Some)
 }
+
+#[cfg(test)]
+#[path = "recovery_store_process_tests.rs"]
+mod process_tests;
