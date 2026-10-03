@@ -20,6 +20,8 @@ mod image_pdf_commands;
 #[cfg(windows)]
 mod image_edit_commands;
 mod page_image;
+mod recovery_journal;
+mod recovery_store;
 mod sanitization;
 mod raster_redaction;
 #[cfg(windows)]

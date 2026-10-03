@@ -1,6 +1,7 @@
 use std::{collections::{HashMap, HashSet, VecDeque}, io::{Cursor, Write}, path::PathBuf, sync::{Arc, Mutex, mpsc, OnceLock}};
 use pdfium_render::prelude::*;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 use crate::editor::{CropBox, EditSession, PageEdit, PageSpec, write_new_file};
 use crate::combine::CopyOperation;
@@ -26,6 +27,8 @@ impl DocumentInfo {
 }
 #[derive(Serialize)]
 pub struct SavedCopy { path: String, document: DocumentInfo }
+#[allow(dead_code)]
+pub struct RecoveredDocument { pub document: DocumentInfo, pub current_page: u32 }
 #[derive(Debug)]
 pub struct PageImagePreflight { pub suggested_name: String }
 #[derive(Debug)]
@@ -114,6 +117,10 @@ enum Request {
     #[cfg(test)]
     EnginePageLabels(u64, Reply<Vec<Option<String>>>),
     Open(PathBuf, Reply<ReplyLease<DocumentInfo>>),
+    #[allow(dead_code)]
+    CheckpointRecovery(PathBuf, u64, u64, u32, Reply<()>),
+    #[allow(dead_code)]
+    RestoreRecovery(PathBuf, PathBuf, Reply<Option<ReplyLease<RecoveredDocument>>>),
     BeginOpen(PathBuf, Reply<ReplyLease<OpenResult>>),
     Unlock(u64, String, Reply<ReplyLease<OpenResult>>),
     CancelPassword(u64, Reply<()>),
@@ -619,6 +626,48 @@ impl PdfService {
                         let result = result.map(|info| { let cleanup = UnclaimedReply::Document(info.id); ReplyLease::new(info, cleanup, resource_cleanup.clone()) });
                         if let Err(Ok(info)) = reply.send(result) { documents.remove(&info.id); sessions.remove(&info.id); }
                     },
+                    Request::CheckpointRecovery(root, id, revision, current_page, reply) => {
+                        if reply.is_closed() { continue; }
+                        let result = (|| {
+                            let (session, original) = sessions.get(&id).ok_or("Document is closed")?;
+                            if session.revision != revision { return Err("Document changed. Save recovery again.".into()); }
+                            if !session.dirty() { return Err("Only unsaved edits can be stored for recovery.".into()); }
+                            let source = recovery_source_identity(&session.source)?;
+                            let generation = match crate::recovery_store::read_recovery(&root, source, None, 0)? {
+                                Some(record) => record.generation.checked_add(1).ok_or("Recovery generation is exhausted.")?,
+                                None => 1,
+                            };
+                            let record = recovery_record(session, source, generation, current_page, original.pages.len())?;
+                            crate::recovery_store::write_recovery(&root, &record)?;
+                            Ok(())
+                        })();
+                        let _ = reply.send(result);
+                    }
+                    Request::RestoreRecovery(root, path, reply) => {
+                        if reply.is_closed() { continue; }
+                        let result = (|| {
+                            let engine = pdfium.as_ref().map_err(Clone::clone)?;
+                            let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
+                            let source = recovery_source_identity(&bytes)?;
+                            let Some(record) = crate::recovery_store::read_recovery(&root, source, None, 1)? else { return Ok(None); };
+                            let document = engine.load_pdf_from_byte_vec(bytes.clone(), None).map_err(|error| format!("Unable to open PDF: {error}"))?;
+                            if !matches!(document.permissions().security_handler_revision(), Ok(PdfSecurityHandlerRevision::Unprotected)) { return Err("Encrypted or restricted PDFs cannot be restored from recovery.".into()); }
+                            let pages = page_sizes(&document)?;
+                            let mut session = EditSession::new(bytes, pages.len());
+                            restore_recovery_session(&mut session, &record)?;
+                            session.export(None)?;
+                            let id = next_id; next_id += 1;
+                            let original = DocumentInfo { id, name: path.file_name().unwrap_or_default().to_string_lossy().into_owned(), path: path.to_string_lossy().into_owned(), pages, revision: 0, dirty: false, can_undo: false, can_redo: false };
+                            let info = current_info(&session, &original, &document)?;
+                            sessions.insert(id, (session, original));
+                            documents.insert(id, std::rc::Rc::new(document));
+                            let recovered = RecoveredDocument { document: info, current_page: record.current_page };
+                            Ok(Some(ReplyLease::new(recovered, UnclaimedReply::Document(id), resource_cleanup.clone())))
+                        })();
+                        if let Err(Ok(Some(lease))) = reply.send(result) {
+                            let id = lease.document.id; documents.remove(&id); sessions.remove(&id);
+                        }
+                    }
                     Request::AdmittedRender(id,page,width,token)=>{let reply={let mut a=render_admission.lock().expect("render admission mutex poisoned");let key=a.keys.iter().find_map(|(key,value)|(*value==token).then_some(*key));if let Some(key)=key{a.keys.remove(&key);}a.replies.remove(&token)};let Some(reply)=reply else{continue};
                         #[cfg(test)]
                         { render_work.entry(id).or_default().dequeued += 1; }
@@ -1153,6 +1202,14 @@ impl PdfService {
     pub async fn begin_open(&self, path: PathBuf) -> Result<OpenResult, String> {
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::BeginOpen(path, tx)).map_err(|e| e.to_string())?; rx.await.map_err(|e| e.to_string())?.map(ReplyLease::accept)
     }
+    #[allow(dead_code)]
+    pub async fn checkpoint_recovery(&self, root: PathBuf, id: u64, revision: u64, current_page: u32) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel(); self.sender.send(Request::CheckpointRecovery(root, id, revision, current_page, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
+    }
+    #[allow(dead_code)]
+    pub async fn restore_recovery(&self, root: PathBuf, path: PathBuf) -> Result<Option<RecoveredDocument>, String> {
+        let (tx, rx) = oneshot::channel(); self.sender.send(Request::RestoreRecovery(root, path, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?.map(|value| value.map(ReplyLease::accept))
+    }
     pub async fn begin_print(&self, id: u64, revision: u64) -> Result<PrintSnapshotInfo, String> {
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::BeginPrint(id, revision, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
     }
@@ -1436,6 +1493,52 @@ fn checked_ocr_request(
     })?;
     Ok((dimensions, spec, width, height))
 }
+fn recovery_source_identity(bytes: &[u8]) -> Result<crate::recovery_journal::SourceIdentity, String> {
+    let bytes_count = u64::try_from(bytes.len()).map_err(|_| "Recovery source is too large.")?;
+    if bytes_count == 0 { return Err("Recovery source is empty.".into()); }
+    Ok(crate::recovery_journal::SourceIdentity { bytes: bytes_count, sha256: Sha256::digest(bytes).into() })
+}
+fn recovery_rect(rect: CropBox) -> crate::recovery_journal::RecoveryRect {
+    crate::recovery_journal::RecoveryRect { left: rect.left, bottom: rect.bottom, right: rect.right, top: rect.top }
+}
+fn recovery_record(session: &EditSession, source: crate::recovery_journal::SourceIdentity, generation: u64, current_page: u32, source_pages: usize) -> Result<crate::recovery_journal::RecoveryRecord, String> {
+    let pages = session.plan.iter().map(|page| {
+        let annotations = page.notes.iter().map(|note| {
+            let kind = match (note.kind, note.quads.is_some()) {
+                (crate::comments::AnnotationKind::Note, false) => crate::recovery_journal::RecoveryAnnotationKind::Note,
+                (crate::comments::AnnotationKind::Highlight, false) => crate::recovery_journal::RecoveryAnnotationKind::AreaHighlight,
+                (crate::comments::AnnotationKind::Highlight, true) => crate::recovery_journal::RecoveryAnnotationKind::TextHighlight,
+                _ => return Err("Recovery annotation state is invalid.".into()),
+            };
+            Ok(crate::recovery_journal::RecoveryAnnotation { id: note.id.clone(), kind, rect: recovery_rect(note.rect), contents: note.contents.clone(), quads: note.quads.as_deref().unwrap_or(&[]).iter().copied().map(recovery_rect).collect() })
+        }).collect::<Result<Vec<_>, String>>()?;
+        Ok(crate::recovery_journal::RecoveryPage { source: u32::try_from(page.source).map_err(|_| "Recovery page mapping is too large.")?, turns: u8::try_from(page.turns).map_err(|_| "Recovery rotation is invalid.")?, crop: page.crop.map(recovery_rect), annotations })
+    }).collect::<Result<Vec<_>, String>>()?;
+    Ok(crate::recovery_journal::RecoveryRecord { generation, revision: session.revision, current_page, source_pages: u32::try_from(source_pages).map_err(|_| "Recovery source has too many pages.")?, source, edit_state: crate::recovery_journal::RecoveryEditState { pages } })
+}
+fn restore_crop(rect: crate::recovery_journal::RecoveryRect) -> CropBox {
+    CropBox { left: rect.left, bottom: rect.bottom, right: rect.right, top: rect.top }
+}
+fn restore_recovery_session(session: &mut EditSession, record: &crate::recovery_journal::RecoveryRecord) -> Result<(), String> {
+    if usize::try_from(record.source_pages).ok() != Some(session.plan.len()) { return Err("Recovery source page count changed.".into()); }
+    let plan = record.edit_state.pages.iter().map(|page| {
+        let notes = page.annotations.iter().map(|annotation| {
+            let (kind, quads) = match annotation.kind {
+                crate::recovery_journal::RecoveryAnnotationKind::Note => (crate::comments::AnnotationKind::Note, None),
+                crate::recovery_journal::RecoveryAnnotationKind::AreaHighlight => (crate::comments::AnnotationKind::Highlight, None),
+                crate::recovery_journal::RecoveryAnnotationKind::TextHighlight => (crate::comments::AnnotationKind::Highlight, Some(annotation.quads.iter().copied().map(restore_crop).collect())),
+            };
+            crate::comments::Note { id: annotation.id.clone(), rect: restore_crop(annotation.rect), contents: annotation.contents.clone(), kind, quads }
+        }).collect();
+        Ok(PageSpec { source: usize::try_from(page.source).map_err(|_| "Recovery page mapping is invalid.")?, turns: i32::from(page.turns), crop: page.crop.map(restore_crop), notes })
+    }).collect::<Result<Vec<_>, String>>()?;
+    crate::comments::validate_plan(&plan)?;
+    if plan == session.plan { return Err("Recovery record contains no unsaved edits.".into()); }
+    session.revision = record.revision.checked_sub(1).ok_or("Recovery revision is invalid.")?;
+    session.commit_comments(plan);
+    if session.revision != record.revision { return Err("Recovery revision could not be restored.".into()); }
+    Ok(())
+}
 type RenderKey=(u64,u16,i32,u64);
 #[derive(Default)]struct RenderAdmission{epoch:u64,next:u64,keys:HashMap<RenderKey,u64>,replies:HashMap<u64,Reply<Vec<u8>>>}
 #[derive(Clone)]struct RequestSender{inner:mpsc::Sender<Request>,renders:Arc<Mutex<RenderAdmission>>,limit:usize}
@@ -1710,7 +1813,7 @@ mod tests {
     macro_rules! accepted_reply_values {
         ($($value:ty),* $(,)?) => { $(impl TestReplyValue for $value { type Accepted = Self; fn accept(self) -> Self { self } })* };
     }
-    accepted_reply_values!((), Vec<u8>, Vec<u64>, Vec<Option<String>>, String, DocumentInfo, SavedCopy, OpenResult, PrintSnapshotInfo, PrintBitmap, PageImagePreflight, RasterRedactionPreflight, SearchableOcrPreflight, PageImageReceipt, BookmarkList, RenderWork, BookmarkWork, OcrWork, OcrWorkerState, crate::ocr::OcrPageRaster, crate::image_edit::ImageEditTargetInfo, TextReplacementInspection, crate::page_labels::DocumentPageLabels, crate::document_properties::DocumentProperties, crate::text_geometry::PageTextGeometry, crate::split::SplitOutput, crate::comments::CommentList, crate::comments::AnnotationList, crate::forms::FormFields);
+    accepted_reply_values!((), Vec<u8>, Vec<u64>, Vec<Option<String>>, String, DocumentInfo, SavedCopy, OpenResult, RecoveredDocument, PrintSnapshotInfo, PrintBitmap, PageImagePreflight, RasterRedactionPreflight, SearchableOcrPreflight, PageImageReceipt, BookmarkList, RenderWork, BookmarkWork, OcrWork, OcrWorkerState, crate::ocr::OcrPageRaster, crate::image_edit::ImageEditTargetInfo, TextReplacementInspection, crate::page_labels::DocumentPageLabels, crate::document_properties::DocumentProperties, crate::text_geometry::PageTextGeometry, crate::split::SplitOutput, crate::comments::CommentList, crate::comments::AnnotationList, crate::forms::FormFields);
     fn call<T: TestReplyValue>(service: &PdfService, request: impl FnOnce(Reply<T>) -> Request) -> Result<T::Accepted, String> {
         let (tx, rx) = oneshot::channel(); service.sender.send(request(tx)).unwrap(); rx.blocking_recv().unwrap().map(TestReplyValue::accept)
     }
@@ -4509,6 +4612,15 @@ mod tests {
         let(old_tx,old_rx)=oneshot::channel();let(sender2,receiver2,state2)=admission_sender();sender2.send(Request::Render(7,2,300,old_tx)).unwrap();let(new_tx,_new_rx)=oneshot::channel();sender2.send(Request::Render(7,2,300,new_tx)).unwrap();assert!(old_rx.blocking_recv().unwrap().unwrap_err().contains("superseded"));assert_eq!(receiver2.try_iter().count(),1);assert_eq!(state2.lock().unwrap().keys.len(),1);
         let(close_tx,_)=oneshot::channel();sender2.send(Request::Close(99,close_tx)).unwrap();let(after_tx,_)=oneshot::channel();sender2.send(Request::Render(7,2,300,after_tx)).unwrap();assert_eq!(receiver2.try_iter().count(),2,"a non-render barrier must split coalescing epochs");assert_eq!(state2.lock().unwrap().keys.len(),2);
         drop(replies);assert_eq!(receiver.try_iter().filter(|r|matches!(r,Request::AdmittedRender(..))).count(),32);
+    }
+    #[test]
+    fn recovery_checkpoint_ack_is_durable_and_explicit_restore_replays_exact_state(){
+        let manifest=PathBuf::from(env!("CARGO_MANIFEST_DIR"));let service=PdfService::start(manifest.join("resources/pdfium/bin/pdfium.dll"));let folder=tempfile::tempdir().unwrap();let recovery=folder.path().join("recovery");std::fs::create_dir(&recovery).unwrap();let source_path=folder.path().join("source.pdf");let source=std::fs::read(manifest.join("resources/welcome.pdf")).unwrap();std::fs::write(&source_path,&source).unwrap();
+        let opened=call(&service,|reply|Request::Open(source_path.clone(),reply)).unwrap();assert!(call(&service,|reply|Request::CheckpointRecovery(recovery.clone(),opened.id,opened.revision,0,reply)).unwrap_err().contains("unsaved"));
+        let edited=call(&service,|reply|Request::Edit(opened.id,PageEdit::Move{from:5,to:0},reply)).unwrap();let edited=call(&service,|reply|Request::Edit(edited.id,PageEdit::Rotate{pages:vec![0],clockwise:true},reply)).unwrap();let edited=call(&service,|reply|Request::Crop(edited.id,0,edited.revision,CropRect{x:0.05,y:0.1,width:0.8,height:0.75},reply)).unwrap();let edited=call(&service,|reply|Request::Comment(edited.id,edited.revision,CommentMutation::CreateHighlight(0,CropRect{x:0.1,y:0.1,width:0.2,height:0.2},Some("Recovered highlight".into())),reply)).unwrap();let expected=call(&service,|reply|Request::Render(edited.id,0,240,reply)).unwrap();
+        call(&service,|reply|Request::CheckpointRecovery(recovery.clone(),edited.id,edited.revision,2,reply)).unwrap();let identity=recovery_source_identity(&source).unwrap();let durable=crate::recovery_store::read_recovery(&recovery,identity,None,edited.revision).unwrap().unwrap();assert_eq!((durable.generation,durable.revision,durable.current_page),(1,edited.revision,2));assert_eq!(std::fs::read(&source_path).unwrap(),source);
+        call(&service,|reply|Request::Close(edited.id,reply)).unwrap();let(tx,rx)=oneshot::channel();service.sender.send(Request::RestoreRecovery(recovery.clone(),source_path.clone(),tx)).unwrap();let restored=rx.blocking_recv().unwrap().unwrap().unwrap().accept();assert_eq!(restored.current_page,2);assert_eq!(restored.document.revision,edited.revision);assert!(restored.document.dirty&&restored.document.can_undo&&!restored.document.can_redo);assert_eq!(call(&service,|reply|Request::Render(restored.document.id,0,240,reply)).unwrap(),expected);let annotations=call(&service,|reply|Request::Annotations(restored.document.id,restored.document.revision,reply)).unwrap();assert_eq!(annotations.annotations.len(),1);assert_eq!(annotations.annotations[0].contents.as_deref(),Some("Recovered highlight"));
+        let missing=folder.path().join("missing");std::fs::create_dir(&missing).unwrap();let(tx,rx)=oneshot::channel();service.sender.send(Request::RestoreRecovery(missing,source_path.clone(),tx)).unwrap();assert!(rx.blocking_recv().unwrap().unwrap().is_none());call(&service,|reply|Request::Close(restored.document.id,reply)).unwrap();assert_eq!(std::fs::read(source_path).unwrap(),source);
     }
     #[test]
     fn searchable_ocr_publication_reopens_pixels_and_exact_pdfium_text() {
