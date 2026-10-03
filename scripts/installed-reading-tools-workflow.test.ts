@@ -47,10 +47,6 @@ describe('installed signed reading-tools verifier', () => {
 
   it('parses and keeps all native interaction process-bound without coordinates or global SendKeys', () => {
     const source = readFileSync('scripts/installed-reading-tools.ps1', 'utf8');
-    const parsed = spawnSync('pwsh.exe', ['-NoProfile', '-NonInteractive', '-Command',
-      `$t=$null;$e=$null;[Management.Automation.Language.Parser]::ParseFile('${process.cwd().replaceAll("'", "''")}\\scripts\\installed-reading-tools.ps1',[ref]$t,[ref]$e)|Out-Null;if($e.Count){$e|% ToString;exit 1}`,
-    ], { encoding: 'utf8', timeout: 15_000 });
-    expect(parsed.status, parsed.stderr || parsed.stdout).toBe(0);
     expect(source).toContain('EnumWindows(EnumWindowsProc callback');
     expect(source).toContain('EnumChildWindows(IntPtr parent');
     expect(source).toContain('GetWindowThreadProcessId');
@@ -68,6 +64,9 @@ describe('installed signed reading-tools verifier', () => {
     expect(source.indexOf('$baselineTargets = @(Get-ReadingPickerTargetSnapshot')).toBeLessThan(source.indexOf('$clicked = Invoke-WebDriverScript'));
     expect(source).not.toMatch(/SendKeys|mouse_event|SetCursorPos|click_input|screenX|screenY|__TAURI_INTERNALS__/i);
     const nativeApi = runPowerShell(extractFunctions('scripts/installed-reading-tools.ps1', ['Initialize-ReadingNativePickerApi'], String.raw`
+      $tokens=$null;$errors=$null
+      [Management.Automation.Language.Parser]::ParseFile('${process.cwd().replaceAll("'", "''")}\scripts\installed-reading-tools.ps1',[ref]$tokens,[ref]$errors)|Out-Null
+      if($errors.Count){$errors|ForEach-Object ToString;exit 1}
       Initialize-ReadingNativePickerApi
       if($null-eq('ReadingNativePickerApi'-as[type])){throw 'The native picker API did not compile.'}
     `));
@@ -370,7 +369,7 @@ public static class ReadingNativePickerApi {
     expect(activate).toBeGreaterThan(render);
     expect(layer).toBeGreaterThan(activate);
     expect(readFileSync('src/preferences.ts', 'utf8')).toContain('hand: true');
-    expect(readFileSync('src/Viewer.tsx', 'utf8')).toContain('selectable={!hand && !commentMode && !highlightMode}');
+    expect(readFileSync('src/Viewer.tsx', 'utf8')).toContain('selectable={!hand && !commentMode && !highlightMode && redactionPage === null}');
   });
 
   it('uses the signed Home marker and the unique global Open action when Home has two Open buttons', () => {

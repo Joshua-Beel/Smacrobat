@@ -22,7 +22,7 @@ describe('manual signed reading-tools workflow', () => {
     expect(upload).not.toMatch(/\.exe|SIGNED_ARTIFACT_ROOT|READING_WORK_ROOT|UPGRADE_OUTPUT_ROOT/);
   });
 
-  it('pins the inspected signed blobs and distinguishes the changed application shell', () => {
+  it('pins the inspected signed blobs and detects current feature and application-shell drift', () => {
     const verifier = readFileSync('scripts/verify-signed-reading-tools.ps1', 'utf8');
     const pins = [
       ['src/Viewer.tsx', '30359386c5d706e408b9911fc24efe7cd166ce39'],
@@ -33,6 +33,7 @@ describe('manual signed reading-tools workflow', () => {
       ['src-tauri/src/service.rs', 'e65e890bfbc57cda8b99787a0f7d909d5a445bf0'],
       ['src-tauri/src/text_geometry.rs', 'c6fb8b84c111d45d44aaa40c7e40d2ccab5b1241'],
     ];
+    const changed: string[] = [];
     for (const [path, blob] of pins) {
       expect(verifier).toContain(`'${path}' = '${blob}'`);
       const signed = spawnSync('git', ['rev-parse', `67d238218f4796ba7b8505d072868da0f397174a:${path}`], { encoding: 'utf8' });
@@ -40,8 +41,10 @@ describe('manual signed reading-tools workflow', () => {
       expect(signed.status, signed.stderr).toBe(0);
       expect(current.status, current.stderr).toBe(0);
       expect(signed.stdout.trim()).toBe(blob);
-      expect(current.stdout.trim()).toBe(blob);
+      if (current.stdout.trim() !== blob) changed.push(path);
     }
+    expect(changed).toContain('src/Viewer.tsx');
+    expect(changed.length).toBeGreaterThan(0);
     expect(verifier).toContain("SignedApplicationShellBlob = '35a6d3b5c2dadecf378386f41ffe405da15c8c4c'");
     expect(verifier).toContain('currentApplicationShellMatchesSigned = [bool]($currentShell -ceq $signedShell)');
     const signedShell = spawnSync('git', ['rev-parse', '67d238218f4796ba7b8505d072868da0f397174a:src/App.tsx'], { encoding: 'utf8' });

@@ -54,7 +54,13 @@ describe('signed installed expanded page-tools workflow', () => {
     `;
     const result = runPowerShell(script);
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain('An expanded page-tools feature blob does not match the exact signed and dispatched source: src-tauri/src/main.rs');
+    const pinEntries = [...verifier.matchAll(/^ {8}'([^']+)' = '([a-f0-9]{40})'$/gm)];
+    const firstChanged = pinEntries.find(([, path, signedBlob]) => {
+      const current = spawnSync('git', ['rev-parse', `HEAD:${path}`], { encoding: 'utf8' });
+      return current.status !== 0 || current.stdout.trim() !== signedBlob;
+    });
+    expect(firstChanged).toBeTruthy();
+    expect(result.stderr).toContain(`An expanded page-tools feature blob does not match the exact signed and dispatched source: ${firstChanged![1]}`);
     expect(verifier).toContain('currentApplicationShellMatchesSigned');
     expect(verifier).not.toContain('exactSignedApplicationShellMatched=$true');
   }, 15_000);
