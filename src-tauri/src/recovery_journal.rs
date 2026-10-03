@@ -1,0 +1,166 @@
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
+
+const MAGIC: &[u8; 8] = b"SMACREC\0";
+const VERSION: u16 = 1;
+const HEADER_BYTES: usize = 78;
+const DIGEST_BYTES: usize = 32;
+const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
+const MAX_PAGES: usize = 65_536;
+const MAX_ANNOTATIONS: usize = 1_000;
+const MAX_TEXT_BYTES: usize = 8 * 1024;
+const MAX_TOTAL_TEXT_BYTES: usize = 1024 * 1024;
+const MAX_QUADS: usize = 256;
+const MAX_TOTAL_QUADS: usize = 4_096;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SourceIdentity { pub bytes: u64, pub sha256: [u8; 32] }
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryRect { pub left: f32, pub bottom: f32, pub right: f32, pub top: f32 }
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryAnnotationKind { Note, AreaHighlight, TextHighlight }
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryAnnotation {
+    pub id: String,
+    pub kind: RecoveryAnnotationKind,
+    pub rect: RecoveryRect,
+    pub contents: String,
+    pub quads: Vec<RecoveryRect>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryPage {
+    pub source: u32,
+    pub turns: u8,
+    pub crop: Option<RecoveryRect>,
+    pub annotations: Vec<RecoveryAnnotation>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryEditState { pub pages: Vec<RecoveryPage> }
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecoveryRecord {
+    pub generation: u64,
+    pub revision: u64,
+    pub current_page: u32,
+    pub source_pages: u32,
+    pub source: SourceIdentity,
+    pub edit_state: RecoveryEditState,
+}
+
+fn positive_rect(rect: RecoveryRect) -> bool {
+    [rect.left, rect.bottom, rect.right, rect.top].iter().all(|value| value.is_finite())
+        && (rect.right - rect.left).is_finite() && (rect.top - rect.bottom).is_finite()
+        && rect.right > rect.left && rect.top > rect.bottom
+}
+
+fn valid_crop(rect: RecoveryRect) -> bool {
+    positive_rect(rect) && rect.right - rect.left >= 1.0 && rect.top - rect.bottom >= 1.0
+}
+
+fn annotation_number(id: &str, prefix: &str) -> bool {
+    id.strip_prefix(prefix).and_then(|suffix| suffix.parse::<u64>().ok().map(|value| (suffix, value)))
+        .is_some_and(|(suffix, value)| value > 0 && suffix == value.to_string())
+}
+
+fn union(quads: &[RecoveryRect]) -> Option<RecoveryRect> {
+    let mut bounds = *quads.first()?;
+    for rect in quads {
+        if !positive_rect(*rect) { return None; }
+        bounds.left = bounds.left.min(rect.left); bounds.bottom = bounds.bottom.min(rect.bottom);
+        bounds.right = bounds.right.max(rect.right); bounds.top = bounds.top.max(rect.top);
+    }
+    positive_rect(bounds).then_some(bounds)
+}
+
+fn validate(record: &RecoveryRecord) -> Result<(), String> {
+    if record.generation == 0 || record.revision == 0 || record.source.bytes == 0 { return Err("Recovery identity is invalid.".into()); }
+    let source_pages = usize::try_from(record.source_pages).map_err(|_| "Recovery page count is invalid.")?;
+    if source_pages == 0 || source_pages > MAX_PAGES || record.edit_state.pages.is_empty() || record.edit_state.pages.len() > source_pages || record.current_page as usize >= record.edit_state.pages.len() { return Err("Recovery page count is invalid.".into()); }
+    let mut sources = HashSet::new();
+    let mut annotations = 0usize;
+    let mut text_bytes = 0usize;
+    let mut geometry_slots = 0usize;
+    let mut ids = HashSet::new();
+    for page in &record.edit_state.pages {
+        if page.source as usize >= source_pages || !sources.insert(page.source) || page.turns > 3 || page.crop.is_some_and(|rect| !valid_crop(rect)) { return Err("Recovery page state is invalid.".into()); }
+        annotations = annotations.checked_add(page.annotations.len()).ok_or("Recovery annotation count is invalid.")?;
+        if annotations > MAX_ANNOTATIONS { return Err("Recovery annotation count is invalid.".into()); }
+        for annotation in &page.annotations {
+            if !ids.insert(&annotation.id) || !positive_rect(annotation.rect) || annotation.contents.contains('\0') || annotation.contents.len() > MAX_TEXT_BYTES { return Err("Recovery annotation state is invalid.".into()); }
+            text_bytes = text_bytes.checked_add(annotation.contents.len()).ok_or("Recovery annotation text is invalid.")?;
+            if text_bytes > MAX_TOTAL_TEXT_BYTES { return Err("Recovery annotation text is invalid.".into()); }
+            let slots = match annotation.kind {
+                RecoveryAnnotationKind::Note if annotation_number(&annotation.id, "pdf-workstation-note-") && annotation.quads.is_empty() && !annotation.contents.trim().is_empty() => 1,
+                RecoveryAnnotationKind::AreaHighlight if annotation_number(&annotation.id, "pdf-workstation-highlight-") && annotation.quads.is_empty() && (annotation.contents.is_empty() || !annotation.contents.trim().is_empty()) => 1,
+                RecoveryAnnotationKind::TextHighlight if annotation_number(&annotation.id, "pdf-workstation-highlight-") && !annotation.quads.is_empty() && annotation.quads.len() <= MAX_QUADS && (annotation.contents.is_empty() || !annotation.contents.trim().is_empty()) && union(&annotation.quads) == Some(annotation.rect) => annotation.quads.len(),
+                _ => return Err("Recovery annotation state is invalid.".into()),
+            };
+            geometry_slots = geometry_slots.checked_add(slots).ok_or("Recovery annotation geometry is invalid.")?;
+            if geometry_slots > MAX_TOTAL_QUADS { return Err("Recovery annotation geometry is invalid.".into()); }
+        }
+    }
+    Ok(())
+}
+
+pub fn encode_recovery(record: &RecoveryRecord) -> Result<Vec<u8>, String> {
+    validate(record)?;
+    let payload = serde_json::to_vec(&record.edit_state).map_err(|_| "Recovery state could not be encoded.")?;
+    let total = HEADER_BYTES.checked_add(payload.len()).and_then(|value| value.checked_add(DIGEST_BYTES)).ok_or("Recovery record is too large.")?;
+    if total > MAX_FRAME_BYTES || payload.len() > u32::MAX as usize { return Err("Recovery record is too large.".into()); }
+    let mut output = Vec::with_capacity(total);
+    output.extend_from_slice(MAGIC);
+    output.extend_from_slice(&VERSION.to_le_bytes());
+    output.extend_from_slice(&record.generation.to_le_bytes());
+    output.extend_from_slice(&record.revision.to_le_bytes());
+    output.extend_from_slice(&record.current_page.to_le_bytes());
+    output.extend_from_slice(&record.source_pages.to_le_bytes());
+    output.extend_from_slice(&record.source.bytes.to_le_bytes());
+    output.extend_from_slice(&record.source.sha256);
+    output.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    output.extend_from_slice(&payload);
+    output.extend_from_slice(&Sha256::digest(&output));
+    Ok(output)
+}
+
+fn take<const N: usize>(bytes: &[u8], offset: &mut usize) -> Result<[u8; N], String> {
+    let end = offset.checked_add(N).ok_or("Recovery record is truncated.")?;
+    let value: [u8; N] = bytes.get(*offset..end).ok_or("Recovery record is truncated.")?.try_into().map_err(|_| "Recovery record is truncated.")?;
+    *offset = end;
+    Ok(value)
+}
+
+pub fn decode_recovery(bytes: &[u8], expected_source: SourceIdentity, prior_generation: Option<u64>, minimum_revision: u64) -> Result<RecoveryRecord, String> {
+    if bytes.len() < HEADER_BYTES + DIGEST_BYTES || bytes.len() > MAX_FRAME_BYTES { return Err("Recovery record length is invalid.".into()); }
+    let mut offset = 0usize;
+    if &take::<8>(bytes, &mut offset)? != MAGIC { return Err("Recovery record header is invalid.".into()); }
+    if u16::from_le_bytes(take(bytes, &mut offset)?) != VERSION { return Err("Recovery record version is unsupported.".into()); }
+    let generation = u64::from_le_bytes(take(bytes, &mut offset)?);
+    let revision = u64::from_le_bytes(take(bytes, &mut offset)?);
+    let current_page = u32::from_le_bytes(take(bytes, &mut offset)?);
+    let source_pages = u32::from_le_bytes(take(bytes, &mut offset)?);
+    let source = SourceIdentity { bytes: u64::from_le_bytes(take(bytes, &mut offset)?), sha256: take(bytes, &mut offset)? };
+    let payload_bytes = u32::from_le_bytes(take(bytes, &mut offset)?) as usize;
+    let expected = HEADER_BYTES.checked_add(payload_bytes).and_then(|value| value.checked_add(DIGEST_BYTES)).ok_or("Recovery record length is invalid.")?;
+    if expected != bytes.len() { return Err("Recovery record length is invalid.".into()); }
+    let payload_end = HEADER_BYTES + payload_bytes;
+    if Sha256::digest(&bytes[..payload_end]).as_slice() != &bytes[payload_end..] { return Err("Recovery record integrity check failed.".into()); }
+    if source != expected_source { return Err("Recovery source identity does not match.".into()); }
+    if prior_generation.is_some_and(|prior| generation <= prior) { return Err("Recovery generation is stale or duplicated.".into()); }
+    if revision < minimum_revision { return Err("Recovery revision is stale.".into()); }
+    let edit_state: RecoveryEditState = serde_json::from_slice(&bytes[HEADER_BYTES..payload_end]).map_err(|_| "Recovery state is malformed.")?;
+    if serde_json::to_vec(&edit_state).map_err(|_| "Recovery state is malformed.")? != &bytes[HEADER_BYTES..payload_end] { return Err("Recovery state is not canonical.".into()); }
+    let record = RecoveryRecord { generation, revision, current_page, source_pages, source, edit_state };
+    validate(&record)?;
+    Ok(record)
+}
