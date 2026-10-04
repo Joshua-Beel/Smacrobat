@@ -46,11 +46,11 @@ function Stop-ExactRecoveryApplication { param([int]$ProcessId,[long]$ProcessSta
 }
 function Open-RecoveryFixture { param($Context,[string]$Path)
  $appPid=[int]$Context.ApplicationProcessId;$ticks=[long]$Context.ApplicationProcessStartUtcTicks;$deadline=[datetime]$Context.Deadline
- $surfaces=@(Get-ReadingProcessUiSurfaceSnapshot -ApplicationProcessId $appPid-ApplicationProcessStartUtcTicks $ticks -Deadline $deadline);$ids=Assert-ReadingSurfaceSnapshot -Snapshot $surfaces -ApplicationProcessId $appPid-Kind 'Recovery open baseline'
- $targets=@(Get-ReadingPickerTargetSnapshot -Surfaces $surfaces -ApplicationProcessId $appPid-ApplicationProcessStartUtcTicks $ticks -Deadline $deadline);$null=Assert-ReadingPickerTargetSnapshot -Snapshot $targets -SurfaceIdentities $ids -ApplicationProcessId $appPid-Kind 'Recovery picker baseline'
+ $surfaces=@(Get-ReadingProcessUiSurfaceSnapshot -ApplicationProcessId $appPid -ApplicationProcessStartUtcTicks $ticks -Deadline $deadline);$ids=Assert-ReadingSurfaceSnapshot -Snapshot $surfaces -ApplicationProcessId $appPid -Kind 'Recovery open baseline'
+ $targets=@(Get-ReadingPickerTargetSnapshot -Surfaces $surfaces -ApplicationProcessId $appPid -ApplicationProcessStartUtcTicks $ticks -Deadline $deadline);$null=Assert-ReadingPickerTargetSnapshot -Snapshot $targets -SurfaceIdentities $ids -ApplicationProcessId $appPid -Kind 'Recovery picker baseline'
  $clicked=Invoke-WebDriverScript -SessionId $Context.SessionId -Script 'const b=[...document.querySelectorAll("button")].filter(x=>x.textContent.trim()==="Open a file"&&!x.disabled);if(b.length===1)setTimeout(()=>b[0].click(),0);return b.length===1;' -Deadline $deadline
- if($clicked-isnot[bool]-or-not$clicked){throw 'Exact Open control was unavailable.'};$picker=Wait-ReadingProcessBoundPickerTargets -ApplicationProcessId $appPid-ApplicationProcessStartUtcTicks $ticks -BaselineSurfaces $surfaces -BaselineTargets $targets -Deadline $deadline
- Submit-ProcessBoundOpenDialog -Binding $picker -ApplicationProcessId $appPid-ApplicationProcessStartUtcTicks $ticks -Path $Path -Deadline $deadline
+ if($clicked-isnot[bool]-or-not$clicked){throw 'Exact Open control was unavailable.'};$picker=Wait-ReadingProcessBoundPickerTargets -ApplicationProcessId $appPid -ApplicationProcessStartUtcTicks $ticks -BaselineSurfaces $surfaces -BaselineTargets $targets -Deadline $deadline
+ Submit-ProcessBoundOpenDialog -Binding $picker -ApplicationProcessId $appPid -ApplicationProcessStartUtcTicks $ticks -Path $Path -Deadline $deadline
 }
 function Wait-RecoveryOracle { param($Context,[string]$Script,[scriptblock]$Predicate,[string]$Kind)
  Wait-WebDriverOracle -SessionId $Context.SessionId -Script $Script -Deadline $Context.Deadline -Kind $Kind -Predicate $Predicate
