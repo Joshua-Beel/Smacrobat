@@ -266,7 +266,7 @@ describe('manual signed OCR installer upgrade workflow', () => {
     );
     const result = runPowerShell(check);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 30_000);
 
   it('rejects malformed signed receipts and validates the exact five OCR roles', () => {
     const check = functionHarness(

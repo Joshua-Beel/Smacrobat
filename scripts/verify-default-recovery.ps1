@@ -16,10 +16,11 @@ $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
 
 function Import-RecoveryFunctions { param([string]$Path,[string[]]$Names)
  $tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile($Path,[ref]$tokens,[ref]$errors);if($errors.Count){throw 'A trusted recovery helper did not parse.'}
- foreach($name in $Names){$node=$ast.Find({param($n)$n-is[Management.Automation.Language.FunctionDefinitionAst]-and$n.Name-ceq$name},$true);if(-not$node){throw "Missing trusted helper: $name"};Invoke-Expression $node.Extent.Text}
+ foreach($name in $Names){$node=$ast.Find({param($n)$n-is[Management.Automation.Language.FunctionDefinitionAst]-and$n.Name-ceq$name},$true);if(-not$node){throw "Missing trusted helper: $name"};Set-Item -Path ("Function:script:"+$name) -Value $node.Body.GetScriptBlock()}
 }
 Import-RecoveryFunctions (Join-Path $PSScriptRoot 'verify-default-expanded-page-tools.ps1') @('Assert-DefaultDraftReceipt','Assert-IndependentReceiptParity','Assert-Step1ArtifactMetadata','Assert-InstalledDefaultResources')
-Import-RecoveryFunctions (Join-Path $PSScriptRoot 'verify-signed-ocr-upgrade.ps1') @('Assert-FileReceipt','Resolve-RunnerPath','Get-FreshInstallFacts','Assert-FreshInstallFacts','Get-ConflictingProcessFacts','Invoke-BoundedSilentInstaller','Get-InstallFacts','Assert-InstallFacts')
+Import-RecoveryFunctions (Join-Path $PSScriptRoot 'verify-signed-ocr-upgrade.ps1') @('Assert-ExactProperties','Assert-FileReceipt','Resolve-RunnerPath','Get-FreshInstallFacts','Assert-FreshInstallFacts','Get-ConflictingProcessFacts','Invoke-BoundedSilentInstaller','Get-InstallFacts','Assert-InstallFacts','Assert-ReceiptValue','Assert-ReceiptFileObject','Get-UniqueResource','Convert-RegistryFilePath')
+Import-RecoveryFunctions (Join-Path $PSScriptRoot 'verify-default-draft.ps1') @('New-GitHubGetRequest','Assert-GitHubResponseSuccess','Invoke-GitHubJson','ConvertTo-ExactUInt64')
 . (Join-Path $PSScriptRoot 'installed-image-page-tools.ps1')
 
 $script:RecoveryPaths=@('src/App.tsx','src/RecoveryOfferDialog.tsx','src/recoveryErrors.ts','src/bridge.ts','src/Organizer.tsx','src-tauri/src/recovery_journal.rs','src-tauri/src/recovery_store.rs','src-tauri/src/recovery_commands.rs','src-tauri/src/service.rs','src-tauri/src/main.rs','src-tauri/tauri.conf.json','src-tauri/resources/welcome.pdf')
@@ -44,12 +45,12 @@ function Stop-ExactRecoveryApplication { param([int]$ProcessId,[long]$ProcessSta
  $p.Kill($true);if(-not$p.WaitForExit(10000)){throw 'Owned application termination timed out.'};$true
 }
 function Open-RecoveryFixture { param($Context,[string]$Path)
- $pid=[int]$Context.ApplicationProcessId;$ticks=[long]$Context.ApplicationProcessStartUtcTicks;$deadline=[datetime]$Context.Deadline
- $surfaces=@(Get-ReadingProcessUiSurfaceSnapshot -ApplicationProcessId $pid -ApplicationProcessStartUtcTicks $ticks -Deadline $deadline);$ids=Assert-ReadingSurfaceSnapshot -Snapshot $surfaces -ApplicationProcessId $pid -Kind 'Recovery open baseline'
- $targets=@(Get-ReadingPickerTargetSnapshot -Surfaces $surfaces -ApplicationProcessId $pid -ApplicationProcessStartUtcTicks $ticks -Deadline $deadline);$null=Assert-ReadingPickerTargetSnapshot -Snapshot $targets -SurfaceIdentities $ids -ApplicationProcessId $pid -Kind 'Recovery picker baseline'
+ $appPid=[int]$Context.ApplicationProcessId;$ticks=[long]$Context.ApplicationProcessStartUtcTicks;$deadline=[datetime]$Context.Deadline
+ $surfaces=@(Get-ReadingProcessUiSurfaceSnapshot -ApplicationProcessId $appPid-ApplicationProcessStartUtcTicks $ticks -Deadline $deadline);$ids=Assert-ReadingSurfaceSnapshot -Snapshot $surfaces -ApplicationProcessId $appPid-Kind 'Recovery open baseline'
+ $targets=@(Get-ReadingPickerTargetSnapshot -Surfaces $surfaces -ApplicationProcessId $appPid-ApplicationProcessStartUtcTicks $ticks -Deadline $deadline);$null=Assert-ReadingPickerTargetSnapshot -Snapshot $targets -SurfaceIdentities $ids -ApplicationProcessId $appPid-Kind 'Recovery picker baseline'
  $clicked=Invoke-WebDriverScript -SessionId $Context.SessionId -Script 'const b=[...document.querySelectorAll("button")].filter(x=>x.textContent.trim()==="Open a file"&&!x.disabled);if(b.length===1)setTimeout(()=>b[0].click(),0);return b.length===1;' -Deadline $deadline
- if($clicked-isnot[bool]-or-not$clicked){throw 'Exact Open control was unavailable.'};$picker=Wait-ReadingProcessBoundPickerTargets -ApplicationProcessId $pid -ApplicationProcessStartUtcTicks $ticks -BaselineSurfaces $surfaces -BaselineTargets $targets -Deadline $deadline
- Submit-ProcessBoundOpenDialog -Binding $picker -ApplicationProcessId $pid -ApplicationProcessStartUtcTicks $ticks -Path $Path -Deadline $deadline
+ if($clicked-isnot[bool]-or-not$clicked){throw 'Exact Open control was unavailable.'};$picker=Wait-ReadingProcessBoundPickerTargets -ApplicationProcessId $appPid-ApplicationProcessStartUtcTicks $ticks -BaselineSurfaces $surfaces -BaselineTargets $targets -Deadline $deadline
+ Submit-ProcessBoundOpenDialog -Binding $picker -ApplicationProcessId $appPid-ApplicationProcessStartUtcTicks $ticks -Path $Path -Deadline $deadline
 }
 function Wait-RecoveryOracle { param($Context,[string]$Script,[scriptblock]$Predicate,[string]$Kind)
  Wait-WebDriverOracle -SessionId $Context.SessionId -Script $Script -Deadline $Context.Deadline -Kind $Kind -Predicate $Predicate

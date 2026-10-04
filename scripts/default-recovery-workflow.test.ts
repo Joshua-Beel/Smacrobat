@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
@@ -12,7 +12,9 @@ function retainedPowerShell(body: string) {
   mkdirSync(root, { recursive: true });
   const path = join(root, 'contract.ps1');
   writeFileSync(path, body, 'utf8');
-  return spawnSync('pwsh.exe', ['-NoProfile', '-NonInteractive', '-File', path], { encoding: 'utf8', timeout: 60_000 });
+  try {
+    return spawnSync('pwsh.exe', ['-NoProfile', '-NonInteractive', '-File', path], { encoding: 'utf8', timeout: 60_000 });
+  } finally { rmSync(root, { recursive: true, force: true }); }
 }
 
 function extractFunction(name: string, body: string) {
