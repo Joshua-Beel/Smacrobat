@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vitest';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const scriptPath = 'scripts/default-comments-forms-native-evidence.ps1';
@@ -48,7 +47,7 @@ describe('comments and forms native evidence', () => {
   });
 
   it('rejects a non-exact fake Cargo footer and accepts the exact six-test sequence', () => {
-    const root = join(tmpdir(), `smacrobat-native-evidence-${randomUUID()}`);
+    const root = join(process.cwd(), 'target', `smacrobat-native-evidence-${randomUUID()}`);
     const project = join(root, 'project'); const output = join(root, 'receipt.json');
     mkdirSync(join(project, 'src-tauri', 'src'), { recursive: true });
     mkdirSync(join(project, 'src-tauri', 'resources', 'pdfium', 'bin'), { recursive: true });

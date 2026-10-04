@@ -58,14 +58,17 @@ function workflowRunBlock(workflow: string, stepName: string) {
   return `${body.join('\n')}\n`;
 }
 
-function functionHarness(names: string[], body: string) {
+function functionHarness(names: string[], body: string, loadDependencies = true) {
+  const dependencies = loadDependencies ? String.raw`
+    . ./scripts/ocr/installer-package.ps1
+    . ./scripts/ocr/windows-signing.ps1
+    . ./scripts/installed-publisher-ui.ps1
+  ` : '';
   return String.raw`
     $ErrorActionPreference = 'Stop'
     Set-StrictMode -Version Latest
     Set-Location -LiteralPath '${process.cwd().replaceAll("'", "''")}'
-    . ./scripts/ocr/installer-package.ps1
-    . ./scripts/ocr/windows-signing.ps1
-    . ./scripts/installed-publisher-ui.ps1
+    ${dependencies}
     $scriptPath = (Resolve-Path ./scripts/verify-signed-ocr-upgrade.ps1).Path
     $tokens = $null; $errors = $null
     $ast = [Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$errors)
@@ -259,6 +262,7 @@ describe('manual signed OCR installer upgrade workflow', () => {
           if(-not $rejected){throw ('Nonfresh machine state was accepted: '+$name)}
         }
       `,
+      false,
     );
     const result = runPowerShell(check);
     expect(result.status, result.stderr || result.stdout).toBe(0);

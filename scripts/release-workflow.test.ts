@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-const workflow = readFileSync('.github/workflows/release.yml', 'utf8');
+const workflow = readFileSync('.github/workflows/release.yml', 'utf8').replace(/\r\n/g, '\n');
 const versionValidator = readFileSync('scripts/assert-release-version.ps1', 'utf8');
 const serviceSource = readFileSync('src-tauri/src/service.rs', 'utf8');
 const restartSource = readFileSync('src-tauri/src/recovery_restart_tests.rs', 'utf8');

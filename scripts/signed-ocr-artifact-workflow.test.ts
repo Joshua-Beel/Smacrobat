@@ -16,7 +16,7 @@ function runPowerShell(source: string) {
 
 describe('manual signed OCR artifact workflow', () => {
   it('is manual, master-bound, read-only, exact-revision, and isolated from releases and updater secrets', () => {
-    const workflow = readFileSync('.github/workflows/ocr-signed-artifact.yml', 'utf8');
+    const workflow = readFileSync('.github/workflows/ocr-signed-artifact.yml', 'utf8').replace(/\r\n/g, '\n');
     const release = readFileSync('.github/workflows/release.yml', 'utf8');
     const builder = readFileSync('scripts/build-installer.ps1', 'utf8');
 
@@ -57,9 +57,9 @@ describe('manual signed OCR artifact workflow', () => {
     expect(workflow).toContain('${{ env.EXPORT_ROOT }}/artifact-verification.json');
     expect(workflow.slice(workflow.indexOf('actions/upload-artifact@v4'))).not.toContain('BUILD_PROOF_ROOT');
 
-    expect(builder).toContain("if ($SourceRevision -and -not $ArtifactOnly)");
+    expect(builder).toContain("if ($SourceRevision -and -not ($ArtifactOnly -or $UnsignedLocal))");
     expect(builder).toContain('SourceRevision does not match the current git HEAD.');
-    expect(builder).toContain('sourceRevision = if ($ArtifactOnly) { $SourceRevision } else { $null }');
+    expect(builder).toContain('sourceRevision = $SourceRevision');
     expect(release).not.toContain('ocr-signed-artifact');
     expect(release).not.toContain('ArtifactOnly');
   });
