@@ -6,6 +6,8 @@ You can already read PDFs, rearrange pages, and save your changes to a new file.
 
 ## Install
 
+PDF Workstation is free, open-source software under the [MIT License](LICENSE).
+
 Download the Windows setup file from the [latest release](https://github.com/Joshua-Beel/Smacrobat/releases/latest). The installer includes the PDF engine. Once installed, open a file or choose **Explore a sample PDF** to try it out.
 
 For updates, use **Menu > Check for updates**. The app shows what's new and lets you choose when to install. Save any edited documents first; the app won't install an update while you have unsaved changes.
@@ -106,6 +108,8 @@ An open document keeps a snapshot of its original bytes. Before saving, the app 
 For more background, see the [architecture notes](docs/decisions.md) and [PDFium documentation](https://docs.rs/pdfium-render/0.9.4/pdfium_render/). The interface follows the [current Acrobat workspace](https://helpx.adobe.com/acrobat/desktop/get-started/learn-the-basics/workspace.html).
 
 ## Recent changes
+
+- Added the MIT `LICENSE` (copyright 2026 Joshua Beel). Until now the public repository carried no license file, which left it all-rights-reserved by default despite being intended as free open-source software. The `license` fields in `package.json` and `src-tauri/Cargo.toml` are deliberately not set yet: both files are hashed inputs of the third-party notice inventory, so that change must regenerate the inventory in the same commit and will land separately. The bundled third-party notices and MPL source archives are unchanged.
 
 - Committed the unfinished work left when development moved from Codex to Claude. Unsigned local installer proofs now require and record the exact clean 40-character git HEAD (`Assert-InstallerSourceRevision`), as the artifact-only Azure OCR mode already did. Workflow tests now normalize CRLF before matching. A new default-recovery verification workflow, its PowerShell verifier and two contract test files were added. The native-evidence fixture test moves its scratch root from the OS temp directory to `target/` (the runner's 8.3 temp path failed the verifier's exact root comparison) and keeps its `finally` cleanup. With PowerShell 7.6.6 installed locally, the 8 affected test files pass 61 of 61 tests. Nothing here was run on hosted CI; this is local source evidence only.
 
