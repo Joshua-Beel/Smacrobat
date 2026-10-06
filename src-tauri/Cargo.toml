@@ -1,6 +1,7 @@
 [package]
 name = "pdf-workstation"
 version = "0.2.12"
+license = "MIT"
 edition = "2021"
 
 [build-dependencies]

@@ -1,6 +1,7 @@
 {
   "name": "pdf-workstation",
   "version": "0.2.12",
+  "license": "MIT",
   "private": true,
   "type": "module",
   "scripts": {

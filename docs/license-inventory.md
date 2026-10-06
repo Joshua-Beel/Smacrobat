@@ -75,7 +75,7 @@ This table highlights exceptions; it is not the complete transitive package list
 
 ## Generated collection
 
-`scripts/dependency-notices.mjs` collects the conservative resolved Windows Cargo graph and production npm lock entries into `src-tauri/resources/third-party-licenses/inventory.json` and `THIRD-PARTY-NOTICES.txt`. There are 367 package records, including build/auxiliary packages; this is not a count of libraries linked into the application. The collection includes Lucide's Feather attribution and nested `ring` notices. The current inventory is 202,858 bytes with SHA-256 `A4EF40C50F66EF1B1B384841F59187830FF27C0253451C2F8A4BE0423B5C0532`; all 367 records have license evidence and zero records are marked for review. Moving `sha2` from a development dependency to a production dependency changed `sha2`, `block-buffer`, `cpufeatures`, `crypto-common`, `digest`, and `generic-array` from build/auxiliary to conservative runtime-candidate scope. Package identities, license evidence, source archives, and notice text are unchanged.
+`scripts/dependency-notices.mjs` collects the conservative resolved Windows Cargo graph and production npm lock entries into `src-tauri/resources/third-party-licenses/inventory.json` and `THIRD-PARTY-NOTICES.txt`. There are 367 package records, including build/auxiliary packages; this is not a count of libraries linked into the application. The collection includes Lucide's Feather attribution and nested `ring` notices. The current inventory is 202,858 bytes with SHA-256 `9916BFC0E818BE3B17813E53EF7635132CCCA5F0741F9CB25709B45AD5CA0AEF` (regenerated after `package.json` and `src-tauri/Cargo.toml` gained `license` fields; only `inputHashes` changed); all 367 records have license evidence and zero records are marked for review. Moving `sha2` from a development dependency to a production dependency changed `sha2`, `block-buffer`, `cpufeatures`, `crypto-common`, `digest`, and `generic-array` from build/auxiliary to conservative runtime-candidate scope. Package identities, license evidence, source archives, and notice text are unchanged.
 
 Twelve missing local notices were resolved using published crate commits and official upstream license files. `scripts/notice-supplements/manifest.json` records exact commits, provenance URLs and SHA-256 hashes. Offline generation verifies those inputs. Explicitly running `scripts/fetch-notice-supplements.mjs --fetch` retrieves the recorded files and rejects unexpected hashes.
 
@@ -116,7 +116,7 @@ node scripts/dependency-notices.mjs --check
 ## Remaining release checks
 
 1. Check the installed app's notice entry after installation. The signed v0.2.6 draft extraction establishes bundled resources, not installed-app interaction.
-2. Record the WebView2 bootstrapper/distribution version and its associated terms separately. The config downloads the bootstrapper; this inventory did not inspect that payload. The app's own redistribution license is also unresolved: the root has no `LICENSE` file and its Cargo package has no license field. Joshua owns that choice.
+2. Record the WebView2 bootstrapper/distribution version and its associated terms separately. The config downloads the bootstrapper; this inventory did not inspect that payload. The app itself is MIT-licensed: the root `LICENSE` holds the text, and `package.json` and `src-tauri/Cargo.toml` declare `MIT`.
 
 ## Reproducing the metadata read
 
