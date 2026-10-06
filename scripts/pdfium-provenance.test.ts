@@ -1,6 +1,68 @@
-import { readFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
+import { spawn, spawnSync } from 'node:child_process';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { expect, it } from 'vitest';
+
+const pinnedArchiveSha256 = '73CC0DE638AC2095E7445BF56A38200A5B7C7CA0E9F4BA144598F2457377AC08';
+
+function runPwsh(args: string[], timeoutMs: number): Promise<{ code: number | null; output: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('pwsh.exe', args, { windowsHide: true });
+    let output = '';
+    child.stdout.on('data', chunk => { output += chunk; });
+    child.stderr.on('data', chunk => { output += chunk; });
+    const timer = setTimeout(() => { child.kill(); reject(new Error(`pwsh timed out: ${output}`)); }, timeoutMs);
+    child.on('error', error => { clearTimeout(timer); reject(error); });
+    child.on('close', code => { clearTimeout(timer); resolve({ code, output }); });
+  });
+}
+
+it('pins the same PDFium archive SHA-256 for setup and draft reconstruction', () => {
+  const setup = readFileSync('scripts/setup-pdfium.ps1', 'utf8');
+  const preparation = readFileSync('scripts/prepare-default-draft-pdfium.ps1', 'utf8');
+  expect(setup).toContain(`$archiveSha256 = '${pinnedArchiveSha256}'`);
+  expect(preparation).toContain(`$assetSha256='${pinnedArchiveSha256}'`);
+});
+
+it('refuses and deletes a downloaded PDFium archive whose SHA-256 differs from the pin, without extracting it', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'smacrobat-pdfium-pin-'));
+  const server = createServer();
+  try {
+    mkdirSync(join(root, 'scripts'));
+    copyFileSync('scripts/setup-pdfium.ps1', join(root, 'scripts', 'setup-pdfium.ps1'));
+    const payload = join(root, 'payload');
+    mkdirSync(join(payload, 'bin'), { recursive: true });
+    writeFileSync(join(payload, 'bin', 'pdfium.dll'), 'not the pinned binary');
+    const tgz = join(root, 'substitute.tgz');
+    const packed = spawnSync('tar', ['-czf', 'substitute.tgz', '-C', 'payload', 'bin'], { cwd: root, encoding: 'utf8' });
+    expect(packed.status, packed.stderr).toBe(0);
+    const bytes = readFileSync(tgz);
+    const substituteSha256 = createHash('sha256').update(bytes).digest('hex').toUpperCase();
+    expect(substituteSha256).not.toBe(pinnedArchiveSha256);
+
+    let requests = 0;
+    server.on('request', (_request, response) => { requests += 1; response.writeHead(200, { 'Content-Type': 'application/gzip' }); response.end(bytes); });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address() as AddressInfo;
+
+    const result = await runPwsh(['-NoProfile', '-NonInteractive', '-File', join(root, 'scripts', 'setup-pdfium.ps1'), '-ArchiveUri', `http://127.0.0.1:${port}/pdfium-win-x64.tgz`], 60_000);
+    expect(requests).toBe(1);
+    expect(result.code, result.output).not.toBe(0);
+    expect(result.output).toContain('PDFium archive SHA-256 mismatch');
+    expect(result.output).toContain(substituteSha256);
+    const resources = join(root, 'src-tauri', 'resources');
+    expect(existsSync(join(resources, 'pdfium-win-x64.tgz'))).toBe(false);
+    expect(existsSync(join(resources, 'pdfium', 'bin', 'pdfium.dll'))).toBe(false);
+    expect(readdirSync(resources)).toEqual([]);
+  } finally {
+    server.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 90_000);
 
 const versionPath = 'resources/pdfium/VERSION';
 const argsPath = 'resources/pdfium/args.gn';
