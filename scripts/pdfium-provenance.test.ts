@@ -59,7 +59,8 @@ it('refuses and deletes a downloaded PDFium archive whose SHA-256 differs from t
     expect(existsSync(join(resources, 'pdfium', 'bin', 'pdfium.dll'))).toBe(false);
     expect(readdirSync(resources)).toEqual([]);
   } finally {
-    server.close();
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
     rmSync(root, { recursive: true, force: true });
   }
 }, 90_000);

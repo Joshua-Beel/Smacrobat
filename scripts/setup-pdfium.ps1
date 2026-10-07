@@ -13,7 +13,7 @@ try {
     Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue
     throw
 }
-if ($actualSha256 -cne $archiveSha256) {
+if ($actualSha256 -ne $archiveSha256) {
     Remove-Item -LiteralPath $archivePath -Force
     throw "PDFium archive SHA-256 mismatch: expected $archiveSha256, got $actualSha256. The download was deleted and nothing was extracted."
 }
