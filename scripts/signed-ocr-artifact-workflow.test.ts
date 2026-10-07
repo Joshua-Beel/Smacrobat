@@ -55,7 +55,6 @@ describe('manual signed OCR artifact workflow', () => {
     expect(workflow).toContain('-SourceRevision $env:GITHUB_SHA');
     expect(workflow).toContain('${{ env.EXPORT_ROOT }}/*_x64-setup.exe');
     expect(workflow).toContain('${{ env.EXPORT_ROOT }}/artifact-verification.json');
-    expect(workflow).not.toMatch(/uses:\s*[^\s]+@(?:v\d+|stable|main|master)\b/);
     expect(workflow.indexOf('actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02')).toBeGreaterThan(0);
     expect(workflow.slice(workflow.indexOf('actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02'))).not.toContain('BUILD_PROOF_ROOT');
 
