@@ -65,6 +65,105 @@ it('refuses and deletes a downloaded PDFium archive whose SHA-256 differs from t
   }
 }, 90_000);
 
+async function withPinnedArchiveFixture(archive: Buffer, body: (fixture: { resources: string; requests: () => number; runSetup: (extra?: string[]) => Promise<{ code: number | null; output: string }> }) => Promise<void>) {
+  const root = mkdtempSync(join(tmpdir(), 'smacrobat-pdfium-swap-'));
+  const server = createServer();
+  try {
+    mkdirSync(join(root, 'scripts'));
+    const archiveSha256 = createHash('sha256').update(archive).digest('hex').toUpperCase();
+    const original = readFileSync('scripts/setup-pdfium.ps1', 'utf8');
+    const pinLine = `$archiveSha256 = '${pinnedArchiveSha256}'`;
+    expect(original.split(pinLine).length).toBe(2);
+    writeFileSync(join(root, 'scripts', 'setup-pdfium.ps1'), original.replace(pinLine, `$archiveSha256 = '${archiveSha256}'`));
+    let requests = 0;
+    server.on('request', (_request, response) => { requests += 1; response.writeHead(200, { 'Content-Type': 'application/gzip' }); response.end(archive); });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address() as AddressInfo;
+    await body({
+      resources: join(root, 'src-tauri', 'resources'),
+      requests: () => requests,
+      runSetup: (extra = []) => runPwsh(['-NoProfile', '-NonInteractive', '-File', join(root, 'scripts', 'setup-pdfium.ps1'), '-ArchiveUri', `http://127.0.0.1:${port}/pdfium-win-x64.tgz`, ...extra], 60_000),
+    });
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function packArchive(files: Record<string, string | Buffer>): Buffer {
+  const root = mkdtempSync(join(tmpdir(), 'smacrobat-pdfium-pack-'));
+  try {
+    for (const [relative, content] of Object.entries(files)) {
+      mkdirSync(join(root, 'payload', relative, '..'), { recursive: true });
+      writeFileSync(join(root, 'payload', relative), content);
+    }
+    const packed = spawnSync('tar', ['-czf', 'archive.tgz', '-C', 'payload', ...Object.keys(files)], { cwd: root, encoding: 'utf8' });
+    expect(packed.status, packed.stderr).toBe(0);
+    return readFileSync(join(root, 'archive.tgz'));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function seedStaleFolder(resources: string) {
+  mkdirSync(join(resources, 'pdfium', 'bin'), { recursive: true });
+  writeFileSync(join(resources, 'pdfium', 'bin', 'pdfium.dll'), 'stale unverified binary');
+  writeFileSync(join(resources, 'pdfium', 'leftover.txt'), 'from an older archive');
+}
+
+it('replaces a stale, unmarked pdfium folder with the verified archive and re-extracts when the recorded DLL hash no longer matches', async () => {
+  const archive = packArchive({ 'bin/pdfium.dll': 'verified binary', LICENSE: 'license text' });
+  await withPinnedArchiveFixture(archive, async ({ resources, requests, runSetup }) => {
+    seedStaleFolder(resources);
+    const stale = await runSetup(['-SkipIfCurrent']);
+    expect(stale.code, stale.output).toBe(0);
+    expect(requests()).toBe(1);
+    expect(readFileSync(join(resources, 'pdfium', 'bin', 'pdfium.dll'), 'utf8')).toBe('verified binary');
+    expect(readdirSync(join(resources, 'pdfium')).sort()).toEqual(['.verified-archive', 'LICENSE', 'bin']);
+    expect(readdirSync(resources).sort()).toEqual(['pdfium', 'pdfium-win-x64.tgz']);
+    const archiveSha256 = createHash('sha256').update(archive).digest('hex').toUpperCase();
+    const dllSha256 = createHash('sha256').update('verified binary').digest('hex').toUpperCase();
+    expect(readFileSync(join(resources, 'pdfium', '.verified-archive'), 'utf8')).toBe(`archive-sha256=${archiveSha256}\npdfium.dll-sha256=${dllSha256}\n`);
+
+    const current = await runSetup(['-SkipIfCurrent']);
+    expect(current.code, current.output).toBe(0);
+    expect(current.output).toContain('already extracted');
+    expect(requests()).toBe(1);
+
+    writeFileSync(join(resources, 'pdfium', 'bin', 'pdfium.dll'), 'swapped after extraction');
+    const tampered = await runSetup(['-SkipIfCurrent']);
+    expect(tampered.code, tampered.output).toBe(0);
+    expect(requests()).toBe(2);
+    expect(readFileSync(join(resources, 'pdfium', 'bin', 'pdfium.dll'), 'utf8')).toBe('verified binary');
+  });
+}, 120_000);
+
+it('leaves no half-populated pdfium folder when a hash-matching archive fails to extract', async () => {
+  const filler = Buffer.concat(Array.from({ length: 4096 }, (_, index) => createHash('sha512').update(String(index)).digest()));
+  const full = packArchive({ 'bin/pdfium.dll': 'first entry', 'licenses/large.bin': filler });
+  await withPinnedArchiveFixture(full.subarray(0, Math.floor(full.length * 0.7)), async ({ resources, requests, runSetup }) => {
+    const fresh = await runSetup();
+    expect(requests()).toBe(1);
+    expect(fresh.code, fresh.output).not.toBe(0);
+    expect(fresh.output).toContain('PDFium extraction failed');
+    expect(readdirSync(resources)).toEqual(['pdfium-win-x64.tgz']);
+
+    seedStaleFolder(resources);
+    const overStale = await runSetup();
+    expect(overStale.code, overStale.output).not.toBe(0);
+    expect(readdirSync(resources).sort()).toEqual(['pdfium', 'pdfium-win-x64.tgz']);
+    expect(readdirSync(join(resources, 'pdfium')).sort()).toEqual(['bin', 'leftover.txt']);
+    expect(readFileSync(join(resources, 'pdfium', 'bin', 'pdfium.dll'), 'utf8')).toBe('stale unverified binary');
+  });
+  await withPinnedArchiveFixture(packArchive({ LICENSE: 'license only' }), async ({ resources, runSetup }) => {
+    const result = await runSetup();
+    expect(result.code, result.output).not.toBe(0);
+    expect(result.output).toContain('no bin/pdfium.dll');
+    expect(readdirSync(resources)).toEqual(['pdfium-win-x64.tgz']);
+  });
+}, 120_000);
+
 const versionPath = 'resources/pdfium/VERSION';
 const argsPath = 'resources/pdfium/args.gn';
 

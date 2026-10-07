@@ -175,7 +175,7 @@ try {
         $env:PDF_WORKSTATION_OCR_SETUP_ROOT = $ocrPlan.Root
     }
 
-    if (-not (Test-Path 'src-tauri/resources/pdfium/bin/pdfium.dll')) { & "$PSScriptRoot/setup-pdfium.ps1" }
+    & "$PSScriptRoot/setup-pdfium.ps1" -SkipIfCurrent
     cargo fetch --locked --target x86_64-pc-windows-msvc --manifest-path src-tauri/Cargo.toml
     if ($LASTEXITCODE -ne 0) { throw 'Could not fetch locked dependencies for notice verification.' }
     node scripts/mpl-source-archives.mjs --check
