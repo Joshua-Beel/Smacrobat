@@ -9,9 +9,11 @@ import { expect, it } from 'vitest';
 
 const pinnedArchiveSha256 = '73CC0DE638AC2095E7445BF56A38200A5B7C7CA0E9F4BA144598F2457377AC08';
 
-function runPwsh(args: string[], timeoutMs: number): Promise<{ code: number | null; output: string }> {
+function runPwsh(args: string[], timeoutMs: number, host = 'pwsh.exe'): Promise<{ code: number | null; output: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn('pwsh.exe', args, { windowsHide: true });
+    const env = { ...process.env };
+    if (host === 'powershell.exe') for (const key of Object.keys(env)) if (key.toLowerCase() === 'psmodulepath') delete env[key];
+    const child = spawn(host, args, { windowsHide: true, env });
     let output = '';
     child.stdout.on('data', chunk => { output += chunk; });
     child.stderr.on('data', chunk => { output += chunk; });
@@ -65,7 +67,7 @@ it('refuses and deletes a downloaded PDFium archive whose SHA-256 differs from t
   }
 }, 90_000);
 
-async function withPinnedArchiveFixture(archive: Buffer, body: (fixture: { resources: string; requests: () => number; runSetup: (extra?: string[]) => Promise<{ code: number | null; output: string }> }) => Promise<void>) {
+async function withPinnedArchiveFixture(archive: Buffer, body: (fixture: { resources: string; requests: () => number; runSetup: (extra?: string[], host?: string) => Promise<{ code: number | null; output: string }> }) => Promise<void>) {
   const root = mkdtempSync(join(tmpdir(), 'smacrobat-pdfium-swap-'));
   const server = createServer();
   try {
@@ -82,7 +84,7 @@ async function withPinnedArchiveFixture(archive: Buffer, body: (fixture: { resou
     await body({
       resources: join(root, 'src-tauri', 'resources'),
       requests: () => requests,
-      runSetup: (extra = []) => runPwsh(['-NoProfile', '-NonInteractive', '-File', join(root, 'scripts', 'setup-pdfium.ps1'), '-ArchiveUri', `http://127.0.0.1:${port}/pdfium-win-x64.tgz`, ...extra], 60_000),
+      runSetup: (extra = [], host = 'pwsh.exe') => runPwsh(['-NoProfile', '-NonInteractive', '-File', join(root, 'scripts', 'setup-pdfium.ps1'), '-ArchiveUri', `http://127.0.0.1:${port}/pdfium-win-x64.tgz`, ...extra], 60_000, host),
     });
   } finally {
     server.closeAllConnections();
@@ -215,6 +217,31 @@ it('never reuses an orphaned backup, and removes stale backup and staging folder
     expect(current.output).toContain('already extracted');
     expect(requests()).toBe(1);
     expect(readdirSync(resources).sort()).toEqual(['pdfium', 'pdfium-win-x64.tgz']);
+  });
+}, 120_000);
+
+it.each(['pwsh.exe', 'powershell.exe'])('removes a junction named like a stale backup or staging folder without deleting its target (%s)', async host => {
+  const archive = packArchive({ 'bin/pdfium.dll': 'verified binary', LICENSE: 'license text' });
+  await withPinnedArchiveFixture(archive, async ({ resources, runSetup }) => {
+    const targets = mkdtempSync(join(tmpdir(), 'smacrobat-pdfium-junction-target-'));
+    try {
+      const sentinels = ['backup', 'staging', 'nested'].map(name => { mkdirSync(join(targets, name)); const file = join(targets, name, 'sentinel.txt'); writeFileSync(file, 'must survive'); return file; });
+      mkdirSync(resources, { recursive: true });
+      const backupLink = join(resources, '.pdfium-backup-44444444444444444444444444444444');
+      const stagingLink = join(resources, '.pdfium-staging-55555555555555555555555555555555');
+      const realBackup = join(resources, '.pdfium-backup-66666666666666666666666666666666');
+      mkdirSync(realBackup);
+      const linked = spawnSync('pwsh.exe', ['-NoProfile', '-NonInteractive', '-Command', `New-Item -ItemType Junction -Path '${backupLink}' -Target '${join(targets, 'backup')}' | Out-Null; New-Item -ItemType Junction -Path '${stagingLink}' -Target '${join(targets, 'staging')}' | Out-Null; New-Item -ItemType Junction -Path '${join(realBackup, 'inner')}' -Target '${join(targets, 'nested')}' | Out-Null`], { encoding: 'utf8' });
+      expect(linked.status, linked.stderr + linked.stdout).toBe(0);
+      expect(readdirSync(resources).sort()).toEqual(['.pdfium-backup-44444444444444444444444444444444', '.pdfium-backup-66666666666666666666666666666666', '.pdfium-staging-55555555555555555555555555555555']);
+      const result = await runSetup([], host);
+      expect(result.code, result.output).toBe(0);
+      expect(readdirSync(resources).sort()).toEqual(['pdfium', 'pdfium-win-x64.tgz']);
+      expect(readFileSync(join(resources, 'pdfium', 'bin', 'pdfium.dll'), 'utf8')).toBe('verified binary');
+      for (const sentinel of sentinels) expect(readFileSync(sentinel, 'utf8')).toBe('must survive');
+    } finally {
+      rmSync(targets, { recursive: true, force: true });
+    }
   });
 }, 120_000);
 

@@ -10,10 +10,20 @@ function Get-VerifiedMarker([string]$Root) {
     $dll = Join-Path $Root 'bin\pdfium.dll'
     "archive-sha256=$archiveSha256`npdfium.dll-sha256=$((Get-FileHash -Algorithm SHA256 -LiteralPath $dll).Hash)`n"
 }
+function Remove-TreeNoFollow([string]$Path) {
+    $item = Get-Item -LiteralPath $Path -Force
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        if ($item.PSIsContainer) { [IO.Directory]::Delete($item.FullName, $false) } else { [IO.File]::Delete($item.FullName) }
+        return
+    }
+    if ($item.PSIsContainer) { foreach ($child in @(Get-ChildItem -LiteralPath $item.FullName -Force)) { Remove-TreeNoFollow $child.FullName } }
+    if ($item.Attributes -band [IO.FileAttributes]::ReadOnly) { $item.Attributes = [IO.FileAttributes]::Normal }
+    if ($item.PSIsContainer) { [IO.Directory]::Delete($item.FullName, $false) } else { [IO.File]::Delete($item.FullName) }
+}
 function Remove-StaleSwapFolders {
     $stale = @(Get-ChildItem -LiteralPath $resourceRoot -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '.pdfium-backup-*' -or $_.Name -like '.pdfium-staging-*' })
     foreach ($folder in $stale) {
-        try { Remove-Item -LiteralPath $folder.FullName -Recurse -Force }
+        try { Remove-TreeNoFollow $folder.FullName }
         catch { Write-Warning "Could not remove stale PDFium folder $($folder.FullName): $($_.Exception.Message)" }
     }
 }
@@ -68,11 +78,11 @@ try {
     $swapped = $true
 } finally {
     if (Test-Path -LiteralPath $stagingRoot) {
-        try { Remove-Item -LiteralPath $stagingRoot -Recurse -Force }
+        try { Remove-TreeNoFollow $stagingRoot }
         catch { Write-Warning "Could not remove PDFium staging folder ${stagingRoot}: $($_.Exception.Message)" }
     }
     if ($swapped -and (Test-Path -LiteralPath $backupRoot)) {
-        try { Remove-Item -LiteralPath $backupRoot -Recurse -Force }
+        try { Remove-TreeNoFollow $backupRoot }
         catch { Write-Warning "Could not remove previous PDFium folder backup ${backupRoot}: $($_.Exception.Message)" }
     }
 }
