@@ -6,7 +6,10 @@
   "build": { "beforeDevCommand": "npm run dev", "devUrl": "http://localhost:1420", "beforeBuildCommand": "npm run build", "frontendDist": "../dist" },
   "app": {
     "windows": [{ "title": "PDF Workstation", "width": 1440, "height": 940, "minWidth": 900, "minHeight": 600 }],
-    "security": { "csp": "default-src 'self'; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost http://localhost:1420 ws://localhost:1420" }
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost",
+      "devCsp": "default-src 'self'; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost http://localhost:1420 ws://localhost:1420"
+    }
   },
   "bundle": {
     "active": true,
