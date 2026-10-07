@@ -5,7 +5,17 @@ export default defineConfig({
   plugins: [react()],
   clearScreen: false,
   test: {
-    exclude: [...configDefaults.exclude, 'target/**']
+    exclude: [
+      ...configDefaults.exclude,
+      'target/**',
+      'dist/**',
+      'artifacts/**',
+      'Smacrobat-private/**',
+      'scripts/%SystemDrive%/**',
+      'src-tauri/target/**',
+      'src-tauri/gen/**',
+      'src-tauri/resources/**'
+    ]
   },
   server: {
     host: '127.0.0.1',
