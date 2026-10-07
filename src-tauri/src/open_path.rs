@@ -104,6 +104,18 @@ mod tests {
     }
 
     #[test]
+    fn unlock_rejects_passwords_over_one_kib_before_any_read() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let service = crate::service::PdfService::start(root.join("resources/pdfium/bin/pdfium.dll"));
+        let error = tauri::async_runtime::block_on(service.unlock(1, "a".repeat(1025))).err().unwrap();
+        assert!(error.contains("1 KiB"), "{error}");
+        let multibyte = "\u{e9}".repeat(513);
+        assert!(tauri::async_runtime::block_on(service.unlock(1, multibyte)).err().unwrap().contains("1 KiB"));
+        let at_limit = tauri::async_runtime::block_on(service.unlock(1, "a".repeat(1024))).err().unwrap();
+        assert!(at_limit.contains("expired"), "{at_limit}");
+    }
+
+    #[test]
     fn gate_rejects_before_touching_the_filesystem() {
         let error = tauri::async_runtime::block_on(gate_open_path(PathBuf::from(r"\\127.0.0.1\share\a.pdf"))).unwrap_err();
         assert!(error.contains("UNC"), "{error}");

@@ -44,6 +44,7 @@ pub struct BookmarkInfo { title: String, page: Option<usize>, depth: usize }
 #[derive(Serialize)]
 pub struct BookmarkList { items: Vec<BookmarkInfo>, truncated: bool }
 const MAX_READ_TEXT_BYTES: usize = 1_048_576;
+const MAX_PASSWORD_BYTES: usize = 1024;
 #[derive(Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum OpenResult {
@@ -1424,6 +1425,7 @@ impl PdfService {
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::PrintRender(token, page, max_width, max_height, tx)).map_err(|error| error.to_string())?; rx.blocking_recv().map_err(|error| error.to_string())?
     }
     pub async fn unlock(&self, id: u64, password: String) -> Result<OpenResult, String> {
+        if password.len() > MAX_PASSWORD_BYTES { return Err("Passwords cannot be longer than 1 KiB.".into()); }
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::Unlock(id, password, tx)).map_err(|e| e.to_string())?; rx.await.map_err(|e| e.to_string())?.map(ReplyLease::accept)
     }
     pub async fn cancel_password(&self, id: u64) -> Result<(), String> {
