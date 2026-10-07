@@ -8,7 +8,7 @@ You can already read PDFs, rearrange pages, and save your changes to a new file.
 
 PDF Workstation is free, open-source software under the [MIT License](LICENSE).
 
-Download the Windows setup file from the [latest release](https://github.com/Joshua-Beel/Smacrobat/releases/latest). The installer includes the PDF engine. Once installed, open a file or choose **Explore a sample PDF** to try it out.
+Download the Windows setup file from the [latest release](https://github.com/Joshua-Beel/Smacrobat/releases/latest). The installer includes the PDF engine. It does not include Microsoft's WebView2 Runtime: on a machine without WebView2, the installer is configured to download it, so that install needs network access once. Installing without WebView2 has not been exercised. Once installed, open a file or choose **Explore a sample PDF** to try it out.
 
 For updates, use **Menu > Check for updates**. The app shows what's new and lets you choose when to install. Save any edited documents first; the app won't install an update while you have unsaved changes.
 
@@ -108,6 +108,8 @@ An open document keeps a snapshot of its original bytes. Before saving, the app 
 For more background, see the [architecture notes](docs/decisions.md) and [PDFium documentation](https://docs.rs/pdfium-render/0.9.4/pdfium_render/). The interface follows the [current Acrobat workspace](https://helpx.adobe.com/acrobat/desktop/get-started/learn-the-basics/workspace.html).
 
 ## Recent changes
+
+- Documented the WebView2 install requirement. The installer uses Tauri's WebView2 download bootstrapper (kept by project decision), so it carries no WebView2 Runtime and installing on a machine without WebView2 needs network access once. The Install section above and [Releases and signing](docs/releases.md) now say so. Documentation only; installing on a machine without WebView2, offline install behavior, and the bootstrapper's version and terms remain unverified.
 
 - Pinned the last 16 tag- or branch-referenced GitHub Actions steps to full commit SHAs, with the resolved tag kept as a trailing comment, in `ocr-signed-artifact.yml`, `in-app-update-verification.yml`, `persistence-verification.yml`, `print-dialog-verification.yml` and `reading-tools-verification.yml`. Each SHA was resolved on 2026-10-06 with `gh api repos/<owner>/<repo>/git/ref/tags/v4` (all five were lightweight tags pointing directly at commits): `actions/checkout` v4.4.0 `11d5960a…`, `actions/setup-node` v4.4.0 `49933ea5…`, `actions/setup-dotnet` v4.3.1 `67a3573c…`, `actions/upload-artifact` v4.6.2 `ea165f8d…`, `actions/download-artifact` v4.3.0 `d3f86a10…`, the same commits the other workflows already pin. `dtolnay/rust-toolchain@stable` is a branch, so it is pinned to that branch's head on 2026-10-06, `89b12181…`; this differs from the `6bed0761…` pin in `release.yml` and `windows-validation.yml` because the upstream branch has since moved. No `uses:` line in `.github/workflows/` now references a tag or branch. The signed OCR artifact workflow test now rejects mutable action references and matches the pinned upload step. Source checks only: all workflow files parse as YAML and the eight affected workflow test files pass 53/53. No workflow was dispatched, so hosted behavior with these pins is unverified.
 
