@@ -1,5 +1,5 @@
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
-import { expect, it, vi } from 'vitest';
+import { expect, it, vi, type Mock } from 'vitest';
 import ReplacePagesDialog from './ReplacePagesDialog';
 import type { SavedCopy } from './bridge';
 import type { DocumentInfo } from './model';
@@ -9,7 +9,7 @@ const output = (document: DocumentInfo): SavedCopy => ({ path: 'C:/replaced.pdf'
 const field = (ui: ReactTestRenderer, label: string) => ui.root.findByProps({ 'aria-label': label });
 const replaceButton = (ui: ReactTestRenderer) => ui.root.findAllByType('button').find(button => button.children.join('') === 'Replace pages')!;
 
-async function mount({ documents = [document(1, 5, 4), document(2, 2, 7)], activeId = 1, initialRange = { start: 1, count: 2 }, busy = false, replace = vi.fn().mockResolvedValue(output(document(3, 2, 0))), close = vi.fn() }: { documents?: DocumentInfo[]; activeId?: number; initialRange?: { start: number; count: number }; busy?: boolean; replace?: ReturnType<typeof vi.fn>; close?: ReturnType<typeof vi.fn> } = {}) {
+async function mount({ documents = [document(1, 5, 4), document(2, 2, 7)], activeId = 1, initialRange = { start: 1, count: 2 }, busy = false, replace = vi.fn().mockResolvedValue(output(document(3, 2, 0))), close = vi.fn() }: { documents?: DocumentInfo[]; activeId?: number; initialRange?: { start: number; count: number }; busy?: boolean; replace?: Mock<(...args: any[]) => any>; close?: Mock<(...args: any[]) => any> } = {}) {
   let ui!: ReactTestRenderer;
   await act(async () => { ui = create(<ReplacePagesDialog documents={documents} activeId={activeId} initialRange={initialRange} busy={busy} replace={replace} close={close} />, { createNodeMock: element => element.type === 'dialog' ? { showModal: vi.fn() } : null }); });
   return { ui, replace, close };

@@ -1,5 +1,5 @@
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi, type Mock } from 'vitest';
 import FillFormsDialog, { formPatches, validateFormPatches } from './FillFormsDialog';
 import type { DocumentFormFields, SavedCopy } from './bridge';
 import type { DocumentInfo } from './model';
@@ -9,7 +9,7 @@ const fields: DocumentFormFields = { documentId: 4, revision: 7, status: 'suppor
 const output: SavedCopy = { path: 'C:/filled.pdf', document: { ...document, id: 8, name: 'filled.pdf', path: 'C:/filled.pdf', revision: 0, dirty: false, can_undo: false } };
 const save = (ui: ReactTestRenderer) => ui.root.findAllByType('button').find(button => button.children.join('') === 'Save filled copy')!;
 
-async function mount({ formFields = fields, error = '', busy = false, fill = vi.fn().mockResolvedValue(output), close = vi.fn() }: { formFields?: DocumentFormFields | null; error?: string; busy?: boolean; fill?: ReturnType<typeof vi.fn>; close?: ReturnType<typeof vi.fn> } = {}) {
+async function mount({ formFields = fields, error = '', busy = false, fill = vi.fn().mockResolvedValue(output), close = vi.fn() }: { formFields?: DocumentFormFields | null; error?: string; busy?: boolean; fill?: Mock<(...args: any[]) => any>; close?: Mock<(...args: any[]) => any> } = {}) {
   let ui!: ReactTestRenderer;
   await act(async () => { ui = create(<FillFormsDialog document={document} formFields={formFields} error={error} busy={busy} fill={fill} close={close} />, { createNodeMock: element => element.type === 'dialog' ? { showModal: vi.fn() } : null }); });
   return { ui, fill, close };

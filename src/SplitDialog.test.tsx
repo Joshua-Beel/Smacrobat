@@ -1,5 +1,5 @@
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
-import { expect, it, vi } from 'vitest';
+import { expect, it, vi, type Mock } from 'vitest';
 import type { SplitOutput } from './bridge';
 import SplitDialog from './SplitDialog';
 
@@ -7,7 +7,7 @@ const output: SplitOutput = { folder: 'C:/splits', files: [{ path: 'C:/splits/pa
 const input = (ui: ReactTestRenderer) => ui.root.findByProps({ 'aria-label': 'Pages per split file' });
 const splitButton = (ui: ReactTestRenderer) => ui.root.findAllByType('button').find(button => button.children.includes('Split PDF'))!;
 
-async function mount({ pageCount = 128, busy = false, split = vi.fn().mockResolvedValue(output), close = vi.fn() }: { pageCount?: number; busy?: boolean; split?: ReturnType<typeof vi.fn>; close?: ReturnType<typeof vi.fn> } = {}) {
+async function mount({ pageCount = 128, busy = false, split = vi.fn().mockResolvedValue(output), close = vi.fn() }: { pageCount?: number; busy?: boolean; split?: Mock<(...args: any[]) => any>; close?: Mock<(...args: any[]) => any> } = {}) {
   let ui!: ReactTestRenderer;
   await act(async () => { ui = create(<SplitDialog pageCount={pageCount} busy={busy} split={split} close={close} />, { createNodeMock: element => element.type === 'dialog' ? { showModal: vi.fn() } : null }); });
   return { ui, split, close };

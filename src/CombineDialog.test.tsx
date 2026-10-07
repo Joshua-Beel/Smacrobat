@@ -1,5 +1,5 @@
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
-import { expect, it, vi } from 'vitest';
+import { expect, it, vi, type Mock } from 'vitest';
 import CombineDialog from './CombineDialog';
 import type { SavedCopy } from './bridge';
 import type { DocumentInfo } from './model';
@@ -9,7 +9,7 @@ const output = (document: DocumentInfo): SavedCopy => ({ path: 'C:/combined.pdf'
 const select = (ui: ReactTestRenderer, label: string) => ui.root.findByProps({ 'aria-label': label });
 const combineButton = (ui: ReactTestRenderer) => ui.root.findAllByType('button').find(button => button.children.join('') === 'Combine PDFs')!;
 
-async function mount({ documents = [document(1, 2, 4), document(2, 3, 7)], activeId = 1, busy = false, combine = vi.fn().mockResolvedValue(output(document(3, 5, 0))), close = vi.fn() }: { documents?: DocumentInfo[]; activeId?: number; busy?: boolean; combine?: ReturnType<typeof vi.fn>; close?: ReturnType<typeof vi.fn> } = {}) {
+async function mount({ documents = [document(1, 2, 4), document(2, 3, 7)], activeId = 1, busy = false, combine = vi.fn().mockResolvedValue(output(document(3, 5, 0))), close = vi.fn() }: { documents?: DocumentInfo[]; activeId?: number; busy?: boolean; combine?: Mock<(...args: any[]) => any>; close?: Mock<(...args: any[]) => any> } = {}) {
   let ui!: ReactTestRenderer;
   await act(async () => { ui = create(<CombineDialog documents={documents} activeId={activeId} busy={busy} combine={combine} close={close} />, { createNodeMock: element => element.type === 'dialog' ? { showModal: vi.fn() } : null }); });
   return { ui, combine, close };

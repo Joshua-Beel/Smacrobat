@@ -1,5 +1,5 @@
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
-import { expect, it, vi } from 'vitest';
+import { expect, it, vi, type Mock } from 'vitest';
 import InsertPagesDialog from './InsertPagesDialog';
 import type { SavedCopy } from './bridge';
 import type { DocumentInfo } from './model';
@@ -9,7 +9,7 @@ const output = (document: DocumentInfo): SavedCopy => ({ path: 'C:/inserted.pdf'
 const select = (ui: ReactTestRenderer, label: string) => ui.root.findByProps({ 'aria-label': label });
 const insertButton = (ui: ReactTestRenderer) => ui.root.findAllByType('button').find(button => button.children.join('') === 'Insert pages')!;
 
-async function mount({ documents = [document(1, 3, 4), document(2, 2, 7)], activeId = 1, busy = false, insert = vi.fn().mockResolvedValue(output(document(3, 5, 0))), close = vi.fn() }: { documents?: DocumentInfo[]; activeId?: number; busy?: boolean; insert?: ReturnType<typeof vi.fn>; close?: ReturnType<typeof vi.fn> } = {}) {
+async function mount({ documents = [document(1, 3, 4), document(2, 2, 7)], activeId = 1, busy = false, insert = vi.fn().mockResolvedValue(output(document(3, 5, 0))), close = vi.fn() }: { documents?: DocumentInfo[]; activeId?: number; busy?: boolean; insert?: Mock<(...args: any[]) => any>; close?: Mock<(...args: any[]) => any> } = {}) {
   let ui!: ReactTestRenderer;
   await act(async () => { ui = create(<InsertPagesDialog documents={documents} activeId={activeId} busy={busy} insert={insert} close={close} />, { createNodeMock: element => element.type === 'dialog' ? { showModal: vi.fn() } : null }); });
   return { ui, insert, close };

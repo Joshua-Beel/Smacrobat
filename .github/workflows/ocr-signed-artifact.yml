@@ -67,7 +67,7 @@ jobs:
       - name: Fetch locked Windows Cargo registry before frontend tests
         run: cargo fetch --locked --target x86_64-pc-windows-msvc --manifest-path src-tauri/Cargo.toml
 
-      - run: npm test -- --pool=threads --maxWorkers=1 --minWorkers=1 --no-file-parallelism
+      - run: npm test -- --pool=threads --maxWorkers=1 --no-file-parallelism
       - run: ./scripts/run-native-recovery-gates.ps1
         shell: pwsh
 

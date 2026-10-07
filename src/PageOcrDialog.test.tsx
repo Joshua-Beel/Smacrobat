@@ -1,5 +1,5 @@
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
-import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi, type Mock } from 'vitest';
 import { cancelPageOcr, recognizePageOcr, type OcrReceipt } from './bridge';
 import PageOcrDialog, { validPageOcrReceipt, type PageOcrTarget } from './PageOcrDialog';
 
@@ -18,7 +18,7 @@ beforeEach(() => {
 });
 afterEach(() => vi.unstubAllGlobals());
 
-async function mount({ close = vi.fn(), setBusy = vi.fn() }: { close?: ReturnType<typeof vi.fn>; setBusy?: ReturnType<typeof vi.fn> } = {}) {
+async function mount({ close = vi.fn(), setBusy = vi.fn() }: { close?: Mock<(...args: any[]) => any>; setBusy?: Mock<(...args: any[]) => any> } = {}) {
   let ui!: ReactTestRenderer;
   await act(async () => { ui = create(<PageOcrDialog target={target} setBusy={setBusy} close={close} />, { createNodeMock: element => element.type === 'dialog' ? { showModal: vi.fn() } : null }); });
   return { ui, close, setBusy };

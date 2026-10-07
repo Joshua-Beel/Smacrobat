@@ -33,7 +33,7 @@ describe('manual signed OCR artifact workflow', () => {
     expect(workflow).toContain('$headRevision -cne $env:GITHUB_SHA');
     expect(workflow.indexOf('Require a manual master dispatch')).toBeLessThan(workflow.indexOf('AZURE_TENANT_ID'));
     expect(workflow.indexOf('cargo fetch --locked')).toBeLessThan(workflow.indexOf('npm test'));
-    expect(workflow).toContain('- run: npm test -- --pool=threads --maxWorkers=1 --minWorkers=1 --no-file-parallelism');
+    expect(workflow).toContain('- run: npm test -- --pool=threads --maxWorkers=1 --no-file-parallelism');
     expect(workflow).toContain('- run: ./scripts/run-native-recovery-gates.ps1\n        shell: pwsh');
     expect(workflow).not.toMatch(/run: cargo test/);
 

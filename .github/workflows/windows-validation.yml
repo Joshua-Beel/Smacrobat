@@ -57,7 +57,7 @@ jobs:
         run: cargo fetch --locked --target x86_64-pc-windows-msvc --manifest-path src-tauri/Cargo.toml
       - name: Verify bundled dependency notices are current
         run: node scripts/dependency-notices.mjs --check
-      - run: npm test -- --pool=threads --maxWorkers=1 --minWorkers=1 --no-file-parallelism
+      - run: npm test -- --pool=threads --maxWorkers=1 --no-file-parallelism
       - run: ./scripts/run-native-recovery-gates.ps1
         shell: pwsh
       - run: npm run build

@@ -1,5 +1,5 @@
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
-import { expect, it, vi } from 'vitest';
+import { expect, it, vi, type Mock } from 'vitest';
 import ExportPageImageDialog, { DEFAULT_PNG_DPI, MAX_PNG_PIXELS, pageImageDimensions, validPageImageReceipt, validatePageImageDimensions, type PageImageTarget } from './ExportPageImageDialog';
 import type { PageImageExport } from './bridge';
 
@@ -9,7 +9,7 @@ const button = (ui: ReactTestRenderer, text: string) => ui.root.findAllByType('b
 const dpiField = (ui: ReactTestRenderer) => ui.root.findByProps({ 'aria-label': 'Image resolution' });
 const formatField = (ui: ReactTestRenderer) => ui.root.findByProps({ 'aria-label': 'Image format' });
 
-async function mount({ busy = false, exportPage = vi.fn().mockResolvedValue(receipt()), close = vi.fn() }: { busy?: boolean; exportPage?: ReturnType<typeof vi.fn>; close?: ReturnType<typeof vi.fn> } = {}) {
+async function mount({ busy = false, exportPage = vi.fn().mockResolvedValue(receipt()), close = vi.fn() }: { busy?: boolean; exportPage?: Mock<(...args: any[]) => any>; close?: Mock<(...args: any[]) => any> } = {}) {
   let ui!: ReactTestRenderer;
   await act(async () => { ui = create(<ExportPageImageDialog target={target} busy={busy} exportPage={exportPage} close={close} />, { createNodeMock: element => element.type === 'dialog' ? { showModal: vi.fn() } : null }); });
   return { ui, exportPage, close };

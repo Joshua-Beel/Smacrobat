@@ -1,5 +1,5 @@
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
-import { expect, it, vi } from 'vitest';
+import { expect, it, vi, type Mock } from 'vitest';
 import CreatePdfDialog from './CreatePdfDialog';
 import type { SavedCopy } from './bridge';
 import type { DocumentInfo } from './model';
@@ -9,7 +9,7 @@ const output = (id = 1): SavedCopy => ({ path: `C:/created-${id}.pdf`, document:
 const field = (ui: ReactTestRenderer, label: string) => ui.root.findByProps({ 'aria-label': label });
 const createButton = (ui: ReactTestRenderer) => ui.root.findAllByType('button').find(button => button.children.join('') === 'Create PDF')!;
 
-async function mount({ busy = false, createPdf = vi.fn().mockResolvedValue(output()), close = vi.fn() }: { busy?: boolean; createPdf?: ReturnType<typeof vi.fn>; close?: ReturnType<typeof vi.fn> } = {}) {
+async function mount({ busy = false, createPdf = vi.fn().mockResolvedValue(output()), close = vi.fn() }: { busy?: boolean; createPdf?: Mock<(...args: any[]) => any>; close?: Mock<(...args: any[]) => any> } = {}) {
   let ui!: ReactTestRenderer;
   await act(async () => { ui = create(<CreatePdfDialog busy={busy} create={createPdf} close={close} />, { createNodeMock: element => element.type === 'dialog' ? { showModal: vi.fn() } : null }); });
   return { ui, createPdf, close };

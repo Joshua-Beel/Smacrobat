@@ -85,7 +85,7 @@ describe('release workflow contract', () => {
 
   it('fails closed on signing and publishes only the explicit three-asset draft inventory', () => {
     expect(workflow.indexOf('run: node scripts/dependency-notices.mjs --check')).toBeGreaterThan(workflow.indexOf('run: cargo fetch --locked --target x86_64-pc-windows-msvc --manifest-path src-tauri/Cargo.toml'));
-    const frontendGate = '- run: npm test -- --pool=threads --maxWorkers=1 --minWorkers=1 --no-file-parallelism';
+    const frontendGate = '- run: npm test -- --pool=threads --maxWorkers=1 --no-file-parallelism';
     expect(workflow.indexOf('run: node scripts/dependency-notices.mjs --check')).toBeLessThan(workflow.indexOf(frontendGate));
     expect(workflow).toContain(frontendGate);
     expect(workflow).toContain('- run: ./scripts/run-native-recovery-gates.ps1\n        shell: pwsh');
