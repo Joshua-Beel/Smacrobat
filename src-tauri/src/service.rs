@@ -1362,9 +1362,11 @@ impl PdfService {
         Self { sender }
     }
     pub async fn open(&self, path: PathBuf) -> Result<DocumentInfo, String> {
+        let path = crate::open_path::gate_open_path(path).await?;
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::Open(path, tx)).map_err(|e| e.to_string())?; rx.await.map_err(|e| e.to_string())?.map(ReplyLease::accept)
     }
     pub async fn begin_open(&self, path: PathBuf) -> Result<OpenResult, String> {
+        let path = crate::open_path::gate_open_path(path).await?;
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::BeginOpen(path, tx)).map_err(|e| e.to_string())?; rx.await.map_err(|e| e.to_string())?.map(ReplyLease::accept)
     }
     #[allow(dead_code)]
