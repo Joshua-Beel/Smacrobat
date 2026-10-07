@@ -35,9 +35,11 @@ describe('FillFormsDialog', () => {
     expect(formPatches(fields.fields, { ...initial, city: 'Paris', approved: false, updates: true, contact: 'contact-post', frequency: 'frequency-monthly', shipping: 'shipping-air', window: 'window-evening' })).toEqual([{ fieldId: 'city', kind: 'text', value: 'Paris' }, { fieldId: 'approved', kind: 'checkbox', checked: false }, { fieldId: 'updates', kind: 'checkbox', checked: true }, { fieldId: 'contact', kind: 'radio', optionId: 'contact-post' }, { fieldId: 'frequency', kind: 'radio', optionId: 'frequency-monthly' }, { fieldId: 'shipping', kind: 'choice', optionId: 'shipping-air' }, { fieldId: 'window', kind: 'choice', optionId: 'window-evening' }]);
     expect(validateFormPatches(fields.fields, initial, 4096)).toContain('Change at least one');
     expect(validateFormPatches(fields.fields, { ...initial, name: 'Åda' }, 4096)).toContain('printable ASCII');
-    expect(validateFormPatches(fields.fields, { ...initial, contact: null }, 4096)).toContain('cannot be cleared');
+    expect(validateFormPatches(fields.fields, { ...initial, contact: null }, 4096)).toContain('does not allow this radio group to be cleared');
+    expect(formPatches(fields.fields, { ...initial, contact: null, frequency: null })).toEqual([]);
     expect(validateFormPatches(fields.fields, { ...initial, frequency: 'unknown' }, 4096)).toContain('form changed');
-    expect(validateFormPatches(fields.fields, { ...initial, shipping: null }, 4096)).toContain('cannot be cleared');
+    expect(validateFormPatches(fields.fields, { ...initial, shipping: null }, 4096)).toBeNull();
+    expect(formPatches(fields.fields, { ...initial, shipping: null, window: null })).toEqual([{ fieldId: 'shipping', kind: 'choice', optionId: null }]);
     expect(validateFormPatches(fields.fields, { ...initial, window: 'unknown' }, 4096)).toContain('form changed');
     const name = fields.fields[0];
     if (name.kind !== 'text') throw new Error('fixture field changed');
@@ -81,6 +83,36 @@ describe('FillFormsDialog', () => {
     await act(async () => save(ui).props.onClick());
     expect(fill).toHaveBeenCalledWith(4, 7, [{ fieldId: 'contact', kind: 'radio', optionId: 'contact-post' }, { fieldId: 'frequency', kind: 'radio', optionId: 'frequency-weekly' }]);
     expect(close).not.toHaveBeenCalled();
+    act(() => ui.unmount());
+  });
+
+  it('clears dropdown and list selections with a labelled keyboard button and sends a null choice patch, but offers no radio clear', async () => {
+    const { ui, fill, close } = await mount({ fill: vi.fn().mockResolvedValue(null) });
+    const clearShipping = ui.root.findByProps({ 'aria-label': 'Clear selection: Shipping method, page 4' });
+    const clearWindow = ui.root.findByProps({ 'aria-label': 'Clear selection: Delivery window, page 4' });
+    expect(clearShipping.type).toBe('button');
+    expect(clearShipping.props.type).toBe('button');
+    expect(clearShipping.children.join('')).toBe('Clear selection');
+    expect(clearShipping.props.disabled).toBe(false);
+    expect(clearWindow.props.disabled).toBe(true);
+    expect(ui.root.findAllByType('button').filter(button => String(button.props['aria-label'] ?? '').includes('Contact'))).toHaveLength(0);
+    expect(ui.root.findAllByType('button').filter(button => button.children.join('') === 'Clear selection')).toHaveLength(2);
+    act(() => ui.root.findByProps({ 'aria-label': 'Delivery window, page 4' }).props.onChange({ target: { value: 'window-morning' } }));
+    expect(ui.root.findByProps({ 'aria-label': 'Clear selection: Delivery window, page 4' }).props.disabled).toBe(false);
+    act(() => ui.root.findByProps({ 'aria-label': 'Delivery window, page 4' }).props.onChange({ target: { value: '' } }));
+    act(() => clearShipping.props.onClick());
+    expect(ui.root.findByProps({ 'aria-label': 'Shipping method, page 4' }).props.value).toBe('');
+    expect(ui.root.findByProps({ 'aria-label': 'Clear selection: Shipping method, page 4' }).props.disabled).toBe(true);
+    await act(async () => save(ui).props.onClick());
+    expect(fill).toHaveBeenCalledWith(4, 7, [{ fieldId: 'shipping', kind: 'choice', optionId: null }]);
+    expect(close).not.toHaveBeenCalled();
+    expect(ui.root.findByProps({ 'aria-label': 'Shipping method, page 4' }).props.value).toBe('');
+    act(() => ui.unmount());
+  });
+
+  it('disables choice clearing while busy', async () => {
+    const { ui } = await mount({ busy: true });
+    expect(ui.root.findByProps({ 'aria-label': 'Clear selection: Shipping method, page 4' }).props.disabled).toBe(true);
     act(() => ui.unmount());
   });
 

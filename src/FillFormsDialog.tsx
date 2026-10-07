@@ -33,7 +33,9 @@ export function formPatches(fields: FormField[], values: Record<string, DraftVal
       if (checked !== field.checked) patches.push({ fieldId: field.fieldId, kind: 'checkbox', checked });
     } else {
       const optionId = choiceDraft(field, values);
-      if (optionId !== field.selectedOptionId && optionId !== null) patches.push({ fieldId: field.fieldId, kind: field.kind, optionId });
+      if (optionId === field.selectedOptionId) continue;
+      if (field.kind === 'choice') patches.push({ fieldId: field.fieldId, kind: 'choice', optionId });
+      else if (optionId !== null) patches.push({ fieldId: field.fieldId, kind: 'radio', optionId });
     }
   }
   return patches;
@@ -44,7 +46,7 @@ export function validateFormPatches(fields: FormField[], values: Record<string, 
     const value = values[field.fieldId];
     if (value === undefined) continue;
     if (field.kind === 'radio' || field.kind === 'choice') {
-      if (value === null && field.selectedOptionId !== null) return `This ${field.kind === 'radio' ? 'radio group' : 'choice field'} cannot be cleared.`;
+      if (value === null && field.kind === 'radio' && field.selectedOptionId !== null) return `${field.name} keeps one option selected: the form author does not allow this radio group to be cleared.`;
       if (value !== null && (typeof value !== 'string' || !field.options.some(option => option.optionId === value))) return 'This form changed. Reload it and try again.';
     } else if (typeof value !== (field.kind === 'text' ? 'string' : 'boolean')) return 'This form changed. Reload it and try again.';
   }
@@ -66,6 +68,7 @@ export default function FillFormsDialog({ document, formFields, error: loadError
   const dialog = useRef<HTMLDialogElement>(null);
   const inFlight = useRef(false);
   const initialized = useRef('');
+  const selects = useRef<Record<string, HTMLSelectElement | null>>({});
   const [values, setValues] = useState<Record<string, DraftValue>>({});
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
@@ -101,7 +104,7 @@ export default function FillFormsDialog({ document, formFields, error: loadError
       if (field.kind === 'checkbox') return <label className={s.checkbox} key={field.fieldId}><input type="checkbox" aria-label={`${field.name}, page ${field.page + 1}`} checked={checkboxDraft(field, values)} disabled={working} onChange={event => change(field.fieldId, event.target.checked)} /><span>{field.name}<small>Page {field.page + 1}</small></span></label>;
       const selected = choiceDraft(field, values);
       if (field.kind === 'radio') return <fieldset className={s.radio} key={field.fieldId}><legend>{field.name}<small>Page {field.page + 1}</small></legend>{field.options.map(option => <label key={option.optionId}><input type="radio" name={field.fieldId} aria-label={`${field.name}: ${option.label}, page ${field.page + 1}`} checked={selected === option.optionId} disabled={working} onChange={() => change(field.fieldId, option.optionId)} /><span>{option.label}</span></label>)}</fieldset>;
-      return <label className={s.choice} key={field.fieldId}><span>{field.name}<small>Page {field.page + 1}</small></span><select aria-label={`${field.name}, page ${field.page + 1}`} value={selected ?? ''} size={field.presentation === 'list' ? field.options.length : undefined} disabled={working} onChange={event => change(field.fieldId, event.target.value || null)}><option value="" disabled hidden>Choose an option</option>{field.options.map(option => <option key={option.optionId} value={option.optionId}>{option.label}</option>)}</select></label>;
+      return <div className={s.choice} key={field.fieldId}><label><span>{field.name}<small>Page {field.page + 1}</small></span><select ref={node => { selects.current[field.fieldId] = node; }} aria-label={`${field.name}, page ${field.page + 1}`} value={selected ?? ''} size={field.presentation === 'list' ? field.options.length : undefined} disabled={working} onChange={event => change(field.fieldId, event.target.value || null)}><option value="" disabled hidden>Choose an option</option>{field.options.map(option => <option key={option.optionId} value={option.optionId}>{option.label}</option>)}</select></label><button type="button" aria-label={`Clear selection: ${field.name}, page ${field.page + 1}`} disabled={working || selected === null} onClick={() => { change(field.fieldId, null); selects.current[field.fieldId]?.focus(); }}>Clear selection</button></div>;
     })}</div>}
     {error && <p role="alert">{error}</p>}
     {notice && <p role="status">{notice}</p>}
