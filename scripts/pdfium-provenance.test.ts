@@ -164,6 +164,54 @@ it('leaves no half-populated pdfium folder when a hash-matching archive fails to
   });
 }, 120_000);
 
+it('restores the previous pdfium folder intact when moving the staged folder into place fails', async () => {
+  const archive = packArchive({ 'bin/pdfium.dll': 'verified binary', LICENSE: 'license text' });
+  await withPinnedArchiveFixture(archive, async ({ resources, requests, runSetup }) => {
+    seedStaleFolder(resources);
+    const result = await runSetup(['-TestOnlyFailStagingMove']);
+    expect(requests()).toBe(1);
+    expect(result.code, result.output).not.toBe(0);
+    expect(result.output).toContain('previous pdfium folder was restored unchanged');
+    expect(readdirSync(resources).sort()).toEqual(['pdfium', 'pdfium-win-x64.tgz']);
+    expect(readdirSync(join(resources, 'pdfium')).sort()).toEqual(['bin', 'leftover.txt']);
+    expect(readFileSync(join(resources, 'pdfium', 'bin', 'pdfium.dll'), 'utf8')).toBe('stale unverified binary');
+    expect(readFileSync(join(resources, 'pdfium', 'leftover.txt'), 'utf8')).toBe('from an older archive');
+  });
+}, 120_000);
+
+it('leaves every file of the previous pdfium folder in place when a file inside it is locked', async () => {
+  const archive = packArchive({ 'bin/pdfium.dll': 'verified binary', LICENSE: 'license text' });
+  await withPinnedArchiveFixture(archive, async ({ resources, runSetup }) => {
+    seedStaleFolder(resources);
+    const locked = join(resources, 'pdfium', 'leftover.txt');
+    const locker = spawn('pwsh.exe', ['-NoProfile', '-NonInteractive', '-Command', `$h=[IO.File]::Open('${locked.replace(/'/g, "''")}','Open','Read','None'); [Console]::Out.WriteLine('locked'); [Console]::Out.Flush(); [void][Console]::In.ReadLine(); $h.Dispose()`], { windowsHide: true });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        let seen = '';
+        locker.stdout.on('data', chunk => { seen += chunk; if (seen.includes('locked')) resolve(); });
+        locker.on('error', reject);
+        locker.on('close', code => reject(new Error(`locker exited ${code}: ${seen}`)));
+      });
+      const result = await runSetup();
+      expect(result.code, result.output).not.toBe(0);
+      expect(result.output).toContain('existing pdfium folder was left unchanged');
+    } finally {
+      locker.stdin.end('\n');
+      await new Promise<void>(resolve => { if (locker.exitCode !== null) resolve(); else locker.on('close', () => resolve()); });
+    }
+    expect(readdirSync(resources).sort()).toEqual(['pdfium', 'pdfium-win-x64.tgz']);
+    expect(readdirSync(join(resources, 'pdfium')).sort()).toEqual(['bin', 'leftover.txt']);
+    expect(readFileSync(join(resources, 'pdfium', 'bin', 'pdfium.dll'), 'utf8')).toBe('stale unverified binary');
+    expect(readFileSync(locked, 'utf8')).toBe('from an older archive');
+  });
+}, 120_000);
+
+it('keeps PDFium staging and backup folders out of git', () => {
+  const ignore = readFileSync('.gitignore', 'utf8').split(/\r?\n/);
+  expect(ignore).toContain('src-tauri/resources/.pdfium-staging-*/');
+  expect(ignore).toContain('src-tauri/resources/.pdfium-backup-*/');
+});
+
 const versionPath = 'resources/pdfium/VERSION';
 const argsPath = 'resources/pdfium/args.gn';
 
