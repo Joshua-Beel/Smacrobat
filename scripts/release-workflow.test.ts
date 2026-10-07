@@ -28,11 +28,11 @@ function validateFixture(root: string) {
 
 describe('release workflow contract', () => {
   it('pins every action to an immutable full commit SHA', () => {
-    const uses = [...workflow.matchAll(/^\s*-?\s*uses:\s*([^\s#]+)\s*$/gm)].map(match => match[1]);
+    const uses = [...workflow.matchAll(/^\s*-?\s*uses:\s*([^\s#]+)\s*(?:#.*)?$/gm)].map(match => match[1]);
     expect(uses).toEqual([
       'actions/checkout@11d5960a326750d5838078e36cf38b85af677262',
       'actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020',
-      'dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87',
+      'dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d',
       'actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9',
       'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02',
     ]);

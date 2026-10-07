@@ -19,7 +19,7 @@ describe('Windows validation workflow', () => {
     expect(workflow).toContain('if: ${{ always() }}');
     expect(workflow).toContain('actions/checkout@11d5960a326750d5838078e36cf38b85af677262');
     expect(workflow).toContain('actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020');
-    expect(workflow).toContain('dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87');
+    expect(workflow).toContain('dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d');
     expect(workflow).toContain("node-version: '22'");
   });
 
@@ -28,7 +28,7 @@ describe('Windows validation workflow', () => {
       'actions/checkout@11d5960a326750d5838078e36cf38b85af677262',
       'Verify exact clean dispatched source',
       'actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020',
-      'dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87',
+      'dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d',
       'Verify hosted cross-drive topology',
       'run: npm ci',
       'run: npm run fixtures',
