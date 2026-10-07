@@ -179,6 +179,45 @@ it('restores the previous pdfium folder intact when moving the staged folder int
   });
 }, 120_000);
 
+function seedOrphanBackup(resources: string, name: string) {
+  mkdirSync(join(resources, name, 'bin'), { recursive: true });
+  writeFileSync(join(resources, name, 'bin', 'pdfium.dll'), 'orphaned by an interrupted swap');
+}
+
+it('does not claim a restore on a first run whose staged move fails, and keeps an orphaned backup when the run fails', async () => {
+  const archive = packArchive({ 'bin/pdfium.dll': 'verified binary', LICENSE: 'license text' });
+  await withPinnedArchiveFixture(archive, async ({ resources, requests, runSetup }) => {
+    seedOrphanBackup(resources, '.pdfium-backup-0123456789abcdef0123456789abcdef');
+    const result = await runSetup(['-SkipIfCurrent', '-TestOnlyFailStagingMove']);
+    expect(requests()).toBe(1);
+    expect(result.code, result.output).not.toBe(0);
+    expect(result.output).toContain('No pdfium folder existed before this run');
+    expect(result.output).not.toContain('restored unchanged');
+    expect(readdirSync(resources).sort()).toEqual(['.pdfium-backup-0123456789abcdef0123456789abcdef', 'pdfium-win-x64.tgz']);
+    expect(readFileSync(join(resources, '.pdfium-backup-0123456789abcdef0123456789abcdef', 'bin', 'pdfium.dll'), 'utf8')).toBe('orphaned by an interrupted swap');
+  });
+}, 120_000);
+
+it('never reuses an orphaned backup, and removes stale backup and staging folders only after a verified folder is in place', async () => {
+  const archive = packArchive({ 'bin/pdfium.dll': 'verified binary', LICENSE: 'license text' });
+  await withPinnedArchiveFixture(archive, async ({ resources, requests, runSetup }) => {
+    seedOrphanBackup(resources, '.pdfium-backup-11111111111111111111111111111111');
+    seedOrphanBackup(resources, '.pdfium-staging-22222222222222222222222222222222');
+    const fresh = await runSetup(['-SkipIfCurrent']);
+    expect(fresh.code, fresh.output).toBe(0);
+    expect(requests()).toBe(1);
+    expect(readFileSync(join(resources, 'pdfium', 'bin', 'pdfium.dll'), 'utf8')).toBe('verified binary');
+    expect(readdirSync(resources).sort()).toEqual(['pdfium', 'pdfium-win-x64.tgz']);
+
+    seedOrphanBackup(resources, '.pdfium-backup-33333333333333333333333333333333');
+    const current = await runSetup(['-SkipIfCurrent']);
+    expect(current.code, current.output).toBe(0);
+    expect(current.output).toContain('already extracted');
+    expect(requests()).toBe(1);
+    expect(readdirSync(resources).sort()).toEqual(['pdfium', 'pdfium-win-x64.tgz']);
+  });
+}, 120_000);
+
 it('leaves every file of the previous pdfium folder in place when a file inside it is locked', async () => {
   const archive = packArchive({ 'bin/pdfium.dll': 'verified binary', LICENSE: 'license text' });
   await withPinnedArchiveFixture(archive, async ({ resources, runSetup }) => {

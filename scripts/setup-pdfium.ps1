@@ -10,10 +10,18 @@ function Get-VerifiedMarker([string]$Root) {
     $dll = Join-Path $Root 'bin\pdfium.dll'
     "archive-sha256=$archiveSha256`npdfium.dll-sha256=$((Get-FileHash -Algorithm SHA256 -LiteralPath $dll).Hash)`n"
 }
+function Remove-StaleSwapFolders {
+    $stale = @(Get-ChildItem -LiteralPath $resourceRoot -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '.pdfium-backup-*' -or $_.Name -like '.pdfium-staging-*' })
+    foreach ($folder in $stale) {
+        try { Remove-Item -LiteralPath $folder.FullName -Recurse -Force }
+        catch { Write-Warning "Could not remove stale PDFium folder $($folder.FullName): $($_.Exception.Message)" }
+    }
+}
 if ($SkipIfCurrent) {
     $markerPath = Join-Path $pdfiumRoot $markerName
     if ((Test-Path -LiteralPath $markerPath -PathType Leaf) -and (Test-Path -LiteralPath (Join-Path $pdfiumRoot 'bin\pdfium.dll') -PathType Leaf)) {
         if ([IO.File]::ReadAllText($markerPath) -ceq (Get-VerifiedMarker $pdfiumRoot)) {
+            Remove-StaleSwapFolders
             Write-Output 'PDFium Chromium 7881 already extracted from the SHA-256 verified archive.'
             return
         }
@@ -50,10 +58,11 @@ try {
         [IO.Directory]::Move($stagingRoot, $pdfiumRoot)
     } catch {
         $moveError = $_
-        if (Test-Path -LiteralPath $backupRoot) {
-            try { [IO.Directory]::Move($backupRoot, $pdfiumRoot) }
-            catch { throw "Moving the staged PDFium folder into place failed ($($moveError.Exception.Message)) and the previous pdfium folder could not be restored ($($_.Exception.Message)). It is preserved at $backupRoot." }
+        if (-not (Test-Path -LiteralPath $backupRoot)) {
+            throw "Moving the staged PDFium folder into place failed ($($moveError.Exception.Message)). No pdfium folder existed before this run, so none was restored and there is still no pdfium folder."
         }
+        try { [IO.Directory]::Move($backupRoot, $pdfiumRoot) }
+        catch { throw "Moving the staged PDFium folder into place failed ($($moveError.Exception.Message)) and the previous pdfium folder could not be restored ($($_.Exception.Message)). It is preserved at $backupRoot." }
         throw "Moving the staged PDFium folder into place failed ($($moveError.Exception.Message)). The previous pdfium folder was restored unchanged."
     }
     $swapped = $true
@@ -67,4 +76,5 @@ try {
         catch { Write-Warning "Could not remove previous PDFium folder backup ${backupRoot}: $($_.Exception.Message)" }
     }
 }
+Remove-StaleSwapFolders
 Write-Output 'PDFium Chromium 7881 (SHA-256 verified) extracted with its license notices.'
