@@ -43,6 +43,19 @@ it('cancels during opening and closes a late successful document without adding 
   await act(async () => resolve({ status: 'opened', document }));
   expect(onOpened).not.toHaveBeenCalled(); expect(closeDocument).toHaveBeenCalledWith(7);
 });
+it('shows the backend over-1-KiB message and limits the input to 1024 UTF-8 bytes', async () => {
+  vi.mocked(unlockDocument).mockRejectedValue('Passwords cannot be longer than 1 KiB.');
+  let ui!: ReactTestRenderer; act(() => { ui = create(<PasswordDialog challenge={challenge} onOpened={vi.fn()} onClose={vi.fn()} />); });
+  expect(ui.root.findByType('input').props.maxLength).toBe(1024);
+  act(() => ui.root.findByType('input').props.onChange({ target: { value: 'é'.repeat(512) } }));
+  expect(ui.root.findByType('input').props.value).toHaveLength(512);
+  act(() => ui.root.findByType('input').props.onChange({ target: { value: 'é'.repeat(513) } }));
+  expect(ui.root.findByType('input').props.value).toHaveLength(512);
+  expect(JSON.stringify(ui.toJSON())).toContain('1 KiB');
+  await act(async () => ui.root.findByType('form').props.onSubmit({ preventDefault() {} }));
+  expect(JSON.stringify(ui.toJSON())).toContain('1 KiB'); expect(JSON.stringify(ui.toJSON())).not.toContain('Unable to unlock');
+  act(() => ui.unmount());
+});
 it('does not display native errors that might contain entered secrets', async () => {
   vi.mocked(unlockDocument).mockRejectedValue(new Error('sensitive password'));
   let ui!: ReactTestRenderer; act(() => { ui = create(<PasswordDialog challenge={challenge} onOpened={vi.fn()} onClose={vi.fn()} />); });

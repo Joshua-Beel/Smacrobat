@@ -23,7 +23,7 @@ pub(crate) fn classify_open_path(path: &Path) -> Result<(), String> {
     let text = path.to_string_lossy().replace('/', "\\");
     if text.is_empty() || text.contains('\0') { return Err(reject("the path is empty or contains a null character")); }
     let rest = if let Some(verbatim) = text.strip_prefix("\\\\?\\") {
-        if verbatim.len() >= 4 && verbatim[..4].eq_ignore_ascii_case("UNC\\") { return Err(reject("network (UNC) paths are not supported")); }
+        if verbatim.get(..4).is_some_and(|prefix| prefix.eq_ignore_ascii_case("UNC\\")) { return Err(reject("network (UNC) paths are not supported")); }
         if !is_drive_letter_path(verbatim) { return Err(reject("device and namespace paths are not supported")); }
         verbatim
     } else if text.starts_with("\\\\") {
@@ -31,7 +31,7 @@ pub(crate) fn classify_open_path(path: &Path) -> Result<(), String> {
     } else if is_drive_letter_path(&text) { text.as_str() } else {
         return Err(reject("the path must be absolute and start with a drive letter"));
     };
-    let tail = &rest[3..];
+    let tail = rest.get(3..).unwrap_or("");
     if tail.contains(':') { return Err(reject("alternate data streams are not supported")); }
     if tail.split('\\').any(reserved_device_component) { return Err(reject("device names such as CON, NUL and COM1 are not supported")); }
     Ok(())
@@ -43,7 +43,7 @@ pub(crate) fn validate_open_path(path: &Path) -> Result<(), String> {
     classify_open_path(path)?;
     let canonical = std::fs::canonicalize(path).map_err(|error| format!("This file could not be found or read: {error}."))?;
     let text = canonical.to_string_lossy().into_owned();
-    let mapped = text.len() >= 8 && text[..8].eq_ignore_ascii_case("\\\\?\\UNC\\");
+    let mapped = text.get(..8).is_some_and(|prefix| prefix.eq_ignore_ascii_case("\\\\?\\UNC\\"));
     if !mapped { classify_open_path(&canonical)?; }
     else if text.get(8..).is_some_and(|unc| unc.split('\\').skip(2).any(reserved_device_component) || unc.contains(':')) { return Err(reject("device names and streams are not supported")); }
     let metadata = std::fs::metadata(&canonical).map_err(|error| format!("This file could not be read: {error}."))?;
@@ -77,6 +77,32 @@ mod tests {
         for text in [r"C:\a.pdf", r"c:\Users\me\My Docs\a.pdf", "C:/Users/me/a.pdf", r"G:\My Drive\a.pdf", r"\\?\C:\Users\me\a.pdf", r"C:\console.pdf", r"C:\com10.pdf", r"C:\comma\a.pdf", r"C:\nullable.pdf"] {
             assert!(classify_open_path(Path::new(text)).is_ok(), "should accept {text:?}");
         }
+    }
+
+    #[test]
+    fn non_ascii_text_never_panics_at_prefix_boundaries() {
+        for text in [
+            "\\\\?\\abc\u{20ac}", "\\\\?\\\u{20ac}", "\\\\?\\a\u{20ac}", "\\\\?\\ab\u{20ac}", "\\\\?\\\u{e9}\u{e9}\u{e9}\u{e9}", "\\\\?\\UN\u{20ac}",
+            "\\\\?\\UNC\u{20ac}", "\\\\?\\C:\u{20ac}", "\\\\\u{20ac}", "\\\\.\u{20ac}", "\u{20ac}", "\u{20ac}:\\a.pdf", "C\u{20ac}\\a.pdf", "C:\u{20ac}a.pdf",
+            "\u{dc}:\\a.pdf", "\\\\?\\\u{dc}:\\a.pdf", "C:\\\u{20ac}\u{20ac}\u{20ac}", "\\\\\u{20ac}\u{20ac}\u{20ac}\u{20ac}\u{20ac}",
+        ] {
+            assert!(classify_open_path(Path::new(text)).is_err() || text.starts_with("C:\\"), "unexpected result for {text:?}");
+            let _ = validate_open_path(Path::new(text));
+        }
+        for text in ["\\\\?\\abc\u{20ac}", "\\\\?\\UNC\u{20ac}", "\\\\?\\\u{20ac}", "\\\\\u{20ac}"] {
+            assert!(classify_open_path(Path::new(text)).is_err(), "should reject {text:?}");
+        }
+    }
+
+    #[test]
+    fn accepts_a_real_file_under_a_non_ascii_top_level_folder() {
+        let folder = tempfile::tempdir().unwrap();
+        let unicode = folder.path().join("\u{dc}nterlagen \u{20ac}");
+        std::fs::create_dir(&unicode).unwrap();
+        let file = unicode.join("a.pdf"); std::fs::write(&file, b"%PDF-1.4").unwrap();
+        validate_open_path(&file).unwrap();
+        assert!(classify_open_path(Path::new("C:\\\u{dc}nterlagen\\a.pdf")).is_ok());
+        assert!(tauri::async_runtime::block_on(gate_open_path(file.clone())).is_ok());
     }
 
     #[test]

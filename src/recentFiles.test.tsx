@@ -44,6 +44,16 @@ it('persists stars across app remounts, reopens history and reuses an existing t
   expect(reopenDocument).toHaveBeenCalledOnce();
   act(() => ui.unmount());
 });
+it('shows a gate refusal on its own without the moved-or-deleted wording', async () => {
+  saveRecentFiles([file]); vi.mocked(reopenDocument).mockRejectedValue('This path cannot be opened: network (UNC) paths are not supported.');
+  let ui!: ReactTestRenderer;
+  await act(async () => { ui = create(<App />); });
+  const row = ui.root.findAllByType('button').find(button => button.findAllByType('small').some(small => small.children.includes('PDF document')))!;
+  await act(async () => row.props.onClick());
+  const text = JSON.stringify(ui.toJSON());
+  expect(text).toContain('network (UNC) paths are not supported'); expect(text).not.toContain('moved or been deleted');
+  act(() => ui.unmount());
+});
 it('reports missing files and clears history without closing tabs or deleting PDFs', async () => {
   saveRecentFiles([file]); vi.mocked(reopenDocument).mockRejectedValue(new Error('File not found'));
   let ui!: ReactTestRenderer;
@@ -51,6 +61,7 @@ it('reports missing files and clears history without closing tabs or deleting PD
   const row = ui.root.findAllByType('button').find(button => button.findAllByType('small').some(small => small.children.includes('PDF document')))!;
   await act(async () => row.props.onClick());
   expect(JSON.stringify(ui.toJSON())).toContain('Could not reopen this file');
+  expect(JSON.stringify(ui.toJSON())).toContain('moved or been deleted');
   expect(readRecentFiles()).toEqual([file]);
   act(() => ui.root.findAllByType('button').find(button => button.children.includes('Clear file history'))!.props.onClick());
   expect(readRecentFiles()).toEqual([]);

@@ -3,6 +3,9 @@ import { cancelPasswordRequest, closeDocument, unlockDocument, type PasswordChal
 import type { DocumentInfo } from './model';
 import s from './PasswordDialog.module.css';
 
+const MAX_PASSWORD_BYTES = 1024;
+const TOO_LONG = 'Passwords cannot be longer than 1 KiB.';
+
 export default function PasswordDialog({ challenge, onOpened, onClose }: { challenge: PasswordChallenge; onOpened: (document: DocumentInfo) => void; onClose: () => void }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const active = useRef(true), submitting = useRef(false);
@@ -36,8 +39,8 @@ export default function PasswordDialog({ challenge, onOpened, onClose }: { chall
       }
       if (result.status === 'opened') onOpened(result.document);
       else setError('Incorrect password. Try again.');
-    } catch {
-      if (active.current) setError('Unable to unlock this PDF. Cancel and open the file again.');
+    } catch (e) {
+      if (active.current) setError(String(e).includes(TOO_LONG) ? TOO_LONG : 'Unable to unlock this PDF. Cancel and open the file again.');
     } finally {
       submitting.current = false;
       if (active.current) setBusy(false);
@@ -47,7 +50,7 @@ export default function PasswordDialog({ challenge, onOpened, onClose }: { chall
     <h2 id="password-title">Password required</h2>
     <p>{challenge.name}</p>
     <form onSubmit={event => { event.preventDefault(); void submit(); }}>
-      <label>PDF password<input autoFocus type="password" autoComplete="off" value={password} disabled={busy} onChange={event => setPassword(event.target.value)} /></label>
+      <label>PDF password<input autoFocus type="password" autoComplete="off" value={password} disabled={busy} maxLength={MAX_PASSWORD_BYTES} onChange={event => { const next = event.target.value; if (new TextEncoder().encode(next).length <= MAX_PASSWORD_BYTES) { setPassword(next); setError(''); } else setError(TOO_LONG); }} /></label>
       <p>Your password is used only to open this document.</p>
       {error && <p role="alert">{error}</p>}
       <div className={s.actions}><button type="button" onClick={cancel}>Cancel</button><button type="submit" disabled={busy}>{busy ? 'Opening…' : 'Open PDF'}</button></div>
