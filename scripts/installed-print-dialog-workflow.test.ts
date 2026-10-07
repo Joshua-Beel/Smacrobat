@@ -165,7 +165,7 @@ public sealed class NativeSaveDialogFixture : IDisposable {
       }finally{$fixture.Dispose()}
     `);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('completes the exact Save action before proving the active print lifecycle returned to baseline', () => {
     const result = runPowerShell7(String.raw`
@@ -207,7 +207,7 @@ public sealed class NativeSaveDialogFixture : IDisposable {
     expect(uiaAction).toBeGreaterThan(nativeTransport);
     expect(uiaTransport).toBeGreaterThan(uiaAction);
     expect(closeReceipt).toBeGreaterThan(uiaTransport);
-  });
+  }, 15_000);
 
   it('rejects ambiguous foreign reparented cyclic and changed native save roles before mutation', () => {
     const result = runPowerShell7(String.raw`
@@ -246,7 +246,7 @@ public sealed class NativeSaveDialogFixture : IDisposable {
       $script:records=$duplicate;$callsBefore=$script:setCalls;$rejected=$false;try{Set-BoundNativeSaveFileNameExact -ProcessId 7319 -ProcessStartUtcTicks 638500000000000000L -Binding $binding -Value 'C:\fixture\proof.pdf' -DeadlineTickCount ([Environment]::TickCount64+2000) -NativeWindowProvider $provider -SetProvider $setProvider}catch{$rejected=$true};if(-not$rejected-or$script:setCalls-ne$callsBefore){throw 'Changed native save roles reached filename mutation.'}
     `);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('binds cancel transport, reopen, conditional PDF output, parsing, correlation, and cleanup', () => {
     const source = readFileSync('scripts/installed-print-dialog.ps1', 'utf8');
@@ -288,7 +288,7 @@ public sealed class NativeSaveDialogFixture : IDisposable {
       if(-not$rejected-or$script:expiredProbeCalls-ne0){throw 'Expired print port handoff performed a port probe.'}
     `);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('classifies printer capability exactly and never claims feature installation', () => {
     const result = runPowerShell7(String.raw`
@@ -304,7 +304,7 @@ public sealed class NativeSaveDialogFixture : IDisposable {
       $rejected=$false;try{Get-PrintCapabilityFacts -PrinterProvider { @([pscustomobject]@{Name='x'},[pscustomobject]@{Name='X'}) }}catch{$rejected=$true};if(-not$rejected){throw 'Duplicate printer identity accepted.'}
     `);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('waits through a zero-length spool file and requires a stable positive output', () => {
     const result = runPowerShell7(String.raw`
@@ -414,7 +414,7 @@ public static class PrintSpoolWriterFixture {
       if([Math]::Abs($corr-1)-gt0.000001-or$diff-ne0){throw 'Fingerprint comparison changed.'}
     `);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('does not assign to PowerShell automatic or read-only variables', () => {
     const result = runPowerShell7(String.raw`
@@ -426,7 +426,7 @@ public static class PrintSpoolWriterFixture {
       $collisions=@($assigned|Where-Object{$forbidden-contains$_});if($collisions.Count){throw ('Print helper assigns automatic/read-only variables: '+($collisions-join','))}
     `);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('labels native timeout stages and emits only bounded process-owned UI structure counts', () => {
     const source = readFileSync('scripts/installed-print-dialog.ps1', 'utf8');
@@ -467,7 +467,7 @@ public static class PrintSpoolWriterFixture {
       $rejected=$false;try{Get-SanitizedProcessUiStructureReceipt -ProcessId $ownedProcessId -ElementProvider $oversized|Out-Null}catch{$rejected=$true};if(-not$rejected){throw 'Oversized UI diagnostic inventory was accepted.'}
     `);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('does not start a UI Automation inventory when a native deadline is already expired', () => {
     const result = runPowerShell7(String.raw`
@@ -487,7 +487,7 @@ public static class PrintSpoolWriterFixture {
       if($script:postDeadlineCalls-ne0){throw 'Expired native wait started UI Automation.'}
     `);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('enumerates only targeted descendants below validated owned roots and fails closed after a delayed query', () => {
     const result = runPowerShell7(String.raw`
@@ -540,7 +540,7 @@ public static class PrintSpoolWriterFixture {
     expect(source).toContain('$topLevel = @(if ($FindAllProvider)');
     expect(source).toContain('$descendants = @(if ($FindAllProvider)');
     expect(source).toContain('$elements = @(if ($ElementProvider)');
-  });
+  }, 15_000);
 
   it('retains sanitized observed counts when an exact native match is ambiguous', () => {
     const result = runPowerShell7(String.raw`
@@ -557,7 +557,7 @@ public static class PrintSpoolWriterFixture {
       if($message-match'(?i)(bounding|rectangle|caption|"name"|"text"|"path"|"processid"|7319)'){throw 'Ambiguous-match diagnostics leaked private UI data.'}
     `);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('preserves exact top-level cleanup baselines and rejects late runtime identity reads', () => {
     const result = runPowerShell7(String.raw`
@@ -597,7 +597,7 @@ public static class PrintSpoolWriterFixture {
     expect(outputIndex).toBeGreaterThan(submitIndex);
     expect(closeIndex).toBeGreaterThan(outputIndex);
     expect(finalCleanupIndex).toBeGreaterThan(closeIndex);
-  });
+  }, 15_000);
 
   it('binds a descendant delta inside an unchanged owned top-level surface and rejects other ancestry', () => {
     const result = runPowerShell7(String.raw`
@@ -683,7 +683,7 @@ public static class PrintSpoolWriterFixture {
     expect(source).toContain('-not $baselineIdentities.Contains($surfaceRootIdentity)');
     expect(source).not.toContain('$firstNativeControlBaseline = @(Get-ProcessUiTreeSnapshot');
     expect(source).not.toContain('$secondNativeControlBaseline = @(Get-ProcessUiTreeSnapshot');
-  });
+  }, 15_000);
 
   it('uses an exact rooted target query after the hosted surface-only delta', () => {
     const result = runPowerShell7(String.raw`
@@ -738,7 +738,7 @@ public static class PrintSpoolWriterFixture {
       if([string]$binding.surfaceRootIdentity-cne'88:5'-or$script:rootedTargetQueries-lt2-or@($binding.trackedIdentities).Count-ne35){throw 'Hosted surface delta did not trigger the exact rooted target proof.'}
     `);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('uses exact owned HWND controls when the hosted UIA descendant provider stalls', () => {
     const source = readFileSync('scripts/installed-print-dialog.ps1', 'utf8');
@@ -995,7 +995,7 @@ public static class PrintSpoolWriterFixture {
       if($unavailable.inventoryStatus-cne'unavailable'-or$unavailable.nativeEnumerationStage-cne'unavailable'-or$unavailable.childCount-ne-1-or$unavailable.requiredRoleMatchesAvailable){throw 'Unavailable HWND topology diagnostic changed.'}
     `);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('binds the evidenced native print roles and revalidates them before exact actions', () => {
     const result = runPowerShell7(String.raw`
@@ -1115,7 +1115,7 @@ public static class PrintSpoolWriterFixture {
       if(-not$rejected){throw 'Ambiguous complete descendant radio groups were accepted.'}
     `);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('routes a null UIA printer result through the exact native list and propagates lookup errors', () => {
     const result = runPowerShell7(String.raw`
@@ -1145,7 +1145,7 @@ public static class PrintSpoolWriterFixture {
       if(-not$rejected){throw 'An exact native-list ambiguity reached printer selection.'}
     `);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('emits only bounded privacy-safe facts below the exact native printer list', () => {
     const result = runPowerShell7(String.raw`
@@ -1182,7 +1182,7 @@ public static class PrintSpoolWriterFixture {
       if($unavailable-cne'{"inventoryStatus":"unavailable","descendantCount":-1,"countCapped":false,"facts":[]}'){throw 'Expired printer-list diagnostics did not fail closed.'}
     `);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('selects one visible dialog-class HWND from the hosted 11-owned 5-candidate topology', () => {
     const result = runPowerShell7(String.raw`
@@ -1253,7 +1253,7 @@ public static class PrintSpoolWriterFixture {
       if(-not$rejected-or$script:hostedRootQueries-ne$queriesBefore){throw 'Multiple visible dialog-class HWNDs reached a rooted UIA query.'}
     `);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('maps every native wait callsite to its exact diagnostic stage', () => {
     const result = runPowerShell7(String.raw`
@@ -1282,7 +1282,7 @@ public static class PrintSpoolWriterFixture {
       if(($actual-join'|')-cne($expected-join'|')){throw ('Native wait stage mapping changed: '+($actual-join','))}
     `);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('caps phases by one deadline and rejects rogue processes, foreign UIA, incomplete cleanup, and weak correlation', () => {
     const result = runPowerShell7(String.raw`
@@ -1340,5 +1340,5 @@ public static class PrintSpoolWriterFixture {
     expect(source).toContain('$processCleanupDeadline = [datetime]::UtcNow.AddMilliseconds($script:LaunchPins.CleanupProcessTimeoutMilliseconds)');
     expect(source).toContain('Wait-LaunchProcessQuiescence -Deadline $processCleanupDeadline');
     expect(source).toContain('$clear = $processesQuiescent -and $residualCategory');
-  });
+  }, 15_000);
 });

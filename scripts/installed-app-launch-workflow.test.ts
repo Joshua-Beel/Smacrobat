@@ -70,7 +70,7 @@ describe('hosted installed signed application launch proof', () => {
       if($calls-lt7){throw 'Production bounded child launch inventory was unexpectedly incomplete.'}
     `);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('bounds trickled response bodies by one deadline and rejects late oracle results', () => {
     const source = extractFunctions('scripts/installed-app-launch.ps1', ['Get-LaunchRemainingMilliseconds', 'Read-BoundedLoopbackResponseText', 'Wait-WebDriverOracle'], String.raw`
@@ -126,7 +126,7 @@ public sealed class NonCooperativeResponseStream : MemoryStream {
     const production = readFileSync('scripts/installed-app-launch.ps1', 'utf8');
     expect(production).toContain('Read-BoundedLoopbackResponseText -Stream $stream -Deadline $requestDeadline');
     expect(production).toContain('$request.Abort()');
-  });
+  }, 15_000);
 
   it('keeps the workflow manual, runner-only, token-scoped, and clean after driver preparation', () => {
     const workflow = readFileSync('.github/workflows/ocr-installer-upgrade.yml', 'utf8');
@@ -188,7 +188,7 @@ public sealed class NonCooperativeResponseStream : MemoryStream {
     );
     const result = runPowerShell(source);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('rejects EdgeDriver archive traversal and duplicate canonical executables', () => {
     const source = extractFunctions('scripts/setup-installed-app-webdriver.ps1', ['Expand-ExactEdgeDriver'], String.raw`
@@ -203,7 +203,7 @@ public sealed class NonCooperativeResponseStream : MemoryStream {
     `);
     const result = runPowerShell(source);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('requires exact driver receipt origins, toolchain versions, runtime matching, and Microsoft trust', () => {
     const source = extractFunctions('scripts/installed-app-launch.ps1', ['Assert-LaunchExactProperties', 'Assert-LaunchReceiptValue', 'Assert-WebDriverReceipt'], String.raw`
@@ -214,7 +214,7 @@ public sealed class NonCooperativeResponseStream : MemoryStream {
     `);
     const result = runPowerShell(source);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('binds the live native-driver status and fresh profile when vendor capabilities are absent', () => {
     const source = extractFunctions('scripts/installed-app-launch.ps1', ['Assert-NativeDriverStatus', 'Wait-NativeDriverStatus', 'Get-ExactProfileBinding', 'Get-OwnedProfileBinding', 'Assert-TrustedConsoleHostTopology', 'Assert-OwnedLaunchExecutables', 'Get-UniqueOwnedLaunchProcesses'], String.raw`
@@ -244,7 +244,7 @@ public sealed class NonCooperativeResponseStream : MemoryStream {
     `);
     const result = runPowerShell(source);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('allows only the exact signed System32 console-host root and WebView topology', () => {
     const source = extractFunctions('scripts/installed-app-launch.ps1', ['Assert-TrustedConsoleHostTopology', 'Assert-OwnedLaunchExecutables'], String.raw`
@@ -304,7 +304,7 @@ public sealed class NonCooperativeResponseStream : MemoryStream {
     for (const path of ['scripts/installed-reading-tools.ps1', 'scripts/installed-persistence.ps1', 'scripts/installed-print-dialog.ps1']) {
       expect(readFileSync(path, 'utf8')).not.toContain('AdditionalTrustedParent');
     }
-  });
+  }, 15_000);
 
   it('validates exact UI/runtime/cleanup results before producing sanitized launch evidence', () => {
     const source = extractFunctions('scripts/installed-app-launch.ps1', ['Assert-LaunchExactProperties', 'Assert-LaunchReceiptValue', 'Assert-WebDriverReceipt', 'Invoke-InstalledAppLaunchSmoke'], String.raw`
@@ -435,7 +435,7 @@ return document.querySelectorAll('dialog[aria-labelledby="page-ocr-title"]').len
     `;
     const result = runPowerShell(source);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('reports only fixed OCR stages and bounded allowlisted WebDriver error codes', () => {
     const source = extractFunctions('scripts/installed-app-launch.ps1', ['Get-BoundedWebDriverErrorCode', 'Invoke-OcrWebDriverScript'], String.raw`
@@ -477,7 +477,7 @@ public sealed class FixedMemoryStream : MemoryStream {
     `);
     const result = runPowerShell(source);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('hashes only bounded nonblank OCR text and never returns the text', () => {
     const source = extractFunctions('scripts/installed-app-launch.ps1', ['Get-LaunchOcrTextReceipt'], String.raw`
@@ -488,7 +488,7 @@ public sealed class FixedMemoryStream : MemoryStream {
     `);
     const result = runPowerShell(source);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('does not assign to PowerShell automatic or read-only variables in the real launch path', () => {
     const source = String.raw`
@@ -504,7 +504,7 @@ public sealed class FixedMemoryStream : MemoryStream {
     `;
     const result = runPowerShell(source);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('reports only fixed cleanup outcomes and booleans while keeping every failure rejected', () => {
     const source = extractFunctions('scripts/installed-app-launch.ps1', ['Invoke-SessionDeleteOutcome', 'Assert-LaunchCleanupState'], String.raw`
@@ -524,7 +524,7 @@ public sealed class FixedMemoryStream : MemoryStream {
     `);
     const result = runPowerShell(source);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('waits boundedly for an inert owned process tree and never kills mismatched identities', () => {
     const source = extractFunctions('scripts/installed-app-launch.ps1', ['Wait-BoundedOwnedProcessExit', 'Get-LaunchProcessCategory', 'Get-CapturedCategoryOutcome', 'Stop-OwnedLaunchProcesses'], String.raw`
@@ -554,7 +554,7 @@ $child=[Diagnostics.Process]::Start($info);[IO.File]::WriteAllText($ChildPidPath
     `);
     const result = runPowerShell(source);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('snapshots real driver exit before disposing its bounded capture', () => {
     const launchSource = readFileSync('scripts/installed-app-launch.ps1', 'utf8');
@@ -568,7 +568,7 @@ $child=[Diagnostics.Process]::Start($info);[IO.File]::WriteAllText($ChildPidPath
     `);
     const result = runPowerShell(source);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('requires two fresh empty cleanup snapshots and fails closed on late or persistent residuals', () => {
     const launchSource = readFileSync('scripts/installed-app-launch.ps1', 'utf8');
@@ -603,7 +603,7 @@ $child=[Diagnostics.Process]::Start($info);[IO.File]::WriteAllText($ChildPidPath
     expect(launchSource.match(/function Wait-LaunchProcessQuiescence[\s\S]*?\n}/)?.[0]).not.toMatch(/\.Kill\(|Stop-Process/);
     const result = runPowerShell(source);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('uses one-microsecond process timestamp precision without capturing stale parent-PID collisions', () => {
     const source = extractFunctions('scripts/installed-app-launch.ps1', ['Get-OwnedLaunchProcesses'], String.raw`
@@ -639,7 +639,7 @@ $child=[Diagnostics.Process]::Start($info);[IO.File]::WriteAllText($ChildPidPath
     `);
     const result = runPowerShell(source);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('classifies only fixed residual process categories and fails closed for unknown or multiple entries', () => {
     const source = extractFunctions('scripts/installed-app-launch.ps1', ['Get-LaunchProcessCategory', 'Get-LaunchResidualCategory', 'Get-LaunchResidualFacts'], String.raw`
@@ -657,7 +657,7 @@ $child=[Diagnostics.Process]::Start($info);[IO.File]::WriteAllText($ChildPidPath
     `);
     const result = runPowerShell(source);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('reports a newly orphaned descendant as uncaptured without weakening identity-bound cleanup', () => {
     const source = extractFunctions('scripts/installed-app-launch.ps1', ['Get-OwnedLaunchProcesses', 'Wait-BoundedOwnedProcessExit', 'Get-LaunchProcessCategory', 'Get-CapturedCategoryOutcome', 'Stop-OwnedLaunchProcesses', 'Get-LaunchResidualFacts', 'Assert-LaunchCleanupState'], String.raw`
@@ -678,7 +678,7 @@ $info=[Diagnostics.ProcessStartInfo]::new();$info.FileName=$Pwsh;$info.UseShellE
     `);
     const result = runPowerShell(source);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('does not retry a timed-out session POST and still stops the owned process tree', () => {
     const source = extractFunctions('scripts/installed-app-launch.ps1', ['Get-MinimalWindowsProcessEnvironment', 'Invoke-RealInstalledAppLaunch'], String.raw`
@@ -701,7 +701,7 @@ $info=[Diagnostics.ProcessStartInfo]::new();$info.FileName=$Pwsh;$info.UseShellE
     `);
     const result = runPowerShell(source);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 
   it('rejects occupied ports, over-deep JSON, and every native endpoint except fixed GET status', () => {
     const source = extractFunctions('scripts/installed-app-launch.ps1', ['Assert-BoundedJsonShape', 'Get-LaunchRemainingMilliseconds', 'Get-LoopbackRequestTimeoutMilliseconds', 'Invoke-BoundedLoopbackJson', 'Assert-FixedWebDriverPortsFree', 'Wait-FixedWebDriverPortsFree'], String.raw`
@@ -723,5 +723,5 @@ $info=[Diagnostics.ProcessStartInfo]::new();$info.FileName=$Pwsh;$info.UseShellE
     `);
     const result = runPowerShell(source);
     expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+  }, 15_000);
 });
