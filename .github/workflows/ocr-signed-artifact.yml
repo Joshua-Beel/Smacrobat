@@ -36,7 +36,7 @@ jobs:
             throw 'Provide the exact verified publisher certificate name as expected_publisher.'
           }
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.sha }}
           fetch-depth: 1
@@ -50,12 +50,12 @@ jobs:
             throw 'Checked-out HEAD does not match github.sha.'
           }
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '22'
           cache: npm
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable branch head on 2026-10-06
 
       - run: npm ci
       - run: npm run fixtures
@@ -75,7 +75,7 @@ jobs:
         shell: pwsh
         run: ./scripts/setup-ocr.ps1 -OutputRoot $env:OCR_SETUP_ROOT -Jobs 4
 
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
         with:
           dotnet-version: '8.0.x'
 
@@ -120,7 +120,7 @@ jobs:
             -ExpectedPublisher $env:EXPECTED_PUBLISHER `
             -SourceRevision $env:GITHUB_SHA
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: signed-ocr-installer-${{ github.sha }}
           path: |
