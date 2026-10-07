@@ -52,14 +52,19 @@ function dryRun(overrides: Record<string, string>, extraEnv: Record<string, stri
   return spawnSync('pwsh.exe', ['-NoProfile', '-NonInteractive', '-File', absolute(verifierPath), ...placeholderArguments(overrides)], { encoding: 'utf8', timeout: 60_000, env });
 }
 
-it('is manual, candidate-bound, immutable-action pinned, and read-only to the repository', () => {
+it('is manual, candidate-bound, immutable-action pinned, and write-scoped only on the draft-reading job', () => {
   const workflow = readFileSync(workflowPath, 'utf8');
   expect(workflow).toContain('name: Manual default installed recovery verification');
   expect(workflow).toContain('workflow_dispatch:');
   expect(workflow).not.toMatch(/^\s*(push|pull_request|schedule):/m);
   for (const input of ['target_source_revision','target_release_id','installer_asset_id','installer_sha256','signature_asset_id','manifest_asset_id','draft_proof_run_id','draft_proof_workflow_id','draft_proof_artifact_id','draft_proof_workflow_revision','draft_proof_receipt_sha256']) expect(workflow).toContain(input + ':');
-  expect(workflow.match(/contents:\s*read/g)?.length).toBe(1);
-  expect(workflow).not.toMatch(/contents:\s*write|actions:\s*write|id-token:\s*write|secrets\.|AZURE_|TAURI_SIGNING|gh release|git push/);
+  const lf = workflow.replaceAll('\r\n', '\n');
+  expect(lf.match(/contents:\s*read/g)?.length).toBe(1);
+  expect(lf.match(/contents:\s*write/g)?.length).toBe(1);
+  expect(lf.match(/^permissions:/gm)?.length).toBe(1);
+  expect(lf.match(/^ +permissions:/gm)?.length).toBe(1);
+  expect(lf).toContain('\npermissions:\n  contents: read\n  actions: read\n\njobs:\n  verify-installed-recovery:\n    permissions:\n      contents: write\n      actions: read\n    runs-on: windows-2022\n');
+  expect(lf).not.toMatch(/actions:\s*write|id-token:\s*write|secrets\.|AZURE_|TAURI_SIGNING|gh release|git push/);
   expect(workflow.match(/actions\/checkout@11d5960a326750d5838078e36cf38b85af677262/g)?.length).toBe(2);
   expect(workflow).toContain('actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093');
   expect(workflow).toContain('actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02');
