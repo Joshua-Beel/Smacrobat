@@ -3,6 +3,8 @@ dist/
 src-tauri/target/
 /target/
 src-tauri/resources/pdfium/
+src-tauri/resources/.pdfium-staging-*/
+src-tauri/resources/.pdfium-backup-*/
 *.log
 artifacts/
 src-tauri/resources/*.tgz
