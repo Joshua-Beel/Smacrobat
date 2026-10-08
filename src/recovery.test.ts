@@ -38,7 +38,7 @@ it('recognizes only the exact structured committed-recovery error for the captur
 
 it('sends the exact physical viewer page with every journaled mutation', async () => {
   vi.mocked(invoke).mockResolvedValue({});
-  await editPages(7, { kind: 'undo' }, 3);
+  await editPages(7, 4, { kind: 'undo' }, 3);
   await cropPage(7, 1, 4, { x: .1, y: .2, width: .7, height: .6 }, 3);
   await cropPages(7, 4, [1, 2], { top: 1, right: 2, bottom: 3, left: 4 }, 3);
   await resetCrops(7, 4, [1, 2], 3);
@@ -50,7 +50,7 @@ it('sends the exact physical viewer page with every journaled mutation', async (
   await updateHighlight(7, 4, 'highlight-1', null, 3);
   await deleteHighlight(7, 4, 'highlight-1', 3);
   expect(vi.mocked(invoke).mock.calls).toEqual([
-    ['edit_pages', { id: 7, edit: { kind: 'undo' }, currentPage: 3 }],
+    ['edit_pages', { id: 7, revision: 4, edit: { kind: 'undo' }, currentPage: 3 }],
     ['crop_page', { id: 7, page: 1, revision: 4, rect: { x: .1, y: .2, width: .7, height: .6 }, currentPage: 3 }],
     ['crop_pages', { id: 7, revision: 4, pages: [1, 2], insets: { top: 1, right: 2, bottom: 3, left: 4 }, currentPage: 3 }],
     ['reset_crops', { id: 7, revision: 4, pages: [1, 2], currentPage: 3 }],

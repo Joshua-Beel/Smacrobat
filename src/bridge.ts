@@ -60,9 +60,9 @@ export type PageTextGeometry = {
 export const pageTextGeometry = (id: number, page: number, revision: number) => invoke<PageTextGeometry>('page_text_geometry', { id, page, revision });
 export type BookmarkList = { items: { title: string; page: number | null; depth: number }[]; truncated: boolean };
 export const documentBookmarks = (id: number, revision: number) => invoke<BookmarkList>('document_bookmarks', { id, revision });
-export const editPages = (id: number, edit: PageEdit, currentPage: number) => invoke<DocumentInfo>('edit_pages', { id, edit, currentPage });
+export const editPages = (id: number, revision: number, edit: PageEdit, currentPage: number) => invoke<DocumentInfo>('edit_pages', { id, revision, edit, currentPage });
 export type SavedCopy = { path: string; document: DocumentInfo };
-export const saveCopy = (id: number, pages?: number[]) => invoke<SavedCopy | null>('save_copy', { id, pages: pages ?? null });
+export const saveCopy = (id: number, revision: number, pages?: number[]) => invoke<SavedCopy | null>('save_copy', { id, revision, pages: pages ?? null });
 export type CreatePdfOptions = { pageSize: 'letter' | 'a4'; orientation: 'auto' | 'portrait' | 'landscape'; marginPoints: number };
 export const createPdfFromImage = (options: CreatePdfOptions) => invoke<SavedCopy | null>('create_pdf_from_image', { options });
 export type ImagePdfSource = { sourceId: string; name: string };

@@ -44,6 +44,7 @@ pub struct BookmarkInfo { title: String, page: Option<usize>, depth: usize }
 #[derive(Serialize)]
 pub struct BookmarkList { items: Vec<BookmarkInfo>, truncated: bool }
 const MAX_READ_TEXT_BYTES: usize = 1_048_576;
+const STALE_PAGE_PLAN: &str = "Document changed. Reload the page list and try again.";
 #[derive(Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum OpenResult {
@@ -162,6 +163,8 @@ enum Request {
     Close(u64, Reply<()>),
     Edit(u64, PageEdit, Reply<DocumentInfo>),
     DurableEdit(u64, PageEdit, u32, Reply<DocumentInfo>),
+    DurableEditAt(u64, u64, PageEdit, u32, Reply<DocumentInfo>),
+    SaveAt(u64, u64, Option<Vec<usize>>, PathBuf, Reply<SavedCopy>),
     Crop(u64, u16, u64, CropRect, Reply<DocumentInfo>),
     DurableCrop(u64, u16, u64, CropRect, u32, Reply<DocumentInfo>),
     CropPages(u64, Vec<u16>, u64, CropInsets, Reply<DocumentInfo>),
@@ -273,6 +276,8 @@ impl PdfService {
             while let Ok(request) = requests.next(&receiver) {
                 let request = match request {
                     Request::DurableEdit(id,edit,page,reply)=>{recovery_pages.insert(id,page);Request::Edit(id,edit,reply)},
+                    Request::DurableEditAt(id,revision,edit,page,reply)=>{if sessions.get(&id).is_some_and(|(session,_)|session.revision!=revision){let _=reply.send(Err(STALE_PAGE_PLAN.into()));continue;}recovery_pages.insert(id,page);Request::Edit(id,edit,reply)},
+                    Request::SaveAt(id,revision,pages,path,reply)=>{if sessions.get(&id).is_some_and(|(session,_)|session.revision!=revision){let _=reply.send(Err(STALE_PAGE_PLAN.into()));continue;}Request::Save(id,pages,path,reply)},
                     Request::DurableCrop(id,index,revision,rect,page,reply)=>{recovery_pages.insert(id,page);Request::Crop(id,index,revision,rect,reply)},
                     Request::DurableCropPages(id,pages,revision,insets,page,reply)=>{recovery_pages.insert(id,page);Request::CropPages(id,pages,revision,insets,reply)},
                     Request::DurableResetCrops(id,pages,revision,page,reply)=>{recovery_pages.insert(id,page);Request::ResetCrops(id,pages,revision,reply)},
@@ -602,7 +607,7 @@ impl PdfService {
                         drop(admission);
                         let _ = reply.send(result);
                     }
-                    Request::BeginOpen(_, _)|Request::DurableEdit(..)|Request::DurableCrop(..)|Request::DurableCropPages(..)|Request::DurableResetCrops(..)|Request::DurableComment(..) => unreachable!(),
+                    Request::BeginOpen(_, _)|Request::DurableEdit(..)|Request::DurableEditAt(..)|Request::SaveAt(..)|Request::DurableCrop(..)|Request::DurableCropPages(..)|Request::DurableResetCrops(..)|Request::DurableComment(..) => unreachable!(),
                     Request::CancelPassword(id, reply) => { pending.remove(&id); let _ = reply.send(Ok(())); }
                     Request::Unlock(request_id, password, reply) => {
                         if reply.is_closed() { pending.remove(&request_id); continue; }
@@ -1460,6 +1465,9 @@ impl PdfService {
     pub async fn edit(&self, id: u64, edit: PageEdit, current_page: u32) -> Result<DocumentInfo, String> {
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::DurableEdit(id, edit, current_page, tx)).map_err(|e| e.to_string())?; rx.await.map_err(|e| e.to_string())?
     }
+    pub async fn edit_at(&self, id: u64, revision: u64, edit: PageEdit, current_page: u32) -> Result<DocumentInfo, String> {
+        let (tx, rx) = oneshot::channel(); self.sender.send(Request::DurableEditAt(id, revision, edit, current_page, tx)).map_err(|e| e.to_string())?; rx.await.map_err(|e| e.to_string())?
+    }
     pub async fn crop(&self, id: u64, page: u16, revision: u64, rect: CropRect, current_page: u32) -> Result<DocumentInfo, String> {
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::DurableCrop(id, page, revision, rect, current_page, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
     }
@@ -1510,8 +1518,8 @@ impl PdfService {
     pub async fn delete_comment(&self, id: u64, revision: u64, note_id: String, current_page: u32) -> Result<DocumentInfo, String> {
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::DurableComment(id, revision, CommentMutation::Delete(note_id), current_page, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
     }
-    pub async fn save(&self, id: u64, pages: Option<Vec<usize>>, path: PathBuf) -> Result<SavedCopy, String> {
-        let (tx, rx) = oneshot::channel(); self.sender.send(Request::Save(id, pages, path, tx)).map_err(|e| e.to_string())?; rx.await.map_err(|e| e.to_string())?
+    pub async fn save_at(&self, id: u64, revision: u64, pages: Option<Vec<usize>>, path: PathBuf) -> Result<SavedCopy, String> {
+        let (tx, rx) = oneshot::channel(); self.sender.send(Request::SaveAt(id, revision, pages, path, tx)).map_err(|e| e.to_string())?; rx.await.map_err(|e| e.to_string())?
     }
     pub async fn split(&self, id: u64, revision: u64, pages_per_file: usize, folder: PathBuf) -> Result<crate::split::SplitOutput, String> {
         let (tx, rx) = oneshot::channel(); self.sender.send(Request::Split(id, revision, pages_per_file, folder, tx)).map_err(|error| error.to_string())?; rx.await.map_err(|error| error.to_string())?
@@ -2065,6 +2073,40 @@ mod tests {
         let dimensions = std::str::from_utf8(lines.next().unwrap()).unwrap().split_once(' ').unwrap();
         assert_eq!(lines.next(), Some(b"255".as_slice()));
         (dimensions.0.parse().unwrap(), dimensions.1.parse().unwrap(), lines.next().unwrap())
+    }
+    #[test]
+    fn page_edit_and_save_reject_stale_revisions_and_accept_the_current_one() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let path = root.join("resources/welcome.pdf");
+        let source = std::fs::read(&path).unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        let service = PdfService::start(root.join("resources/pdfium/bin/pdfium.dll"));
+        let mut info = call(&service, |reply| Request::Open(path.clone(), reply)).unwrap();
+        let stale = info.revision;
+        info = call(&service, |reply| Request::DurableEditAt(info.id, stale, PageEdit::Rotate { pages: vec![0], clockwise: true }, 0, reply)).unwrap();
+        assert_ne!(info.revision, stale);
+        let (count, current) = (info.pages.len(), info.revision);
+        for kind in 0..3 {
+            let edit = match kind { 0 => PageEdit::Rotate { pages: vec![1], clockwise: true }, 1 => PageEdit::Delete { pages: vec![1] }, _ => PageEdit::Move { from: 1, to: 2 } };
+            let error = call(&service, |reply| Request::DurableEditAt(info.id, stale, edit, 0, reply)).err().unwrap();
+            assert_eq!(error, STALE_PAGE_PLAN);
+        }
+        let stale_copy = folder.path().join("stale.pdf");
+        assert_eq!(call(&service, |reply| Request::SaveAt(info.id, stale, Some(vec![0]), stale_copy.clone(), reply)).err().unwrap(), STALE_PAGE_PLAN);
+        assert_eq!(call(&service, |reply| Request::SaveAt(info.id, stale, None, stale_copy.clone(), reply)).err().unwrap(), STALE_PAGE_PLAN);
+        assert!(!stale_copy.exists());
+        assert_eq!(call(&service, |reply| Request::Edit(info.id, PageEdit::Move { from: 0, to: 0 }, reply)).unwrap().pages.len(), count);
+        let moved = call(&service, |reply| Request::DurableEditAt(info.id, current, PageEdit::Move { from: 0, to: 1 }, 0, reply)).unwrap();
+        let deleted = call(&service, |reply| Request::DurableEditAt(info.id, moved.revision, PageEdit::Delete { pages: vec![1] }, 0, reply)).unwrap();
+        assert_eq!(deleted.pages.len(), count - 1);
+        assert_eq!(call(&service, |reply| Request::DurableEditAt(info.id, current, PageEdit::Undo, 0, reply)).err().unwrap(), STALE_PAGE_PLAN);
+        let extracted = folder.path().join("extracted.pdf");
+        call(&service, |reply| Request::SaveAt(info.id, deleted.revision, Some(vec![0]), extracted.clone(), reply)).unwrap();
+        assert!(extracted.exists());
+        let full = folder.path().join("full.pdf");
+        call(&service, |reply| Request::SaveAt(info.id, deleted.revision, None, full.clone(), reply)).unwrap();
+        assert!(full.exists());
+        assert_eq!(std::fs::read(&path).unwrap(), source);
     }
     #[test]
     fn page_labels_follow_current_plan_revision_and_close_without_changing_source() {
