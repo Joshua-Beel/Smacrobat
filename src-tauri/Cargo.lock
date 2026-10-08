@@ -2950,6 +2950,7 @@ dependencies = [
  "pdfium-render",
  "png 0.18.1",
  "rfd",
+ "semver",
  "serde",
  "serde_json",
  "sha2 0.10.9",

@@ -1,1 +1,1 @@
-{ "$schema": "../gen/schemas/desktop-schema.json", "identifier": "default", "description": "Local desktop window", "windows": ["main"], "permissions": ["core:default", "core:window:allow-destroy", "updater:default"] }
+{ "$schema": "../gen/schemas/desktop-schema.json", "identifier": "default", "description": "Local desktop window", "windows": ["main"], "permissions": ["core:default", "core:window:allow-destroy"] }
