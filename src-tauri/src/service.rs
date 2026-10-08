@@ -50,11 +50,11 @@ pub enum OpenResult {
     Opened { document: DocumentInfo, recovery: Option<RecoveryOffer> },
     PasswordRequired { request_id: u64, name: String, incorrect: bool },
 }
-pub struct PrintSnapshotInfo { pub token: u64, pub pages: usize, pub name: String, cleanup: mpsc::Sender<Request> }
+pub struct PrintSnapshotInfo { pub token: u64, pub pages: usize, pub name: String, cleanup: RequestSender }
 impl Drop for PrintSnapshotInfo {
     fn drop(&mut self) {
         let (reply, _) = oneshot::channel();
-        let _ = self.cleanup.send(Request::EndPrint(self.token, reply));
+        let _ = self.cleanup.send_cleanup(Request::EndPrint(self.token, reply));
     }
 }
 pub struct PrintBitmap { pub width: u32, pub height: u32, pub bgra: Vec<u8> }
@@ -82,9 +82,9 @@ struct OcrWorkerState {
     note_documents: Vec<(u64, u64)>,
 }
 enum UnclaimedReply { Document(u64), Password(u64) }
-struct ReplyLease<T> { value: Option<T>, cleanup: Option<UnclaimedReply>, sender: mpsc::Sender<Request> }
+struct ReplyLease<T> { value: Option<T>, cleanup: Option<UnclaimedReply>, sender: RequestSender }
 impl<T> ReplyLease<T> {
-    fn new(value: T, cleanup: UnclaimedReply, sender: mpsc::Sender<Request>) -> Self { Self { value: Some(value), cleanup: Some(cleanup), sender } }
+    fn new(value: T, cleanup: UnclaimedReply, sender: RequestSender) -> Self { Self { value: Some(value), cleanup: Some(cleanup), sender } }
     fn accept(mut self) -> T { self.cleanup = None; self.value.take().expect("A reply lease owns its value until acceptance") }
 }
 impl<T> std::ops::Deref for ReplyLease<T> {
@@ -96,7 +96,7 @@ impl<T> Drop for ReplyLease<T> {
         if let Some(cleanup) = self.cleanup.take() {
             let (reply, _) = oneshot::channel();
             let request = match cleanup { UnclaimedReply::Document(id) => Request::Close(id, reply), UnclaimedReply::Password(id) => Request::CancelPassword(id, reply) };
-            let _ = self.sender.send(request);
+            let _ = self.sender.send_cleanup(request);
         }
     }
 }
@@ -183,20 +183,24 @@ enum Request {
     CreateCopy(CombineSource, CombineSource, CopyOperation, PathBuf, Reply<ReplyLease<SavedCopy>>),
 }
 #[derive(Default)]
-struct RequestQueue { deferred: VecDeque<Request>, cleanup_overtakes: usize }
+struct RequestQueue { deferred: VecDeque<Request>, cleanup_overtakes: usize, pending: Arc<std::sync::atomic::AtomicUsize> }
 impl RequestQueue {
+    fn received(&self, request: Request) -> Request {
+        if !matches!(request, Request::Render(..)|Request::AdmittedRender(..)) { let _ = self.pending.fetch_update(std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire, |n| n.checked_sub(1)); }
+        request
+    }
     fn next(&mut self, receiver: &mpsc::Receiver<Request>) -> Result<Request, mpsc::RecvError> {
         // Only viewer renders may be overtaken. Every other command preserves its FIFO boundary.
         // Two cleanup overtakes allow Close + EndPrint together while guaranteeing render progress.
         const WINDOW: usize = 32;
         const MAX_CLEANUP_OVERTAKES: usize = 2;
-        if self.deferred.is_empty() { self.deferred.push_back(receiver.recv()?); }
+        if self.deferred.is_empty() { let request = self.received(receiver.recv()?); self.deferred.push_back(request); }
         if matches!(self.deferred.front(), Some(Request::Render(..)|Request::AdmittedRender(..))) && self.cleanup_overtakes < MAX_CLEANUP_OVERTAKES {
             let mut index = 1;
             while index < WINDOW {
                 if index == self.deferred.len() {
                     match receiver.try_recv() {
-                        Ok(request) => self.deferred.push_back(request),
+                        Ok(request) => { let request = self.received(request); self.deferred.push_back(request) }
                         Err(_) => break,
                     }
                 }
@@ -243,9 +247,10 @@ impl PdfService {
     }
     fn start_worker(library: PathBuf,render_limit:usize,recovery_root:Option<PathBuf>) -> Self {
         let (raw_sender, receiver) = mpsc::channel();
-        let resource_cleanup = raw_sender.clone();
         let render_admission=Arc::new(Mutex::new(RenderAdmission::default()));
-        let sender=RequestSender{inner:raw_sender,renders:render_admission.clone(),limit:render_limit};
+        let sender=RequestSender{inner:raw_sender,renders:render_admission.clone(),limit:render_limit,pending:Arc::default(),queue_limit:if cfg!(test){4096}else{WORKER_QUEUE_LIMIT}};
+        let resource_cleanup = sender.clone();
+        let queue_pending = sender.pending.clone();
         std::thread::Builder::new().name("pdf-worker".into()).spawn(move || {
             let pdfium = Pdfium::bind_to_library(library).map(Pdfium::new).map_err(|e| format!("PDF engine could not start: {e}"));
             let mut documents = HashMap::new();
@@ -269,7 +274,7 @@ impl PdfService {
             let mut bookmark_work = HashMap::<u64, BookmarkWork>::new();
             #[cfg(test)]
             let mut ocr_work = HashMap::<u64, OcrWork>::new();
-            let mut requests = RequestQueue::default();
+            let mut requests = RequestQueue { pending: queue_pending, ..RequestQueue::default() };
             while let Ok(request) = requests.next(&receiver) {
                 let request = match request {
                     Request::DurableEdit(id,edit,page,reply)=>{recovery_pages.insert(id,page);Request::Edit(id,edit,reply)},
@@ -1774,16 +1779,33 @@ fn restore_recovery_session(session: &mut EditSession, record: &crate::recovery_
 }
 type RenderKey=(u64,u16,i32,u64);
 #[derive(Default)]struct RenderAdmission{epoch:u64,next:u64,keys:HashMap<RenderKey,u64>,replies:HashMap<u64,Reply<Vec<u8>>>}
-#[derive(Clone)]struct RequestSender{inner:mpsc::Sender<Request>,renders:Arc<Mutex<RenderAdmission>>,limit:usize}
+const WORKER_QUEUE_LIMIT:usize=256;
+#[derive(Debug)]enum SendRejected{Closed,Busy}
+impl std::fmt::Display for SendRejected{fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{f.write_str(match self{SendRejected::Closed=>"sending on a closed channel",SendRejected::Busy=>"The PDF worker is busy with earlier requests. Try again."})}}
+impl From<mpsc::SendError<Request>> for SendRejected{fn from(_:mpsc::SendError<Request>)->Self{SendRejected::Closed}}
+#[derive(Clone)]struct RequestSender{inner:mpsc::Sender<Request>,renders:Arc<Mutex<RenderAdmission>>,limit:usize,pending:Arc<std::sync::atomic::AtomicUsize>,queue_limit:usize}
 impl RequestSender{
-    fn send(&self,request:Request)->Result<(),mpsc::SendError<Request>>{
+    fn send_cleanup(&self,request:Request)->Result<(),SendRejected>{
+        self.pending.fetch_add(1,std::sync::atomic::Ordering::AcqRel);
+        self.inner.send(request).map_err(|error|{self.release();error.into()})
+    }
+    fn release(&self){let _=self.pending.fetch_update(std::sync::atomic::Ordering::AcqRel,std::sync::atomic::Ordering::Acquire,|n|n.checked_sub(1));}
+    fn admit(&self,request:&Request)->bool{
+        if matches!(request,Request::Close(..)|Request::CancelPassword(..)|Request::EndPrint(..)){self.pending.fetch_add(1,std::sync::atomic::Ordering::AcqRel);return true}
+        self.pending.fetch_update(std::sync::atomic::Ordering::AcqRel,std::sync::atomic::Ordering::Acquire,|n|(n<self.queue_limit).then_some(n+1)).is_ok()
+    }
+    fn send(&self,request:Request)->Result<(),SendRejected>{
         if let Request::Render(id,page,width,reply)=request{
             let mut a=self.renders.lock().expect("render admission mutex poisoned");let key=(id,page,width,a.epoch);
             if let Some(token)=a.keys.get(&key).copied(){if let Some(old)=a.replies.insert(token,reply){let _=old.send(Err("Viewer render was superseded by a newer request.".into()));}return Ok(())}
             if a.keys.len()>=self.limit{let _=reply.send(Err("Viewer render queue is full. Try again.".into()));return Ok(())}
             a.next=a.next.wrapping_add(1);let token=a.next;a.keys.insert(key,token);a.replies.insert(token,reply);
-            if let Err(mpsc::SendError(marker))=self.inner.send(Request::AdmittedRender(id,page,width,token)){a.keys.remove(&key);a.replies.remove(&token);return Err(mpsc::SendError(marker))}Ok(())
-        }else{{let mut a=self.renders.lock().expect("render admission mutex poisoned");a.epoch=a.epoch.wrapping_add(1);}self.inner.send(request)}
+            if self.inner.send(Request::AdmittedRender(id,page,width,token)).is_err(){a.keys.remove(&key);a.replies.remove(&token);return Err(SendRejected::Closed)}Ok(())
+        }else{
+            if !self.admit(&request){return Err(SendRejected::Busy)}
+            {let mut a=self.renders.lock().expect("render admission mutex poisoned");a.epoch=a.epoch.wrapping_add(1);}
+            self.inner.send(request).map_err(|error|{self.release();error.into()})
+        }
     }
 }
 
@@ -2729,7 +2751,7 @@ mod tests {
         fifo.push_back(scheduler_cleanup(99, false)); fifo.push_back(scheduler_cleanup(100, true));
         let before_close = fifo.iter().take_while(|request| !matches!(request, Request::Close(..))).filter(|request| matches!(request, Request::Render(..))).count();
         assert_eq!(before_close, 8, "FIFO control must reproduce eight render dispatches before Close");
-        let mut queue = RequestQueue { deferred: fifo, cleanup_overtakes: 0 };
+        let mut queue = RequestQueue { deferred: fifo, cleanup_overtakes: 0, pending: Arc::default() };
         assert!(matches!(queue.next(&receiver).unwrap(), Request::Close(99, ..)));
         assert!(matches!(queue.next(&receiver).unwrap(), Request::EndPrint(100, ..)));
         drop(sender);
@@ -4853,7 +4875,37 @@ mod tests {
         let(replacement_tx,replacement_rx)=oneshot::channel();sender.send(Request::Render(1,0,64,replacement_tx)).unwrap();assert!(admitted[0].take().unwrap().blocking_recv().unwrap().unwrap_err().contains("superseded"));for width in 96..104{let(tx,rx)=oneshot::channel();sender.send(Request::Render(1,0,width,tx)).unwrap();assert!(rx.blocking_recv().unwrap().unwrap_err().contains("queue is full"));}for value in admitted.iter_mut().skip(1).take(12){drop(value.take());}
         let(close_tx,_)=oneshot::channel();sender.send(Request::Close(1,close_tx)).unwrap();let mut markers=0;for request in receiver.try_iter(){if let Request::AdmittedRender(_,_,_,token)=request{markers+=1;let reply={let mut a=state.lock().unwrap();let key=a.keys.iter().find_map(|(key,value)|(*value==token).then_some(*key)).unwrap();a.keys.remove(&key);a.replies.remove(&token)};if let Some(reply)=reply{if !reply.is_closed(){let _=reply.send(Err("Document is closed".into()));}}}}assert_eq!(markers,32);assert_eq!(state.lock().unwrap().keys.len(),0);assert!(replacement_rx.blocking_recv().unwrap().unwrap_err().contains("closed"));for receiver in admitted.into_iter().flatten(){assert!(receiver.blocking_recv().unwrap().unwrap_err().contains("closed"));}
     }
-    fn admission_sender()->(RequestSender,mpsc::Receiver<Request>,Arc<Mutex<RenderAdmission>>){let(inner,receiver)=mpsc::channel();let renders=Arc::new(Mutex::new(RenderAdmission::default()));(RequestSender{inner,renders:renders.clone(),limit:32},receiver,renders)}
+    fn admission_sender()->(RequestSender,mpsc::Receiver<Request>,Arc<Mutex<RenderAdmission>>){queue_sender(WORKER_QUEUE_LIMIT)}
+    fn queue_sender(queue_limit:usize)->(RequestSender,mpsc::Receiver<Request>,Arc<Mutex<RenderAdmission>>){let(inner,receiver)=mpsc::channel();let renders=Arc::new(Mutex::new(RenderAdmission::default()));(RequestSender{inner,renders:renders.clone(),limit:32,pending:Arc::default(),queue_limit},receiver,renders)}
+    fn pending(sender:&RequestSender)->usize{sender.pending.load(std::sync::atomic::Ordering::Acquire)}
+    #[test]
+    fn worker_queue_rejects_excess_non_render_requests_but_never_renders_or_cleanup(){
+        let(sender,receiver,state)=queue_sender(4);
+        for page in 0..4{sender.send(Request::Text(1,page,0,oneshot::channel().0)).unwrap();}
+        let error=sender.send(Request::Text(1,4,0,oneshot::channel().0)).unwrap_err();assert!(matches!(error,SendRejected::Busy));assert!(error.to_string().contains("busy"));
+        assert!(matches!(sender.send(Request::Bookmarks(1,0,oneshot::channel().0)),Err(SendRejected::Busy)));
+        assert_eq!(pending(&sender),4,"a rejected request must not hold a slot");
+        sender.send(Request::Render(1,0,64,oneshot::channel().0)).unwrap();assert_eq!(state.lock().unwrap().keys.len(),1,"viewer renders keep their own admission");
+        sender.send(Request::Close(1,oneshot::channel().0)).unwrap();sender.send(Request::CancelPassword(2,oneshot::channel().0)).unwrap();sender.send(Request::EndPrint(3,oneshot::channel().0)).unwrap();sender.send_cleanup(Request::Close(4,oneshot::channel().0)).unwrap();
+        assert_eq!(pending(&sender),8,"cleanup is counted but never refused");
+        let mut queue=RequestQueue{pending:sender.pending.clone(),..RequestQueue::default()};
+        let mut texts=0;for _ in 0..9{if let Request::Text(..)=queue.next(&receiver).unwrap(){texts+=1;}}
+        assert_eq!(texts,4);assert_eq!(pending(&sender),0,"every dequeued request frees its slot");assert!(receiver.try_recv().is_err());
+        for page in 0..4{sender.send(Request::TextGeometry(1,page,0,oneshot::channel().0)).unwrap();}
+        assert!(matches!(sender.send(Request::Properties(1,0,oneshot::channel().0)),Err(SendRejected::Busy)));
+        drop(receiver);assert!(matches!(sender.send(Request::Close(1,oneshot::channel().0)),Err(SendRejected::Closed)));assert_eq!(pending(&sender),4,"a send on a closed channel returns its slot");
+    }
+    #[test]
+    fn worker_queue_limit_admits_the_largest_ui_fan_out_with_nothing_drained(){
+        let(sender,receiver,_)=queue_sender(WORKER_QUEUE_LIMIT);
+        for id in 1..=4u64{
+            sender.send(Request::Bookmarks(id,0,oneshot::channel().0)).unwrap();sender.send(Request::PageLabels(id,0,oneshot::channel().0)).unwrap();sender.send(Request::Properties(id,0,oneshot::channel().0)).unwrap();sender.send(Request::FormFields(id,0,oneshot::channel().0)).unwrap();sender.send(Request::Annotations(id,0,oneshot::channel().0)).unwrap();sender.send(Request::Comments(id,0,oneshot::channel().0)).unwrap();
+        }
+        for page in 0..64{sender.send(Request::TextGeometry(1,page,0,oneshot::channel().0)).unwrap();}
+        sender.send(Request::Text(1,0,0,oneshot::channel().0)).unwrap();sender.send(Request::CheckpointRecovery(PathBuf::new(),1,0,0,oneshot::channel().0)).unwrap();sender.send(Request::Edit(1,PageEdit::Undo,oneshot::channel().0)).unwrap();
+        let queued=pending(&sender);assert_eq!(queued,4*6+64+3);assert!(queued*2<=WORKER_QUEUE_LIMIT,"the worst UI fan-out keeps at least half the queue free");
+        assert_eq!(receiver.try_iter().count(),queued);
+    }
     #[test]
     fn viewer_render_admission_bounds_coalesces_and_respects_barriers(){
         let(sender,receiver,state)=admission_sender();let mut replies=Vec::new();
