@@ -69,11 +69,13 @@ fn clear_update_attempt(app: tauri::AppHandle) -> Result<(), String> {
 async fn open_document(app: tauri::AppHandle, service: State<'_, PdfService>) -> Result<Option<service::OpenResult>, String> {
     let window = app.get_webview_window("main").ok_or("Application window is unavailable")?;
     let path = tauri::async_runtime::spawn_blocking(move || rfd::FileDialog::new().set_parent(&window).add_filter("PDF documents", &["pdf"]).pick_file()).await.map_err(|e| e.to_string())?;
-    match path { Some(path) => service.begin_open(path).await.map(Some), None => Ok(None) }
+    match path { Some(path) => service.begin_open_from(path, open_path::OpenOrigin::UserChosen).await.map(Some), None => Ok(None) }
 }
 #[tauri::command]
-async fn reopen_document(service: State<'_, PdfService>, path: String) -> Result<service::OpenResult, String> {
-    service.begin_open(std::path::PathBuf::from(path)).await
+async fn reopen_document(service: State<'_, PdfService>, grants: State<'_, open_path::OpenPathGrants>, path: String) -> Result<service::OpenResult, String> {
+    let path = std::path::PathBuf::from(path);
+    let origin = if grants.consume(&path) { open_path::OpenOrigin::UserChosen } else { open_path::OpenOrigin::Webview };
+    service.begin_open_from(path, origin).await
 }
 #[tauri::command]
 async fn unlock_document(service: State<'_, PdfService>, request_id: u64, password: String) -> Result<service::OpenResult, String> { service.unlock(request_id, password).await }
@@ -341,6 +343,15 @@ fn main() {
             app.manage(commands);
         }
         app.manage(service);
+        app.manage(open_path::OpenPathGrants::default());
+        if let Some(window) = app.get_webview_window("main") {
+            let handle = app.handle().clone();
+            window.on_window_event(move |event| {
+                if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
+                    if let Some(grants) = handle.try_state::<open_path::OpenPathGrants>() { for path in paths { grants.grant(path); } }
+                }
+            });
+        }
         app.manage(print_commands::PrintJobs::default());
         #[cfg(windows)]
         app.manage(image_pdf_commands::ImagePdfSelections::default());

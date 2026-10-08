@@ -74,6 +74,7 @@ pub(crate) async fn restore_recovery(app: tauri::AppHandle, service: State<'_, c
     let window = app.get_webview_window("main").ok_or("Application window is unavailable")?;
     let path = tauri::async_runtime::spawn_blocking(move || rfd::FileDialog::new().set_parent(&window).set_title("Restore unsaved PDF edits").add_filter("PDF documents", &["pdf"]).pick_file()).await.map_err(|error| error.to_string())?;
     let Some(path) = path else { return Ok(None); };
+    let path = crate::open_path::gate_open_path_from(path, crate::open_path::OpenOrigin::UserChosen).await?;
     service.restore_recovery(root, path).await.map(|result| result.map(|recovered| RecoveryRestoreResult { document: recovered.document, current_page: recovered.current_page }))
 }
 
