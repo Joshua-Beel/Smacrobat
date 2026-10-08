@@ -48,7 +48,7 @@ Updater tests cover interrupted downloads, timeouts, retry, reset progress count
 ## Open risks and verification work
 
 - A brief forms audit raised hardening hypotheses. Its small fixture did not reproduce an omission, the review tool blocked follow-up, and no forms change was validated or retained; this remains unverified work.
-- File reads and PDFium's source copy have no total memory limit, and the worker queue remains unbounded. Undo/redo snapshot allocations now share a 32 MiB per-document budget with oldest-history eviction. Close and EndPrint can bypass a bounded head run of viewer renders, but broader rapid-scroll and memory-pressure limits still need measurement.
+- File reads and PDFium's source copy have no total memory limit. The worker queue admits at most 256 pending non-render requests (cleanup is never refused) beside the 32-key viewer-render limit. Undo/redo snapshot allocations now share a 32 MiB per-document budget with oldest-history eviction. Close and EndPrint can bypass a bounded head run of viewer renders, but broader rapid-scroll and memory-pressure limits still need measurement.
 - Matching page counts do not prove that two parsers repair a damaged page tree in the same order. More damaged-document fixtures are needed.
 - Native parser crash isolation, fuzzing, a real-document compatibility corpus and sustained memory-pressure tests remain missing.
 - Reply leases stop when a public service method accepts and returns a plain DTO. They do not establish that Tauri, WebView, or JavaScript received that result; post-acceptance transport loss remains unverified.
