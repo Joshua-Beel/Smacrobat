@@ -33,6 +33,7 @@ mod searchable_pdf;
 #[cfg(windows)]
 mod searchable_ocr_job;
 mod update_attempt;
+mod update_commands;
 #[cfg(windows)]
 mod notices;
 #[cfg(windows)]
@@ -326,7 +327,7 @@ async fn fill_form_copy(app: tauri::AppHandle, service: State<'_, PdfService>, i
 }
 
 fn main() {
-    tauri::Builder::default().plugin(tauri_plugin_updater::Builder::new().build()).setup(|app| {
+    tauri::Builder::default().plugin(tauri_plugin_updater::Builder::new().build()).manage(update_commands::PendingUpdate::default()).setup(|app| {
         let library = app.path().resource_dir()?.join("resources/pdfium/bin/pdfium.dll");
         let recovery_root = app.path().app_data_dir()?.join("recovery");
         std::fs::create_dir_all(&recovery_root)?;
@@ -360,6 +361,6 @@ fn main() {
         app.manage(text_edit_commands::TextReplacementSelections::default());
         app.manage(recovery_commands::RecoveryCommands::default());
         Ok(())
-    }).invoke_handler(tauri::generate_handler![recovery_commands::checkpoint_recovery, recovery_commands::restore_recovery, recovery_commands::keep_recovered_edits, recovery_commands::open_original, recovery_commands::discard_recovery, read_update_attempt, write_update_attempt, clear_update_attempt, document_form_fields, fill_form_copy, open_document, reopen_document, open_example, render_page, export_page_image, close_document, edit_pages, crop_page, crop_pages, reset_crops, create_pdf_from_image, choose_image_pdf_sources, create_pdf_from_images, cancel_image_pdf_sources, inspect_image_replacement_target, replace_pdf_image_copy, cancel_image_replacement, inspect_text_replacement_target, replace_pdf_text_copy, cancel_text_replacement, create_comment, update_comment, delete_comment, document_comments, document_annotations, create_highlight, create_text_highlight, update_highlight, delete_highlight, save_copy, redact_document, split_document, combine_documents, insert_pages_copy, replace_pages_copy, page_text, page_text_geometry, document_bookmarks, document_page_labels, document_properties, dependency_notices, unlock_document, cancel_password_request, ocr_capability, recognize_page_ocr, create_searchable_ocr_copy, cancel_page_ocr, print_commands::print_document, print_commands::cancel_print])
+    }).invoke_handler(tauri::generate_handler![recovery_commands::checkpoint_recovery, recovery_commands::restore_recovery, recovery_commands::keep_recovered_edits, recovery_commands::open_original, recovery_commands::discard_recovery, read_update_attempt, write_update_attempt, clear_update_attempt, update_commands::check_for_update, update_commands::download_update, update_commands::install_update, update_commands::release_update, document_form_fields, fill_form_copy, open_document, reopen_document, open_example, render_page, export_page_image, close_document, edit_pages, crop_page, crop_pages, reset_crops, create_pdf_from_image, choose_image_pdf_sources, create_pdf_from_images, cancel_image_pdf_sources, inspect_image_replacement_target, replace_pdf_image_copy, cancel_image_replacement, inspect_text_replacement_target, replace_pdf_text_copy, cancel_text_replacement, create_comment, update_comment, delete_comment, document_comments, document_annotations, create_highlight, create_text_highlight, update_highlight, delete_highlight, save_copy, redact_document, split_document, combine_documents, insert_pages_copy, replace_pages_copy, page_text, page_text_geometry, document_bookmarks, document_page_labels, document_properties, dependency_notices, unlock_document, cancel_password_request, ocr_capability, recognize_page_ocr, create_searchable_ocr_copy, cancel_page_ocr, print_commands::print_document, print_commands::cancel_print])
       .run(tauri::generate_context!()).expect("Desktop application failed");
 }

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { getVersion } from '@tauri-apps/api/app';
-import { check, type Update } from '@tauri-apps/plugin-updater';
+import { checkForUpdate, type Update } from './updateCommands';
 import { native } from './bridge';
 import { clearUpdateAttempt, readUpdateAttempt, writeUpdateAttempt } from './updateAttempt';
 import s from './Updates.module.css';
@@ -35,7 +35,7 @@ export default function Updates({ dirty, busy, setBusy, close }: { dirty: boolea
             }
           } else if (attempt) await clearUpdateAttempt();
         }
-        const update = await check({ timeout: 20000 });
+        const update = await checkForUpdate();
         if (disposed) { await update?.close(); return; }
         pending.current = update; setAvailable(update);
         setStatus(update ? `Version ${update.version} is available.` : 'You have the latest released version.');
@@ -62,14 +62,14 @@ export default function Updates({ dirty, busy, setBusy, close }: { dirty: boolea
           setStatus(total ? `Downloading update: ${Math.min(100, Math.round(downloaded / total * 100))}%` : `Downloaded ${(downloaded / 1048576).toFixed(1)} MB`);
         }
         if (event.event === 'Finished') setStatus('Verifying update and starting installer…');
-      }, { timeout: 120000 });
+      });
       downloadComplete = true;
       try {
         await writeUpdateAttempt({ schemaVersion: 1, fromVersion: version, targetVersion: available.version, phase: 'installing' });
       } catch (reason) {
         throw new Error(`Update recovery state could not be saved. The installer was not started. You can retry. ${String(reason)}`);
       }
-      await available.install({ restartAfterInstall: true });
+      await available.install();
       throw new Error('Installer returned without closing the app.');
     } catch (e) {
       try { await clearUpdateAttempt(); } catch {}
@@ -84,7 +84,7 @@ export default function Updates({ dirty, busy, setBusy, close }: { dirty: boolea
           return;
         }
         try {
-          const refreshed = await check({ timeout: 20000 });
+          const refreshed = await checkForUpdate();
           pending.current = refreshed; setAvailable(refreshed);
           setStatus(refreshed ? 'Your installed version is unchanged. You can retry.' : 'You have the latest released version.');
         } catch {

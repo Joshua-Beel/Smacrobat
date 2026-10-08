@@ -1,12 +1,12 @@
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { check, type DownloadEvent } from '@tauri-apps/plugin-updater';
+import { checkForUpdate, type DownloadEvent } from './updateCommands';
 import Updates from './Updates';
 
 const attemptBridge = vi.hoisted(() => ({ read: vi.fn(), write: vi.fn(), clear: vi.fn() }));
 
 vi.mock('@tauri-apps/api/app', () => ({ getVersion: async () => '0.2.0' }));
-vi.mock('@tauri-apps/plugin-updater', () => ({ check: vi.fn() }));
+vi.mock('./updateCommands', () => ({ checkForUpdate: vi.fn() }));
 vi.mock('./bridge', () => ({ native: true }));
 vi.mock('./updateAttempt', () => ({
   readUpdateAttempt: attemptBridge.read,
@@ -28,14 +28,14 @@ describe('software updates', () => {
     return { ui, setBusy, close };
   };
   it('reports a successful no-update response', async () => {
-    vi.mocked(check).mockResolvedValue(null);
+    vi.mocked(checkForUpdate).mockResolvedValue(null);
     const { ui } = await mount();
     expect(JSON.stringify(ui.toJSON())).toContain('You have the latest released version.');
     act(() => ui.unmount());
   });
   it('retains and reports an interrupted download attempt', async () => {
     attemptBridge.read.mockResolvedValue({ schemaVersion: 1, fromVersion: '0.2.0', targetVersion: '0.3.0', phase: 'downloading' });
-    vi.mocked(check).mockResolvedValue({ version: '0.3.0', download: vi.fn(), install: vi.fn(), close: vi.fn() } as never);
+    vi.mocked(checkForUpdate).mockResolvedValue({ version: '0.3.0', download: vi.fn(), install: vi.fn(), close: vi.fn() } as never);
     const { ui } = await mount();
     expect(JSON.stringify(ui.toJSON())).toContain('The previous update download was interrupted. You can retry.');
     expect(attemptBridge.clear).not.toHaveBeenCalled();
@@ -44,7 +44,7 @@ describe('software updates', () => {
   it('keeps installer recovery fail-closed until completion or manual repair', async () => {
     attemptBridge.read.mockResolvedValue({ schemaVersion: 1, fromVersion: '0.2.0', targetVersion: '0.3.0', phase: 'installing' });
     const download = vi.fn(), install = vi.fn();
-    vi.mocked(check).mockResolvedValue({ version: '0.3.0', download, install, close: vi.fn() } as never);
+    vi.mocked(checkForUpdate).mockResolvedValue({ version: '0.3.0', download, install, close: vi.fn() } as never);
     const { ui, setBusy } = await mount();
     const button = ui.root.findAllByType('button').find(node => node.children.includes('Install update and restart'))!;
     expect(button.props.disabled).toBe(true);
@@ -63,7 +63,7 @@ describe('software updates', () => {
     { schemaVersion: 1, fromVersion: '0.1.0', targetVersion: '0.3.0', phase: 'downloading' }
   ])('clears completed or stale attempt records', async attempt => {
     attemptBridge.read.mockResolvedValue(attempt);
-    vi.mocked(check).mockResolvedValue(null);
+    vi.mocked(checkForUpdate).mockResolvedValue(null);
     const { ui } = await mount();
     expect(attemptBridge.clear).toHaveBeenCalledOnce();
     expect(JSON.stringify(ui.toJSON())).not.toContain('previous update');
@@ -71,7 +71,7 @@ describe('software updates', () => {
   });
   it('blocks installation when any document is dirty, even if called directly', async () => {
     const download = vi.fn(), install = vi.fn(), close = vi.fn();
-    vi.mocked(check).mockResolvedValue({ version: '0.3.0', download, install, close } as never);
+    vi.mocked(checkForUpdate).mockResolvedValue({ version: '0.3.0', download, install, close } as never);
     const { ui, setBusy } = await mount(true);
     const button = ui.root.findAllByType('button').find(node => node.children.includes('Install update and restart'))!;
     expect(button.props.disabled).toBe(true);
@@ -81,7 +81,7 @@ describe('software updates', () => {
   });
   it('absorbs an asynchronous release failure while the dialog unmounts', async () => {
     const release = vi.fn().mockRejectedValue(new Error('updater cleanup unavailable'));
-    vi.mocked(check).mockResolvedValue({ version: '0.3.0', download: vi.fn(), install: vi.fn(), close: release } as never);
+    vi.mocked(checkForUpdate).mockResolvedValue({ version: '0.3.0', download: vi.fn(), install: vi.fn(), close: release } as never);
     const { ui } = await mount();
     await act(async () => { ui.unmount(); await Promise.resolve(); });
     expect(release).toHaveBeenCalledOnce();
@@ -89,7 +89,7 @@ describe('software updates', () => {
   it('releases the busy guard and shows errors when signature verification fails', async () => {
     const download = vi.fn().mockRejectedValue(new Error('signature verification failed'));
     const install = vi.fn();
-    vi.mocked(check).mockResolvedValue({ version: '0.3.0', download, install, close: vi.fn() } as never);
+    vi.mocked(checkForUpdate).mockResolvedValue({ version: '0.3.0', download, install, close: vi.fn() } as never);
     const { ui, setBusy } = await mount();
     await act(async () => { ui.root.findAllByType('button').find(node => node.children.includes('Install update and restart'))!.props.onClick(); });
     expect(setBusy.mock.calls).toEqual([[true], [false]]);
@@ -101,7 +101,7 @@ describe('software updates', () => {
   it('does not download when the interruption marker cannot be persisted', async () => {
     attemptBridge.write.mockRejectedValueOnce(new Error('flush failed'));
     const download = vi.fn(), install = vi.fn();
-    vi.mocked(check).mockResolvedValue({ version: '0.3.0', download, install, close: vi.fn() } as never);
+    vi.mocked(checkForUpdate).mockResolvedValue({ version: '0.3.0', download, install, close: vi.fn() } as never);
     const { ui, setBusy } = await mount();
     await act(async () => { ui.root.findAllByType('button').find(node => node.children.includes('Install update and restart'))!.props.onClick(); });
     expect(download).not.toHaveBeenCalled();
@@ -114,13 +114,13 @@ describe('software updates', () => {
     attemptBridge.write.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error('flush failed'));
     const download = vi.fn().mockResolvedValue(undefined), install = vi.fn(), release = vi.fn().mockResolvedValue(undefined);
     const refreshed = { version: '0.3.0', download: vi.fn(), install: vi.fn(), close: vi.fn() };
-    vi.mocked(check).mockResolvedValueOnce({ version: '0.3.0', download, install, close: release } as never).mockResolvedValueOnce(refreshed as never);
+    vi.mocked(checkForUpdate).mockResolvedValueOnce({ version: '0.3.0', download, install, close: release } as never).mockResolvedValueOnce(refreshed as never);
     const { ui, setBusy } = await mount();
     await act(async () => { ui.root.findAllByType('button').find(node => node.children.includes('Install update and restart'))!.props.onClick(); });
     expect(download).toHaveBeenCalledOnce();
     expect(install).not.toHaveBeenCalled();
     expect(release).toHaveBeenCalledOnce();
-    expect(check).toHaveBeenCalledTimes(2);
+    expect(checkForUpdate).toHaveBeenCalledTimes(2);
     expect(JSON.stringify(ui.toJSON())).toContain('The installer was not started. You can retry.');
     expect(setBusy.mock.calls).toEqual([[true], [false]]);
     act(() => ui.unmount());
@@ -128,18 +128,18 @@ describe('software updates', () => {
   it('withholds retry when a downloaded updater resource cannot be released', async () => {
     attemptBridge.write.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error('flush failed'));
     const release = vi.fn().mockRejectedValue(new Error('resource busy'));
-    vi.mocked(check).mockResolvedValueOnce({ version: '0.3.0', download: vi.fn().mockResolvedValue(undefined), install: vi.fn(), close: release } as never);
+    vi.mocked(checkForUpdate).mockResolvedValueOnce({ version: '0.3.0', download: vi.fn().mockResolvedValue(undefined), install: vi.fn(), close: release } as never);
     const { ui, setBusy } = await mount();
     await act(async () => { ui.root.findAllByType('button').find(node => node.children.includes('Install update and restart'))!.props.onClick(); });
     expect(release).toHaveBeenCalledOnce();
-    expect(check).toHaveBeenCalledOnce();
+    expect(checkForUpdate).toHaveBeenCalledOnce();
     expect(ui.root.findAllByType('button').some(node => node.children.includes('Install update and restart'))).toBe(false);
     expect(JSON.stringify(ui.toJSON())).toContain('Close and reopen PDF Workstation to retry.');
     expect(setBusy.mock.calls).toEqual([[true], [false]]);
     act(() => ui.unmount());
   });
   it('reports network failure rather than claiming the app is current', async () => {
-    vi.mocked(check).mockRejectedValue(new Error('offline'));
+    vi.mocked(checkForUpdate).mockRejectedValue(new Error('offline'));
     const { ui } = await mount();
     expect(JSON.stringify(ui.toJSON())).toContain('Could not check for updates');
     expect(JSON.stringify(ui.toJSON())).not.toContain('latest released version');
@@ -151,18 +151,18 @@ describe('software updates', () => {
     const install = vi.fn(() => new Promise<void>((_, reject) => { failInstall = reject; }));
     const release = vi.fn().mockResolvedValue(undefined);
     const refreshed = { version: '0.3.0', download: vi.fn(), install: vi.fn(), close: vi.fn() };
-    vi.mocked(check).mockResolvedValueOnce({ version: '0.3.0', download, install, close: release } as never).mockResolvedValueOnce(refreshed as never);
+    vi.mocked(checkForUpdate).mockResolvedValueOnce({ version: '0.3.0', download, install, close: release } as never).mockResolvedValueOnce(refreshed as never);
     const { ui, setBusy } = await mount();
     const button = ui.root.findAllByType('button').find(node => node.children.includes('Install update and restart'))!;
     await act(async () => button.props.onClick());
     expect(attemptBridge.write).toHaveBeenNthCalledWith(1, { schemaVersion: 1, fromVersion: '0.2.0', targetVersion: '0.3.0', phase: 'downloading' });
     await act(async () => finishDownload());
-    expect(install).toHaveBeenCalledWith({ restartAfterInstall: true });
+    expect(install).toHaveBeenCalledWith();
     expect(attemptBridge.write).toHaveBeenNthCalledWith(2, { schemaVersion: 1, fromVersion: '0.2.0', targetVersion: '0.3.0', phase: 'installing' });
     await act(async () => failInstall(new Error('ShellExecute failed')));
     expect(attemptBridge.clear).toHaveBeenCalledOnce();
     expect(release).toHaveBeenCalledOnce();
-    expect(check).toHaveBeenCalledTimes(2);
+    expect(checkForUpdate).toHaveBeenCalledTimes(2);
     expect(JSON.stringify(ui.toJSON())).toContain('ShellExecute failed');
     expect(setBusy.mock.calls).toEqual([[true], [false]]);
     act(() => ui.unmount());
@@ -171,7 +171,7 @@ describe('software updates', () => {
     const download = vi.fn().mockResolvedValue(undefined);
     const install = vi.fn().mockResolvedValue(undefined);
     const release = vi.fn().mockResolvedValue(undefined);
-    vi.mocked(check).mockResolvedValueOnce({ version: '0.3.0', download, install, close: release } as never).mockResolvedValueOnce(null);
+    vi.mocked(checkForUpdate).mockResolvedValueOnce({ version: '0.3.0', download, install, close: release } as never).mockResolvedValueOnce(null);
     const { ui } = await mount();
     await act(async () => {
       ui.root.findAllByType('button').find(node => node.children.includes('Install update and restart'))!.props.onClick();
@@ -188,7 +188,7 @@ describe('software updates', () => {
     const install = vi.fn().mockRejectedValue(new Error('installer launch failed'));
     const release = vi.fn();
     const refreshedRelease = vi.fn();
-    vi.mocked(check)
+    vi.mocked(checkForUpdate)
       .mockResolvedValueOnce({ version: '0.3.0', download, install, close: release } as never)
       .mockResolvedValueOnce({ version: '0.3.0', download: vi.fn(), install: vi.fn(), close: refreshedRelease } as never);
     const { ui, setBusy, close } = await mount();
@@ -196,7 +196,7 @@ describe('software updates', () => {
     const closeButton = () => ui.root.findAllByType('button').find(node => node.children.includes('Close'))!;
     await act(async () => installButton().props.onClick());
     expect(download).toHaveBeenCalledOnce();
-    expect(download.mock.calls[0]).toEqual([expect.any(Function), { timeout: 120000 }]);
+    expect(download.mock.calls[0]).toEqual([expect.any(Function)]);
     expect(setBusy.mock.calls).toEqual([[true]]);
     expect(installButton().props.disabled).toBe(true);
     expect(closeButton().props.disabled).toBe(true);
@@ -229,7 +229,7 @@ describe('software updates', () => {
     act(() => attempts[1].emit({ event: 'Finished' }));
     expect(JSON.stringify(ui.toJSON())).toContain('Verifying update and starting installer');
     await act(async () => attempts[1].resolve());
-    expect(install).toHaveBeenCalledWith({ restartAfterInstall: true });
+    expect(install).toHaveBeenCalledWith();
     expect(setBusy.mock.calls).toEqual([[true], [false], [true], [false]]);
     act(() => ui.root.findByType('dialog').props.onCancel({ preventDefault }));
     expect(close).toHaveBeenCalledOnce();

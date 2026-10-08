@@ -62768,7 +62768,7 @@ PackageDownloadLocation: git+ssh://github.com/tauri-apps/wry.git
 Creator: Person: Daniel Thompson-Yvetot
 
 ==============================================================================
-cargo: yoke-derive 0.8.3
+cargo: yoke-derive 0.8.4
 Declared license: Unicode-3.0
 Scope: build-or-auxiliary
 Source: registry+https://github.com/rust-lang/crates.io-index
