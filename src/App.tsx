@@ -398,14 +398,14 @@ export default function App() {
   const edit = async (action: PageEdit): Promise<boolean> => {
     if (!doc || busy || searchableOcrTarget || newCopyModalOpen || closingDocument.current !== null) return false;
     setBusy(true); setError(''); setNotice('');
-    try { updateDocument(await editPages(doc.id, action, clampPage(page, doc.pages.length))); return true; }
+    try { updateDocument(await editPages(doc.id, doc.revision, action, clampPage(page, doc.pages.length))); return true; }
     catch (e) { if (!await handleCommittedRecoveryFailure(doc.id, doc.revision, e)) setError(String(e)); return false; } finally { setBusy(false); }
   };
   const save = async (pages?: number[]) => {
     if (!doc || busy || searchableOcrTarget || newCopyModalOpen || closingDocument.current !== null) return;
     setBusy(true); setError(''); setNotice('');
     try {
-      const result = await saveCopy(doc.id, pages);
+      const result = await saveCopy(doc.id, doc.revision, pages);
       if (result) { updateDocument(result.document); setNotice(`Saved ${pages ? 'selected pages' : 'a copy'} to ${result.path}`); }
     } catch (e) { setError(String(e)); } finally { setBusy(false); }
   };

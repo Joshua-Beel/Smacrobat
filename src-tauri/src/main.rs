@@ -165,8 +165,8 @@ async fn dependency_notices(app: tauri::AppHandle) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn edit_pages(service: State<'_, PdfService>, id: u64, edit: editor::PageEdit, current_page: u32) -> Result<DocumentInfo, recovery_commands::MutationCommandError> {
-    service.edit(id, edit, current_page).await.map_err(Into::into)
+async fn edit_pages(service: State<'_, PdfService>, id: u64, revision: u64, edit: editor::PageEdit, current_page: u32) -> Result<DocumentInfo, recovery_commands::MutationCommandError> {
+    service.edit_at(id, revision, edit, current_page).await.map_err(Into::into)
 }
 #[tauri::command]
 async fn crop_page(service: State<'_, PdfService>, id: u64, page: u16, revision: u64, rect: service::CropRect, current_page: u32) -> Result<DocumentInfo, recovery_commands::MutationCommandError> {
@@ -181,11 +181,11 @@ async fn reset_crops(service: State<'_, PdfService>, id: u64, revision: u64, pag
     service.reset_crops(id, pages, revision, current_page).await.map_err(Into::into)
 }
 #[tauri::command]
-async fn save_copy(app: tauri::AppHandle, service: State<'_, PdfService>, id: u64, pages: Option<Vec<usize>>) -> Result<Option<service::SavedCopy>, String> {
+async fn save_copy(app: tauri::AppHandle, service: State<'_, PdfService>, id: u64, revision: u64, pages: Option<Vec<usize>>) -> Result<Option<service::SavedCopy>, String> {
     let window = app.get_webview_window("main").ok_or("Application window is unavailable")?;
     let suggested = if pages.is_some() { "extracted-pages.pdf" } else { "organized-copy.pdf" };
     let path = tauri::async_runtime::spawn_blocking(move || rfd::FileDialog::new().set_parent(&window).add_filter("PDF documents", &["pdf"]).set_file_name(suggested).save_file()).await.map_err(|e| e.to_string())?;
-    match path { Some(path) => service.save(id, pages, path).await.map(Some), None => Ok(None) }
+    match path { Some(path) => service.save_at(id, revision, pages, path).await.map(Some), None => Ok(None) }
 }
 
 #[tauri::command]

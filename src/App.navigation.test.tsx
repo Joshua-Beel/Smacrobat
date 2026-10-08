@@ -2,7 +2,7 @@ import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import App from './App';
 import Viewer from './Viewer';
-import { documentPageLabels, editPages, openDocument, pageText, renderPage, resetCrops } from './bridge';
+import { documentPageLabels, editPages, openDocument, pageText, renderPage, resetCrops, saveCopy } from './bridge';
 import type { DocumentInfo } from './model';
 vi.mock('./bridge', () => ({ native: false, openDocument: vi.fn(), reopenDocument: vi.fn(), closeDocument: vi.fn(), editPages: vi.fn(), saveCopy: vi.fn(), pageText: vi.fn(), renderPage: vi.fn(), resetCrops: vi.fn(), createPdfFromImage: vi.fn(), documentPageLabels: vi.fn() }));
 vi.mock('./Viewer', () => ({ default: () => <div>Viewer</div> }));
@@ -38,7 +38,7 @@ it('clamps the remembered position when page edits shorten a document', async ()
   act(() => ui.root.findByType(Viewer).props.onPage(5));
   vi.mocked(editPages).mockResolvedValue({ ...document(1), pages: document(1).pages.slice(0, 2), revision: 1 });
   await act(async () => ui.root.findByProps({ 'aria-label': 'Undo' }).props.onClick());
-  expect(editPages).toHaveBeenLastCalledWith(1, { kind: 'undo' }, 5);
+  expect(editPages).toHaveBeenLastCalledWith(1, 0, { kind: 'undo' }, 5);
   await open(ui, 2);
   act(() => tab(ui, 'file-1.pdf').props.onClick());
   expect(ui.root.findByType(Viewer).props.target.page).toBe(1);
@@ -87,6 +87,27 @@ it('keeps reset-crop no-ops neutral and allows a stale failure to retry without 
   expect(resetCrops).toHaveBeenLastCalledWith(1, 0, [3], 3);
   expect(ui.root.findByProps({ 'aria-label': 'Select page 4' }).props['aria-pressed']).toBe(true);
   expect(text(ui.toJSON())).toContain('Unsaved changes');
+  act(() => ui.unmount());
+});
+it('sends the rendered revision with page edits and saves and surfaces a stale-revision rejection', async () => {
+  let ui!: ReactTestRenderer; act(() => { ui = create(<App />); });
+  await open(ui, 1);
+  vi.mocked(editPages).mockRejectedValueOnce('Document changed. Reload the page list and try again.');
+  await act(async () => ui.root.findByProps({ 'aria-label': 'Undo' }).props.onClick());
+  expect(editPages).toHaveBeenLastCalledWith(1, 0, { kind: 'undo' }, 0);
+  expect(text(ui.toJSON())).toContain('Document changed. Reload the page list and try again.');
+  vi.mocked(saveCopy).mockRejectedValueOnce('Document changed. Reload the page list and try again.');
+  await act(async () => ui.root.findByProps({ 'aria-label': 'Save a copy' }).props.onClick());
+  expect(saveCopy).toHaveBeenLastCalledWith(1, 0, undefined);
+  expect(text(ui.toJSON())).toContain('Document changed. Reload the page list and try again.');
+  vi.mocked(editPages).mockResolvedValueOnce({ ...document(1), revision: 3, dirty: true });
+  await act(async () => ui.root.findByProps({ 'aria-label': 'Undo' }).props.onClick());
+  vi.mocked(saveCopy).mockResolvedValueOnce(null);
+  await act(async () => ui.root.findByProps({ 'aria-label': 'Save a copy' }).props.onClick());
+  expect(saveCopy).toHaveBeenLastCalledWith(1, 3, undefined);
+  vi.mocked(editPages).mockResolvedValueOnce({ ...document(1), revision: 4, dirty: true });
+  await act(async () => ui.root.findByProps({ 'aria-label': 'Undo' }).props.onClick());
+  expect(editPages).toHaveBeenLastCalledWith(1, 3, { kind: 'undo' }, 0);
   act(() => ui.unmount());
 });
 it('shows labels as secondary text while numeric navigation stays physical', async () => {
