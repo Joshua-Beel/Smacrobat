@@ -670,6 +670,7 @@ impl PdfService {
                             if !session.dirty() { return Err("Only unsaved edits can be stored for recovery.".into()); }
                             if current_page as usize >= session.plan.len() { return Err("Current page is out of range.".into()); }
                             ensure_recovery_owner(Some(&root), &recovery_heads, &mut recovery_floors, id, session)?;
+                            if recovery_checkpoint_current(&root, recovery_heads.get(&id), session, original, current_page)? { return Ok(()); }
                             let record = persist_recovery_state(Some(&root), &mut recovery_floors, session, original, current_page)?.ok_or("Recovery is unavailable.")?;
                             recovery_heads.insert(id, (record.source, record.generation));
                             Ok(())
@@ -1742,6 +1743,15 @@ fn persist_recovery_state(root: Option<&std::path::Path>, floors: &mut HashMap<c
     if verified != record { return Err(format!("{RECOVERY_COMMITTED_REOPEN_REQUIRED}: Recovery changed after publication. Close and reopen this PDF.")); }
     accept_recovery_record(floors, &verified)?;
     Ok(Some(record))
+}
+fn recovery_checkpoint_current(root: &std::path::Path, head: Option<&(crate::recovery_journal::SourceIdentity, u64)>, session: &EditSession, original: &DocumentInfo, current_page: u32) -> Result<bool, String> {
+    let source = recovery_source_identity(&session.source)?;
+    let Some(current) = crate::recovery_store::read_recovery(root, source, None, 0)? else { return Ok(false); };
+    if !current.active || head != Some(&(source, current.generation)) || current.revision != session.revision || current.current_page != current_page { return Ok(false); }
+    if recovery_record(session, source, current.generation, current_page, original.pages.len())? != current { return Ok(false); }
+    let disk = std::fs::read(&original.path).map_err(|_| "The source PDF changed or became unavailable; recovery was not updated.".to_owned())?;
+    if disk != session.source { return Err("The source PDF changed outside the app; recovery was not updated.".into()); }
+    Ok(true)
 }
 fn ensure_recovery_owner(root: Option<&std::path::Path>, heads: &HashMap<u64, (crate::recovery_journal::SourceIdentity, u64)>, floors: &mut HashMap<crate::recovery_journal::SourceIdentity, crate::recovery_journal::RecoveryRecord>, id: u64, session: &EditSession) -> Result<(), String> {
     let source = recovery_source_identity(&session.source)?;
@@ -4905,6 +4915,21 @@ mod tests {
         sender.send(Request::Text(1,0,0,oneshot::channel().0)).unwrap();sender.send(Request::CheckpointRecovery(PathBuf::new(),1,0,0,oneshot::channel().0)).unwrap();sender.send(Request::Edit(1,PageEdit::Undo,oneshot::channel().0)).unwrap();
         let queued=pending(&sender);assert_eq!(queued,4*6+64+3);assert!(queued*2<=WORKER_QUEUE_LIMIT,"the worst UI fan-out keeps at least half the queue free");
         assert_eq!(receiver.try_iter().count(),queued);
+    }
+    #[test]
+    fn unchanged_recovery_checkpoint_skips_the_journal_write(){
+        let manifest=PathBuf::from(env!("CARGO_MANIFEST_DIR"));let folder=tempfile::tempdir().unwrap();let recovery=folder.path().join("recovery");std::fs::create_dir(&recovery).unwrap();let source_path=folder.path().join("source.pdf");let source=std::fs::read(manifest.join("resources/welcome.pdf")).unwrap();std::fs::write(&source_path,&source).unwrap();let identity=recovery_source_identity(&source).unwrap();
+        let service=PdfService::start(manifest.join("resources/pdfium/bin/pdfium.dll"));let opened=call(&service,|reply|Request::Open(source_path.clone(),reply)).unwrap();
+        let journal=|revision:u64|{let record=crate::recovery_store::read_recovery(&recovery,identity,None,revision).unwrap().unwrap();(record.generation,record.current_page)};
+        let edited=call(&service,|reply|Request::Edit(opened.id,PageEdit::Rotate{pages:vec![0],clockwise:true},reply)).unwrap();
+        call(&service,|reply|Request::CheckpointRecovery(recovery.clone(),edited.id,edited.revision,0,reply)).unwrap();assert_eq!(journal(edited.revision),(1,0));
+        call(&service,|reply|Request::CheckpointRecovery(recovery.clone(),edited.id,edited.revision,0,reply)).unwrap();assert_eq!(journal(edited.revision),(1,0),"an unchanged checkpoint must not rewrite the journal");
+        std::fs::write(&source_path,b"changed").unwrap();assert!(call(&service,|reply|Request::CheckpointRecovery(recovery.clone(),edited.id,edited.revision,0,reply)).unwrap_err().contains("changed outside"),"a skipped write still verifies the source");std::fs::write(&source_path,&source).unwrap();
+        call(&service,|reply|Request::CheckpointRecovery(recovery.clone(),edited.id,edited.revision,1,reply)).unwrap();assert_eq!(journal(edited.revision),(2,1),"a new current page is a change");
+        call(&service,|reply|Request::CheckpointRecovery(recovery.clone(),edited.id,edited.revision,1,reply)).unwrap();assert_eq!(journal(edited.revision),(2,1));
+        let edited=call(&service,|reply|Request::Edit(edited.id,PageEdit::Rotate{pages:vec![1],clockwise:true},reply)).unwrap();
+        call(&service,|reply|Request::CheckpointRecovery(recovery.clone(),edited.id,edited.revision,1,reply)).unwrap();assert_eq!(journal(edited.revision),(3,1),"a new revision is a change");
+        call(&service,|reply|Request::Close(edited.id,reply)).unwrap();
     }
     #[test]
     fn viewer_render_admission_bounds_coalesces_and_respects_barriers(){
