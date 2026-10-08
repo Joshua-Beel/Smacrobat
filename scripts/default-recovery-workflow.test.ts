@@ -130,16 +130,19 @@ it('resolves every command the verifier reaches through its own importer and dot
   expect(result.stdout).toContain('PASS');
 }, 120_000);
 
+const refusedProxy = 'http://127.0.0.1:9';
+const refusedProxyEnv = { HTTPS_PROXY: refusedProxy, HTTP_PROXY: refusedProxy, ALL_PROXY: refusedProxy };
+
 it('binds every placeholder argument and stops at input validation before any request', () => {
-  const result = dryRun({ DraftProofRunId: 'placeholder' });
+  const result = dryRun({ DraftProofRunId: 'placeholder' }, refusedProxyEnv);
   expect(result.status).not.toBe(0);
   expect(result.stderr + result.stdout).toContain('Step 1 run id must be one positive base-10 integer.');
   expect(result.stderr + result.stdout).not.toMatch(/CommandNotFoundException|is not recognized|ParameterBindingException|Cannot overwrite variable/);
+  expect(result.stderr + result.stdout).not.toContain('127.0.0.1:9');
 }, 60_000);
 
 it('passes input validation with well-formed placeholders and fails at the first GitHub request', () => {
-  const proxy = 'http://127.0.0.1:9';
-  const result = dryRun({}, { HTTPS_PROXY: proxy, HTTP_PROXY: proxy, ALL_PROXY: proxy });
+  const result = dryRun({}, refusedProxyEnv);
   const output = result.stderr + result.stdout;
   expect(result.status).not.toBe(0);
   expect(output).toContain('GetResult');
