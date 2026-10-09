@@ -7,7 +7,7 @@ export type DownloadEvent =
 
 export type InstallOutcome = 'cancelled' | 'started';
 
-type UpdateOffer = { currentVersion: string; version: string; body: string | null; signature: string };
+type UpdateOffer = { currentVersion: string; version: string; body: string | null; signature: string; check: number };
 
 export type Update = {
   version: string;
@@ -17,12 +17,10 @@ export type Update = {
   close: () => Promise<void>;
 };
 
-export const releaseUpdate = () => invoke<void>('release_update');
-
 export async function checkForUpdate(): Promise<Update | null> {
   const offer = await invoke<UpdateOffer | null>('check_for_update');
   if (!offer) return null;
-  const update = { version: offer.version, signature: offer.signature };
+  const update = { version: offer.version, signature: offer.signature, check: offer.check };
   return {
     version: offer.version,
     body: offer.body,
@@ -32,6 +30,6 @@ export async function checkForUpdate(): Promise<Update | null> {
       return invoke<void>('download_update', { update, onEvent: channel });
     },
     install: () => invoke<InstallOutcome>('install_update', { update }),
-    close: releaseUpdate
+    close: () => invoke<void>('release_update', { update })
   };
 }

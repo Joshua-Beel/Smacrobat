@@ -14,6 +14,9 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 pub struct UpdateKey {
     pub version: String,
     pub signature: String,
+    /// The backend's number for the check that produced this offer, so two
+    /// checks of the same release are still different offers.
+    pub check: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -23,6 +26,7 @@ pub struct UpdateOffer {
     pub version: String,
     pub body: Option<String>,
     pub signature: String,
+    pub check: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -47,33 +51,49 @@ enum Stage<U, B> {
 /// signature; install consumes it.
 pub struct UpdateSlot<U, B> {
     stage: Stage<U, B>,
+    latest_check: u64,
 }
 
 impl<U, B> Default for UpdateSlot<U, B> {
     fn default() -> Self {
-        Self { stage: Stage::Empty }
+        Self { stage: Stage::Empty, latest_check: 0 }
     }
 }
 
 impl<U, B> UpdateSlot<U, B> {
+    /// Clears any previous offer and numbers the new check. Only the latest
+    /// check may store its result.
+    pub fn begin_check(&mut self) -> Result<u64, String> {
+        if matches!(self.stage, Stage::Downloading(_)) {
+            return Err("An update download is already in progress.".into());
+        }
+        self.stage = Stage::Empty;
+        self.latest_check += 1;
+        Ok(self.latest_check)
+    }
+
     pub fn offer(&mut self, key: UpdateKey, update: U) -> Result<(), String> {
         if matches!(self.stage, Stage::Downloading(_)) {
             return Err("An update download is already in progress.".into());
+        }
+        if key.check != self.latest_check {
+            return Err("A newer update check replaced this one.".into());
         }
         self.stage = Stage::Checked(key, update);
         Ok(())
     }
 
-    pub fn clear_unless_downloading(&mut self) -> Result<(), String> {
-        if matches!(self.stage, Stage::Downloading(_)) {
-            return Err("An update download is already in progress.".into());
+    /// Clears the slot only if it holds the offer named by `key`; another
+    /// check's offer is left alone. Returns whether anything was released.
+    pub fn release(&mut self, key: &UpdateKey) -> bool {
+        let matches = match &self.stage {
+            Stage::Checked(held, _) | Stage::Downloading(held) | Stage::Downloaded(held, ..) => held == key,
+            Stage::Empty => false,
+        };
+        if matches {
+            self.stage = Stage::Empty;
         }
-        self.stage = Stage::Empty;
-        Ok(())
-    }
-
-    pub fn release(&mut self) {
-        self.stage = Stage::Empty;
+        matches
     }
 
     pub fn begin_download(&mut self, key: &UpdateKey) -> Result<U, String> {
@@ -154,7 +174,7 @@ fn lock<'a>(state: &'a State<'_, PendingUpdate>) -> Result<std::sync::MutexGuard
 
 #[tauri::command]
 pub async fn check_for_update<R: Runtime>(app: AppHandle<R>, state: State<'_, PendingUpdate>) -> Result<Option<UpdateOffer>, String> {
-    lock(&state)?.clear_unless_downloading()?;
+    let check = lock(&state)?.begin_check()?;
     let updater = app
         .updater_builder()
         .timeout(CHECK_TIMEOUT)
@@ -165,8 +185,8 @@ pub async fn check_for_update<R: Runtime>(app: AppHandle<R>, state: State<'_, Pe
     if !is_upgrade(&app.package_info().version, &update.version) {
         return Ok(None);
     }
-    let offer = UpdateOffer { current_version: update.current_version.clone(), version: update.version.clone(), body: update.body.clone(), signature: update.signature.clone() };
-    lock(&state)?.offer(UpdateKey { version: offer.version.clone(), signature: offer.signature.clone() }, update)?;
+    let offer = UpdateOffer { current_version: update.current_version.clone(), version: update.version.clone(), body: update.body.clone(), signature: update.signature.clone(), check };
+    lock(&state)?.offer(UpdateKey { version: offer.version.clone(), signature: offer.signature.clone(), check }, update)?;
     Ok(Some(offer))
 }
 
@@ -263,8 +283,8 @@ pub async fn install_update<R: Runtime>(app: AppHandle<R>, update: UpdateKey) ->
 }
 
 #[tauri::command]
-pub fn release_update(state: State<'_, PendingUpdate>) -> Result<(), String> {
-    lock(&state)?.release();
+pub fn release_update(state: State<'_, PendingUpdate>, update: UpdateKey) -> Result<(), String> {
+    lock(&state)?.release(&update);
     Ok(())
 }
 
@@ -273,11 +293,18 @@ mod tests {
     use super::*;
 
     fn key(version: &str, signature: &str) -> UpdateKey {
-        UpdateKey { version: version.into(), signature: signature.into() }
+        UpdateKey { version: version.into(), signature: signature.into(), check: 1 }
+    }
+
+    /// A slot whose first check (number 1) is in flight.
+    fn fresh<U>() -> UpdateSlot<U, Vec<u8>> {
+        let mut slot = UpdateSlot::default();
+        assert_eq!(slot.begin_check(), Ok(1));
+        slot
     }
 
     fn downloaded(k: &UpdateKey) -> UpdateSlot<&'static str, Vec<u8>> {
-        let mut slot = UpdateSlot::default();
+        let mut slot = fresh();
         slot.offer(k.clone(), "update").unwrap();
         let update = slot.begin_download(k).unwrap();
         assert!(slot.finish_download(k, update, Ok(vec![1, 2, 3])));
@@ -286,9 +313,10 @@ mod tests {
 
     #[test]
     fn webview_key_rejects_endpoint_proxy_header_target_and_downgrade_fields() {
-        assert_eq!(serde_json::from_value::<UpdateKey>(serde_json::json!({ "version": "0.3.0", "signature": "sig" })).unwrap(), key("0.3.0", "sig"));
+        assert_eq!(serde_json::from_value::<UpdateKey>(serde_json::json!({ "version": "0.3.0", "signature": "sig", "check": 1 })).unwrap(), key("0.3.0", "sig"));
+        assert!(serde_json::from_value::<UpdateKey>(serde_json::json!({ "version": "0.3.0", "signature": "sig" })).is_err(), "the check number is required");
         for extra in ["proxy", "headers", "target", "allowDowngrades", "endpoints", "pubkey", "timeout", "restartAfterInstall", "rid"] {
-            let mut value = serde_json::json!({ "version": "0.3.0", "signature": "sig" });
+            let mut value = serde_json::json!({ "version": "0.3.0", "signature": "sig", "check": 1 });
             value[extra] = serde_json::json!("http://attacker.invalid");
             assert!(serde_json::from_value::<UpdateKey>(value).is_err(), "{extra} must be rejected");
         }
@@ -297,7 +325,7 @@ mod tests {
     #[test]
     fn install_rejects_without_a_prior_check_or_download() {
         let k = key("0.3.0", "sig");
-        let mut slot: UpdateSlot<&str, Vec<u8>> = UpdateSlot::default();
+        let mut slot: UpdateSlot<&str, Vec<u8>> = fresh();
         assert!(slot.take_for_install(&k).is_err());
         assert!(slot.begin_download(&k).is_err());
         slot.offer(k.clone(), "update").unwrap();
@@ -321,7 +349,7 @@ mod tests {
         assert!(slot.take_for_install(&key("0.3.0", "other")).is_err());
         assert!(slot.take_for_install(&key("0.4.0", "sig")).is_err());
         assert!(slot.take_for_install(&k).is_ok());
-        let mut checked: UpdateSlot<&str, Vec<u8>> = UpdateSlot::default();
+        let mut checked: UpdateSlot<&str, Vec<u8>> = fresh();
         checked.offer(k.clone(), "update").unwrap();
         assert!(checked.begin_download(&key("0.3.0", "forged")).is_err());
         assert!(checked.begin_download(&k).is_ok());
@@ -330,9 +358,10 @@ mod tests {
     #[test]
     fn a_new_check_replaces_the_previous_offer() {
         let old = key("0.3.0", "old");
-        let new = key("0.3.1", "new");
+        let new = UpdateKey { check: 2, ..key("0.3.1", "new") };
         let mut slot = downloaded(&old);
-        slot.clear_unless_downloading().unwrap();
+        assert_eq!(slot.begin_check(), Ok(2));
+        assert!(slot.begin_download(&old).is_err(), "starting a check clears the previous offer");
         slot.offer(new.clone(), "newer").unwrap();
         assert!(slot.begin_download(&old).is_err());
         assert_eq!(slot.begin_download(&new).unwrap(), "newer");
@@ -341,7 +370,7 @@ mod tests {
     #[test]
     fn failed_download_keeps_the_offer_for_retry_and_concurrent_download_is_refused() {
         let k = key("0.3.0", "sig");
-        let mut slot: UpdateSlot<&str, Vec<u8>> = UpdateSlot::default();
+        let mut slot: UpdateSlot<&str, Vec<u8>> = fresh();
         slot.offer(k.clone(), "update").unwrap();
         let update = slot.begin_download(&k).unwrap();
         assert!(slot.begin_download(&k).is_err());
@@ -357,12 +386,37 @@ mod tests {
     #[test]
     fn release_during_download_discards_the_result() {
         let k = key("0.3.0", "sig");
-        let mut slot: UpdateSlot<&str, Vec<u8>> = UpdateSlot::default();
+        let mut slot: UpdateSlot<&str, Vec<u8>> = fresh();
         slot.offer(k.clone(), "update").unwrap();
         let update = slot.begin_download(&k).unwrap();
-        slot.release();
+        assert!(slot.release(&k));
         assert!(!slot.finish_download(&k, update, Ok(vec![1])));
         assert!(slot.take_for_install(&k).is_err());
+    }
+
+    #[test]
+    fn release_clears_only_the_named_offer() {
+        let k = key("0.3.0", "sig");
+        let mut slot = downloaded(&k);
+        for other in [key("0.3.0", "other"), key("0.4.0", "sig"), UpdateKey { check: 2, ..k.clone() }] {
+            assert!(!slot.release(&other));
+        }
+        assert_eq!(slot.take_for_install(&k).unwrap().0, "update", "a non-matching release keeps the offer");
+        let mut empty: UpdateSlot<&str, Vec<u8>> = fresh();
+        assert!(!empty.release(&k));
+    }
+
+    #[test]
+    fn a_stale_check_cannot_replace_or_release_a_newer_checks_offer() {
+        let mut slot: UpdateSlot<&str, Vec<u8>> = UpdateSlot::default();
+        let closed = slot.begin_check().unwrap();
+        let reopened = slot.begin_check().unwrap();
+        let fresh_key = UpdateKey { version: "0.3.0".into(), signature: "sig".into(), check: reopened };
+        let stale_key = UpdateKey { check: closed, ..fresh_key.clone() };
+        slot.offer(fresh_key.clone(), "reopened").unwrap();
+        assert!(slot.offer(stale_key.clone(), "closed").is_err(), "a check that finishes late must not replace the latest offer");
+        assert!(!slot.release(&stale_key), "the closed dialog's release names the same release but a different check");
+        assert_eq!(slot.begin_download(&fresh_key).unwrap(), "reopened");
     }
 
     fn current() -> semver::Version {
@@ -410,7 +464,7 @@ mod tests {
         let k = key("0.3.0", "sig");
         let slot = Mutex::new(downloaded(&k));
         let mut installed = false;
-        let outcome = install_confirmed(&slot, &k, &current(), |_| { slot.lock().unwrap().release(); true }, |_, _| { installed = true; Ok(()) });
+        let outcome = install_confirmed(&slot, &k, &current(), |_| { slot.lock().unwrap().release(&k); true }, |_, _| { installed = true; Ok(()) });
         assert!(outcome.is_err());
         assert!(!installed);
     }

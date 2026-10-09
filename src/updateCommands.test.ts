@@ -7,7 +7,8 @@ vi.mock('@tauri-apps/api/core', () => ({
   Channel: class { onmessage: (event: unknown) => void = () => {}; }
 }));
 
-const offer = { currentVersion: '0.2.0', version: '0.3.0', body: 'Notes', signature: 'c2ln' };
+const offer = { currentVersion: '0.2.0', version: '0.3.0', body: 'Notes', signature: 'c2ln', check: 7 };
+const key = { version: '0.3.0', signature: 'c2ln', check: 7 };
 const forbidden = ['proxy', 'headers', 'target', 'allowDowngrades', 'endpoints', 'pubkey', 'timeout', 'restartAfterInstall', 'rid'];
 const sentKeys = () => vi.mocked(invoke).mock.calls.flatMap(([, args]) => {
   const record = (args ?? {}) as Record<string, unknown>;
@@ -38,13 +39,26 @@ describe('app-owned updater commands', () => {
     await update.download(event => events.push(event));
     expect(events.map(event => event.event)).toEqual(['Started', 'Finished']);
     expect(vi.mocked(invoke).mock.calls[1][0]).toBe('download_update');
-    expect((vi.mocked(invoke).mock.calls[1][1] as { update: unknown }).update).toEqual({ version: '0.3.0', signature: 'c2ln' });
+    expect((vi.mocked(invoke).mock.calls[1][1] as { update: unknown }).update).toEqual(key);
     vi.mocked(invoke).mockResolvedValueOnce('cancelled');
     expect(await update.install()).toBe('cancelled');
-    expect(vi.mocked(invoke).mock.calls[2]).toEqual(['install_update', { update: { version: '0.3.0', signature: 'c2ln' } }]);
+    expect(vi.mocked(invoke).mock.calls[2]).toEqual(['install_update', { update: key }]);
     vi.mocked(invoke).mockResolvedValueOnce(undefined);
     await update.close();
-    expect(vi.mocked(invoke).mock.calls[3]).toEqual(['release_update']);
-    expect(sentKeys().filter(key => forbidden.includes(key))).toEqual([]);
+    expect(vi.mocked(invoke).mock.calls[3]).toEqual(['release_update', { update: key }]);
+    expect(sentKeys().filter(name => forbidden.includes(name))).toEqual([]);
+  });
+
+  it('releases only its own offer, so a stale dialog cannot release a newer check', async () => {
+    vi.mocked(invoke).mockResolvedValueOnce(offer).mockResolvedValueOnce({ ...offer, check: 8 });
+    const closed = (await checkForUpdate())!;
+    const reopened = (await checkForUpdate())!;
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    await closed.close();
+    await reopened.close();
+    expect(vi.mocked(invoke).mock.calls.slice(2)).toEqual([
+      ['release_update', { update: key }],
+      ['release_update', { update: { ...key, check: 8 } }]
+    ]);
   });
 });

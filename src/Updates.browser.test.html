@@ -4,7 +4,7 @@ window.isTauri=true;
 window.addEventListener('unhandledrejection',event=>{document.body.dataset.rejection=String(event.reason)});
 window.__TAURI_INTERNALS__={invoke:async command=>{
   if(command==='plugin:app|version')return'0.2.0';
-  if(command==='check_for_update')return{currentVersion:'0.2.0',version:'0.3.0',body:null,signature:'c2ln'};
+  if(command==='check_for_update')return{currentVersion:'0.2.0',version:'0.3.0',body:null,signature:'c2ln',check:1};
   if(command==='release_update'){document.body.dataset.closeCalls=String(Number(document.body.dataset.closeCalls||0)+1);return Promise.reject(new Error('updater cleanup unavailable'))}
   throw new Error(command);
 }};
