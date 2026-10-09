@@ -167,6 +167,28 @@ describe('software updates', () => {
     expect(setBusy.mock.calls).toEqual([[true], [false]]);
     act(() => ui.unmount());
   });
+  it('shows a declined native install confirmation calmly and keeps the offer', async () => {
+    let answer!: (outcome: 'cancelled') => void;
+    const download = vi.fn().mockResolvedValue(undefined);
+    const install = vi.fn(() => new Promise<'cancelled'>(resolve => { answer = resolve; }));
+    const release = vi.fn().mockResolvedValue(undefined);
+    vi.mocked(checkForUpdate).mockResolvedValueOnce({ version: '0.3.0', download, install, close: release } as never);
+    const { ui, setBusy } = await mount();
+    const installButton = () => ui.root.findAllByType('button').find(node => node.children.includes('Install update and restart'))!;
+    await act(async () => { installButton().props.onClick(); await Promise.resolve(); await Promise.resolve(); });
+    expect(install).toHaveBeenCalledOnce();
+    expect(JSON.stringify(ui.toJSON())).toContain('Waiting for you to confirm installing version 0.3.0');
+    await act(async () => answer('cancelled'));
+    expect(JSON.stringify(ui.toJSON())).toContain('Version 0.3.0 was not installed. Your installed version is unchanged. You can install it later.');
+    expect(ui.root.findAllByProps({ role: 'alert' })).toHaveLength(0);
+    expect(attemptBridge.clear).toHaveBeenCalledOnce();
+    expect(release).not.toHaveBeenCalled();
+    expect(checkForUpdate).toHaveBeenCalledOnce();
+    expect(installButton().props.disabled).toBe(false);
+    expect(setBusy.mock.calls).toEqual([[true], [false]]);
+    act(() => ui.unmount());
+    expect(release).toHaveBeenCalledOnce();
+  });
   it('treats an installer promise resolving on Windows as a retryable failure', async () => {
     const download = vi.fn().mockResolvedValue(undefined);
     const install = vi.fn().mockResolvedValue(undefined);

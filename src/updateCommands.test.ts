@@ -39,8 +39,8 @@ describe('app-owned updater commands', () => {
     expect(events.map(event => event.event)).toEqual(['Started', 'Finished']);
     expect(vi.mocked(invoke).mock.calls[1][0]).toBe('download_update');
     expect((vi.mocked(invoke).mock.calls[1][1] as { update: unknown }).update).toEqual({ version: '0.3.0', signature: 'c2ln' });
-    vi.mocked(invoke).mockResolvedValueOnce(undefined);
-    await update.install();
+    vi.mocked(invoke).mockResolvedValueOnce('cancelled');
+    expect(await update.install()).toBe('cancelled');
     expect(vi.mocked(invoke).mock.calls[2]).toEqual(['install_update', { update: { version: '0.3.0', signature: 'c2ln' } }]);
     vi.mocked(invoke).mockResolvedValueOnce(undefined);
     await update.close();

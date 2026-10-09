@@ -69,7 +69,12 @@ export default function Updates({ dirty, busy, setBusy, close }: { dirty: boolea
       } catch (reason) {
         throw new Error(`Update recovery state could not be saved. The installer was not started. You can retry. ${String(reason)}`);
       }
-      await available.install();
+      setStatus(`Waiting for you to confirm installing version ${available.version}…`);
+      if (await available.install() === 'cancelled') {
+        try { await clearUpdateAttempt(); } catch {}
+        setStatus(`Version ${available.version} was not installed. Your installed version is unchanged. You can install it later.`);
+        return;
+      }
       throw new Error('Installer returned without closing the app.');
     } catch (e) {
       try { await clearUpdateAttempt(); } catch {}

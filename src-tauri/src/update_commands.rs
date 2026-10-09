@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{sync::Mutex, time::Duration};
-use tauri::{ipc::Channel, AppHandle, Runtime, State};
+use tauri::{ipc::Channel, AppHandle, Manager, Runtime, State};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(20);
@@ -114,17 +114,29 @@ impl<U, B> UpdateSlot<U, B> {
         }
     }
 
+    fn not_installable(&self) -> String {
+        match &self.stage {
+            Stage::Downloading(_) => "The update download has not finished.",
+            Stage::Downloaded(..) | Stage::Checked(..) => "This update was not downloaded by the latest check. Check for updates again.",
+            Stage::Empty => "No downloaded update is available. Check for updates again.",
+        }
+        .into()
+    }
+
+    /// The version of the downloaded update held for `key`, without taking it.
+    pub fn downloaded_version(&self, key: &UpdateKey) -> Result<String, String> {
+        match &self.stage {
+            Stage::Downloaded(held, ..) if held == key => Ok(held.version.clone()),
+            _ => Err(self.not_installable()),
+        }
+    }
+
     pub fn take_for_install(&mut self, key: &UpdateKey) -> Result<(U, B), String> {
         match std::mem::replace(&mut self.stage, Stage::Empty) {
             Stage::Downloaded(held, update, bytes) if held == *key => Ok((update, bytes)),
             other => {
-                let message = match &other {
-                    Stage::Downloading(_) => "The update download has not finished.",
-                    Stage::Downloaded(..) | Stage::Checked(..) => "This update was not downloaded by the latest check. Check for updates again.",
-                    Stage::Empty => "No downloaded update is available. Check for updates again.",
-                };
                 self.stage = other;
-                Err(message.into())
+                Err(self.not_installable())
             }
         }
     }
@@ -187,13 +199,67 @@ pub async fn download_update(state: State<'_, PendingUpdate>, update: UpdateKey,
     outcome
 }
 
-#[tauri::command]
-pub async fn install_update<R: Runtime>(app: AppHandle<R>, state: State<'_, PendingUpdate>, update: UpdateKey) -> Result<(), String> {
-    let (pending, bytes) = lock(&state)?.take_for_install(&update)?;
-    if !is_upgrade(&app.package_info().version, &pending.version) {
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum InstallOutcome {
+    Cancelled,
+    Started,
+}
+
+fn lock_slot<U, B>(slot: &Mutex<UpdateSlot<U, B>>) -> Result<std::sync::MutexGuard<'_, UpdateSlot<U, B>>, String> {
+    slot.lock().map_err(|_| "The updater state is unavailable. Restart PDF Workstation and try again.".to_string())
+}
+
+/// Asks before installing the downloaded update the backend holds for `key`.
+/// The question names the backend's own version, not one supplied by the
+/// webview. The slot is not locked while the question is open; No leaves the
+/// downloaded offer in place, Yes takes it single use and installs it.
+pub fn install_confirmed<U, B>(slot: &Mutex<UpdateSlot<U, B>>, key: &UpdateKey, current: &semver::Version, confirm: impl FnOnce(&str) -> bool, install: impl FnOnce(U, B) -> Result<(), String>) -> Result<InstallOutcome, String> {
+    let version = lock_slot(slot)?.downloaded_version(key)?;
+    if !is_upgrade(current, &version) {
         return Err("The offered update is not newer than the installed version.".into());
     }
-    pending.restart_after_install(true).install(&bytes).map_err(|error| error.to_string())
+    if !confirm(&version) {
+        return Ok(InstallOutcome::Cancelled);
+    }
+    let (update, bytes) = lock_slot(slot)?.take_for_install(key)?;
+    install(update, bytes)?;
+    Ok(InstallOutcome::Started)
+}
+
+pub fn confirmation_text(version: &str) -> String {
+    format!("PDF Workstation {version} is ready to install.\n\nPDF Workstation will close and reopen to finish the update. Save your work first: changes that are not saved will be lost.\n\nInstall version {version} now?")
+}
+
+const CONFIRMATION_TITLE: &str = "Install update?";
+
+#[cfg(windows)]
+fn ask_to_install(owner: Option<isize>, version: &str) -> bool {
+    use windows::{core::PCWSTR, Win32::{Foundation::HWND, UI::WindowsAndMessaging::{MessageBoxW, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_SETFOREGROUND, MB_YESNO}}};
+    let wide = |text: &str| text.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    let (text, title) = (wide(&confirmation_text(version)), wide(CONFIRMATION_TITLE));
+    let owner = owner.map(|hwnd| HWND(hwnd as *mut _)).unwrap_or_default();
+    unsafe { MessageBoxW(Some(owner), PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND) == IDYES }
+}
+
+#[cfg(not(windows))]
+fn ask_to_install(_owner: Option<isize>, version: &str) -> bool {
+    rfd::MessageDialog::new().set_title(CONFIRMATION_TITLE).set_description(confirmation_text(version)).set_buttons(rfd::MessageButtons::YesNo).set_level(rfd::MessageLevel::Warning).show() == rfd::MessageDialogResult::Yes
+}
+
+#[tauri::command]
+pub async fn install_update<R: Runtime>(app: AppHandle<R>, update: UpdateKey) -> Result<InstallOutcome, String> {
+    #[cfg(windows)]
+    let owner = app.get_webview_window("main").and_then(|window| window.hwnd().ok()).map(|hwnd| hwnd.0 as isize);
+    #[cfg(not(windows))]
+    let owner = None;
+    let worker = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = worker.state::<PendingUpdate>();
+        install_confirmed(&state, &update, &worker.package_info().version, |version| ask_to_install(owner, version), |pending, bytes| pending.restart_after_install(true).install(&bytes).map_err(|error| error.to_string()))
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -297,6 +363,67 @@ mod tests {
         slot.release();
         assert!(!slot.finish_download(&k, update, Ok(vec![1])));
         assert!(slot.take_for_install(&k).is_err());
+    }
+
+    fn current() -> semver::Version {
+        semver::Version::parse("0.2.0").unwrap()
+    }
+
+    #[test]
+    fn declining_the_confirmation_installs_nothing_and_keeps_the_downloaded_offer() {
+        let k = key("0.3.0", "sig");
+        let slot = Mutex::new(downloaded(&k));
+        let mut asked = Vec::new();
+        let mut installed = false;
+        let outcome = install_confirmed(&slot, &k, &current(), |version| { asked.push(version.to_string()); false }, |_, _| { installed = true; Ok(()) });
+        assert_eq!(outcome, Ok(InstallOutcome::Cancelled));
+        assert_eq!(asked, ["0.3.0"]);
+        assert!(!installed);
+        assert_eq!(slot.lock().unwrap().take_for_install(&k).unwrap(), ("update", vec![1, 2, 3]), "No keeps the downloaded offer for a later Yes");
+    }
+
+    #[test]
+    fn accepting_the_confirmation_installs_the_held_update_once() {
+        let k = key("0.3.0", "sig");
+        let slot = Mutex::new(downloaded(&k));
+        let mut installed = Vec::new();
+        let outcome = install_confirmed(&slot, &k, &current(), |_| true, |update, bytes| { installed.push((update, bytes)); Ok(()) });
+        assert_eq!(outcome, Ok(InstallOutcome::Started));
+        assert_eq!(installed, [("update", vec![1, 2, 3])]);
+        assert!(install_confirmed(&slot, &k, &current(), |_| true, |_, _| Ok(())).is_err(), "a consumed update must not install twice");
+    }
+
+    #[test]
+    fn confirmation_is_not_shown_for_an_unheld_or_stale_update() {
+        let k = key("0.3.0", "sig");
+        let empty: Mutex<UpdateSlot<&str, Vec<u8>>> = Mutex::new(UpdateSlot::default());
+        let mut asked = false;
+        assert!(install_confirmed(&empty, &k, &current(), |_| { asked = true; true }, |_, _| Ok(())).is_err());
+        let slot = Mutex::new(downloaded(&k));
+        assert!(install_confirmed(&slot, &key("0.9.0", "forged"), &current(), |_| { asked = true; true }, |_, _| Ok(())).is_err());
+        assert!(install_confirmed(&slot, &k, &semver::Version::parse("0.3.0").unwrap(), |_| { asked = true; true }, |_, _| Ok(())).is_err());
+        assert!(!asked, "the question must only name an update the backend downloaded and that is newer");
+    }
+
+    #[test]
+    fn an_offer_replaced_while_the_question_is_open_is_not_installed() {
+        let k = key("0.3.0", "sig");
+        let slot = Mutex::new(downloaded(&k));
+        let mut installed = false;
+        let outcome = install_confirmed(&slot, &k, &current(), |_| { slot.lock().unwrap().release(); true }, |_, _| { installed = true; Ok(()) });
+        assert!(outcome.is_err());
+        assert!(!installed);
+    }
+
+    #[test]
+    fn confirmation_text_names_the_version_restart_and_unsaved_work() {
+        let text = confirmation_text("0.3.0");
+        assert!(text.contains("PDF Workstation 0.3.0 is ready to install."));
+        assert!(text.contains("close and reopen"));
+        assert!(text.contains("Save your work first"));
+        assert!(text.contains("Install version 0.3.0 now?"));
+        assert_eq!(serde_json::to_value(InstallOutcome::Cancelled).unwrap(), serde_json::json!("cancelled"));
+        assert_eq!(serde_json::to_value(InstallOutcome::Started).unwrap(), serde_json::json!("started"));
     }
 
     #[test]

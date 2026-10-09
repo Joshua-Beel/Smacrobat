@@ -5,13 +5,15 @@ export type DownloadEvent =
   | { event: 'Progress'; data: { chunkLength: number } }
   | { event: 'Finished' };
 
+export type InstallOutcome = 'cancelled' | 'started';
+
 type UpdateOffer = { currentVersion: string; version: string; body: string | null; signature: string };
 
 export type Update = {
   version: string;
   body: string | null;
   download: (onEvent: (event: DownloadEvent) => void) => Promise<void>;
-  install: () => Promise<void>;
+  install: () => Promise<InstallOutcome>;
   close: () => Promise<void>;
 };
 
@@ -29,7 +31,7 @@ export async function checkForUpdate(): Promise<Update | null> {
       channel.onmessage = onEvent;
       return invoke<void>('download_update', { update, onEvent: channel });
     },
-    install: () => invoke<void>('install_update', { update }),
+    install: () => invoke<InstallOutcome>('install_update', { update }),
     close: releaseUpdate
   };
 }
