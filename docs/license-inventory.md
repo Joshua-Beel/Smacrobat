@@ -14,12 +14,11 @@ PDFium's version/build configuration files are now in the source bundle resource
 
 ## Frontend production dependencies
 
-These are the eight non-development entries in `package-lock.json`. A production bundler may remove unused code; this list is the conservative package inventory, not a claim that every package is present byte-for-byte in the final JavaScript.
+These are the seven non-development entries in `package-lock.json`. A production bundler may remove unused code; this list is the conservative package inventory, not a claim that every package is present byte-for-byte in the final JavaScript.
 
 | Package | Locked version | Declared license | Notice source in `node_modules` |
 | --- | --- | --- | --- |
 | `@tauri-apps/api` | 2.11.1 | Apache-2.0 OR MIT | `@tauri-apps/api/LICENSE_APACHE-2.0`, `LICENSE_MIT` |
-| `@tauri-apps/plugin-updater` | 2.11.0 | MIT OR Apache-2.0 | npm package contains `LICENSE.spdx`; full matching-version texts exist in the cached Rust updater crate |
 | `lucide-react` | 1.46.0 | ISC in package metadata | `lucide-react/LICENSE` also contains Feather-derived icon attribution and MIT text; retain the whole file |
 | `react` | 18.3.1 | MIT | `react/LICENSE` |
 | `react-dom` | 18.3.1 | MIT | `react-dom/LICENSE` |
@@ -27,7 +26,7 @@ These are the eight non-development entries in `package-lock.json`. A production
 | `loose-envify` | 1.4.0 | MIT | `loose-envify/LICENSE` |
 | `js-tokens` | 4.0.0 | MIT | `js-tokens/LICENSE` |
 
-The updater's `LICENSE.spdx` is metadata, not the full Apache/MIT text. Its generic `PackageName: tauri` should not be used as an exact inventory of that npm package's contents.
+The npm `@tauri-apps/plugin-updater` package was removed: the app calls its own updater commands, and the Rust `tauri-plugin-updater` crate below remains.
 
 Frontend development tools are separately declared: Tauri CLI 2.11.4, TypeScript 5.8.3, Vite 6.4.3, Vitest 3.2.4, React Vite plugin 4.7.0, React test renderer 18.3.1, and React type packages. They are not application runtime dependencies just because they appear in the lockfile. Their installed development trees still need their own upstream notices if those trees or tools are redistributed.
 

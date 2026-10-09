@@ -4,9 +4,9 @@
   "coverage": "Conservative resolved Cargo Windows graph, including build/auxiliary packages, plus non-development npm lock entries. Runtime-candidate is not proof of linked code. PDFium notices are packaged separately. Five exact MPL-2.0 crate source archives are packaged with verified locations and hashes; this collection does not determine the app license or complete release licensing review.",
   "inputHashes": {
     "src-tauri/Cargo.lock": "6e5907b52b54468add70f816d7a23d331e07dd67d63cafa907c791a17c409a9a",
-    "src-tauri/Cargo.toml": "b481aeaca5e5b2428cfe9b6a37236a16d2922017630ac6c4fc74aedff5b775e3",
-    "package-lock.json": "39e8634e39ff7def9af313739bfcf72b0856ed68851b8190bfa93e9100ab072d",
-    "package.json": "bcabf07b63dfe64c00fe28acfbd8f220165b29345dfcc57d083296d636d56e75",
+    "src-tauri/Cargo.toml": "88dfed5ef762f9948de6f9a100d18872a3502c1efc9a568e9d9eef240e10bcf4",
+    "package-lock.json": "6f1441c57c13489547c54c3e845d12827b907b9cdb1d2f3d54c3321da7683801",
+    "package.json": "e4ee9f328ec0dafc305cdee6e632dab65763ed1fd092cac204a3a13a3b314455",
     "scripts/notice-supplements/manifest.json": "f0700cbb9d20d43f42d709852e7961194d22937a41bf1fad5063e27f5fae2121",
     "scripts/mpl-source-archives.manifest.json": "d5575a6facde7afb4f4faae54009bb776da8b0d1410c68de1915c7a46a73e915"
   },
@@ -6360,28 +6360,6 @@
         {
           "path": "LICENSE_MIT",
           "sha256": "9dd42ea92cff2ede5cd477cbfcce051b2d0115c0ac7f368ee88cb545055dff1d"
-        }
-      ]
-    },
-    {
-      "ecosystem": "npm",
-      "name": "@tauri-apps/plugin-updater",
-      "version": "2.11.0",
-      "license": "MIT OR Apache-2.0",
-      "source": "https://registry.npmjs.org/@tauri-apps/plugin-updater/-/plugin-updater-2.11.0.tgz",
-      "scope": "production-lock-entry",
-      "notices": [
-        {
-          "path": "LICENSE.spdx",
-          "sha256": "eb8a6c84630461b352badcab1dbe5d0168c56d377358b2b8c86b51003272d5ef"
-        },
-        {
-          "path": "matching-rust-crate/LICENSE_APACHE-2.0",
-          "sha256": "0cec06e0e55fbc3dc5cee4fca9b607f66cb8f4e4dbcf3b3c013594dd156732e9"
-        },
-        {
-          "path": "matching-rust-crate/LICENSE_MIT",
-          "sha256": "89ff9689dcf9dd53968785d05a26f7898bb169dbfcada8d032b3e68cf0d55607"
         }
       ]
     },
